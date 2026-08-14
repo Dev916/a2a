@@ -5,4 +5,5 @@ pub mod events;
 pub mod home;
 pub mod ids;
 pub mod output;
+pub mod redact;
 pub mod store;

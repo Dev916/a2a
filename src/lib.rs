@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod events;
+pub mod fsm;
 pub mod home;
 pub mod ids;
 pub mod output;

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-14
 **Status:** Approved design, pre-implementation
-**Repo:** `~/dev/a2a` → private GitHub (Dev916), Python CLI `a2a` installed globally via uv tool
+**Repo:** `~/dev/a2a` → private GitHub (Dev916), Rust CLI `a2a` (single binary, cargo-built, installed to `~/.local/bin`)
 
 ## 1. Purpose
 
@@ -12,8 +12,17 @@ steers, and verifies; Codex executes discrete tasks. Alongside the dispatch
 protocol, a shared-capability layer keeps skills, MCP servers, and project
 context available to both runners without double maintenance.
 
-Everything targets this machine's existing conventions: own repo + global uv-tool
-CLI, devloop-driven builds, file-based state that a human or agent can inspect.
+Everything targets this machine's existing conventions: own repo, a single
+global CLI binary, devloop-driven builds, file-based state that a human or agent
+can inspect.
+
+**Implementation language: Rust.** One workspace crate producing the `a2a`
+binary (CLI + broker in the same binary; `a2a broker` is the daemon entry
+point). Tokio for the broker's async core (app-server child I/O, unix socket
+server, event fan-out); clap for the CLI; serde/serde_json for the file layer
+and JSON-RPC; toml_edit for comment-preserving `config.toml` edits. A single
+static binary also removes the uv-tool cached-build failure mode that affected
+prior Python CLIs on this machine.
 
 ## 2. Decisions made during brainstorming
 
@@ -203,7 +212,7 @@ Lanes are brief templates + spawn defaults only — no separate machinery.
 ### 5.2 `a2a sync mcp`
 
 - Translates `~/.claude.json` `mcpServers` → `[mcp_servers.*]` in
-  `~/.codex/config.toml` using tomlkit (preserves comments/formatting).
+  `~/.codex/config.toml` using toml_edit (preserves comments/formatting).
   stdio → `command`/`args`/`env`; HTTP → `url`.
 - Never modifies entries that exist only on the Codex side (mx, laravel-boost,
   mono, chrome-devtools, puppeteer, playwright, context7).
@@ -237,9 +246,10 @@ Lanes are brief templates + spawn defaults only — no separate machinery.
 
 ## 7. Testing
 
-- **Unit:** broker state machine + both transports against a fake app-server
-  (scripted JSON-RPC); sync tools against fixture configs asserting the
-  no-clobber rules (curated skills, Codex-only MCP entries).
+- **Unit/integration (cargo test):** broker state machine + both transports
+  against a fake app-server (a test helper binary speaking scripted JSON-RPC
+  over stdio); sync tools against fixture configs asserting the no-clobber
+  rules (curated skills, Codex-only MCP entries).
 - **E2E smoke (real codex):** trivial spawn→result; BLOCKED→`a2a send`→resume
   round-trip; mid-turn interrupt (app-server); forced exec-transport fallback;
   `a2a sync * --dry-run` on the live machine producing sane diffs.

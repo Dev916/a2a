@@ -27,5 +27,20 @@ pub enum Cmd {
     /// (hidden) canned typed error for contract tests
     #[command(hide = true, name = "__selftest-error")]
     SelftestError,
+    /// Inspect effective configuration
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     // later tasks append variants here
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCmd {
+    /// Print the effective configuration
+    Show {
+        /// Annotate each value with the layer it came from
+        #[arg(long)]
+        origin: bool,
+    },
 }

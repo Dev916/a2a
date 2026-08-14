@@ -45,7 +45,10 @@ fn layout_version_mismatch_exits_9() {
     let home = tmp.path().join("h");
     cmd(&home).args(["config", "show"]).assert().success();
     std::fs::write(home.join("LAYOUT_VERSION"), "999\n").unwrap();
-    let out = cmd(&home).args(["--json", "config", "show"]).assert().code(9);
+    let out = cmd(&home)
+        .args(["--json", "config", "show"])
+        .assert()
+        .code(9);
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["error"]["code"], "LAYOUT_VERSION_MISMATCH");
 }

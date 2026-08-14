@@ -33,10 +33,9 @@ fn run(cli: &Cli) -> Result<serde_json::Value, AppError> {
             "canned error",
         )),
         Cmd::Config { cmd } => match cmd {
-            // Temporary stub — replaced by the real layered config in Task 3.
-            ConfigCmd::Show { .. } => {
+            ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;
-                Ok(serde_json::json!({ "home": home.root() }))
+                a2a::commands::config_show::run(&home, *origin, cli.global.quiet)
             }
         },
     }

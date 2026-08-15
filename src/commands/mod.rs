@@ -2,8 +2,10 @@
 //! and returns the machine payload that `main` wraps in the output envelope.
 
 pub mod config_show;
+pub mod kill;
 pub mod ls;
 pub mod result;
+pub mod resume;
 pub mod send;
 pub mod spawn;
 pub mod status;

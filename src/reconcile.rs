@@ -221,15 +221,33 @@ fn reconcile_locked(
         && death_observed
         && matches!(snap.state, WorkerState::Running | WorkerState::Spawned)
     {
-        snap = commit(
-            &mut log,
-            dir,
-            snap,
-            EventKind::StateChange,
-            json!({"fsm": "ProcessExited", "code": exit_code}),
-            &FsmEvent::ProcessExited { code: exit_code },
-            now,
-        )?;
+        // A RESUMED epoch whose process died without ever starting a turn did
+        // not "run and produce nothing" — codex refused the session (deleted or
+        // archived out from under us), and spec §7 gives that its own
+        // `failure_class` so an orchestrator reports it distinctly instead of
+        // retrying a conversation that no longer exists.
+        snap = if snap.state == WorkerState::Running && session_missing(dir, snap.epoch) {
+            let session = snap.session_id.clone();
+            commit(
+                &mut log,
+                dir,
+                snap,
+                EventKind::StateChange,
+                json!({"fsm": "SessionMissing", "session_id": session, "code": exit_code}),
+                &FsmEvent::SessionMissing,
+                now,
+            )?
+        } else {
+            commit(
+                &mut log,
+                dir,
+                snap,
+                EventKind::StateChange,
+                json!({"fsm": "ProcessExited", "code": exit_code}),
+                &FsmEvent::ProcessExited { code: exit_code },
+                now,
+            )?
+        };
     }
 
     // 3c. Deadline expiry, against the persisted absolute deadline.
@@ -466,6 +484,37 @@ fn has_unanswered_question(dir: &Path, last_answer_seq: u64) -> bool {
         }
     }
     false
+}
+
+/// Did `epoch` begin with an `a2a resume` that never saw a turn start?
+///
+/// Both halves are read from the WAL rather than remembered in the snapshot, so
+/// the answer survives a rebuild-from-zero:
+///
+/// * the `Resumed` event that bumped INTO this epoch was appended while the
+///   snapshot still carried the previous one, so it is stamped `epoch - 1`;
+/// * `TurnStarted` is the first thing a healthy resumed session emits, and
+///   ingest stamps every exec line with the epoch it was read under.
+///
+/// A resumed process that exits with neither is the `session_missing` shape
+/// (spec §7): codex could not open the conversation, so nothing ever started.
+fn session_missing(dir: &Path, epoch: u32) -> bool {
+    let Ok(events) = crate::store::read_events(dir, 0) else {
+        return false; // unreadable log: fall back to the ordinary death path
+    };
+    let mut resumed = false;
+    for env in &events {
+        if env.kind == EventKind::TurnStarted && env.epoch == epoch {
+            return false; // this epoch did start a turn — a real run died
+        }
+        if env.kind == EventKind::Resumed
+            && env.epoch + 1 == epoch
+            && env.raw.get("fsm").and_then(Value::as_str) == Some("Resume")
+        {
+            resumed = true;
+        }
+    }
+    resumed
 }
 
 // -------------------------------------------------------- inbox at turn end

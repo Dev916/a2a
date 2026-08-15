@@ -96,6 +96,21 @@ pub enum Cmd {
         #[arg(long, value_enum, default_value_t = MsgKindArg::Answer)]
         kind: MsgKindArg,
     },
+    /// Stop a worker: witnessed group-kill, state → cancelled (never failed).
+    /// Idempotent — a worker that is already terminal exits 0.
+    Kill {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+    },
+    /// Continue a parked or terminal worker in a NEW epoch, resuming its codex
+    /// session
+    Resume {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+        /// Extra instruction for the resumed turn. Never appears in argv of the
+        /// codex child — it travels through a 0600 prompt file on stdin.
+        message: Option<String>,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

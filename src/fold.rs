@@ -104,8 +104,11 @@ pub fn fold(mut snap: WorkerSnapshot, events: &[Envelope], now: DateTime<Utc>) -
         } else if env.epoch >= snap.epoch {
             if let Some(ev) = envelope_to_fsm_event(env) {
                 apply_event(&mut snap, env, &ev, now);
-            } else if env.kind == events::EventKind::InboxDelivered {
-                apply_inbox_delivered(&mut snap, env);
+            } else if matches!(
+                env.kind,
+                events::EventKind::InboxDelivered | events::EventKind::TransportRestarted
+            ) {
+                apply_transport_identity(&mut snap, env);
             }
         }
         // else: stale epoch — fenced. The seq is still consumed below.
@@ -172,17 +175,20 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     snap.updated_at = now;
 }
 
-/// Inbox delivery moves no state — it is bookkeeping the fold must still apply,
-/// because losing it would mean re-delivering messages the worker already read
-/// after any snapshot rebuild.
+/// Transport bookkeeping: events that move no state but replace the worker's
+/// process, and therefore must still reach the snapshot.
 ///
-/// The pid/witness pair travels with it: a delivery replaces the worker's
-/// process without bumping the epoch, so the snapshot has to follow it or a
-/// later `a2a kill` would aim at the previous, already-dead process.
+/// Two events land here, for the same reason. An **inbox delivery** resumes the
+/// worker inside the current epoch; a **resume** starts a new epoch on the same
+/// session. Neither has an FSM row that could carry a pid (the machine is
+/// already in `running`), and neither may be lost: the snapshot has to follow
+/// the pid/witness pair or a later `a2a kill` would aim at the previous,
+/// already-dead process. Losing a delivery's watermark would additionally
+/// re-deliver messages the worker already read after any snapshot rebuild.
 ///
 /// The watermark only ever moves FORWARD (`max`), so replaying an older
 /// delivery after a newer one cannot un-acknowledge a message.
-fn apply_inbox_delivered(snap: &mut WorkerSnapshot, env: &Envelope) {
+fn apply_transport_identity(snap: &mut WorkerSnapshot, env: &Envelope) {
     if let Some(w) = env.raw.get("watermark").and_then(|v| v.as_u64()) {
         snap.last_delivered_seq = snap.last_delivered_seq.max(w);
     }

@@ -40,6 +40,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Result { .. } => "result",
         Cmd::Wait { .. } => "wait",
         Cmd::Send { .. } => "send",
+        Cmd::Kill { .. } => "kill",
+        Cmd::Resume { .. } => "resume",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -112,6 +114,20 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 from,
                 (*kind).into(),
                 *queue_only,
+                cli.global.json,
+                cli.global.quiet,
+            )
+        }
+        Cmd::Kill { id } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::kill::run(&home, id, cli.global.json, cli.global.quiet)
+        }
+        Cmd::Resume { id, message } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::resume::run(
+                &home,
+                id,
+                message.as_deref(),
                 cli.global.json,
                 cli.global.quiet,
             )

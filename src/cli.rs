@@ -1,3 +1,4 @@
+use crate::config::Lane;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -38,12 +39,49 @@ pub enum Cmd {
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         argv: Vec<String>,
     },
+    /// Dispatch a Codex worker; prints its id
+    Spawn(SpawnArgs),
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
     // later tasks append variants here
+}
+
+#[derive(clap::Args)]
+pub struct SpawnArgs {
+    /// Lane: impl|review|research|general (sets sandbox, model, effort)
+    #[arg(long)]
+    pub lane: Lane,
+    /// Working directory; must be under an allowed root. Forbidden for
+    /// `--lane research`, which always runs in the worker's own scratch dir.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Brief file (Markdown + optional YAML front matter)
+    #[arg(long)]
+    pub brief: PathBuf,
+    /// Extra file staged read-only into <worker>/context/ (repeatable)
+    #[arg(long)]
+    pub context: Vec<PathBuf>,
+    /// JSON schema the worker's result must satisfy
+    #[arg(long)]
+    pub schema: Option<PathBuf>,
+    /// Override the lane's model
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Override the lane's reasoning effort
+    #[arg(long)]
+    pub effort: Option<String>,
+    /// auto|exec (Phase 1); app-server arrives with the broker
+    #[arg(long)]
+    pub transport: Option<String>,
+    /// Run in a git worktree (Phase 4; warns and is ignored today)
+    #[arg(long)]
+    pub worktree: bool,
+    /// Fail rather than queue at the admission cap (Phase 2; no-op today)
+    #[arg(long)]
+    pub no_queue: bool,
 }
 
 #[derive(Subcommand)]

@@ -31,6 +31,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::SelftestError => "__selftest-error",
         Cmd::ExecShim { .. } => "__exec-shim",
+        Cmd::Spawn(_) => "spawn",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -45,6 +46,10 @@ fn run(cli: &Cli) -> Result<serde_json::Value, AppError> {
             "canned error",
         )),
         Cmd::ExecShim { .. } => unreachable!("__exec-shim diverges before dispatch"),
+        Cmd::Spawn(args) => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::spawn::run(&home, args, cli.global.json, cli.global.quiet)
+        }
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;

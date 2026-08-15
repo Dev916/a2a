@@ -46,6 +46,19 @@ pub enum Cmd {
         /// Worker id, or any unambiguous prefix of one
         id: String,
     },
+    /// List every worker (reconciling each): id, lane, state, dwell, last-event age
+    Ls,
+    /// Print a worker's events: `<seq> <ts> <kind>`, lifecycle only by default
+    Tail {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+        /// Only events after this seq (the cursor from a previous tail)
+        #[arg(long, value_name = "SEQ")]
+        since: Option<u64>,
+        /// Print full event envelopes as JSONL instead of the projection
+        #[arg(long)]
+        raw: bool,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

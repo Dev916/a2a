@@ -35,6 +35,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::ExecShim { .. } => "__exec-shim",
         Cmd::Spawn(_) => "spawn",
         Cmd::Status { .. } => "status",
+        Cmd::Ls => "ls",
+        Cmd::Tail { .. } => "tail",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -57,6 +59,21 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
         Cmd::Status { id } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::status::run(&home, id, cli.global.json, cli.global.quiet)
+        }
+        Cmd::Ls => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::ls::run(&home, cli.global.json, cli.global.quiet)
+        }
+        Cmd::Tail { id, since, raw } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::tail::run(
+                &home,
+                id,
+                *since,
+                *raw,
+                cli.global.json,
+                cli.global.quiet,
+            )
         }
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {

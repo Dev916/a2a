@@ -27,6 +27,17 @@ pub enum Cmd {
     /// (hidden) canned typed error for contract tests
     #[command(hide = true, name = "__selftest-error")]
     SelftestError,
+    /// (hidden) detached exec-transport shim: holds run.lock, wires the child's
+    /// streams to the worker dir, and lands the exit code in `exit_code`.
+    #[command(hide = true, name = "__exec-shim")]
+    ExecShim {
+        worker_dir: PathBuf,
+        epoch: u32,
+        prompt_file: PathBuf,
+        /// codex argv after `--` (never parsed by us, never shell-interpreted)
+        #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

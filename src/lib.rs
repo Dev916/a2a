@@ -3,6 +3,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod events;
+pub mod exec;
 pub mod fold;
 pub mod fsm;
 pub mod home;

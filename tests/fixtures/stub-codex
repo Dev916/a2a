@@ -1,0 +1,32 @@
+#!/bin/sh
+# stub-codex: scripted `codex exec --json` stand-in.
+# Env knobs: STUB_SLEEP, STUB_EXIT, STUB_LAST_MSG, STUB_NO_RESULT, STUB_LEAK,
+#            STUB_EMIT_QUESTION, STUB_RECORD (dir for resume recordings), STUB_RESUME_FAIL
+out=""; outbox=""; resume=0
+[ "$1" = "exec" ] && shift
+if [ "$1" = "resume" ]; then resume=1; shift; shift; fi   # consume "resume <session-id>"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output-last-message) shift; out="$1";;
+    --add-dir)             shift; outbox="$1";;
+  esac; shift
+done
+if [ "$resume" = 1 ] && [ -n "$STUB_RECORD" ]; then
+  printf '%s\n' "$0 $*" > "$STUB_RECORD/resume-argv.txt"
+  cat > "$STUB_RECORD/resume-stdin.txt"
+fi
+[ -n "$STUB_RESUME_FAIL" ] && [ "$resume" = 1 ] && exit "$STUB_RESUME_FAIL"
+printf '%s\n' '{"type":"session.created","session_id":"stub-sess-1"}'
+printf '%s\n' '{"type":"turn.started","id":"t1"}'
+printf '%s\n' "{\"type\":\"agent_message\",\"message\":\"working ${STUB_LEAK:-}\"}"
+printf '%s\n' '{"type":"agent_message_delta","delta":"x"}'
+if [ -n "$STUB_DUMP_ENV" ]; then env > "$STUB_DUMP_ENV"; fi
+[ -n "$STUB_SLEEP" ] && sleep "$STUB_SLEEP"
+if [ -n "$STUB_EMIT_QUESTION" ] && [ -n "$outbox" ]; then
+  printf '%s\n' '{"seq":1,"question":"A or B?","blocking":true}' > "$outbox/1.question.json"
+fi
+printf '%s\n' '{"type":"turn.completed","id":"t1"}'
+if [ -n "$out" ] && [ -z "$STUB_NO_RESULT" ] && [ -z "$STUB_EMIT_QUESTION" ]; then
+  printf '%s\n' "${STUB_LAST_MSG:-done}" > "$out"
+fi
+exit "${STUB_EXIT:-0}"

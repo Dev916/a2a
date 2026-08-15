@@ -104,6 +104,8 @@ pub fn fold(mut snap: WorkerSnapshot, events: &[Envelope], now: DateTime<Utc>) -
         } else if env.epoch >= snap.epoch {
             if let Some(ev) = envelope_to_fsm_event(env) {
                 apply_event(&mut snap, env, &ev, now);
+            } else if env.kind == events::EventKind::InboxDelivered {
+                apply_inbox_delivered(&mut snap, env);
             }
         }
         // else: stale epoch — fenced. The seq is still consumed below.
@@ -168,6 +170,30 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     snap.failure_class = None;
     snap.entered_state_at = snap.created_at;
     snap.updated_at = now;
+}
+
+/// Inbox delivery moves no state — it is bookkeeping the fold must still apply,
+/// because losing it would mean re-delivering messages the worker already read
+/// after any snapshot rebuild.
+///
+/// The pid/witness pair travels with it: a delivery replaces the worker's
+/// process without bumping the epoch, so the snapshot has to follow it or a
+/// later `a2a kill` would aim at the previous, already-dead process.
+///
+/// The watermark only ever moves FORWARD (`max`), so replaying an older
+/// delivery after a newer one cannot un-acknowledge a message.
+fn apply_inbox_delivered(snap: &mut WorkerSnapshot, env: &Envelope) {
+    if let Some(w) = env.raw.get("watermark").and_then(|v| v.as_u64()) {
+        snap.last_delivered_seq = snap.last_delivered_seq.max(w);
+    }
+    if let Some(pid) = env.raw.get("pid").and_then(|v| v.as_u64()) {
+        snap.pid = Some(pid as u32);
+        snap.pid_start_witness = env
+            .raw
+            .get("start_witness")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    }
 }
 
 fn apply_event(snap: &mut WorkerSnapshot, env: &Envelope, ev: &FsmEvent, now: DateTime<Utc>) {

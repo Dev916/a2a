@@ -78,6 +78,24 @@ pub enum Cmd {
         #[arg(long, value_name = "DUR", value_parser = crate::commands::wait::parse_duration)]
         timeout: Option<std::time::Duration>,
     },
+    /// Queue a message for a worker; delivered at the next turn boundary
+    Send {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+        /// The message text. Never appears in argv of the codex child — it
+        /// travels to the worker through a 0600 prompt file on stdin.
+        message: String,
+        /// Queue without delivering or stepping the machine, so several
+        /// messages can be batched into the next delivery
+        #[arg(long)]
+        queue_only: bool,
+        /// Who the message is from (recorded in the message's front matter)
+        #[arg(long, default_value = "orchestrator")]
+        from: String,
+        /// answer (responds to an outbox question) | steer (mid-flight guidance)
+        #[arg(long, value_enum, default_value_t = MsgKindArg::Answer)]
+        kind: MsgKindArg,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]
@@ -119,6 +137,24 @@ pub struct SpawnArgs {
     /// Fail rather than queue at the admission cap (Phase 2; no-op today)
     #[arg(long)]
     pub no_queue: bool,
+}
+
+/// clap-facing mirror of [`crate::inbox::MsgKind`]; the domain enum stays free
+/// of CLI derives so the file layer does not depend on the argument parser.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[value(rename_all = "lowercase")]
+pub enum MsgKindArg {
+    Answer,
+    Steer,
+}
+
+impl From<MsgKindArg> for crate::inbox::MsgKind {
+    fn from(k: MsgKindArg) -> Self {
+        match k {
+            MsgKindArg::Answer => crate::inbox::MsgKind::Answer,
+            MsgKindArg::Steer => crate::inbox::MsgKind::Steer,
+        }
+    }
 }
 
 #[derive(Subcommand)]

@@ -3,6 +3,7 @@
 # Env knobs: STUB_SLEEP, STUB_EXIT, STUB_LAST_MSG, STUB_NO_RESULT, STUB_LEAK,
 #            STUB_EMIT_QUESTION, STUB_RECORD (dir for resume recordings), STUB_RESUME_FAIL
 out=""; outbox=""; resume=0
+argv="$*"   # captured before the parse loop consumes it — resume-argv.txt is the ps-safety witness
 [ "$1" = "exec" ] && shift
 if [ "$1" = "resume" ]; then resume=1; shift; shift; fi   # consume "resume <session-id>"
 while [ $# -gt 0 ]; do
@@ -12,7 +13,7 @@ while [ $# -gt 0 ]; do
   esac; shift
 done
 if [ "$resume" = 1 ] && [ -n "$STUB_RECORD" ]; then
-  printf '%s\n' "$0 $*" > "$STUB_RECORD/resume-argv.txt"
+  printf '%s\n' "$0 $argv" > "$STUB_RECORD/resume-argv.txt"
   cat > "$STUB_RECORD/resume-stdin.txt"
 fi
 [ -n "$STUB_RESUME_FAIL" ] && [ "$resume" = 1 ] && exit "$STUB_RESUME_FAIL"

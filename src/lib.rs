@@ -8,6 +8,7 @@ pub mod fold;
 pub mod fsm;
 pub mod home;
 pub mod ids;
+pub mod inbox;
 pub mod output;
 pub mod reconcile;
 pub mod redact;

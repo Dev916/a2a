@@ -40,6 +40,7 @@ use crate::exec::{self, Liveness};
 use crate::fold::{self, append_and_fold, LivenessInput};
 use crate::fsm::{self, Action, FsmEvent, TimeoutKind, WorkerState};
 use crate::home::A2aHome;
+use crate::inbox;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
 use crate::state::{load_snapshot, save_snapshot, SnapshotError, WorkerSnapshot};
@@ -143,62 +144,73 @@ fn reconcile_locked(
     //     awaiting-input with nobody home.
     let mut turn_concluded = false;
     if ingested.turn_completed && snap.state == WorkerState::Running {
-        let has_result = has_result(dir);
-        let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
-        if has_result || has_question || !death_observed {
-            // The gate runs only when this turn actually produced a result AND
-            // the worker was spawned with a schema; everything else keeps the
-            // plain `result.md`-is-the-result rule (spec §4.3).
-            let gate = match (has_result, snap.schema_path.clone()) {
-                (true, Some(schema)) => Some(schema_gate(dir, &schema)?),
-                _ => None,
-            };
-            snap = match gate {
-                // Failed the gate: the raw text is preserved, the worker fails
-                // *resumably*, and `done` is never reached.
-                Some(Gate::Violation { detail }) => {
-                    let detail = redact::redact_egress(&detail);
-                    commit(
-                        &mut log,
-                        dir,
-                        snap,
-                        EventKind::StateChange,
-                        json!({"fsm": "ResultInvalid", "detail": detail}),
-                        &FsmEvent::ResultInvalid {
-                            detail: detail.clone(),
-                        },
-                        now,
-                    )?
-                }
-                passed => {
-                    if let Some(Gate::Pass { path, rotated }) = passed {
-                        // Bookkeeping, not a transition: no `fsm` key, so the
-                        // fold consumes the seq and changes nothing.
-                        snap = append_and_fold(
+        // Turn-boundary delivery FIRST (spec §4.3): if the operator queued
+        // anything, this instant is when the transport can accept it, so the
+        // batch goes out and the worker keeps running. No `TurnEnded` is
+        // computed — a queued steer must not have to be followed by a manual
+        // `a2a send` to un-park the worker it was meant to steer.
+        if let Some(next) = deliver_at_turn_boundary(&mut log, dir, &snap, cfg, now)? {
+            snap = next;
+            // A worker we just restarted is emphatically not dead.
+            turn_concluded = true;
+        } else {
+            let has_result = has_result(dir);
+            let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
+            if has_result || has_question || !death_observed {
+                // The gate runs only when this turn actually produced a result
+                // AND the worker was spawned with a schema; everything else
+                // keeps the plain `result.md`-is-the-result rule (spec §4.3).
+                let gate = match (has_result, snap.schema_path.clone()) {
+                    (true, Some(schema)) => Some(schema_gate(dir, &schema)?),
+                    _ => None,
+                };
+                snap = match gate {
+                    // Failed the gate: the raw text is preserved, the worker
+                    // fails *resumably*, and `done` is never reached.
+                    Some(Gate::Violation { detail }) => {
+                        let detail = redact::redact_egress(&detail);
+                        commit(
                             &mut log,
                             dir,
                             snap,
-                            EventKind::ResultWritten,
-                            json!({"path": path, "rotated_prior_to": rotated}),
+                            EventKind::StateChange,
+                            json!({"fsm": "ResultInvalid", "detail": detail}),
+                            &FsmEvent::ResultInvalid {
+                                detail: detail.clone(),
+                            },
                             now,
-                        )?;
+                        )?
                     }
-                    commit(
-                        &mut log,
-                        dir,
-                        snap,
-                        EventKind::StateChange,
-                        json!({"fsm": "TurnEnded", "has_result": has_result,
-                               "has_question": has_question}),
-                        &FsmEvent::TurnEnded {
-                            has_result,
-                            has_question,
-                        },
-                        now,
-                    )?
-                }
-            };
-            turn_concluded = true;
+                    passed => {
+                        if let Some(Gate::Pass { path, rotated }) = passed {
+                            // Bookkeeping, not a transition: no `fsm` key, so
+                            // the fold consumes the seq and changes nothing.
+                            snap = append_and_fold(
+                                &mut log,
+                                dir,
+                                snap,
+                                EventKind::ResultWritten,
+                                json!({"path": path, "rotated_prior_to": rotated}),
+                                now,
+                            )?;
+                        }
+                        commit(
+                            &mut log,
+                            dir,
+                            snap,
+                            EventKind::StateChange,
+                            json!({"fsm": "TurnEnded", "has_result": has_result,
+                                   "has_question": has_question}),
+                            &FsmEvent::TurnEnded {
+                                has_result,
+                                has_question,
+                            },
+                            now,
+                        )?
+                    }
+                };
+                turn_concluded = true;
+            }
         }
     }
 
@@ -248,7 +260,10 @@ fn reconcile_locked(
 
 /// Exclusive, nonblocking, retried. Held for the whole reconcile; released by
 /// the kernel when the returned guard drops (or when this process dies).
-fn lock_state(dir: &Path) -> Result<Flock<File>, AppError> {
+///
+/// Public because every mutating command (`send` today, `kill`/`resume` next)
+/// serializes on the SAME lock a reconcile takes — one worker, one writer.
+pub fn lock_state(dir: &Path) -> Result<Flock<File>, AppError> {
     let path = dir.join(STATE_LOCK);
     let mut file = OpenOptions::new()
         .create(true)
@@ -453,6 +468,54 @@ fn has_unanswered_question(dir: &Path, last_answer_seq: u64) -> bool {
     false
 }
 
+// -------------------------------------------------------- inbox at turn end
+
+/// Hand any queued `inbox/` messages to the worker at the turn boundary and
+/// return the resulting snapshot; `None` means there was nothing to deliver and
+/// the caller should conclude the turn normally.
+///
+/// Two deliberate non-failures:
+///
+/// * **No session id** — nothing to resume, so the messages stay queued and the
+///   worker parks in `awaiting-input`, where an operator can see them. A read
+///   path must not turn "cannot deliver yet" into "cannot read this worker".
+/// * **Unreadable inbox** — same reasoning: park the worker, let `doctor`
+///   report the directory.
+///
+/// A delivery that *starts* and then fails (no prompt file, no fork) IS an
+/// error: the worker's transport is broken, and silently reporting `done` on a
+/// turn we tried to extend would be a lie.
+fn deliver_at_turn_boundary(
+    log: &mut EventLog,
+    dir: &Path,
+    snap: &WorkerSnapshot,
+    cfg: &Config,
+    now: DateTime<Utc>,
+) -> Result<Option<WorkerSnapshot>, AppError> {
+    if snap.session_id.is_none() {
+        return Ok(None);
+    }
+    match inbox::undelivered(dir, snap.last_delivered_seq) {
+        Ok(pending) if pending.is_empty() => return Ok(None),
+        Err(_) => return Ok(None),
+        Ok(_) => {}
+    }
+    let delivery = inbox::deliver(dir, cfg, snap)?;
+    Ok(Some(append_and_fold(
+        log,
+        dir,
+        snap.clone(),
+        EventKind::InboxDelivered,
+        json!({
+            "watermark": delivery.watermark,
+            "seqs": delivery.seqs,
+            "pid": delivery.pid,
+            "start_witness": delivery.start_witness,
+        }),
+        now,
+    )?))
+}
+
 // ------------------------------------------------------------ the schema gate
 
 /// The name every schema-conforming result lands under.
@@ -639,8 +702,11 @@ fn perform(snap: &WorkerSnapshot, action: Action) {
                 let _ = exec::kill_worker(pid, witness);
             }
         }
-        // Inbox delivery is `send`'s job (Task 16); the escalation hook lands
-        // with the broker. Both are listed so this match stays total.
+        // `DeliverInbox` is performed by `send` itself (it owns the queue write
+        // that precedes it) and by `deliver_at_turn_boundary` above, both of
+        // which record the resulting watermark. Reconcile never reaches this
+        // arm with a Send event, and the escalation hook lands with the broker.
+        // Both are listed so this match stays total.
         Action::DeliverInbox | Action::RecordEscalation => {}
     }
 }
@@ -671,7 +737,11 @@ fn timeout_name(kind: TimeoutKind) -> &'static str {
 /// Deriving (rather than incrementing) is what stops a deadline from sliding
 /// forward one poll at a time: N reconciles of an unchanged worker compute the
 /// same absolute instant. Terminal and escalated states carry no deadline.
-fn arm_deadline(snap: &mut WorkerSnapshot, cfg: &Config) {
+///
+/// Public for the same reason as [`lock_state`]: a command that commits a
+/// transition outside `reconcile` must re-arm from the state it landed in, or
+/// it leaves the previous state's deadline pointed at the new one.
+pub fn arm_deadline(snap: &mut WorkerSnapshot, cfg: &Config) {
     let Some(lane) = cfg.lanes.get(&snap.lane) else {
         return;
     };

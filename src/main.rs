@@ -39,6 +39,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Tail { .. } => "tail",
         Cmd::Result { .. } => "result",
         Cmd::Wait { .. } => "wait",
+        Cmd::Send { .. } => "send",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -92,6 +93,25 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 ids,
                 *until,
                 timeout.unwrap_or(a2a::commands::wait::DEFAULT_TIMEOUT),
+                cli.global.json,
+                cli.global.quiet,
+            )
+        }
+        Cmd::Send {
+            id,
+            message,
+            queue_only,
+            from,
+            kind,
+        } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::send::run(
+                &home,
+                id,
+                message,
+                from,
+                (*kind).into(),
+                *queue_only,
                 cli.global.json,
                 cli.global.quiet,
             )

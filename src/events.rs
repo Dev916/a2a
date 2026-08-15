@@ -51,6 +51,10 @@ pub enum EventKind {
     CommandExec,
     Blocked,
     OutboxNotice,
+    /// A batch of `inbox/` messages was handed to the worker; carries the new
+    /// `last_delivered_seq` watermark, so a snapshot rebuilt from the WAL never
+    /// re-delivers what was already acknowledged.
+    InboxDelivered,
     StateChange,
     EventsDropped,
     TransportRestarted,

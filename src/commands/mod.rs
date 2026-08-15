@@ -4,6 +4,7 @@
 pub mod config_show;
 pub mod ls;
 pub mod result;
+pub mod send;
 pub mod spawn;
 pub mod status;
 pub mod tail;

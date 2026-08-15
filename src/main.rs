@@ -37,6 +37,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Status { .. } => "status",
         Cmd::Ls => "ls",
         Cmd::Tail { .. } => "tail",
+        Cmd::Result { .. } => "result",
+        Cmd::Wait { .. } => "wait",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -71,6 +73,25 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 id,
                 *since,
                 *raw,
+                cli.global.json,
+                cli.global.quiet,
+            )
+        }
+        Cmd::Result { id } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::result::run(&home, id, cli.global.json, cli.global.quiet)
+        }
+        Cmd::Wait {
+            ids,
+            until,
+            timeout,
+        } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::wait::run(
+                &home,
+                ids,
+                *until,
+                timeout.unwrap_or(a2a::commands::wait::DEFAULT_TIMEOUT),
                 cli.global.json,
                 cli.global.quiet,
             )

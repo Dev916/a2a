@@ -21,6 +21,11 @@
 //! 2. **Turn completion** first, because a worker that ended its turn with a
 //!    result finished; its process exiting afterwards is a consequence, not a
 //!    failure.
+//!    A turn that produced a result under a `--schema` passes through the
+//!    **schema gate** (spec §4.3) *before* the transition is committed, because
+//!    a result that does not satisfy the schema must land the worker in
+//!    `failed{schema_violation}` rather than `done` — and `done` is absorbing,
+//!    so there is no second chance to demote it afterwards.
 //! 3. **Process death** second, and only when the kernel actually says so:
 //!    a free/absent `run.lock` is treated as death only once `exit_code` exists
 //!    or a 5s grace has elapsed — otherwise a worker reconciled milliseconds
@@ -45,7 +50,7 @@ use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Per-worker serialization point for every reconcile.
@@ -141,18 +146,58 @@ fn reconcile_locked(
         let has_result = has_result(dir);
         let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
         if has_result || has_question || !death_observed {
-            snap = commit(
-                &mut log,
-                dir,
-                snap,
-                EventKind::StateChange,
-                json!({"fsm": "TurnEnded", "has_result": has_result, "has_question": has_question}),
-                &FsmEvent::TurnEnded {
-                    has_result,
-                    has_question,
-                },
-                now,
-            )?;
+            // The gate runs only when this turn actually produced a result AND
+            // the worker was spawned with a schema; everything else keeps the
+            // plain `result.md`-is-the-result rule (spec §4.3).
+            let gate = match (has_result, snap.schema_path.clone()) {
+                (true, Some(schema)) => Some(schema_gate(dir, &schema)?),
+                _ => None,
+            };
+            snap = match gate {
+                // Failed the gate: the raw text is preserved, the worker fails
+                // *resumably*, and `done` is never reached.
+                Some(Gate::Violation { detail }) => {
+                    let detail = redact::redact_egress(&detail);
+                    commit(
+                        &mut log,
+                        dir,
+                        snap,
+                        EventKind::StateChange,
+                        json!({"fsm": "ResultInvalid", "detail": detail}),
+                        &FsmEvent::ResultInvalid {
+                            detail: detail.clone(),
+                        },
+                        now,
+                    )?
+                }
+                passed => {
+                    if let Some(Gate::Pass { path, rotated }) = passed {
+                        // Bookkeeping, not a transition: no `fsm` key, so the
+                        // fold consumes the seq and changes nothing.
+                        snap = append_and_fold(
+                            &mut log,
+                            dir,
+                            snap,
+                            EventKind::ResultWritten,
+                            json!({"path": path, "rotated_prior_to": rotated}),
+                            now,
+                        )?;
+                    }
+                    commit(
+                        &mut log,
+                        dir,
+                        snap,
+                        EventKind::StateChange,
+                        json!({"fsm": "TurnEnded", "has_result": has_result,
+                               "has_question": has_question}),
+                        &FsmEvent::TurnEnded {
+                            has_result,
+                            has_question,
+                        },
+                        now,
+                    )?
+                }
+            };
             turn_concluded = true;
         }
     }
@@ -364,6 +409,13 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
 
 /// A result exists only if it has content — codex creates the
 /// `--output-last-message` file before it has anything to put in it.
+///
+/// Known gap (§4.5 says every worker file is 0600): `result.md` is created by
+/// the codex *child*, so it lands under that child's umask — 0644 in practice.
+/// The schema gate tightens it because the gate legitimately owns the file at
+/// that moment; without `--schema` nothing rewrites it, and reconcile is a read
+/// path that must not silently mutate modes. `doctor` (Task 19) is where a
+/// world-readable `result.md` gets reported.
 fn has_result(dir: &Path) -> bool {
     std::fs::metadata(dir.join("result.md"))
         .map(|m| m.len() > 0)
@@ -399,6 +451,157 @@ fn has_unanswered_question(dir: &Path, last_answer_seq: u64) -> bool {
         }
     }
     false
+}
+
+// ------------------------------------------------------------ the schema gate
+
+/// The name every schema-conforming result lands under.
+pub const RESULT_JSON: &str = "result.json";
+/// Where a schema-violating result's raw text is preserved.
+pub const RESULT_RAW: &str = "result.raw.md";
+/// What codex's `--output-last-message` writes.
+pub const RESULT_MD: &str = "result.md";
+
+/// What the §4.3 gate decided about a completed turn's `result.md`.
+enum Gate {
+    /// Conforming: parsed JSON is now `result.json`, any prior one rotated.
+    Pass {
+        path: PathBuf,
+        rotated: Option<PathBuf>,
+    },
+    /// Non-conforming: `result.md` is preserved as `result.raw.md` and the
+    /// worker fails `schema_violation` — resumable, since the session survives.
+    Violation { detail: String },
+}
+
+/// Spec §4.3, Phase 1 subset: parse `result.md` as JSON and require the
+/// schema's **top-level `required` keys**. Full JSON-Schema validation is a
+/// Phase 2+ upgrade (and a `doctor` note) — the point of the Phase 1 gate is
+/// that a worker can never silently report `done` with a result the
+/// orchestrator cannot parse.
+///
+/// `Err` is reserved for *our* IO failures. Everything the worker (or a human
+/// editing the schema) can get wrong — unparseable result, missing keys, a
+/// schema file that has since become unreadable — is a `Violation`, so the
+/// worker ends in a state a human can read and repair with `a2a resume`,
+/// never in a reconcile that errors forever.
+fn schema_gate(dir: &Path, schema_path: &Path) -> Result<Gate, AppError> {
+    let schema = match std::fs::read_to_string(schema_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
+        Some(v) => v,
+        None => {
+            return violation(
+                dir,
+                format!(
+                    "--schema {} is missing or is not valid JSON",
+                    schema_path.display()
+                ),
+            )
+        }
+    };
+    let text = std::fs::read_to_string(dir.join(RESULT_MD))
+        .map_err(|e| io_err("reading result.md", e))?;
+    let parsed = match serde_json::from_str::<Value>(&text) {
+        Ok(v) => v,
+        // The serde message names a position, never content — the result text
+        // itself must not travel into events.jsonl through an error string.
+        Err(e) => return violation(dir, format!("result.md is not JSON: {e}")),
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !required.is_empty() {
+        let Some(obj) = parsed.as_object() else {
+            return violation(
+                dir,
+                format!(
+                    "result.md is a JSON {}, but the schema requires an object with key(s): {}",
+                    type_name(&parsed),
+                    required.join(", ")
+                ),
+            );
+        };
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|k| !obj.contains_key(*k))
+            .collect();
+        if !missing.is_empty() {
+            return violation(
+                dir,
+                format!("result.md is missing required key(s): {}", missing.join(", ")),
+            );
+        }
+    }
+
+    let rotated = rotate_result_json(dir)?;
+    let mut bytes = serde_json::to_vec_pretty(&parsed).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("re-serializing the result: {e}"),
+        )
+    })?;
+    bytes.push(b'\n');
+    let path = dir.join(RESULT_JSON);
+    // write_atomic creates the temp at 0600, so result.json is 0600 by
+    // construction — unlike result.md, which codex creates under the child's
+    // umask; the gate is the one place that owns it, so it tightens it here.
+    crate::store::write_atomic(&path, &bytes).map_err(|e| io_err("writing result.json", e))?;
+    chmod_0600(&dir.join(RESULT_MD));
+    Ok(Gate::Pass { path, rotated })
+}
+
+/// Preserve the raw text at `result.raw.md` (0600) and report the violation.
+fn violation(dir: &Path, detail: String) -> Result<Gate, AppError> {
+    let raw = dir.join(RESULT_RAW);
+    let md = dir.join(RESULT_MD);
+    if md.exists() {
+        std::fs::rename(&md, &raw).map_err(|e| io_err("preserving result.raw.md", e))?;
+        chmod_0600(&raw);
+    }
+    Ok(Gate::Violation { detail })
+}
+
+/// `result.json` → `result.<n>.json` for the smallest free `n` (spec §4.3:
+/// priors are kept, never overwritten). `None` = there was nothing to rotate.
+fn rotate_result_json(dir: &Path) -> Result<Option<PathBuf>, AppError> {
+    let current = dir.join(RESULT_JSON);
+    if !current.exists() {
+        return Ok(None);
+    }
+    for n in 1..u32::MAX {
+        let candidate = dir.join(format!("result.{n}.json"));
+        if candidate.exists() {
+            continue;
+        }
+        std::fs::rename(&current, &candidate)
+            .map_err(|e| io_err("rotating the prior result.json", e))?;
+        return Ok(Some(candidate));
+    }
+    unreachable!("u32::MAX prior results is not a reachable state")
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Best effort by design: a mode we could not tighten is a `doctor` finding,
+/// never a reason to fail the reconcile that just recorded the result.
+fn chmod_0600(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
 }
 
 // ------------------------------------------------------------- the WAL write
@@ -491,6 +694,7 @@ fn io_err(ctx: &str, e: std::io::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::config::Lane;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn timeout_kind_is_armed_per_state() {
@@ -558,6 +762,118 @@ mod tests {
             "n1"
         );
         assert!(extract_session(&json!({"type":"session.created"})).is_none());
+    }
+
+    /// Helper: a worker dir with `result.md` and a schema file beside it.
+    fn gate_fixture(result: &str, schema: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(RESULT_MD), result).unwrap();
+        let schema_path = tmp.path().join("schema.json");
+        std::fs::write(&schema_path, schema).unwrap();
+        (tmp, schema_path)
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_conforming_result_becomes_result_json_at_0600() {
+        let (tmp, schema) = gate_fixture(
+            r#"{"status":"pass","iterations":3}"#,
+            r#"{"type":"object","required":["status"]}"#,
+        );
+        // codex writes result.md under the child's umask; the gate owns it now
+        chmod(&tmp.path().join(RESULT_MD), 0o644);
+        let gate = schema_gate(tmp.path(), &schema).unwrap();
+        let Gate::Pass { path, rotated } = gate else {
+            panic!("a conforming result must pass the gate");
+        };
+        assert_eq!(path, tmp.path().join(RESULT_JSON));
+        assert!(rotated.is_none(), "nothing to rotate on the first result");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["status"], json!("pass"));
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&tmp.path().join(RESULT_MD)), 0o600, "tightened");
+        assert!(!tmp.path().join(RESULT_RAW).exists());
+    }
+
+    #[test]
+    fn priors_rotate_to_result_n_json_and_are_never_overwritten() {
+        let (tmp, schema) = gate_fixture(
+            r#"{"status":"pass","n":2}"#,
+            r#"{"type":"object","required":["status"]}"#,
+        );
+        std::fs::write(tmp.path().join(RESULT_JSON), br#"{"status":"first"}"#).unwrap();
+        let Gate::Pass { rotated, .. } = schema_gate(tmp.path(), &schema).unwrap() else {
+            panic!("must pass");
+        };
+        assert_eq!(rotated, Some(tmp.path().join("result.1.json")));
+        let prior: Value =
+            serde_json::from_str(&std::fs::read_to_string(rotated.unwrap()).unwrap()).unwrap();
+        assert_eq!(prior["status"], json!("first"), "prior kept verbatim");
+        // a third turn rotates to .2, leaving .1 alone
+        std::fs::write(tmp.path().join(RESULT_MD), br#"{"status":"pass","n":3}"#).unwrap();
+        let Gate::Pass { rotated, .. } = schema_gate(tmp.path(), &schema).unwrap() else {
+            panic!("must pass");
+        };
+        assert_eq!(rotated, Some(tmp.path().join("result.2.json")));
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &std::fs::read_to_string(tmp.path().join("result.1.json")).unwrap()
+            )
+            .unwrap()["status"],
+            json!("first")
+        );
+    }
+
+    #[test]
+    fn every_violation_shape_preserves_the_raw_text_at_0600() {
+        let required = r#"{"type":"object","required":["status"]}"#;
+        for (result, expect) in [
+            ("not json at all", "not JSON"),
+            (r#"{"iterations":3}"#, "missing required key"),
+            (r#"["status"]"#, "requires an object"),
+        ] {
+            let (tmp, schema) = gate_fixture(result, required);
+            let Gate::Violation { detail } = schema_gate(tmp.path(), &schema).unwrap() else {
+                panic!("`{result}` must not pass the gate");
+            };
+            assert!(detail.contains(expect), "{detail}");
+            assert!(!detail.contains(result), "detail must not quote the result");
+            assert!(!tmp.path().join(RESULT_MD).exists(), "moved, not copied");
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(RESULT_RAW)).unwrap(),
+                result
+            );
+            assert_eq!(mode_of(&tmp.path().join(RESULT_RAW)), 0o600);
+            assert!(!tmp.path().join(RESULT_JSON).exists());
+        }
+    }
+
+    #[test]
+    fn a_schema_with_no_required_keys_only_demands_parseable_json() {
+        let (tmp, schema) = gate_fixture("[1, 2, 3]", r#"{"type":"array"}"#);
+        assert!(matches!(
+            schema_gate(tmp.path(), &schema).unwrap(),
+            Gate::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_schema_fails_the_worker_rather_than_passing_it_unvalidated() {
+        let (tmp, _) = gate_fixture(r#"{"status":"pass"}"#, "{}");
+        let missing = tmp.path().join("gone.json");
+        let Gate::Violation { detail } = schema_gate(tmp.path(), &missing).unwrap() else {
+            panic!("an unvalidatable result must never read as done");
+        };
+        assert!(detail.contains("gone.json"), "{detail}");
+        assert!(tmp.path().join(RESULT_RAW).exists());
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 pub mod config_show;
 pub mod ls;
+pub mod result;
 pub mod spawn;
 pub mod status;
 pub mod tail;
+pub mod wait;

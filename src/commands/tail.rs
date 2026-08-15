@@ -111,7 +111,9 @@ fn kind(k: EventKind) -> String {
 /// Mask every string leaf. Structural (rather than whole-document) redaction on
 /// purpose: masking the serialized JSON could in principle corrupt it, and a
 /// `tail --json` that emits invalid JSON is a worse failure than a long token.
-fn redact_value(v: &Value) -> Value {
+///
+/// Shared with `result`, which has the same problem with schema-gated payloads.
+pub(crate) fn redact_value(v: &Value) -> Value {
     match v {
         Value::String(s) => Value::String(redact::redact_egress(s)),
         Value::Array(a) => Value::Array(a.iter().map(redact_value).collect()),

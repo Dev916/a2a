@@ -59,6 +59,25 @@ pub enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// Print a worker's final result (exit code encodes its state)
+    Result {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+    },
+    /// Block until a worker leaves the running states; exit code encodes the
+    /// state reached (timeout expiry exits 6)
+    Wait {
+        /// One or more worker ids (or unambiguous prefixes); the first to
+        /// reach the stop set wins and its id is printed
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        /// Stop set: any (default) | blocked | terminal | done
+        #[arg(long, value_enum, default_value_t = crate::commands::wait::Until::Any)]
+        until: crate::commands::wait::Until,
+        /// Give up after this long and exit 6 — `30s`, `5m`, `2h`
+        #[arg(long, value_name = "DUR", value_parser = crate::commands::wait::parse_duration)]
+        timeout: Option<std::time::Duration>,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

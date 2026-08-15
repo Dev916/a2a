@@ -41,6 +41,33 @@ impl AppError {
     }
 }
 
+/// A successful command's machine payload plus the exit code it maps to.
+///
+/// Success and exit-zero are NOT the same thing: `a2a status` on a failed
+/// worker succeeded (it answered the question) and must still exit 4 with a
+/// full `data` payload, not an error envelope. Commands that only ever exit 0
+/// convert from `Value` and never mention this type.
+#[derive(Debug)]
+pub struct Outcome {
+    pub data: Value,
+    pub exit: ExitCode,
+}
+
+impl Outcome {
+    pub fn with(data: Value, exit: ExitCode) -> Self {
+        Self { data, exit }
+    }
+}
+
+impl From<Value> for Outcome {
+    fn from(data: Value) -> Self {
+        Self {
+            data,
+            exit: ExitCode::Success,
+        }
+    }
+}
+
 /// stdout = machine payload only; stderr = diagnostics/decoration.
 pub fn emit_ok(json_mode: bool, command: &str, data: Value) {
     if json_mode {

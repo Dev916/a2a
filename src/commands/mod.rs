@@ -3,3 +3,4 @@
 
 pub mod config_show;
 pub mod spawn;
+pub mod status;

@@ -1,6 +1,6 @@
 use a2a::cli::{Cli, Cmd, ConfigCmd};
 use a2a::home::A2aHome;
-use a2a::output::{emit_err, emit_ok, AppError, ExitCode};
+use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
 use clap::Parser;
 
 fn main() {
@@ -18,9 +18,11 @@ fn main() {
     }
     let cmd_name = command_name(&cli.cmd);
     let code = match run(&cli) {
-        Ok(data) => {
-            emit_ok(cli.global.json, cmd_name, data);
-            0
+        // A command can succeed and still exit nonzero: `status` on a failed
+        // worker answered the question correctly (exit 4, full payload).
+        Ok(out) => {
+            emit_ok(cli.global.json, cmd_name, out.data);
+            out.exit as i32
         }
         Err(e) => emit_err(cli.global.json, cmd_name, &e),
     };
@@ -32,13 +34,14 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::SelftestError => "__selftest-error",
         Cmd::ExecShim { .. } => "__exec-shim",
         Cmd::Spawn(_) => "spawn",
+        Cmd::Status { .. } => "status",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
     }
 }
 
-fn run(cli: &Cli) -> Result<serde_json::Value, AppError> {
+fn run(cli: &Cli) -> Result<Outcome, AppError> {
     match &cli.cmd {
         Cmd::SelftestError => Err(AppError::new(
             "SELFTEST",
@@ -49,11 +52,17 @@ fn run(cli: &Cli) -> Result<serde_json::Value, AppError> {
         Cmd::Spawn(args) => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::spawn::run(&home, args, cli.global.json, cli.global.quiet)
+                .map(Outcome::from)
+        }
+        Cmd::Status { id } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::status::run(&home, id, cli.global.json, cli.global.quiet)
         }
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;
                 a2a::commands::config_show::run(&home, *origin, cli.global.quiet)
+                    .map(Outcome::from)
             }
         },
     }

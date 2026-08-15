@@ -41,6 +41,11 @@ pub enum Cmd {
     },
     /// Dispatch a Codex worker; prints its id
     Spawn(SpawnArgs),
+    /// Reconcile one worker and report its state (exit code IS the state)
+    Status {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

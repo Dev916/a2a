@@ -9,6 +9,7 @@ pub mod fsm;
 pub mod home;
 pub mod ids;
 pub mod output;
+pub mod reconcile;
 pub mod redact;
 pub mod state;
 pub mod store;

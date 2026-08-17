@@ -331,6 +331,87 @@ pub fn forwarded_test_env() -> Vec<(String, String)> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// codex identity (the drift gate, spec §4.2)
+// ---------------------------------------------------------------------------
+
+/// How long `<codex> --version` is given before the answer is treated as
+/// unknown. A version check is not worth hanging a spawn on.
+pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Which codex binary the broker is serving, and which build of it.
+///
+/// Pinned at broker start and re-checked on every spawn. The *path* alone is not
+/// the identity: an `nvm` switch or a `codex update` replaces the binary behind
+/// a stable path, and mixing two builds against one session store is precisely
+/// what spec §4.2 forbids.
+///
+/// `version: None` means the binary answered nothing parseable — recorded as a
+/// value so that "no version" is compared to "no version" and does not read as
+/// drift on every spawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexIdentity {
+    pub path: PathBuf,
+    pub version: Option<String>,
+}
+
+impl CodexIdentity {
+    /// The identity of the binary a [`ChildSpec`] would launch, probed with the
+    /// same environment that child would get.
+    pub fn of(spec: &ChildSpec) -> CodexIdentity {
+        CodexIdentity::resolve(&spec.bin, &spec.extra_env)
+    }
+
+    /// Ask the binary who it is. Synchronous and cheap; callers on the runtime
+    /// go through `spawn_blocking`.
+    ///
+    /// Three properties are not incidental, and each is a way this could wedge
+    /// the daemon it runs inside:
+    ///
+    /// * **stdin is `/dev/null`.** `codex` (and the scripted fake) read stdin
+    ///   when they are not handed a flag they recognize, and a probe that
+    ///   inherits a terminal is a hang.
+    /// * **The output goes to a FILE, never a pipe.** `Command::output()` reads
+    ///   the pipe to EOF, and EOF means *every* holder of the write end has
+    ///   closed it — including any process that happened to inherit the
+    ///   descriptor across a concurrent fork. A pipe read with no deadline is
+    ///   the one way a version check can outlive the thing it was checking.
+    /// * **It is bounded** ([`VERSION_TIMEOUT`]) and the child is killed on
+    ///   expiry: an unknown version is a fine answer, a stuck broker is not.
+    ///
+    /// The environment is the **child's** ([`crate::rpc::child_env`]), not the
+    /// daemon's — the allowlist governs every process spawned from this binary,
+    /// not just the long-lived one (spec §4.2).
+    pub fn resolve(bin: &Path, extra_env: &[(String, String)]) -> CodexIdentity {
+        CodexIdentity {
+            path: bin.to_path_buf(),
+            version: exec::codex_version(bin, &crate::rpc::child_env(extra_env), VERSION_TIMEOUT),
+        }
+    }
+
+    /// What changed since this identity was recorded, or `None` when nothing
+    /// did. The message is the operator-facing half of the refusal.
+    pub fn drift_from(&self, now: &CodexIdentity) -> Option<String> {
+        if self.path != now.path {
+            return Some(format!(
+                "the broker is serving `{}`, but `{}` is what would run now",
+                self.path.display(),
+                now.path.display()
+            ));
+        }
+        if self.version != now.version {
+            let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "unknown".to_string());
+            return Some(format!(
+                "`{}` was `{}` when the broker started and is `{}` now",
+                self.path.display(),
+                show(&self.version),
+                show(&now.version)
+            ));
+        }
+        None
+    }
+}
+
 /// A child that is spawned, handshaken, and ready to serve workers.
 pub struct Launched {
     /// The handle every worker multiplexes over, carrying this child's pid.
@@ -559,6 +640,84 @@ mod tests {
                 "{key} must not be forwarded as an explicit pair"
             );
         }
+    }
+
+    /// The drift comparison, without a binary: a changed path OR a changed
+    /// version is drift, and two unknowns are not (or every spawn against a
+    /// binary with no `--version` would be refused forever).
+    #[test]
+    fn drift_is_a_changed_path_or_a_changed_version_and_never_two_unknowns() {
+        let at_start = CodexIdentity {
+            path: PathBuf::from("/usr/bin/codex"),
+            version: Some("codex-cli 0.140.0".into()),
+        };
+        assert_eq!(at_start.drift_from(&at_start.clone()), None);
+
+        let upgraded = CodexIdentity {
+            version: Some("codex-cli 0.147.0".into()),
+            ..at_start.clone()
+        };
+        let detail = at_start.drift_from(&upgraded).expect("an upgrade is drift");
+        assert!(detail.contains("0.140.0") && detail.contains("0.147.0"), "{detail}");
+
+        let moved = CodexIdentity {
+            path: PathBuf::from("/opt/codex"),
+            ..at_start.clone()
+        };
+        assert!(at_start.drift_from(&moved).is_some(), "a moved binary is drift");
+
+        let unknown = CodexIdentity {
+            path: at_start.path.clone(),
+            version: None,
+        };
+        assert_eq!(unknown.drift_from(&unknown.clone()), None);
+        assert!(unknown.drift_from(&at_start).is_some(), "unknown → known is drift");
+    }
+
+    /// A binary that answers `--version` is read (first non-empty line); one
+    /// that is not there at all is `None` rather than an error.
+    #[test]
+    fn the_identity_reads_the_first_line_of_the_version_output() {
+        let id = CodexIdentity::resolve(Path::new("/bin/echo"), &[]);
+        assert_eq!(id.path, PathBuf::from("/bin/echo"));
+        let version = id.version.expect("echo answers something");
+        assert!(!version.is_empty() && !version.contains('\n'), "{version:?}");
+        assert_eq!(
+            CodexIdentity::resolve(Path::new("/definitely/not/a/binary"), &[]).version,
+            None
+        );
+    }
+
+    /// A binary that never answers is killed and reported as unknown. The probe
+    /// runs inside the broker's own startup, so "it hangs" is not an option it
+    /// is allowed to have.
+    #[test]
+    fn a_binary_that_will_not_answer_is_bounded_and_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("wedged-codex");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 300\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let id = CodexIdentity::resolve(&bin, &[]);
+        assert_eq!(id.version, None, "a silent binary has no version");
+        assert!(
+            started.elapsed() < VERSION_TIMEOUT * 2,
+            "the probe is bounded: {:?}",
+            started.elapsed()
+        );
+        // ... and it left nothing behind in TMPDIR.
+        let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("a2a-codex-version-{}-", std::process::id()))
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "the probe cleaned up: {leftovers:?}");
     }
 
     #[test]

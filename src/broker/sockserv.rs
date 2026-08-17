@@ -639,10 +639,21 @@ async fn dispatch(
                 .map_err(|e| WireError::from_app(&e))?;
             Ok(serde_json::to_value(snap).unwrap_or(Value::Null))
         }
+        // The one op that carries CLAIMS rather than just a target: the cwd and
+        // the lane the caller says it resolved. The core re-checks both against
+        // what THIS daemon was started with (spec §5).
         "spawn" => {
+            let req = crate::broker::core::SpawnRequest {
+                dir: PathBuf::from(string_arg(body, "dir")?),
+                cwd: body.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+                lane: body
+                    .get("lane")
+                    .and_then(Value::as_str)
+                    .and_then(|l| l.parse::<crate::config::Lane>().ok()),
+            };
             let snap = ctx
                 .core
-                .spawn_worker(string_arg(body, "dir")?)
+                .spawn_checked(req)
                 .await
                 .map_err(|e| WireError::from_app(&e))?;
             Ok(serde_json::to_value(snap).unwrap_or(Value::Null))

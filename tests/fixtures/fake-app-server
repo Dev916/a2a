@@ -37,7 +37,10 @@ SCENARIOS
                    <cwd>/outbox/1.question.json BEFORE turn/completed (the
                    broker passes the WORKER DIR as thread/start `cwd`; that dir
                    is the per-thread channel — env cannot be per-worker on a
-                   child shared by every worker)
+                   child shared by every worker). The turn completes with NO
+                   agent message: a worker that asks a question has produced no
+                   result, and on this transport the final agent message is the
+                   result.
   steer-race       the FIRST turn/steer is rejected with
                    {"code":-32002,"message":"expectedTurnId does not match the
                    active turn"}; a subsequent turn/start succeeds
@@ -72,6 +75,14 @@ TRANSCRIPT = os.environ.get("FAKE_TRANSCRIPT") or ""
 DEFER = [m for m in (os.environ.get("FAKE_DEFER_METHODS") or "").split(",") if m]
 MESSAGE = os.environ.get("FAKE_MESSAGE", "done")
 CLI_VERSION = "0.140.0"
+
+# `--version` answers and exits, BEFORE any state is touched — exactly as the
+# real binary does. It is not a session: it must not bump the launch counter
+# (scenarios key off it), must not open stdin, and must not write a transcript.
+# The broker asks this on every spawn for its codex-drift gate (spec §4.2).
+if "--version" in sys.argv[1:]:
+    sys.stdout.write("codex-cli %s\n" % CLI_VERSION)
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # state that survives a relaunch
@@ -287,11 +298,19 @@ def emit_agent_message(thread_id, turn_id):
     )
 
 
-def complete_turn(status="completed"):
+def complete_turn(status="completed", answer=True):
+    """End the open turn.
+
+    `answer=False` completes it WITHOUT a final agent message — what a worker
+    that asked a question rather than producing a result looks like on the wire
+    (the `blocked` scenario). The distinction is load-bearing downstream: the
+    final agent message IS the result on this transport, so a turn that emits
+    one lands the worker in `done` no matter what it wrote to its outbox.
+    """
     if not OPEN:
         return
     thread_id, turn_id = OPEN["threadId"], OPEN["turnId"]
-    if status == "completed":
+    if status == "completed" and answer:
         emit_agent_message(thread_id, turn_id)
     notify("turn/completed", {"threadId": thread_id, "turn": turn_obj(turn_id, status)})
     OPEN.clear()
@@ -378,6 +397,8 @@ def handle_request(req_id, method, params):
             return
         if SCENARIO == "blocked":
             write_outbox_question(THREADS.get(thread_id, {}).get("cwd") or os.getcwd())
+            complete_turn("completed", answer=False)
+            return
         complete_turn("completed")
         return
 

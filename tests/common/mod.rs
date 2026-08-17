@@ -10,12 +10,20 @@ use std::path::{Path, PathBuf};
 pub fn stub_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stub-codex")
 }
-/// Command with hermetic env: temp home, stub codex, tmp-wide allowlist.
+/// Command with hermetic env: temp home, stub codex, tmp-wide allowlist —
+/// and **no broker**.
+///
+/// `A2A_BROKER_DISABLE=1` is the pin that keeps every Phase-1 test meaningful:
+/// with it set, `a2a` takes the pure exec path and opens no socket at all, so
+/// these tests still assert Phase-1 behaviour rather than "whatever the broker
+/// happened to do". Broker tests opt in through [`a2a_broker`], which removes
+/// it.
 pub fn a2a(home: &Path, allowed_root: &Path) -> Command {
     let mut c = Command::cargo_bin("a2a").unwrap();
     c.env("A2A_HOME", home)
         .env("A2A_CODEX_BIN", stub_path())
         .env("A2A_ALLOWED_ROOTS", allowed_root)
+        .env("A2A_BROKER_DISABLE", "1")
         // Determinism under the test harness: `exec::spawn_detached` would
         // otherwise resolve the shim relative to the running executable.
         .env("A2A_SHIM_BIN", assert_cmd::cargo::cargo_bin("a2a"));

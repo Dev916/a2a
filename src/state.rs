@@ -42,6 +42,20 @@ pub struct WorkerSnapshot {
     pub writable_roots: Vec<PathBuf>,
     pub elevation_reason: Option<String>,
     pub session_id: Option<String>,
+    /// The app-server thread of record. The same UUID as `session_id` on
+    /// 0.140.0 — both are kept because they are two different *claims*: the
+    /// thread id is what `turn/start` and `turn/steer` address, and the session
+    /// id is what `codex exec resume` accepts (the cross-transport resume path).
+    ///
+    /// `#[serde(default)]`, like every field added after schema_version 1
+    /// shipped: a snapshot written by the Phase-1 binary has no such key and
+    /// must still load rather than read as corrupt.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Position in the admission queue while `state == queued` (Task 14 fills
+    /// it; nothing reads it before then).
+    #[serde(default)]
+    pub queue_position: Option<u64>,
     pub rollout_path: Option<PathBuf>,
     pub pid: Option<u32>,
     pub pid_start_witness: Option<String>,
@@ -92,6 +106,8 @@ impl WorkerSnapshot {
             writable_roots: Vec::new(),
             elevation_reason: None,
             session_id: None,
+            thread_id: None,
+            queue_position: None,
             rollout_path: None,
             pid: None,
             pid_start_witness: None,
@@ -227,6 +243,8 @@ mod tests {
         assert_eq!(s.cwd, tmp.path());
         assert_eq!(s.transport, Transport::Exec);
         assert_eq!(s.requested_transport, Transport::Exec);
+        assert_eq!(s.thread_id, None);
+        assert_eq!(s.queue_position, None);
         assert_eq!(s.sandbox, SandboxMode::WorkspaceWrite);
         assert!(!s.network);
         assert_eq!(s.model, "gpt-5.5");
@@ -260,6 +278,28 @@ mod tests {
         let back = load_snapshot(tmp.path()).unwrap();
         assert_eq!(back.extra.get("from_the_future"), Some(&serde_json::json!({"a": 1})));
         assert_eq!(back.lane, Lane::Review);
+    }
+
+    /// A snapshot written by the Phase-1 binary has no `thread_id` and no
+    /// `queue_position`. It must load as a snapshot with neither — never as
+    /// `Corrupt`, which would silently rebuild every worker on a mixed machine.
+    #[test]
+    fn a_snapshot_without_the_phase_two_fields_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        let mut value = serde_json::to_value(&s).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("thread_id");
+        obj.remove("queue_position");
+        std::fs::write(tmp.path().join(STATE_FILE), value.to_string()).unwrap();
+
+        let back = load_snapshot(tmp.path()).expect("an older snapshot is not corrupt");
+        assert_eq!(back.thread_id, None);
+        assert_eq!(back.queue_position, None);
+        assert!(
+            back.extra.get("thread_id").is_none(),
+            "the new fields are typed, not swept into the forward-compat bag"
+        );
     }
 
     #[test]

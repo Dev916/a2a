@@ -22,6 +22,7 @@ use a2a::store::EventLog;
 use a2a::{events::EventKind, fold};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{json, Value};
+use std::io::{BufRead, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -115,11 +116,21 @@ fn socket(home: &Path) -> PathBuf {
 
 fn wait_for_broker(home: &Path) -> u32 {
     until("the broker to publish its socket and pidfile", || {
-        if !socket(home).exists() {
+        // A *socket*, not merely a path that exists: the pidfile is written
+        // before the listener is bound, and a stale regular file left by a
+        // crashed predecessor also "exists" — waiting on existence alone would
+        // return while the daemon is still unlinking it.
+        if !is_socket(&socket(home)) {
             return None;
         }
         read_pidfile(home)
     })
+}
+
+fn is_socket(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 fn read_pidfile(home: &Path) -> Option<u32> {
@@ -256,7 +267,7 @@ fn broker_run_detaches_holds_the_singleton_and_a_second_run_exits_zero() {
         "the daemon's stdio goes to broker.log"
     );
     assert!(
-        socket(&home).metadata().unwrap().file_type().is_socket(),
+        is_socket(&socket(&home)),
         "the stale regular file was unlinked and a real socket bound in its place"
     );
 
@@ -1013,4 +1024,618 @@ fn f() {
     ));
     assert_eq!(blocks.len(), 1);
     assert!(blocks[0].1.contains("write_all"));
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: `a2a spawn` via the broker — transport auto-selection
+// ---------------------------------------------------------------------------
+//
+// Everything below is the SHIPPED `a2a spawn`, from the outside: the CLI picks a
+// transport, the broker re-validates what the CLI sent it, and the worker's own
+// files are the evidence. The conventions of this file still hold — a real
+// daemon per test, a `BrokerGuard` per home, converged-state polling only.
+
+/// A worker's `state.json`, or `None` while it is not there yet.
+fn snap_of(home: &Path, id: &str) -> Option<Value> {
+    let text = std::fs::read_to_string(home.join("workers").join(id).join("state.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Poll a worker's snapshot until it reports `want`.
+fn until_state(home: &Path, id: &str, want: &str) -> Value {
+    until(&format!("worker {id} to reach `{want}`"), || {
+        snap_of(home, id).filter(|s| s["state"] == json!(want))
+    })
+}
+
+/// A worker's snapshot bytes, once they have stopped changing.
+///
+/// Two identical reads a poll apart: the broker owns this file, so the only way
+/// to attribute a later change to somebody else is to start from a moment when
+/// its owner had finished with it.
+fn until_quiescent(state_file: &Path) -> Vec<u8> {
+    until("the broker to stop writing the worker's snapshot", || {
+        let first = std::fs::read(state_file).ok()?;
+        std::thread::sleep(POLL * 3);
+        let second = std::fs::read(state_file).ok()?;
+        (first == second).then_some(second)
+    })
+}
+
+fn events_of(home: &Path, id: &str) -> Vec<Value> {
+    std::fs::read_to_string(home.join("workers").join(id).join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+fn kinds_of(home: &Path, id: &str) -> Vec<String> {
+    events_of(home, id)
+        .iter()
+        .filter_map(|e| e["kind"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn write_brief(dir: &Path, body: &str) -> PathBuf {
+    let p = dir.join("the-brief.md");
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+/// A client that speaks the wire by hand — the only way to send the broker a
+/// frame the CLI would never send (an out-of-roots cwd, for one).
+struct Raw {
+    stream: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl Raw {
+    fn hello(home: &Path) -> Raw {
+        let stream = std::os::unix::net::UnixStream::connect(socket(home))
+            .expect("the broker socket accepts a peer of our own uid");
+        stream.set_read_timeout(Some(CONVERGE)).unwrap();
+        let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut raw = Raw { stream, reader };
+        raw.send(&json!({"v": 1, "id": 0, "type": "hello",
+                         "body": {"protocol_version": 1, "binary_version": "test"}}));
+        let reply = raw.recv().expect("the broker answers a hello");
+        assert_eq!(reply["type"], json!("hello"), "handshake: {reply}");
+        raw
+    }
+
+    fn send(&mut self, frame: &Value) {
+        writeln!(self.stream, "{frame}").unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    fn req(&mut self, id: u64, op: &str, params: Value) -> Value {
+        let mut body = json!({"op": op});
+        if let (Some(into), Some(from)) = (body.as_object_mut(), params.as_object()) {
+            for (k, v) in from {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+        self.send(&json!({"v": 1, "id": id, "type": "req", "body": body}));
+        self.recv().expect("the broker answers a request")
+    }
+
+    fn recv(&mut self) -> Option<Value> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(serde_json::from_str(&line).expect("every frame is one JSON object")),
+        }
+    }
+}
+
+/// `--transport auto` with a reachable broker: the app-server transport, the
+/// whole lifecycle on the fake, and a snapshot that can be thrown away.
+#[test]
+fn spawn_auto_selects_the_app_server_and_the_worker_runs_to_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("FAKE_MESSAGE", "THE ANSWER")
+        .env("A2A_OWNER", "test-owner");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let d = spawned.data();
+    assert_eq!(d["transport"], json!("app-server"), "auto chose the broker: {d}");
+    let id = d["id"].as_str().expect("an id").to_string();
+
+    // The daemon came up because the CLI needed it — nobody ran `broker run`.
+    assert!(socket(&home).exists(), "auto autostarted a broker");
+
+    let waited = run(a2a(&home, tmp.path(), &["wait", &id]), &scratch, "wait");
+    assert_eq!(waited.code, 0, "wait: {}", waited.stderr);
+
+    let done = until_state(&home, &id, "done");
+    assert_eq!(done["transport"], json!("app-server"));
+    assert_eq!(done["requested_transport"], json!("app-server"),
+               "requested = the resolved transport when none was named: {done}");
+    assert_eq!(done["transport_selection"], json!("auto"), "{done}");
+    assert_eq!(done["owner"], json!("test-owner"), "{done}");
+    let thread_id = done["thread_id"].as_str().expect("a thread of record").to_string();
+    assert_eq!(
+        done["session_id"], json!(thread_id),
+        "thread.id IS the session id on 0.140.0: {done}"
+    );
+    assert_eq!(
+        done["resolved_sandbox"]["type"], json!("workspaceWrite"),
+        "the sandbox the server resolved is recorded: {done}"
+    );
+    assert!(
+        done.get("fold_rejections").is_none(),
+        "a happy path folds cleanly: {done}"
+    );
+
+    let result = run(
+        a2a(&home, tmp.path(), &["--json", "result", &id]),
+        &scratch,
+        "result",
+    );
+    assert_eq!(result.code, 0);
+    assert_eq!(
+        result.data()["result"], json!("THE ANSWER"),
+        "the final agent message IS the result on this transport"
+    );
+
+    // Lossless rebuild: the checkpoint is derived, the WAL is the truth.
+    std::fs::remove_file(home.join("workers").join(&id).join("state.json")).unwrap();
+    let rebuilt = run(
+        a2a(&home, tmp.path(), &["--json", "status", &id]),
+        &scratch,
+        "rebuilt",
+    );
+    assert_eq!(rebuilt.code, 0, "status after losing state.json: {}", rebuilt.stderr);
+    let r = rebuilt.data();
+    assert_eq!(r["state"], json!("done"), "{r}");
+    assert_eq!(r["owner"], json!("test-owner"), "owner survives a rebuild: {r}");
+    assert_eq!(r["thread_id"], json!(thread_id), "thread_id survives a rebuild: {r}");
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// `A2A_BROKER_DISABLE=1` is the Phase-1 escape hatch, and it is absolute: a
+/// broker can be RUNNING and reachable and the spawn still never speaks to it.
+#[test]
+fn spawn_auto_stays_on_exec_when_the_broker_is_disabled_even_with_one_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    run(a2a(&home, tmp.path(), &["broker", "run"]), &scratch, "run");
+    wait_for_broker(&home);
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("A2A_BROKER_DISABLE", "1")
+        .env("A2A_CODEX_BIN", common::stub_path());
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let d = spawned.data();
+    assert_eq!(d["transport"], json!("exec"), "the disable seam wins: {d}");
+    let id = d["id"].as_str().unwrap().to_string();
+
+    // An exec worker is advanced by whoever reads it (Phase 1's rule, intact).
+    let waited = run(a2a(&home, tmp.path(), &["wait", &id]), &scratch, "wait");
+    assert_eq!(waited.code, 0, "wait: {}", waited.stderr);
+    let snap = until_state(&home, &id, "done");
+    assert_eq!(snap["transport"], json!("exec"));
+    assert_eq!(snap["requested_transport"], json!("exec"));
+    assert_eq!(snap["transport_selection"], json!("auto"));
+    assert!(
+        !kinds_of(&home, &id).contains(&"transport_degraded".to_string()),
+        "a configured exec spawn is not a degradation: {:?}",
+        kinds_of(&home, &id)
+    );
+
+    // The proof the socket was never touched: the live broker never heard of it.
+    let list = run(
+        a2a(&home, tmp.path(), &["--json", "__broker-call", "list"]),
+        &scratch,
+        "list",
+    );
+    assert_eq!(
+        list.data()["workers"], json!([]),
+        "a disabled spawn does not register with the running broker"
+    );
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// The blocked lifecycle, and the ownership rule that comes with it: while the
+/// broker is alive the CLI's reconcile is READ-ONLY.
+#[test]
+fn a_blocked_app_server_worker_parks_awaiting_input_and_the_cli_reconcile_is_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let scratch = tmp.path().join("scratch");
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "A or B?\n");
+
+    // The research lane is outbox-only, so its thread is rooted on the WORKER
+    // DIR — which is where the fake writes the question.
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "research", "--brief"],
+    );
+    cmd.arg(&brief).env("FAKE_SCENARIO", "blocked");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+
+    let parked = until_state(&home, &id, "awaiting-input");
+    assert_eq!(parked["state_reason"], json!("blocked"), "{parked}");
+    assert!(
+        home.join("workers").join(&id).join("outbox/1.question.json").exists(),
+        "the worker asked its question through the outbox"
+    );
+
+    // "The CLI wrote nothing" is only observable against a worker its OWNER has
+    // stopped writing: the broker is asynchronous, and a frame still in flight
+    // when the bytes were sampled would look exactly like a CLI write.
+    let state_file = home.join("workers").join(&id).join("state.json");
+    let before = until_quiescent(&state_file);
+    let waited = run(
+        a2a(&home, tmp.path(), &["wait", &id, "--until", "blocked"]),
+        &scratch,
+        "wait",
+    );
+    assert_eq!(waited.code, 5, "blocked is exit 5: {}", waited.stderr);
+    let status = run(
+        a2a(&home, tmp.path(), &["--json", "status", &id]),
+        &scratch,
+        "status",
+    );
+    assert_eq!(status.code, 5, "status of a parked worker: {}", status.stderr);
+    assert_eq!(
+        std::fs::read(&state_file).unwrap(),
+        before,
+        "the broker owns this worker's transitions — the CLI read it and wrote nothing"
+    );
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// Defense in depth (spec §5): the socket must not out-privilege the CLI, so
+/// the broker re-validates the cwd it is handed against ITS OWN allowed roots —
+/// and creates nothing when it refuses.
+#[test]
+fn the_broker_revalidates_the_wire_cwd_against_its_own_allowed_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let allowed = tmp.path().join("allowed");
+    let elsewhere = tmp.path().join("elsewhere");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+
+    // The daemon's allowlist is `allowed/` and nothing else.
+    run(a2a(&home, &allowed, &["broker", "run"]), &scratch, "run");
+    wait_for_broker(&home);
+
+    let ghost = home.join("workers").join("general-0817t1200-ghos");
+    let mut raw = Raw::hello(&home);
+    let refused = raw.req(
+        1,
+        "spawn",
+        json!({"dir": ghost, "cwd": elsewhere, "lane": "general"}),
+    );
+    assert_eq!(refused["type"], json!("err"), "{refused}");
+    assert_eq!(refused["body"]["code"], json!("CWD_NOT_ALLOWED"), "{refused}");
+    assert_eq!(refused["body"]["exit"], json!(9), "{refused}");
+    assert!(!ghost.exists(), "a refused spawn creates nothing");
+
+    // ... and the research rule is re-run too: research runs in its own scratch
+    // dir, never in a repo, whoever is asking.
+    let research = home.join("workers").join("research-0817t1200-rsch");
+    let refused = raw.req(
+        2,
+        "spawn",
+        json!({"dir": research, "cwd": allowed, "lane": "research"}),
+    );
+    assert_eq!(refused["body"]["code"], json!("CWD_NOT_ALLOWED"), "{refused}");
+    assert!(!research.exists(), "a refused research spawn creates nothing");
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// A broker that cannot be started at all: `auto` degrades (and says so in the
+/// WAL), while an explicit `--transport app-server` is exit 7 — reachability,
+/// never the static exit 9.
+#[test]
+fn a_broker_that_will_not_start_degrades_auto_to_exec_and_hard_fails_explicit_app_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    // A "broker binary" that exits immediately: autostart succeeds, the daemon
+    // never appears, and the bounded retry-connect is what notices.
+    let dud = tmp.path().join("dud-broker");
+    std::fs::write(&dud, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&dud, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("A2A_BROKER_BIN", &dud)
+        .env("A2A_CODEX_BIN", common::stub_path());
+    let spawned = run(cmd, &scratch, "auto");
+    assert_eq!(spawned.code, 0, "auto degrades rather than failing: {}", spawned.stderr);
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+    assert_eq!(spawned.data()["transport"], json!("exec"));
+
+    let waited = run(a2a(&home, tmp.path(), &["wait", &id]), &scratch, "wait");
+    assert_eq!(waited.code, 0, "wait: {}", waited.stderr);
+    let done = until_state(&home, &id, "done");
+    assert_eq!(done["transport"], json!("exec"));
+    assert_eq!(done["requested_transport"], json!("exec"), "{done}");
+    let degraded: Vec<Value> = events_of(&home, &id)
+        .into_iter()
+        .filter(|e| e["kind"] == json!("transport_degraded"))
+        .collect();
+    assert_eq!(degraded.len(), 1, "the degradation is an event: {:?}", kinds_of(&home, &id));
+    assert_eq!(degraded[0]["raw"]["requested"], json!("app-server"), "{}", degraded[0]);
+    assert_eq!(degraded[0]["raw"]["selected"], json!("exec"), "{}", degraded[0]);
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--transport", "app-server", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("A2A_BROKER_BIN", &dud)
+        .env("A2A_CODEX_BIN", common::stub_path());
+    let hard = run(cmd, &scratch, "explicit");
+    assert_eq!(hard.code, 7, "explicit app-server is a reachability failure: {}", hard.stderr);
+    assert_eq!(
+        hard.json()["error"]["code"], json!("BROKER_UNAVAILABLE"),
+        "{}", hard.stdout
+    );
+    // An unknown transport is the one that stays a static precondition.
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--transport", "carrier-pigeon", "--cwd"],
+    );
+    cmd.arg(&work).arg("--brief").arg(&brief);
+    let unknown = run(cmd, &scratch, "unknown");
+    assert_eq!(unknown.code, 9, "an unknown transport string is exit 9");
+    assert_eq!(unknown.json()["error"]["code"], json!("TRANSPORT_UNKNOWN"));
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// Spec §4.2: the broker pins its codex at start and re-checks on every spawn.
+/// A binary that changed underneath it (nvm switch, `codex update`) refuses new
+/// work rather than mixing versions against one session store.
+#[test]
+fn a_codex_binary_that_drifted_under_the_broker_refuses_new_spawns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    // A codex whose `--version` is whatever the version file says today.
+    let version_file = tmp.path().join("codex-version.txt");
+    std::fs::write(&version_file, "codex-cli 0.140.0\n").unwrap();
+    let wrapper = tmp.path().join("codex-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then cat \"$A2A_TEST_VERSION_FILE\"; exit 0; fi\nexec {} \"$@\"\n",
+            common::fake_app_server_path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = a2a(&home, tmp.path(), &["broker", "run"]);
+    cmd.env("A2A_CODEX_BIN", &wrapper)
+        .env("A2A_TEST_VERSION_FILE", &version_file);
+    run(cmd, &scratch, "run");
+    wait_for_broker(&home);
+    // The socket is bound before the core finishes starting, and the codex
+    // identity is pinned inside that window — so the version must not move until
+    // the daemon is ANSWERING, or the test would be racing the thing it pins.
+    until("the broker to finish starting", || {
+        let up = run(
+            a2a(&home, tmp.path(), &["--json", "broker", "status"]),
+            &scratch,
+            "up",
+        );
+        (up.code == 0 && up.data()["child_pid"].is_u64()).then_some(())
+    });
+
+    // The world moves: same path, different binary.
+    std::fs::write(&version_file, "codex-cli 0.147.0\n").unwrap();
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("A2A_CODEX_BIN", &wrapper)
+        .env("A2A_TEST_VERSION_FILE", &version_file);
+    let drifted = run(cmd, &scratch, "drift");
+    assert_ne!(drifted.code, 0, "a drifted codex refuses the spawn: {}", drifted.stdout);
+    let err = drifted.json()["error"].clone();
+    assert_eq!(err["code"], json!("CODEX_DRIFT"), "{err}");
+    assert!(
+        err["remedy"].as_str().unwrap_or_default().contains("a2a broker restart"),
+        "the refusal names the way out: {err}"
+    );
+    assert!(
+        err["message"].as_str().unwrap_or_default().contains("0.147.0"),
+        "the refusal names what it found: {err}"
+    );
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// The broker died with work in flight. The CLI may then — and only then —
+/// commit `orphaned`; and a kill on this transport NEVER signals the recorded
+/// pid, because that pid is the app-server child every worker shares.
+#[test]
+fn a_dead_broker_orphans_its_workers_and_kill_never_signals_the_shared_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("FAKE_SCENARIO", "hang-turn");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+    until_state(&home, &id, "running");
+
+    // Two more workers the dead broker leaves behind, in the two states the
+    // plan pins: a spawned one never got a thread, a queued one was never
+    // admitted and is the NEXT broker's to re-enqueue.
+    seed_worker(
+        &home,
+        &work,
+        "general-0817t1210-neve",
+        json!({"state": "spawned", "transport": "app-server"}),
+    );
+    seed_worker(
+        &home,
+        &work,
+        "general-0817t1211-queu",
+        json!({"state": "queued", "transport": "app-server"}),
+    );
+
+    let broker_pid = read_pidfile(&home).expect("a pidfile");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(broker_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    until("the broker to be gone", || (!alive(broker_pid)).then_some(()));
+    // A crashed daemon leaves its address behind; nobody else will remove it.
+    let _ = std::fs::remove_file(socket(&home));
+
+    // A process this test owns, standing in for the shared app-server child the
+    // dead broker used to own — a `kill` that signalled it would be the bug.
+    let (mut stand_in, pid, witness) = stand_in_child();
+    let state_file = home.join("workers").join(&id).join("state.json");
+    let mut snap: Value = serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+    snap["pid"] = json!(pid);
+    snap["pid_start_witness"] = json!(witness);
+    a2a::store::write_atomic(&state_file, snap.to_string().as_bytes()).unwrap();
+
+    let status = run(
+        a2a(&home, tmp.path(), &["--json", "status", &id]),
+        &scratch,
+        "orphan",
+    );
+    assert_eq!(status.code, 10, "a live worker with no broker is orphaned: {}", status.stderr);
+    assert_eq!(status.data()["state"], json!("orphaned"));
+    assert!(
+        snap_of(&home, &id).unwrap().get("fold_rejections").is_none(),
+        "the orphan commit is a legal row"
+    );
+
+    let never = run(
+        a2a(&home, tmp.path(), &["--json", "status", "general-0817t1210-neve"]),
+        &scratch,
+        "never",
+    );
+    assert_eq!(never.code, 4, "a spawned worker whose broker died never started");
+    assert_eq!(never.data()["state"], json!("failed"));
+    assert_eq!(never.data()["failure_class"], json!("never_started"));
+
+    let queued = run(
+        a2a(&home, tmp.path(), &["--json", "status", "general-0817t1211-queu"]),
+        &scratch,
+        "queued",
+    );
+    assert_eq!(queued.code, 0);
+    assert_eq!(
+        queued.data()["state"], json!("queued"),
+        "a queued worker is left for the next broker to re-enqueue"
+    );
+
+    let killed = run(
+        a2a(&home, tmp.path(), &["--json", "kill", &id]),
+        &scratch,
+        "kill",
+    );
+    assert_eq!(killed.code, 0, "kill: {}", killed.stderr);
+    assert_eq!(killed.data()["state"], json!("cancelled"));
+    assert_eq!(
+        killed.data()["signal"], json!("no_signal"),
+        "the app-server child is every worker's — kill routes through the broker, never a signal"
+    );
+    assert!(
+        stand_in.try_wait().unwrap().is_none(),
+        "the shared child's stand-in was signalled by a worker-scoped kill"
+    );
+    let _ = stand_in.kill();
+    let _ = stand_in.wait();
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
 }

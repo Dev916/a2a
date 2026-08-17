@@ -1,11 +1,16 @@
-//! Reconcile-on-read: the Phase-1 ownership rule (spec §4.6).
+//! Reconcile-on-read: the exec ownership rule (spec §4.6).
 //!
-//! There is no broker in Phase 1, so **every CLI read path owns the machine**.
-//! `status`/`ls`/`result`/`wait` all funnel through [`reconcile`], which is the
-//! only place where "what the kernel and the filesystem say" becomes "what the
-//! WAL says". `fold::recover` deliberately stops short of that: it *observes*,
-//! this module *commits*, and it commits through exactly the same
-//! append→fold→checkpoint path a broker would use.
+//! On the **exec** transport nothing is alive to own a worker, so **every CLI
+//! read path owns the machine**. `status`/`ls`/`result`/`wait` all funnel
+//! through [`reconcile`], which is the only place where "what the kernel and the
+//! filesystem say" becomes "what the WAL says". `fold::recover` deliberately
+//! stops short of that: it *observes*, this module *commits*, and it commits
+//! through exactly the same append→fold→checkpoint path a broker would use.
+//!
+//! On the **app-server** transport the opposite holds, and the split is the
+//! first thing [`reconcile`] decides: a live broker's `WorkerActor` is that
+//! worker's sole writer, so the CLI is read-only there — see
+//! [`reconcile_app_server`] for the one exception (a broker that is gone).
 //!
 //! Everything below runs under an exclusive `flock` on `<worker>/state.lock`,
 //! so N concurrent `a2a status` invocations serialize instead of interleaving
@@ -83,11 +88,12 @@ pub fn reconcile(
         ));
     }
     let _lock = lock_state(&dir)?;
-    reconcile_locked(&dir, cfg, now)
+    reconcile_locked(home.root(), &dir, cfg, now)
 }
 
 /// Everything from here down assumes `state.lock` is held.
 fn reconcile_locked(
+    home: &Path,
     dir: &Path,
     cfg: &Config,
     now: DateTime<Utc>,
@@ -96,17 +102,36 @@ fn reconcile_locked(
 
     // 1. Load. A newer schema is refused outright (an older binary must never
     //    mutate a newer worker); missing/corrupt is answered by the log.
+    //
+    //    The rebuild is done TWICE in the rare missing/corrupt case, and on
+    //    purpose: `fold::recover` infers `orphaned` from a dead process, which
+    //    is an exec-only observation — so the first pass exists only to learn
+    //    the transport, and an app-server worker never sees that inference (its
+    //    liveness is the broker's, decided below).
     let snap = match load_snapshot(dir) {
         Ok(s) => s,
-        Err(SnapshotError::Missing) | Err(SnapshotError::Corrupt) => fold::recover(
-            dir,
-            LivenessInput {
-                process_alive: live == Liveness::Alive,
-            },
-            now,
-        )?,
+        Err(SnapshotError::Missing) | Err(SnapshotError::Corrupt) => {
+            let rebuilt = fold::recover(dir, LivenessInput { process_alive: true }, now)?;
+            if rebuilt.transport == Transport::AppServer {
+                return reconcile_app_server(home, dir, rebuilt, now);
+            }
+            fold::recover(
+                dir,
+                LivenessInput {
+                    process_alive: live == Liveness::Alive,
+                },
+                now,
+            )?
+        }
         Err(e) => return Err(e.into()),
     };
+
+    // 1b. Ownership (spec §4.2). An app-server worker belongs to the broker's
+    //     `WorkerActor` — the CLI reads it and writes nothing, or two writers
+    //     would be racing the same log with two different ideas of the truth.
+    if snap.transport == Transport::AppServer {
+        return reconcile_app_server(home, dir, snap, now);
+    }
 
     let mut log = EventLog::open(dir).map_err(|e| io_err("opening events.jsonl", e))?;
 
@@ -218,6 +243,68 @@ fn reconcile_locked(
     arm_deadline(&mut snap, cfg);
     save_snapshot(dir, &snap).map_err(|e| io_err("writing state.json", e))?;
     Ok(snap)
+}
+
+// ------------------------------------------------- the app-server ownership
+
+/// Reconcile a worker the BROKER owns: **read-only**, with exactly one
+/// exception.
+///
+/// While a broker is reachable it is the sole writer of these workers' files
+/// (spec §4.2): it holds the live conversation, it fires their deadlines, and
+/// it concludes their turns. A CLI that also committed transitions would be a
+/// second writer with a worse view — no turn state, no thread, no child — and
+/// the two would fight over the same log.
+///
+/// The exception is the one thing the broker cannot report about itself: that
+/// it is **gone**. A worker recorded as live with no broker to be live in is
+/// orphaned, and saying so is what makes `a2a resume` (and the next broker's
+/// adoption) possible. Everything else is left exactly as the broker left it —
+/// including `queued`, which is the next broker's to re-enqueue, in order.
+fn reconcile_app_server(
+    home: &Path,
+    dir: &Path,
+    snap: WorkerSnapshot,
+    now: DateTime<Utc>,
+) -> Result<WorkerSnapshot, AppError> {
+    if broker_is_live(home) {
+        return Ok(snap);
+    }
+    let (kind, payload, ev) = match snap.state {
+        // Live states: the transport that owned them is gone.
+        WorkerState::Running | WorkerState::AwaitingInput | WorkerState::Escalated => (
+            EventKind::Orphaned,
+            json!({"fsm": "OrphanDetected",
+                   "detail": "the broker that owned this worker is not running"}),
+            FsmEvent::OrphanDetected,
+        ),
+        // Registered but never attached to a thread: it never started, and it
+        // never will — the same shape a failed `fork` leaves on exec.
+        WorkerState::Spawned => (
+            EventKind::StateChange,
+            json!({"fsm": "ProcessExited", "code": null,
+                   "detail": "the broker went away before this worker's thread was opened",
+                   "failure_class": "never_started"}),
+            FsmEvent::ProcessExited { code: None },
+        ),
+        // Queued (never admitted) and everything terminal: nothing to say.
+        _ => return Ok(snap),
+    };
+    let mut log = EventLog::open(dir).map_err(|e| io_err("opening events.jsonl", e))?;
+    commit(&mut log, dir, snap, kind, payload, &ev, now)
+}
+
+/// Is there a broker to own these workers?
+///
+/// Asked per reconcile rather than cached: a CLI is short-lived, but `ls` walks
+/// a fleet and a stale "no" would orphan every worker in it. The handshake is
+/// two frames over a unix socket; a skewed broker counts as live, because it is
+/// running and it holds these workers whether or not we can talk to it.
+fn broker_is_live(home: &Path) -> bool {
+    if crate::brokerclient::disabled() {
+        return false;
+    }
+    matches!(crate::brokerclient::try_handshake(home), Ok(Some(_)))
 }
 
 // ------------------------------------------------------------------ the lock
@@ -821,6 +908,14 @@ fn commit(
 fn perform(snap: &WorkerSnapshot, action: Action) {
     match action {
         Action::KillProcess => {
+            // NEVER on the app-server transport: the pid recorded against such a
+            // worker is the broker's shared child, which every OTHER worker is
+            // multiplexed over too. Stopping one worker there is the broker's
+            // `turn/interrupt`, and a worker-scoped group-kill would take the
+            // whole fleet's transport down with it (spec §4.2).
+            if snap.transport == Transport::AppServer {
+                return;
+            }
             if let (Some(pid), Some(witness)) = (snap.pid, snap.pid_start_witness.as_deref()) {
                 // Witness-checked inside: a recycled pid is never signalled.
                 let _ = exec::kill_worker(pid, witness);

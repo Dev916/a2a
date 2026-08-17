@@ -102,6 +102,9 @@ struct Row {
     lane: String,
     state: String,
     sandbox: String,
+    /// Which transport owns this worker — the fleet view's answer to "why is
+    /// `status` not advancing this one?" (an app-server worker is the broker's).
+    transport: String,
     created_at: Option<DateTime<Utc>>,
     dwell_secs: Option<i64>,
     last_event_age_secs: Option<i64>,
@@ -114,6 +117,7 @@ impl Row {
             lane: snap.lane.as_str().to_string(),
             state: snap.state.as_str().to_string(),
             sandbox: snap.sandbox.as_str().to_string(),
+            transport: transport_of(Some(snap)),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -136,6 +140,7 @@ impl Row {
                 .as_ref()
                 .map(|s| s.sandbox.as_str().to_string())
                 .unwrap_or_else(|| "unknown".into()),
+            transport: transport_of(stale.as_ref()),
             created_at: stale.as_ref().map(|s| s.created_at),
             dwell_secs: None,
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -150,8 +155,17 @@ impl Row {
             "dwell_secs": self.dwell_secs,
             "last_event_age_secs": self.last_event_age_secs,
             "sandbox": self.sandbox,
+            "transport": self.transport,
         })
     }
+}
+
+/// The transport as a wire string, `unknown` when the snapshot could not be
+/// read at all.
+fn transport_of(snap: Option<&WorkerSnapshot>) -> String {
+    snap.and_then(|s| serde_json::to_value(s.transport).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
 }
 
 /// Never negative: a snapshot stamped a hair in the future (clock skew, or a
@@ -227,6 +241,7 @@ mod tests {
             lane: "general".into(),
             state: state.into(),
             sandbox: "workspace-write".into(),
+            transport: "exec".into(),
             created_at: None,
             dwell_secs: dwell,
             last_event_age_secs: None,

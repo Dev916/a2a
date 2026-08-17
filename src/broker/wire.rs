@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 18] = [
+pub const KNOWN_CODES: [&str; 20] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -94,6 +94,10 @@ pub const KNOWN_CODES: [&str; 18] = [
     ERR_DRAIN_ONLY,
     ERR_BROKER_UNAVAILABLE,
     "NO_SUCH_WORKER",
+    // The two refusals a spawn can meet on the far side of the socket: the
+    // broker's own allowlist re-check, and the codex drift gate (spec §4.2/§5).
+    "CWD_NOT_ALLOWED",
+    "CODEX_DRIFT",
     "BROKER_GONE",
     "APP_SERVER",
     "APP_SERVER_START",

@@ -123,7 +123,7 @@ pub enum CoreMsg {
     /// Adopt an already-laid-out worker directory (genesis written, `state.json`
     /// present) and give it a `WorkerActor`.
     Spawn {
-        dir: PathBuf,
+        req: SpawnRequest,
         reply: oneshot::Sender<Result<WorkerSnapshot, AppError>>,
     },
     Send {
@@ -213,6 +213,33 @@ pub enum CoreMsg {
     },
 }
 
+/// One `spawn` off the socket: the directory to adopt, plus the two claims the
+/// broker **re-checks for itself** (spec §5 — the socket must not out-privilege
+/// the CLI).
+///
+/// `cwd` and `lane` are `Option` because the adoption paths (startup
+/// reconciliation, `broker::adopt_previous_workers`) hand over directories the
+/// broker itself wrote and has nothing left to validate: what is on disk is
+/// already the record. A CLI spawn always sends both.
+#[derive(Clone, Debug, Default)]
+pub struct SpawnRequest {
+    pub dir: PathBuf,
+    pub cwd: Option<PathBuf>,
+    pub lane: Option<crate::config::Lane>,
+}
+
+impl SpawnRequest {
+    /// A request that carries nothing to re-validate — the in-process and
+    /// adoption callers.
+    pub fn adopt(dir: impl Into<PathBuf>) -> SpawnRequest {
+        SpawnRequest {
+            dir: dir.into(),
+            cwd: None,
+            lane: None,
+        }
+    }
+}
+
 /// One envelope, as a tail subscriber sees it.
 #[derive(Clone, Debug)]
 pub struct TailFrame {
@@ -280,9 +307,16 @@ impl CoreHandle {
         &self.tx
     }
 
+    /// Adopt a directory the broker already trusts (startup reconciliation, and
+    /// the in-process tests). Nothing is re-validated because nothing was
+    /// claimed over a socket.
     pub async fn spawn_worker(&self, dir: impl Into<PathBuf>) -> Result<WorkerSnapshot, AppError> {
-        let dir = dir.into();
-        self.ask(move |reply| CoreMsg::Spawn { dir, reply }).await?
+        self.spawn_checked(SpawnRequest::adopt(dir)).await
+    }
+
+    /// Adopt a directory a CLI asked for, re-validating what it claimed.
+    pub async fn spawn_checked(&self, req: SpawnRequest) -> Result<WorkerSnapshot, AppError> {
+        self.ask(move |reply| CoreMsg::Spawn { req, reply }).await?
     }
 
     pub async fn resume_worker(&self, dir: impl Into<PathBuf>) -> Result<WorkerSnapshot, AppError> {
@@ -366,6 +400,14 @@ impl CoreHandle {
         self.tx.send(build(tx)).await.map_err(|_| core_gone())?;
         rx.await.map_err(|_| core_gone())
     }
+}
+
+/// The broker's own spelling of the CLI's `CWD_NOT_ALLOWED`: same code, same
+/// exit, so a caller cannot tell (and need not care) which side refused it.
+fn cwd_refused(detail: String) -> AppError {
+    AppError::new("CWD_NOT_ALLOWED", ExitCode::Precondition, detail).remedy(
+        "add the root to `allowed_roots` and `a2a broker restart`, or spawn with `--transport exec`",
+    )
 }
 
 fn core_gone() -> AppError {
@@ -771,6 +813,9 @@ struct PendingFrame {
 pub struct BrokerCore {
     cfg: Config,
     spec: ChildSpec,
+    /// The codex binary this broker pinned at start — path AND build. Every
+    /// spawn is checked against it (spec §4.2).
+    codex: child::CodexIdentity,
     tx: mpsc::Sender<CoreMsg>,
     rx: mpsc::Receiver<CoreMsg>,
     workers: HashMap<String, Worker>,
@@ -815,6 +860,22 @@ pub async fn start(
     let cancel = CancellationToken::new();
     let log = BrokerLog::start(home.clone(), &tracker);
 
+    // What this broker is serving is decided ONCE, at start, and never
+    // re-derived from a `PATH` that can change under a long-lived daemon.
+    //
+    // Before the child, not alongside it: the probe forks, and a fork racing the
+    // child's own spawn is a way for one process to inherit the other's
+    // descriptors. It costs one short process at startup — the socket is already
+    // bound by now, so no client is waiting on it.
+    let codex = {
+        let probed = spec.clone();
+        tokio::task::spawn_blocking(move || child::CodexIdentity::of(&probed))
+            .await
+            .unwrap_or(child::CodexIdentity {
+                path: spec.bin.clone(),
+                version: None,
+            })
+    };
     let launched = child::launch(&spec).await?;
     let (adapter_tx, adapter_rx) = watch::channel(launched.adapter.clone());
     let (tx, rx) = mpsc::channel(CORE_MAILBOX_CAPACITY);
@@ -838,6 +899,7 @@ pub async fn start(
     let mut core = BrokerCore {
         cfg,
         spec,
+        codex,
         tx: tx.clone(),
         rx,
         workers: HashMap::new(),
@@ -897,8 +959,11 @@ impl BrokerCore {
 
     async fn handle(&mut self, msg: CoreMsg) {
         match msg {
-            CoreMsg::Spawn { dir, reply } => {
-                let outcome = self.register(dir, false).await;
+            CoreMsg::Spawn { req, reply } => {
+                let outcome = match self.admit(&req).await {
+                    Ok(()) => self.register(req.dir, false).await,
+                    Err(e) => Err(e),
+                };
                 let _ = reply.send(outcome);
             }
             CoreMsg::Resume { dir, reply } => {
@@ -1005,6 +1070,95 @@ impl BrokerCore {
                 epoch,
             } => self.on_thread_learned(id, thread_id, epoch).await,
             CoreMsg::Repromote { generation } => self.on_repromote(generation).await,
+        }
+    }
+
+    // -- the spawn gate -----------------------------------------------------
+
+    /// Everything a `spawn` off the socket must satisfy before a single actor
+    /// exists — and before anything on disk is touched, so a refusal leaves no
+    /// worker behind for `ls`/`gc` to trip over.
+    ///
+    /// Both checks are *re-checks*: the CLI ran the same rules before it wrote
+    /// the worker dir. That is the point. The socket is reachable by anything
+    /// running as this uid, so it must not be a way to spawn into a root the
+    /// broker was never started with (spec §5), and a worker must not be
+    /// attached to a codex build the broker is not the one serving (spec §4.2).
+    async fn admit(&self, req: &SpawnRequest) -> Result<(), AppError> {
+        self.check_cwd(req)?;
+        self.check_codex().await
+    }
+
+    /// Re-validate the wire cwd against the roots THIS daemon was started with,
+    /// component-wise on canonicalized paths (`/x/a` never satisfies `/x/ab`).
+    fn check_cwd(&self, req: &SpawnRequest) -> Result<(), AppError> {
+        let Some(cwd) = req.cwd.as_deref() else {
+            return Ok(()); // an adoption: the record on disk is already the truth
+        };
+        let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+
+        // The research lane is not root-scoped at all: it runs in its own
+        // scratch dir, never a repo and never $HOME (spec §4.9).
+        if req.lane == Some(crate::config::Lane::Research) {
+            let scratch = req.dir.join("scratch");
+            let want = std::fs::canonicalize(&scratch).unwrap_or(scratch);
+            if canon != want {
+                return Err(cwd_refused(format!(
+                    "the research lane runs in {} — `{}` is not it",
+                    want.display(),
+                    canon.display()
+                )));
+            }
+            return Ok(());
+        }
+
+        if !self.cfg.allowed_roots.iter().any(|r| canon.starts_with(r)) {
+            let listed = if self.cfg.allowed_roots.is_empty() {
+                "none are configured".to_string()
+            } else {
+                self.cfg
+                    .allowed_roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(cwd_refused(format!(
+                "{} is not under a root this broker was started with ({listed})",
+                canon.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The codex drift gate (spec §4.2): the binary this broker pinned at start
+    /// must still be the binary that would run now.
+    ///
+    /// Refusing NEW spawns only is deliberate — existing workers keep talking to
+    /// the child they already have, and the operator drains and restarts on
+    /// their own schedule rather than losing work to a background upgrade.
+    async fn check_codex(&self) -> Result<(), AppError> {
+        let spec = self.spec.clone();
+        let now = tokio::task::spawn_blocking(move || child::CodexIdentity::of(&spec))
+            .await
+            .map_err(|e| {
+                AppError::new(
+                    "INTERNAL",
+                    ExitCode::Internal,
+                    format!("checking the codex binary: {e}"),
+                )
+            })?;
+        match self.codex.drift_from(&now) {
+            None => Ok(()),
+            Some(detail) => Err(AppError::new(
+                "CODEX_DRIFT",
+                ExitCode::BrokerUnavailable,
+                format!(
+                    "the codex binary changed under this broker: {detail} — refusing to attach a \
+                     new worker to a build this broker is not serving"
+                ),
+            )
+            .remedy("`a2a broker restart` (existing workers keep running until they finish)")),
         }
     }
 
@@ -1963,7 +2117,7 @@ mod tests {
         }
         let dir = PathBuf::from("/tmp/w");
         let surface = vec![
-            CoreMsg::Spawn { dir: dir.clone(), reply: oneshot::channel().0 },
+            CoreMsg::Spawn { req: SpawnRequest::adopt(dir.clone()), reply: oneshot::channel().0 },
             CoreMsg::Send { id: "w".into(), text: "hi".into(), reply: oneshot::channel().0 },
             CoreMsg::Interrupt { id: "w".into(), reply: oneshot::channel().0 },
             CoreMsg::Kill { id: "w".into(), reply: oneshot::channel().0 },

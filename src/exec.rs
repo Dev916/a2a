@@ -304,6 +304,81 @@ pub fn start_witness(pid: u32) -> Option<String> {
     }
 }
 
+/// How often [`codex_version`] checks whether the probe has finished.
+const VERSION_POLL: Duration = Duration::from_millis(20);
+
+/// `<bin> --version`, bounded: the first non-empty line, or `None` for anything
+/// that is not a clean, timely answer.
+///
+/// The broker's drift gate (spec §4.2) asks this at start and on every spawn,
+/// but the *running* of it lives here, in the synchronous process layer, for two
+/// reasons. It is the same kind of thing as [`start_witness`] — a short `exec`
+/// whose answer is a fact about a process — and the bounded wait needs a
+/// blocking sleep, which the broker's async modules forbid by construction (a
+/// source-scan gate enforces it). The broker calls this from `spawn_blocking`,
+/// which is exactly the thread pool that is allowed to block.
+///
+/// Three details are each a way this could otherwise wedge its caller:
+///
+/// * **stdin is `/dev/null`** — `codex` (and the scripted fake) read stdin when
+///   they are not handed a flag they recognize, so a probe that inherited a
+///   terminal would never return.
+/// * **stdout goes to a FILE, never a pipe.** Reading a pipe to EOF waits for
+///   *every* holder of the write end to close it, including any process that
+///   inherited the descriptor across a concurrent fork — a wait with no
+///   deadline, on a descriptor this function does not control.
+/// * **The wait is bounded and the child is killed on expiry.** An unknown
+///   version is a fine answer; a stuck broker is not.
+pub fn codex_version(bin: &Path, env: &[(String, String)], budget: Duration) -> Option<String> {
+    let sink = std::env::temp_dir().join(format!(
+        "a2a-codex-version-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let file = std::fs::File::create(&sink).ok()?;
+    let version = match Command::new(bin)
+        .arg("--version")
+        .env_clear()
+        .envs(env.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Err(_) => None,
+        Ok(mut child) => {
+            let deadline = std::time::Instant::now() + budget;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Err(_) => break None,
+                    Ok(None) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(VERSION_POLL);
+            };
+            status
+                .filter(|s| s.success())
+                .and_then(|_| std::fs::read_to_string(&sink).ok())
+                .and_then(|text| {
+                    text.lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .map(str::to_string)
+                })
+        }
+    };
+    let _ = std::fs::remove_file(&sink);
+    version
+}
+
 /// Signal the worker's process GROUP, but only after the start-time witness
 /// matches — a recycled PID must never be signalled.
 pub fn kill_worker(pid: u32, witness: &str) -> Result<KillOutcome, AppError> {

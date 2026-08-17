@@ -89,6 +89,10 @@ const TRACE_FLUSH_THRESHOLD: usize = 64;
 /// bounds a wedged child, not a slow model.
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The brief's body, as `a2a spawn` wrote it — the text of the worker's first
+/// turn on this transport, exactly as it is the exec transport's stdin.
+pub const PROMPT_FILE: &str = "prompt.md";
+
 // ---------------------------------------------------------------------------
 // the mailbox
 // ---------------------------------------------------------------------------
@@ -407,6 +411,7 @@ impl WorkerActor {
         if self.snap.state == WorkerState::Running {
             let session_id = info.session_id.clone();
             let thread_id = info.thread_id.clone();
+            let resolved = serde_json::to_value(&info.resolved_sandbox).unwrap_or(Value::Null);
             self.persist("session_identified", move |log, dir, snap| {
                 let snap = fold::append_and_fold(
                     log,
@@ -414,13 +419,62 @@ impl WorkerActor {
                     snap,
                     EventKind::SessionIdentified,
                     json!({"fsm": "SessionIdentified", "session_id": session_id,
-                           "rollout_path": null, "thread_id": thread_id}),
+                           "rollout_path": null, "thread_id": thread_id,
+                           // The sandbox the server RESOLVED (the typed policy
+                           // it echoed), not the string it was sent — recorded
+                           // in the WAL so a rebuilt snapshot still reports what
+                           // the worker was actually confined to.
+                           "resolved_sandbox": resolved}),
                     Utc::now(),
                 )?;
                 Ok((snap, ()))
             })
             .await?;
+            self.start_first_turn(&info.thread_id, &lane, &cwd, &dir)
+                .await?;
         }
+        Ok(())
+    }
+
+    /// The worker's own brief, as its first turn.
+    ///
+    /// This is the app-server spelling of what the exec transport does by
+    /// handing `prompt.md` to `codex exec` on stdin: a spawned worker is
+    /// supposed to start working, and nothing else in the system will tell it
+    /// to. A directory with no `prompt.md` is therefore not an error — it is a
+    /// worker that was adopted or seeded rather than spawned, and it starts its
+    /// turns when someone sends it one.
+    async fn start_first_turn(
+        &mut self,
+        thread_id: &str,
+        lane: &LaneConfig,
+        cwd: &Path,
+        dir: &Path,
+    ) -> Result<(), AppError> {
+        let path = dir.join(PROMPT_FILE);
+        let Some(text) = std::fs::read_to_string(&path)
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let spec = TurnSpec {
+            thread_id,
+            text: &text,
+            lane,
+            cwd,
+            worker_dir: dir,
+            output_schema: self.output_schema.as_ref(),
+        };
+        let started = self
+            .adapter()
+            .turn_start(&spec, RPC_TIMEOUT)
+            .await
+            .map_err(|e| rpc_err("turn/start", e))?;
+        // The `turn/started` notification sets this too; recording it here
+        // closes the window in which a `send` arriving first would open a second
+        // turn against a thread that already has one.
+        self.open_turn = Some(started.turn_id);
         Ok(())
     }
 

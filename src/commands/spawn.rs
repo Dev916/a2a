@@ -8,11 +8,28 @@
 //!
 //! ```text
 //! home+config → transport gate → elevation gate → cwd resolution
-//!   → brief parse+validate → secret scan → id allocation
+//!   → brief parse+validate → secret scan → TRANSPORT SELECTION → id allocation
 //!   ───────────────────────── first write ─────────────────────────
 //!   → dir tree (0700) → context staging → brief.md + prompt.md
-//!   → genesis event (WAL) → detached spawn → ProcessStarted (WAL)
+//!   → genesis event (WAL) → detached spawn / broker Spawn frame
+//!                         → ProcessStarted (WAL, exec only)
 //! ```
+//!
+//! **Transport selection is a gate, not a fallback inside the write path**
+//! (spec §4.4). It sits with the other gates, before the first byte is written,
+//! so that:
+//!
+//! * `A2A_BROKER_DISABLE=1` takes *zero* socket syscalls — the Phase-1 path, bit
+//!   for bit, which is what keeps the Phase-1 suite meaningful;
+//! * `--transport auto` that cannot reach a broker degrades to exec and records
+//!   a `transport_degraded` envelope, so a silently-downgraded worker does not
+//!   exist;
+//! * `--transport app-server` that cannot reach one **hard-fails with exit 7**
+//!   rather than downgrading: exec has no true interrupt and no mid-turn steer,
+//!   and a caller who named the transport asked for those.
+//!
+//! Exit 7 there is reachability, not a static precondition — exit 9 is reserved
+//! for a transport string this build could never offer at all.
 //!
 //! Two failure boundaries matter:
 //!
@@ -29,9 +46,10 @@
 //! allowlist component-wise — `/x/a` must never satisfy a root of `/x/ab`.
 
 use crate::brief::{self, Brief};
+use crate::brokerclient::{self, BrokerClient};
 use crate::cli::SpawnArgs;
 use crate::config::{self, Lane, LaneConfig, SandboxMode};
-use crate::events::EventKind;
+use crate::events::{EventKind, Transport};
 use crate::exec::{self, SpawnSpec};
 use crate::fold::append_and_fold;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
@@ -89,7 +107,7 @@ pub fn run(
     }
 
     // ---- gates: nothing below this block has touched the filesystem --------
-    transport_gate(args.transport.as_deref())?;
+    let requested = transport_gate(args.transport.as_deref())?;
 
     let lane = args.lane;
     let lane_cfg = cfg
@@ -121,9 +139,24 @@ pub fn run(
         }
     }
 
+    // The last gate: which transport will own this worker. A refusal here still
+    // leaves nothing behind, and the answer is what the genesis event records.
+    let selected = select_transport(home.root(), requested)?;
+    let transport = selected.transport();
+    if let Selected::Exec {
+        degraded: Some(err),
+    } = &selected
+    {
+        warn(&format!(
+            "the broker is not reachable ({}: {}) — falling back to the exec transport",
+            err.code, err.message
+        ));
+    }
+
     let model = args.model.clone().unwrap_or_else(|| lane_cfg.model.clone());
     let effort = args.effort.clone().unwrap_or_else(|| lane_cfg.effort.clone());
     let brief_sha = brief::sha256_hex(&brief_text);
+    let owner = resolve_owner();
     let now = Utc::now();
     let id = allocate_id(home, lane, now)?;
 
@@ -149,7 +182,7 @@ pub fn run(
     snap.writable_roots = vec![wdir.join("outbox")];
     snap.schema_path = args.schema.clone();
     let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
-    let snap = append_and_fold(
+    let mut snap = append_and_fold(
         &mut log,
         &wdir,
         snap,
@@ -164,12 +197,73 @@ pub fn run(
             "network": lane_cfg.network,
             "model": model,
             "effort": effort,
-            "transport": "exec",
+            "transport": transport,
+            // Spec §4.4: both are recorded. `requested` is the explicit value
+            // when one was given, and the resolved one otherwise — so it always
+            // answers "what was this worker asked to be", never "nothing".
+            "requested_transport": requested.recorded(transport),
+            "transport_selection": requested.selection(),
+            "owner": owner,
             "schema_path": args.schema,
             "created_at": now.to_rfc3339(),
         }),
         now,
     )?;
+
+    // A degradation is an EVENT (spec §4.4), not a log line: an orchestrator
+    // reading the worker's own stream must be able to see that it asked for the
+    // live transport and got the fallback.
+    if let Selected::Exec {
+        degraded: Some(err),
+    } = &selected
+    {
+        snap = append_and_fold(
+            &mut log,
+            &wdir,
+            snap,
+            EventKind::TransportDegraded,
+            json!({
+                "requested": "app-server",
+                "selected": "exec",
+                "code": err.code,
+                "detail": redact::redact_egress(&err.message),
+            }),
+            Utc::now(),
+        )?;
+    }
+
+    // ---- hand the worker to its transport ---------------------------------
+    if let Selected::AppServer(client) = selected {
+        let snap = attach_to_broker(client, &mut log, &wdir, snap, lane, &cwd)?;
+        if !quiet {
+            eprintln!(
+                "a2a: spawned {id} ({lane} lane, app-server) in {}",
+                cwd.display()
+            );
+        }
+        return Ok(if json_mode {
+            json!({
+                "id": id,
+                "lane": lane.as_str(),
+                "state": snap.state.as_str(),
+                "transport": Transport::AppServer,
+                "epoch": snap.epoch,
+                // The app-server child is the BROKER's process, shared by every
+                // worker: no worker-scoped pid exists to report.
+                "pid": Value::Null,
+                "cwd": cwd,
+                "worker_dir": wdir,
+                "brief_sha": brief_sha,
+                "sandbox": lane_cfg.sandbox.as_str(),
+                "network": lane_cfg.network,
+                "model": model,
+                "effort": effort,
+                "deadline_at": snap.deadline_at,
+            })
+        } else {
+            Value::String(id)
+        });
+    }
 
     let codex_bin = cfg
         .codex_bin
@@ -209,7 +303,6 @@ pub fn run(
     };
 
     let started = Utc::now();
-    let mut snap = snap;
     // The task deadline is armed the moment the process is observed running;
     // `reconcile` (Task 13) is what later fires it.
     snap.deadline_at =
@@ -237,7 +330,7 @@ pub fn run(
             "id": id,
             "lane": lane.as_str(),
             "state": snap.state.as_str(),
-            "transport": "exec",
+            "transport": Transport::Exec,
             "epoch": snap.epoch,
             "pid": spawned.pid,
             "cwd": cwd,
@@ -256,22 +349,156 @@ pub fn run(
 
 // --------------------------------------------------------------------- gates
 
-/// Phase 1 speaks exec only; `auto` resolves to it rather than failing.
-fn transport_gate(requested: Option<&str>) -> Result<(), AppError> {
+/// What `--transport` asked for, parsed. Every value this build can offer is
+/// here; anything else is the one *static* transport failure left (exit 9).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Requested {
+    /// The default: the live transport when there is one, exec when there is
+    /// not.
+    Auto,
+    /// Named explicitly — and therefore never silently downgraded.
+    AppServer,
+    Exec,
+}
+
+impl Requested {
+    /// The value recorded as `requested_transport`: the explicit ask, or the
+    /// transport actually resolved when the caller named none.
+    fn recorded(self, resolved: Transport) -> Transport {
+        match self {
+            Requested::Auto => resolved,
+            Requested::AppServer => Transport::AppServer,
+            Requested::Exec => Transport::Exec,
+        }
+    }
+
+    /// `auto` | `explicit` — how the transport was chosen, which is not
+    /// derivable from the transport itself.
+    fn selection(self) -> &'static str {
+        match self {
+            Requested::Auto => "auto",
+            _ => "explicit",
+        }
+    }
+}
+
+/// Parse `--transport`. Unknown values are the only remaining exit-9 transport
+/// failure: they name something this build could never offer, whatever the
+/// broker is doing.
+fn transport_gate(requested: Option<&str>) -> Result<Requested, AppError> {
     match requested.unwrap_or("auto") {
-        "auto" | "exec" => Ok(()),
-        "app-server" => Err(AppError::new(
-            "TRANSPORT_UNAVAILABLE",
-            ExitCode::Precondition,
-            "the app-server transport is not available in Phase 1 (it arrives with the broker)",
-        )
-        .remedy("re-run with `--transport exec`, or drop the flag")),
+        "auto" => Ok(Requested::Auto),
+        "exec" => Ok(Requested::Exec),
+        "app-server" => Ok(Requested::AppServer),
         other => Err(AppError::new(
             "TRANSPORT_UNKNOWN",
             ExitCode::Precondition,
             format!("unknown transport `{other}` (expected auto|app-server|exec)"),
-        )),
+        )
+        .remedy("re-run with `--transport auto|app-server|exec`, or drop the flag")),
     }
+}
+
+/// The transport this spawn will use, and (for app-server) the connection it
+/// will use it over.
+enum Selected {
+    Exec {
+        /// `Some` when the caller asked for `auto`, a broker was attempted, and
+        /// it could not be reached — the reason a `transport_degraded` envelope
+        /// is about to be written.
+        degraded: Option<AppError>,
+    },
+    AppServer(BrokerClient),
+}
+
+impl Selected {
+    fn transport(&self) -> Transport {
+        match self {
+            Selected::Exec { .. } => Transport::Exec,
+            Selected::AppServer(_) => Transport::AppServer,
+        }
+    }
+}
+
+/// Choose the transport — the ONE place a socket may be opened before the
+/// worker exists.
+///
+/// The disable seam is checked first and short-circuits absolutely: with
+/// `A2A_BROKER_DISABLE` set, neither branch reaches [`brokerclient`], so a
+/// Phase-1 spawn performs no socket syscall at all.
+fn select_transport(home: &Path, requested: Requested) -> Result<Selected, AppError> {
+    match requested {
+        Requested::Exec => Ok(Selected::Exec { degraded: None }),
+        // A configured exec spawn is not a degradation: nothing was attempted,
+        // so there is nothing to report as lost.
+        Requested::Auto if brokerclient::disabled() => Ok(Selected::Exec { degraded: None }),
+        Requested::Auto => match brokerclient::connect_or_start(home) {
+            Ok(client) => Ok(Selected::AppServer(client)),
+            Err(e) => Ok(Selected::Exec { degraded: Some(e) }),
+        },
+        // Explicit means explicit: exec has no true interrupt and no mid-turn
+        // steer, so a caller who named app-server gets an error, not a quieter
+        // worker (spec §4.4).
+        Requested::AppServer if brokerclient::disabled() => Err(brokerclient::disabled_error()),
+        Requested::AppServer => brokerclient::connect_or_start(home).map(Selected::AppServer),
+    }
+}
+
+/// Who this worker belongs to.
+///
+/// Phase 2 records it at genesis so a rebuild is lossless; the `--owner` flag
+/// and the cross-owner guards land in Task 15. `anon-<uid>` rather than `None`
+/// because "unowned" already means something else on disk: a worker from before
+/// owners existed, which every caller may touch.
+fn resolve_owner() -> String {
+    std::env::var("A2A_OWNER")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| format!("anon-{}", nix::unistd::getuid().as_raw()))
+}
+
+/// Hand a laid-out, genesis-written worker to the broker.
+///
+/// The frame carries the resolved `cwd` and the lane **as well as** the
+/// directory: the broker re-validates both against its own allowed roots
+/// (spec §5 — the socket must not out-privilege the CLI), and it cannot do that
+/// from a path alone.
+///
+/// A refusal here is the same failure boundary a failed `fork` is on the exec
+/// path: the worker is already durable, so the reason is recorded
+/// (`failed{never_started}`) rather than deleted.
+fn attach_to_broker(
+    mut client: BrokerClient,
+    log: &mut EventLog,
+    wdir: &Path,
+    snap: WorkerSnapshot,
+    lane: Lane,
+    cwd: &Path,
+) -> Result<WorkerSnapshot, AppError> {
+    let answer = client.request(
+        "spawn",
+        json!({"dir": wdir, "cwd": cwd, "lane": lane.as_str()}),
+    );
+    let accepted = match answer {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = append_and_fold(
+                log,
+                wdir,
+                snap,
+                EventKind::StateChange,
+                json!({"fsm": "ProcessExited", "code": null,
+                       "detail": redact::redact_egress(&format!("{}: {}", e.code, e.message))}),
+                Utc::now(),
+            );
+            return Err(e);
+        }
+    };
+    // The broker answers with the snapshot it registered. It is the same file
+    // this process just wrote, read back through the owner of the worker — so
+    // it, not our copy, is what gets reported.
+    Ok(serde_json::from_value(accepted).unwrap_or(snap))
 }
 
 /// `danger-full-access` needs the §5 elevation gate (lane permission AND an
@@ -569,17 +796,82 @@ mod tests {
     }
 
     #[test]
-    fn transport_gate_admits_only_exec_in_phase_one() {
-        assert!(transport_gate(None).is_ok());
-        assert!(transport_gate(Some("auto")).is_ok());
-        assert!(transport_gate(Some("exec")).is_ok());
-        let err = transport_gate(Some("app-server")).unwrap_err();
-        assert_eq!(err.code, "TRANSPORT_UNAVAILABLE");
-        assert_eq!(err.exit, ExitCode::Precondition);
+    fn the_transport_gate_parses_all_three_and_refuses_only_the_unknown() {
+        assert_eq!(transport_gate(None).unwrap(), Requested::Auto);
+        assert_eq!(transport_gate(Some("auto")).unwrap(), Requested::Auto);
+        assert_eq!(transport_gate(Some("exec")).unwrap(), Requested::Exec);
         assert_eq!(
-            transport_gate(Some("carrier-pigeon")).unwrap_err().code,
-            "TRANSPORT_UNKNOWN"
+            transport_gate(Some("app-server")).unwrap(),
+            Requested::AppServer
         );
+        // The one static transport failure left: a value no build can offer.
+        let err = transport_gate(Some("carrier-pigeon")).unwrap_err();
+        assert_eq!(err.code, "TRANSPORT_UNKNOWN");
+        assert_eq!(err.exit, ExitCode::Precondition);
+    }
+
+    /// `requested_transport` always answers "what was this worker asked to
+    /// be" — the explicit value when there was one, the resolved one otherwise.
+    #[test]
+    fn the_recorded_request_is_explicit_or_resolved() {
+        assert_eq!(
+            Requested::Auto.recorded(Transport::AppServer),
+            Transport::AppServer
+        );
+        assert_eq!(Requested::Auto.recorded(Transport::Exec), Transport::Exec);
+        assert_eq!(
+            Requested::AppServer.recorded(Transport::Exec),
+            Transport::AppServer
+        );
+        assert_eq!(
+            Requested::Exec.recorded(Transport::AppServer),
+            Transport::Exec
+        );
+        assert_eq!(Requested::Auto.selection(), "auto");
+        assert_eq!(Requested::Exec.selection(), "explicit");
+        assert_eq!(Requested::AppServer.selection(), "explicit");
+    }
+
+    /// An explicitly-named transport is never downgraded — with the socket
+    /// switched off, `app-server` is a reachability failure (exit 7), while
+    /// `auto` and `exec` are the pure Phase-1 path.
+    #[test]
+    fn the_disable_seam_short_circuits_selection_without_touching_a_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The home is empty: any attempt to reach a broker would autostart one,
+        // and the assertions below would see its socket.
+        temp_env(|| {
+            assert!(matches!(
+                select_transport(tmp.path(), Requested::Auto).unwrap(),
+                Selected::Exec { degraded: None }
+            ));
+            assert!(matches!(
+                select_transport(tmp.path(), Requested::Exec).unwrap(),
+                Selected::Exec { degraded: None }
+            ));
+            let Err(err) = select_transport(tmp.path(), Requested::AppServer) else {
+                panic!("an explicit app-server transport cannot resolve with the socket off");
+            };
+            assert_eq!(err.exit, ExitCode::BrokerUnavailable);
+            assert!(err.remedy.is_some());
+        });
+        assert!(
+            !tmp.path().join(crate::broker::BROKER_SOCK).exists(),
+            "the disabled path never opened a socket"
+        );
+    }
+
+    /// `A2A_BROKER_DISABLE=1` for the duration of `f`, restored afterwards.
+    /// The environment is process-wide, so this test does its own scoping.
+    fn temp_env(f: impl FnOnce()) {
+        let key = brokerclient::DISABLE_ENV;
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, "1");
+        f();
+        match previous {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]

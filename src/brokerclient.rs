@@ -35,6 +35,40 @@ use std::time::{Duration, Instant};
 /// First choice for the daemon binary: an explicit override for ops.
 pub const BROKER_BIN_ENV: &str = "A2A_BROKER_BIN";
 
+/// The escape hatch back to Phase 1: with this set, **no `a2a` command opens the
+/// broker socket at all** — not to connect, not to probe, not to autostart.
+///
+/// It is a hard switch rather than a preference because that is what makes it
+/// testable: the entire Phase-1 suite runs with it set, and "the exec path took
+/// zero socket syscalls" is then a property of the code rather than of timing.
+/// Operationally it is the answer to "the broker is misbehaving, get work
+/// moving now".
+pub const DISABLE_ENV: &str = "A2A_BROKER_DISABLE";
+
+/// True when [`DISABLE_ENV`] is set to anything other than the falsy spellings.
+/// An empty value is *not* a request to disable — `A2A_BROKER_DISABLE=` is what
+/// a shell leaves behind when a variable is cleared badly.
+pub fn disabled() -> bool {
+    match std::env::var(DISABLE_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"),
+        Err(_) => false,
+    }
+}
+
+/// The refusal an explicit `--transport app-server` gets when the socket is
+/// switched off: a reachability failure (exit 7), because from the caller's
+/// point of view that is exactly what it is.
+pub fn disabled_error() -> AppError {
+    AppError::new(
+        wire::ERR_BROKER_UNAVAILABLE,
+        ExitCode::BrokerUnavailable,
+        format!("{DISABLE_ENV} is set: this process will not talk to a broker"),
+    )
+    .remedy(format!(
+        "unset {DISABLE_ENV}, or spawn with `--transport exec`"
+    ))
+}
+
 /// The autostart retry budget: 20 × 100ms. Bounded because a broker that has
 /// not answered in two seconds is not slow, it is broken — and a CLI that waits
 /// forever is worse than one that says so.
@@ -150,6 +184,12 @@ pub fn connect_or_start(home: &Path) -> Result<BrokerClient, AppError> {
                 if !respawned && error.get("live_workers").and_then(Value::as_u64) == Some(0) {
                     client.drain()?;
                     wait_for_socket_removal(home, DRAIN_WAIT)?;
+                    // ... and then for the LOCK, which the retired daemon
+                    // releases after the socket. A successor started inside that
+                    // window finds the singleton still held, exits 0 quietly,
+                    // and leaves this client waiting for a daemon that will
+                    // never come — the same hazard `broker restart` waits out.
+                    wait_for_lock_release(home, DRAIN_WAIT)?;
                     autostart(home)?;
                     respawned = true;
                     outcome = retry_handshake(home)?;
@@ -500,6 +540,54 @@ pub fn autostart(home: &Path) -> Result<u32, AppError> {
         .remedy("check broker.log in the a2a home")
     })?;
     Ok(child.id())
+}
+
+/// Wait for a retired daemon to release `broker.lock` — the last thing it does,
+/// after the child, after the socket, after the pidfile.
+///
+/// "The socket is gone" is therefore NOT "the daemon is gone", and the
+/// difference is a lost successor: a `broker run` that meets the lock still held
+/// prints `broker already running` and exits 0 by design (that is what makes
+/// twenty concurrent cold starts converge), so a client that autostarts inside
+/// this window ends up waiting out its whole connect budget for a daemon nobody
+/// started.
+pub fn wait_for_lock_release(home: &Path, patience: Duration) -> Result<(), AppError> {
+    let deadline = Instant::now() + patience;
+    while !lock_is_free(home) {
+        if Instant::now() >= deadline {
+            return Err(AppError::new(
+                wire::ERR_BROKER_UNAVAILABLE,
+                ExitCode::BrokerUnavailable,
+                format!(
+                    "the previous broker still holds {} after {}s",
+                    crate::broker::lock_path(home).display(),
+                    patience.as_secs()
+                ),
+            )
+            .remedy("check broker.log, then kill the pid in broker.pid"));
+        }
+        std::thread::sleep(CONNECT_INTERVAL);
+    }
+    Ok(())
+}
+
+/// True when nobody holds `broker.lock`. Probing means taking it — non-blocking,
+/// and released immediately, so the probe cannot become the thing that keeps the
+/// next daemon out.
+fn lock_is_free(home: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(crate::broker::lock_path(home))
+    else {
+        return true; // no lock file at all
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            drop(lock);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Wait for a retired daemon to take its socket down.

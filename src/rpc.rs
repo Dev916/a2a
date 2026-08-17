@@ -73,6 +73,30 @@ pub fn is_scrubbed_env(key: &str) -> bool {
     key == "OPENAI_API_KEY" || key == "DEPOT_TOKEN" || key.starts_with("AWS_")
 }
 
+/// The complete environment for a process spawned from the codex binary:
+/// [`CHILD_ENV_ALLOWLIST`] read out of this process's environment, then the
+/// caller's explicit pairs, with [`is_scrubbed_env`] winning over both.
+///
+/// Shared rather than inlined into [`Client::spawn`] because the app-server
+/// child is not the only thing `a2a` runs that binary for — the broker also asks
+/// it `--version` for the drift gate, and a version probe that inherited the
+/// daemon's environment would hand a credential to a process the allowlist
+/// exists to keep it away from.
+pub fn child_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = CHILD_ENV_ALLOWLIST
+        .iter()
+        .filter(|key| !is_scrubbed_env(key))
+        .filter_map(|key| std::env::var(key).ok().map(|v| ((*key).to_string(), v)))
+        .collect();
+    out.extend(
+        extra
+            .iter()
+            .filter(|(key, _)| !is_scrubbed_env(key))
+            .cloned(),
+    );
+    out
+}
+
 /// Everything a `call` can fail with.
 ///
 /// The distinction that matters operationally: [`RpcError::ChildDied`] means the
@@ -182,20 +206,7 @@ impl Client {
         let mut cmd = Command::new(bin);
         cmd.args(args);
         cmd.env_clear();
-        for key in CHILD_ENV_ALLOWLIST {
-            if is_scrubbed_env(key) {
-                continue;
-            }
-            if let Ok(value) = std::env::var(key) {
-                cmd.env(key, value);
-            }
-        }
-        for (key, value) in extra_env {
-            if is_scrubbed_env(key) {
-                continue;
-            }
-            cmd.env(key, value);
-        }
+        cmd.envs(child_env(extra_env));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(errfile))

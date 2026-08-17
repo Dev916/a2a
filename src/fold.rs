@@ -102,6 +102,7 @@ pub fn fold(mut snap: WorkerSnapshot, events: &[Envelope], now: DateTime<Utc>) -
         if is_genesis(env) {
             seed_from_genesis(&mut snap, env, now);
         } else if env.epoch >= snap.epoch {
+            absorb_app_server_identity(&mut snap, env);
             if let Some(ev) = envelope_to_fsm_event(env) {
                 apply_event(&mut snap, env, &ev, now);
             } else if matches!(
@@ -161,8 +162,31 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     if let Some(t) = raw.get("transport") {
         if let Ok(t) = serde_json::from_value::<Transport>(t.clone()) {
             snap.transport = t;
+            // The default when genesis names no separate request: the two agree
+            // (Phase-1 genesis rows have only `transport`).
             snap.requested_transport = t;
         }
+    }
+    // ... and the request is its OWN key when the spawn path recorded one, so a
+    // rebuild can still say what was asked for rather than only what happened.
+    if let Some(t) = raw.get("requested_transport") {
+        if let Ok(t) = serde_json::from_value::<Transport>(t.clone()) {
+            snap.requested_transport = t;
+        }
+    }
+    if let Some(owner) = s("owner") {
+        snap.owner = Some(owner.to_string());
+    }
+    // The thread of record, when the spawn already knew one (a re-attach); a
+    // fresh spawn learns it later, from `SessionIdentified`.
+    if let Some(thread_id) = s("thread_id") {
+        snap.thread_id = Some(thread_id.to_string());
+    }
+    // Bookkeeping the snapshot carries verbatim: HOW the transport was chosen
+    // (`auto` | `explicit`), which is not derivable from the transport itself.
+    if let Some(selection) = raw.get("transport_selection") {
+        snap.extra
+            .insert("transport_selection".to_string(), selection.clone());
     }
     snap.created_at = s("created_at")
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
@@ -199,6 +223,30 @@ fn apply_transport_identity(snap: &mut WorkerSnapshot, env: &Envelope) {
             .get("start_witness")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+    }
+}
+
+/// App-server identity a row may carry regardless of which FSM edge (if any) it
+/// drives: the **thread of record** and the sandbox the server actually
+/// resolved.
+///
+/// In the fold rather than patched onto the snapshot afterwards, for the same
+/// reason `failure_class` is: both facts live in the WAL, so a snapshot rebuilt
+/// from zero a month later reports the same thread and the same sandbox. The
+/// actor writes them onto `ProcessStarted`/`SessionIdentified`; a Phase-1 exec
+/// row carries neither key and is untouched.
+fn absorb_app_server_identity(snap: &mut WorkerSnapshot, env: &Envelope) {
+    if env.class != EventClass::Lifecycle {
+        return;
+    }
+    if let Some(thread_id) = env.raw.get("thread_id").and_then(|v| v.as_str()) {
+        snap.thread_id = Some(thread_id.to_string());
+    }
+    if let Some(sandbox) = env.raw.get("resolved_sandbox") {
+        if !sandbox.is_null() {
+            snap.extra
+                .insert("resolved_sandbox".to_string(), sandbox.clone());
+        }
     }
 }
 
@@ -516,6 +564,79 @@ mod tests {
             Some(std::path::Path::new("/r.jsonl"))
         );
         assert_eq!(after.state, WorkerState::Running);
+    }
+
+    /// Genesis is the only writer of identity, so everything Phase 2 records at
+    /// spawn has to be readable back out of it — otherwise `state.json` becomes
+    /// the source of truth for owner and thread, which is exactly the thing the
+    /// WAL exists to prevent.
+    #[test]
+    fn genesis_seeds_the_owner_the_thread_of_record_and_a_separate_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = WorkerSnapshot::new_for_test("general-0817t1200-aaaa", tmp.path());
+        let after = fold(
+            snap,
+            &[ev(
+                json!({"fsm":"Spawn","id":"general-0817t1200-aaaa","lane":"general",
+                       "cwd":"/repo","transport":"exec","requested_transport":"app-server",
+                       "transport_selection":"auto","owner":"mike","thread_id":"thread-1"}),
+                1,
+                1,
+            )],
+            Utc::now(),
+        );
+        assert_eq!(after.owner.as_deref(), Some("mike"));
+        assert_eq!(after.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(after.transport, Transport::Exec);
+        assert_eq!(after.requested_transport, Transport::AppServer);
+        assert_eq!(after.extra["transport_selection"], json!("auto"));
+
+        // A Phase-1 genesis names no request: the two agree, as they always did.
+        let snap = WorkerSnapshot::new_for_test("general-0817t1200-bbbb", tmp.path());
+        let after = fold(
+            snap,
+            &[ev(
+                json!({"fsm":"Spawn","id":"general-0817t1200-bbbb","lane":"general",
+                       "cwd":"/repo","transport":"app-server"}),
+                1,
+                1,
+            )],
+            Utc::now(),
+        );
+        assert_eq!(after.transport, Transport::AppServer);
+        assert_eq!(after.requested_transport, Transport::AppServer);
+        assert_eq!(after.owner, None);
+    }
+
+    /// The thread of record and the resolved sandbox arrive on later rows (the
+    /// actor opens the thread after genesis), and they must survive a rebuild.
+    #[test]
+    fn the_thread_of_record_and_resolved_sandbox_are_absorbed_from_any_lifecycle_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = WorkerSnapshot::new_for_test("general-0817t1200-aaaa", tmp.path());
+        let after = fold(
+            snap,
+            &[
+                ev(
+                    json!({"fsm":"ProcessStarted","pid":0,"start_witness":"w",
+                           "thread_id":"thread-7",
+                           "resolved_sandbox":{"type":"workspaceWrite","writableRoots":[]}}),
+                    1,
+                    1,
+                ),
+                ev(
+                    json!({"fsm":"SessionIdentified","session_id":"thread-7",
+                           "thread_id":"thread-7"}),
+                    1,
+                    2,
+                ),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(after.thread_id.as_deref(), Some("thread-7"));
+        assert_eq!(after.session_id.as_deref(), Some("thread-7"));
+        assert_eq!(after.extra["resolved_sandbox"]["type"], json!("workspaceWrite"));
+        assert!(after.extra.get("fold_rejections").is_none());
     }
 
     #[test]

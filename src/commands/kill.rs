@@ -15,9 +15,17 @@
 //! process start-time witness before it signals, so a recycled PID is never hit.
 //! The WAL leads the side effect (append + fsync → kill → snapshot), so a crash
 //! mid-kill costs a replay, never an unrecorded stop.
+//!
+//! **On the app-server transport there is no signal at all.** The pid recorded
+//! against such a worker is the broker's shared `codex app-server` child — every
+//! worker's — so stopping one worker is `turn/interrupt` + `Cancelled`, done by
+//! the broker. With the broker gone there is nothing to interrupt either: the
+//! worker is marked `cancelled` and no process is touched. A worker-scoped
+//! `kill -pgid` there would take the whole fleet's transport with it.
 
+use crate::brokerclient::{self, Handshake};
 use crate::config;
-use crate::events::EventKind;
+use crate::events::{EventKind, Transport};
 use crate::exec::{self, KillOutcome, Liveness};
 use crate::fold::append_and_fold;
 use crate::fsm::{self, Action, FsmEvent};
@@ -50,6 +58,16 @@ pub fn run(
     let snap = reconcile(home, &cfg, &id, Utc::now())?;
     if snap.state.is_terminal() {
         return Ok(Outcome::from(already_terminal(&id, &snap, json_mode, quiet)));
+    }
+
+    // An app-server worker is the broker's to stop, because only the broker can
+    // interrupt its turn. A refusal here is real; a broker that has never heard
+    // of the worker (or is not there at all) falls through to the local path,
+    // which records `cancelled` WITHOUT signalling anything.
+    if snap.transport == Transport::AppServer {
+        if let Some(outcome) = kill_via_broker(home, &id, json_mode, quiet)? {
+            return Ok(outcome);
+        }
     }
 
     // Everything below mutates the worker, so it runs under `state.lock` — the
@@ -89,7 +107,12 @@ pub fn run(
     // child; `a2a kill` additionally refuses to leave one behind, so a worker
     // the kernel still says is alive is signalled whatever the row said (the
     // witness check is what makes that safe).
-    let outcome = if transition.actions.contains(&Action::KillProcess)
+    //
+    // Except on the app-server transport, where the recorded pid is not this
+    // worker's process at all (see the module docs).
+    let outcome = if snap.transport == Transport::AppServer {
+        "no_signal"
+    } else if transition.actions.contains(&Action::KillProcess)
         || exec::liveness(&dir) == Liveness::Alive
     {
         signal(&snap)?
@@ -112,6 +135,46 @@ pub fn run(
     Ok(Outcome::from(payload_for(
         &id, &snap, false, outcome, json_mode,
     )))
+}
+
+/// Ask the broker to stop one of ITS workers.
+///
+/// `Ok(None)` = "not the broker's problem after all": the socket is switched
+/// off, no daemon is listening, or the daemon is not tracking this worker. Each
+/// of those is a fall-through to the local path, which records the stop without
+/// touching a process. Any other error is the broker's answer and is returned
+/// as-is — an unreachable-but-present broker must not be quietly worked around.
+fn kill_via_broker(
+    home: &A2aHome,
+    id: &str,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Option<Outcome>, AppError> {
+    if brokerclient::disabled() {
+        return Ok(None);
+    }
+    let Ok(Some(handshake)) = brokerclient::try_handshake(home.root()) else {
+        return Ok(None); // no broker: nothing to interrupt, nothing to signal
+    };
+    let Handshake::Ready(mut client) = handshake else {
+        return Ok(None); // a broker we cannot speak to: record the stop locally
+    };
+    match client.request("kill", json!({"id": id})) {
+        Ok(_) => {}
+        // The daemon is up but does not own this worker (it was spawned against
+        // a previous instance): its files are ours to finish.
+        Err(e) if e.code == "NO_SUCH_WORKER" => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    // The broker's actor has already committed `Cancelled` under the same
+    // `state.lock` this process would have taken, so the file is the answer.
+    let snap = load_snapshot(&home.worker_dir(id))?;
+    if !quiet {
+        eprintln!("a2a: {id}: {} (via the broker)", snap.state.as_str());
+    }
+    Ok(Some(Outcome::from(payload_for(
+        id, &snap, false, "broker", json_mode,
+    ))))
 }
 
 /// Witness-checked group kill of the recorded process. A worker with no pid on

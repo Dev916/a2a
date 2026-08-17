@@ -126,8 +126,19 @@ fn brief_transport_and_elevation_gates() {
         .arg(&no_ac)
         .assert()
         .code(9);
+    // An explicitly-named app-server transport with no broker to reach (these
+    // tests run with `A2A_BROKER_DISABLE=1`) is a REACHABILITY failure — exit 7,
+    // never the static exit 9, which is now only for a transport string this
+    // build could never offer at all.
     a2a(&home, tmp.path())
         .args(["spawn", "--lane", "general", "--transport", "app-server", "--cwd"])
+        .arg(tmp.path())
+        .arg("--brief")
+        .arg(&no_ac)
+        .assert()
+        .code(7);
+    a2a(&home, tmp.path())
+        .args(["spawn", "--lane", "general", "--transport", "carrier-pigeon", "--cwd"])
         .arg(tmp.path())
         .arg("--brief")
         .arg(&no_ac)

@@ -225,13 +225,33 @@ fn apply_event(snap: &mut WorkerSnapshot, env: &Envelope, ev: &FsmEvent, now: Da
             }
             snap.state = t.state;
             snap.state_reason = t.reason;
-            snap.failure_class = t.failure;
+            snap.failure_class = t.failure.map(|class| refine_failure_class(env, class));
             if t.epoch_bump {
                 snap.epoch += 1;
             }
         }
         Err(rejected) => record_rejection(snap, env, &rejected),
     }
+}
+
+/// The FSM decides the STATE; the row may refine the DIAGNOSIS.
+///
+/// `fsm::step` cannot know *why* a process exited — from `running` it can only
+/// say `no_result` — but the writer often does: the broker knows a child died
+/// because its credentials expired, or because that worker's actor panicked.
+/// A lifecycle row may therefore carry `"failure_class": "<snake_case>"`, which
+/// is honoured **only** on a transition that already lands in `failed`.
+///
+/// Deliberately in the fold rather than as a post-hoc snapshot patch: the class
+/// lives in the WAL, so a snapshot rebuilt from zero reports the same failure a
+/// month later. An unparseable or unknown value keeps the machine's own answer.
+fn refine_failure_class(env: &Envelope, class: fsm::FailureClass) -> fsm::FailureClass {
+    env.raw
+        .get("failure_class")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<fsm::FailureClass>(v).ok())
+        .filter(|refined| *refined != fsm::FailureClass::Unknown)
+        .unwrap_or(class)
 }
 
 /// A rejection during replay is data, not an error: the log said something the

@@ -226,6 +226,25 @@ pub fn spawn_worker_actor(
     cancel: CancellationToken,
     tracker: &TaskTracker,
 ) -> WorkerHandle {
+    let (handle, actor) = build_worker_actor(dir, snap, cfg, adapter_rx, settle_tx, cancel);
+    tracker.spawn(actor);
+    handle
+}
+
+/// The actor's mailbox and its future, *unspawned*.
+///
+/// [`spawn_worker_actor`] is this plus a `TaskTracker::spawn`. The broker core
+/// needs the two apart: it spawns actors into a `JoinSet` (tracked, so shutdown
+/// still waits for them) so that a panicking actor is reported as a panic
+/// against exactly one worker instead of vanishing into a detached task.
+pub fn build_worker_actor(
+    dir: PathBuf,
+    snap: WorkerSnapshot,
+    cfg: Config,
+    adapter_rx: watch::Receiver<AdapterRef>,
+    settle_tx: mpsc::Sender<Settled>,
+    cancel: CancellationToken,
+) -> (WorkerHandle, impl std::future::Future<Output = ()> + Send + 'static) {
     let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
     let id = snap.id.clone();
     let actor = WorkerActor {
@@ -242,8 +261,7 @@ pub fn spawn_worker_actor(
         open_turn: None,
         settled: None,
     };
-    tracker.spawn(actor.run());
-    WorkerHandle { id, tx }
+    (WorkerHandle { id, tx }, actor.run())
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +450,11 @@ impl WorkerActor {
     // -- notifications ------------------------------------------------------
 
     async fn on_envelope(&mut self, mut env: Envelope) {
+        // The epoch is the ACTOR's to assign, not the demux's: a frame observed
+        // now belongs to the epoch this worker is in now. Without this, a
+        // resumed worker (epoch 2) would silently fence every envelope the core
+        // built while it still believed the epoch was 1.
+        env.epoch = self.snap.epoch;
         if env.class != EventClass::Lifecycle {
             self.trace.push(env);
             if self.trace.len() >= TRACE_FLUSH_THRESHOLD {
@@ -450,6 +473,12 @@ impl WorkerActor {
             }
             EventKind::AgentMessage => self.turn_messages.push(env.clone()),
             EventKind::SessionIdentified => self.gate_session_identified(&mut env),
+            // Supervision replaced the child: whatever turn was open died with
+            // it, so the next `Deliver` must open a NEW one. Steering a turn id
+            // the new child has never heard of would fail its precondition at
+            // best — and at worst succeed against a stale turn while the
+            // per-turn sandbox overrides went unre-supplied.
+            EventKind::TransportRestarted => self.open_turn = None,
             _ => {}
         }
         // A turn only concludes from `running`: an interrupted or killed worker

@@ -25,3 +25,8 @@ assert_cmd = "2.2.2"
 jsonschema = { version = "0.49.9", default-features = false }
 predicates = "3.1.4"
 tempfile = "3.27.0"
+# `test-util` is what makes `tokio::time::pause` available, and it is dev-only
+# on purpose: the backoff/probe SCHEDULING tests must be able to elapse a
+# 60-second window in microseconds, and a paused clock must never be reachable
+# from the shipped daemon.
+tokio = { version = "1", features = ["test-util"] }

@@ -20,4 +20,19 @@
 //! that every actor write takes the same `state.lock` a reconcile takes and
 //! re-opens the `EventLog` inside it.
 
+pub mod child;
+pub mod core;
 pub mod worker_actor;
+
+/// The daemon's stderr, and the child's: one file, because a broker log that
+/// omits what the app-server said about its own death is not a log.
+pub const BROKER_LOG: &str = "broker.log";
+
+/// Frames that belong to no worker: broker-scoped notifications, unroutable
+/// frames, degradation events. Append-only NDJSON, 0600.
+pub const BROKER_JSONL: &str = "broker.jsonl";
+
+/// What the daemon knows about itself, rewritten atomically on every change —
+/// the file `a2a doctor` and the spawn path read to decide whether the
+/// app-server transport is healthy.
+pub const BROKER_HEALTH: &str = "broker-health.json";

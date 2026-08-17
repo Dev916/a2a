@@ -166,7 +166,11 @@ fn age_secs(then: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
 /// Reads only the tail window and walks it backwards, so a torn trailing line
 /// (a crash mid-append) is skipped rather than mistaken for "no events", and a
 /// window that starts mid-line simply never reaches its leading fragment.
-fn last_event_ts(dir: &Path) -> Option<DateTime<Utc>> {
+///
+/// Shared with `gc`, which anchors its retention age to exactly this instant —
+/// "how long since this worker last said anything" is the same question in both
+/// commands, and it must not have two answers.
+pub(crate) fn last_event_ts(dir: &Path) -> Option<DateTime<Utc>> {
     let mut file = File::open(dir.join("events.jsonl")).ok()?;
     let len = file.metadata().ok()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(TAIL_WINDOW_BYTES)))

@@ -78,9 +78,14 @@ impl Until {
     }
 }
 
-/// `15s`, `5m`, `2h` — and a bare integer means seconds. Deliberately tiny:
-/// this is a CLI flag, not a duration DSL, and an unparseable value is a usage
-/// error (exit 2 via clap) rather than something to guess at.
+/// `15s`, `5m`, `2h`, `7d` — and a bare integer means seconds. Deliberately
+/// tiny: this is a CLI flag, not a duration DSL, and an unparseable value is a
+/// usage error (exit 2 via clap) rather than something to guess at.
+///
+/// Days exist for `a2a gc --age`, whose retention window is naturally counted in
+/// days (its default is `7d`) — a flag whose own default value it could not
+/// parse would be a contradiction. One parser serves every duration flag, so
+/// `--timeout 1d` reads the same as `--age 1d`.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let t = s.trim();
     if t.is_empty() {
@@ -90,16 +95,17 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         's' | 'S' => (&t[..t.len() - 1], 1),
         'm' | 'M' => (&t[..t.len() - 1], 60),
         'h' | 'H' => (&t[..t.len() - 1], 3600),
+        'd' | 'D' => (&t[..t.len() - 1], 86_400),
         '0'..='9' => (t, 1),
         other => {
             return Err(format!(
-                "unknown duration unit `{other}` in `{s}` (expected s, m or h)"
+                "unknown duration unit `{other}` in `{s}` (expected s, m, h or d)"
             ))
         }
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
-            "`{s}` is not a duration (expected <number><s|m|h>, e.g. 30s)"
+            "`{s}` is not a duration (expected <number><s|m|h|d>, e.g. 30s)"
         ));
     }
     let n: u64 = digits
@@ -265,18 +271,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durations_parse_seconds_minutes_and_hours() {
+    fn durations_parse_seconds_minutes_hours_and_days() {
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
         assert_eq!(parse_duration("15S").unwrap(), Duration::from_secs(15));
         assert_eq!(parse_duration(" 45 ").unwrap(), Duration::from_secs(45));
         assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
+        // `gc --age` counts retention in days, and defaults to 7d
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_duration("1D").unwrap(), Duration::from_secs(86_400));
     }
 
     #[test]
     fn a_bad_duration_names_what_was_expected() {
-        for bad in ["", "s", "abc", "5d", "5 s", "-1s", "1.5h", "m5"] {
+        for bad in ["", "s", "abc", "5w", "5 s", "-1s", "1.5h", "m5"] {
             let err = parse_duration(bad).unwrap_err();
             assert!(!err.is_empty(), "{bad}");
         }

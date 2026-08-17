@@ -111,6 +111,19 @@ pub enum Cmd {
         /// codex child — it travels through a 0600 prompt file on stdin.
         message: Option<String>,
     },
+    /// Reclaim finished workers' directories, leaving a tombstone per removal.
+    /// Terminal states only — a worker that is still actionable is never
+    /// removed, and there is no flag that overrides that.
+    Gc {
+        /// Only reclaim workers idle this long, measured from their last event
+        /// — `30s`, `10m`, `2h`, `7d`
+        #[arg(long, value_name = "DUR", default_value = "7d",
+              value_parser = crate::commands::wait::parse_duration)]
+        age: std::time::Duration,
+        /// List what would be reclaimed and exit, deleting nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

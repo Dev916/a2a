@@ -42,6 +42,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Send { .. } => "send",
         Cmd::Kill { .. } => "kill",
         Cmd::Resume { .. } => "resume",
+        Cmd::Gc { .. } => "gc",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -131,6 +132,10 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.json,
                 cli.global.quiet,
             )
+        }
+        Cmd::Gc { age, dry_run } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::gc::run(&home, *age, *dry_run, cli.global.json, cli.global.quiet)
         }
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {

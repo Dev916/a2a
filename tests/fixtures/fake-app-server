@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""fake-app-server — a scripted stand-in for `codex app-server`.
+
+Framing (verified live against codex-cli 0.140.0; see the Phase 2 plan's
+"Ground truth" section): **NDJSON JSON-RPC over stdio**. Client->server requests
+carry `jsonrpc`/`id`/`method`/`params`; **responses omit `jsonrpc`**
+(`{"id":N,"result":…}` / `{"id":N,"error":…}`); notifications carry
+`method`+`params` and no `id`; a frame this process writes with BOTH `id` and
+`method` is a **server->client request** the client owes an answer to.
+
+This fixture is held to a fidelity contract (spec §8.3): `tests/common/fidelity.rs`
+replays the transcript and validates every notification emitted here against the
+checked-in schema in `schema/v2-snapshot/`. A drifted fake is a test failure,
+not a silent pass — so keep the payloads below shaped like the real binary's.
+
+Env knobs (all `FAKE_*`, which is exactly what the broker's test seam forwards
+into the child — production spawns pass zero extra pairs):
+
+  FAKE_SCENARIO        which script to run (default `happy`); see SCENARIOS
+  FAKE_STATE           dir; state that MUST survive a relaunch — the launch
+                       counter, the thread map (id -> cwd) and scenario flags
+  FAKE_TRANSCRIPT      file; every frame in and out, one JSON object per line:
+                       {"dir":"in"|"out","frame":{…}}, or {"raw":"…"} for a
+                       line that is not JSON
+  FAKE_DUMP_ENV        file; this child's environment, `KEY=VALUE` per line
+  FAKE_DEFER_METHODS   comma-separated methods whose responses are held back
+                       until the NEXT request has been answered — deliberate
+                       out-of-order replies, so id-correlation in the client
+                       cannot pass by luck of arrival ordering
+  FAKE_EMIT_UNPARSEABLE  emit one non-JSON line at startup
+  FAKE_MESSAGE         text of the agentMessage item (default "done")
+
+SCENARIOS
+  happy            thread/started -> turn/started -> item/completed{agentMessage}
+                   -> turn/completed
+  blocked          records each thread's cwd at thread/start and writes
+                   <cwd>/outbox/1.question.json BEFORE turn/completed (the
+                   broker passes the WORKER DIR as thread/start `cwd`; that dir
+                   is the per-thread channel — env cannot be per-worker on a
+                   child shared by every worker)
+  steer-race       the FIRST turn/steer is rejected with
+                   {"code":-32002,"message":"expectedTurnId does not match the
+                   active turn"}; a subsequent turn/start succeeds
+  hang-turn        turn/started, then the turn is held OPEN forever — it
+                   completes only when steered (completed) or interrupted
+                   (interrupted)
+  server-request   emits an `execCommandApproval` server->client request
+                   mid-turn; the turn completes only once a response arrives
+  unknown-request  same, with a made-up request method
+  crash-mid-turn   crashes right after turn/started on its FIRST launch only
+                   (the counter lives in FAKE_STATE); later launches behave like
+                   `happy` and answer thread/resume
+  always-crash     answers initialize, then exits — every launch
+  resume-fail      thread/resume returns a remote error
+  bad-vocabulary   emits an unknown notification method (before the initialize
+                   response, which is also where the real server interleaves its
+                   unsolicited `remoteControl/status/changed`)
+
+Every scenario answers `thread/resume` (echoing the persisted thread) unless
+stated otherwise, and every scenario honours every knob above.
+"""
+
+import json
+import os
+import sys
+import time
+import uuid
+
+SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
+STATE = os.environ.get("FAKE_STATE") or ""
+TRANSCRIPT = os.environ.get("FAKE_TRANSCRIPT") or ""
+DEFER = [m for m in (os.environ.get("FAKE_DEFER_METHODS") or "").split(",") if m]
+MESSAGE = os.environ.get("FAKE_MESSAGE", "done")
+CLI_VERSION = "0.140.0"
+
+# ---------------------------------------------------------------------------
+# state that survives a relaunch
+# ---------------------------------------------------------------------------
+
+
+def _state_file(name):
+    if not STATE:
+        return None
+    os.makedirs(STATE, exist_ok=True)
+    return os.path.join(STATE, name)
+
+
+def _read_json(name, default):
+    p = _state_file(name)
+    if not p or not os.path.exists(p):
+        return default
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(name, value):
+    p = _state_file(name)
+    if not p:
+        return
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f)
+    os.replace(tmp, p)
+
+
+def bump_launches():
+    n = _read_json("launches.json", 0) + 1
+    _write_json("launches.json", n)
+    return n
+
+
+LAUNCH = bump_launches()
+THREADS = _read_json("threads.json", {})
+FLAGS = _read_json("flags.json", {})
+
+
+def remember_thread(tid, cwd):
+    THREADS[tid] = {"cwd": cwd, "createdAt": int(time.time())}
+    _write_json("threads.json", THREADS)
+
+
+def set_flag(key, value):
+    FLAGS[key] = value
+    _write_json("flags.json", FLAGS)
+
+
+# ---------------------------------------------------------------------------
+# wire
+# ---------------------------------------------------------------------------
+
+
+def record(direction, frame=None, raw=None):
+    if not TRANSCRIPT:
+        return
+    rec = {"dir": direction}
+    if raw is None:
+        rec["frame"] = frame
+    else:
+        rec["raw"] = raw
+    with open(TRANSCRIPT, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def send(frame):
+    record("out", frame=frame)
+    sys.stdout.write(json.dumps(frame) + "\n")
+    sys.stdout.flush()
+
+
+def send_raw(line):
+    record("out", raw=line)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def notify(method, params):
+    send({"method": method, "params": params})
+
+
+def reply(req_id, result):
+    """A response frame — deliberately WITHOUT a `jsonrpc` field."""
+    send({"id": req_id, "result": result})
+
+
+def reply_error(req_id, code, message):
+    send({"id": req_id, "error": {"code": code, "message": message}})
+
+
+SERVER_REQ_ID = [10_000]
+
+
+def server_request(method, params):
+    SERVER_REQ_ID[0] += 1
+    rid = SERVER_REQ_ID[0]
+    send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    return rid
+
+
+def die(code):
+    sys.stdout.flush()
+    os._exit(code)
+
+
+# ---------------------------------------------------------------------------
+# payload builders (shaped like the real 0.140.0 frames)
+# ---------------------------------------------------------------------------
+
+
+def thread_obj(tid, cwd):
+    ts = int(time.time())
+    return {
+        "id": tid,
+        "sessionId": tid,  # verified live: the same UUID
+        "forkedFromId": None,
+        "parentThreadId": None,
+        "preview": "",
+        "ephemeral": False,
+        "modelProvider": "openai",
+        "createdAt": ts,
+        "updatedAt": ts,
+        "status": {"type": "idle"},
+        "path": os.path.join(STATE or cwd, "rollout-%s.jsonl" % tid),
+        "cwd": cwd,
+        "cliVersion": CLI_VERSION,
+        "source": "vscode",
+        "threadSource": None,
+        "agentNickname": None,
+        "agentRole": None,
+        "gitInfo": None,
+        "name": None,
+        "turns": [],
+    }
+
+
+def sandbox_echo(mode, cwd):
+    """thread/start echoes the TYPED SandboxPolicy, not the string it was sent."""
+    if mode == "danger-full-access":
+        return {"type": "dangerFullAccess"}
+    if mode == "workspace-write":
+        return {
+            "type": "workspaceWrite",
+            "writableRoots": [cwd],
+            "networkAccess": False,
+            "excludeSlashTmp": False,
+            "excludeTmpdirEnvVar": False,
+        }
+    return {"type": "readOnly", "networkAccess": False}
+
+
+def thread_start_result(tid, cwd, mode):
+    return {
+        "thread": thread_obj(tid, cwd),
+        "model": "gpt-5.5",
+        "modelProvider": "openai",
+        "serviceTier": None,
+        "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd],
+        "instructionSources": [],
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "sandbox": sandbox_echo(mode, cwd),
+        "activePermissionProfile": None,
+        "reasoningEffort": None,
+    }
+
+
+def turn_obj(turn_id, status):
+    started = int(time.time())
+    return {
+        "id": turn_id,
+        "items": [],
+        "itemsView": "notLoaded",
+        "status": status,
+        "error": None,
+        "startedAt": started,
+        "completedAt": started,
+        "durationMs": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# turn machinery
+# ---------------------------------------------------------------------------
+
+OPEN = {}  # the single in-flight turn, if any: {"threadId":…, "turnId":…}
+PENDING_SERVER_REQ = [None]  # id of the server->client request we are waiting on
+
+
+def emit_agent_message(thread_id, turn_id):
+    notify(
+        "item/completed",
+        {
+            "item": {
+                "type": "agentMessage",
+                "id": "msg_%s" % uuid.uuid4().hex[:24],
+                "text": MESSAGE,
+                "phase": "final_answer",
+                "memoryCitation": None,
+            },
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "completedAtMs": int(time.time() * 1000),
+        },
+    )
+
+
+def complete_turn(status="completed"):
+    if not OPEN:
+        return
+    thread_id, turn_id = OPEN["threadId"], OPEN["turnId"]
+    if status == "completed":
+        emit_agent_message(thread_id, turn_id)
+    notify("turn/completed", {"threadId": thread_id, "turn": turn_obj(turn_id, status)})
+    OPEN.clear()
+
+
+def write_outbox_question(cwd):
+    outbox = os.path.join(cwd, "outbox")
+    os.makedirs(outbox, exist_ok=True)
+    tmp = os.path.join(outbox, ".1.question.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump({"seq": 1, "question": "A or B?", "blocking": True}, f)
+    os.replace(tmp, os.path.join(outbox, "1.question.json"))
+
+
+# ---------------------------------------------------------------------------
+# request handling
+# ---------------------------------------------------------------------------
+
+
+def handle_request(req_id, method, params):
+    if method == "initialize":
+        if SCENARIO == "bad-vocabulary":
+            # Unsolicited notifications interleave from the very first line on
+            # the real server; here it is one the client has never heard of.
+            notify("sorcery/unicornSummoned", {"horn": "spiral"})
+        reply(
+            req_id,
+            {
+                "userAgent": "fake-app-server/%s (test)" % CLI_VERSION,
+                "codexHome": STATE or os.getcwd(),
+                "platformFamily": "unix",
+                "platformOs": "macos",
+            },
+        )
+        if SCENARIO == "always-crash":
+            die(1)
+        return
+
+    if method == "thread/start":
+        cwd = params.get("cwd") or os.getcwd()
+        tid = str(uuid.uuid4())
+        remember_thread(tid, cwd)
+        notify("thread/started", {"thread": thread_obj(tid, cwd)})
+        reply(req_id, thread_start_result(tid, cwd, params.get("sandbox")))
+        return
+
+    if method == "thread/resume":
+        tid = params.get("threadId") or str(uuid.uuid4())
+        if SCENARIO == "resume-fail":
+            reply_error(req_id, -32001, "thread %s could not be resumed" % tid)
+            return
+        cwd = THREADS.get(tid, {}).get("cwd") or params.get("cwd") or os.getcwd()
+        remember_thread(tid, cwd)
+        reply(req_id, thread_start_result(tid, cwd, params.get("sandbox")))
+        return
+
+    if method == "turn/start":
+        thread_id = params.get("threadId") or ""
+        turn_id = str(uuid.uuid4())
+        reply(req_id, {"turn": turn_obj(turn_id, "inProgress")})
+        OPEN.update({"threadId": thread_id, "turnId": turn_id})
+        notify("turn/started", {"threadId": thread_id, "turn": turn_obj(turn_id, "inProgress")})
+
+        if SCENARIO == "crash-mid-turn" and LAUNCH == 1:
+            die(70)
+        if SCENARIO == "hang-turn":
+            return  # held open until steered or interrupted
+        if SCENARIO == "server-request":
+            PENDING_SERVER_REQ[0] = server_request(
+                "execCommandApproval",
+                {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "callId": "call-1",
+                    "command": ["rm", "-rf", "/"],
+                    "cwd": THREADS.get(thread_id, {}).get("cwd", os.getcwd()),
+                },
+            )
+            return
+        if SCENARIO == "unknown-request":
+            PENDING_SERVER_REQ[0] = server_request(
+                "sorcery/requestUnicorn", {"threadId": thread_id, "turnId": turn_id}
+            )
+            return
+        if SCENARIO == "blocked":
+            write_outbox_question(THREADS.get(thread_id, {}).get("cwd") or os.getcwd())
+        complete_turn("completed")
+        return
+
+    if method == "turn/steer":
+        if SCENARIO == "steer-race" and not FLAGS.get("steer_rejected"):
+            set_flag("steer_rejected", True)
+            reply_error(req_id, -32002, "expectedTurnId does not match the active turn")
+            return
+        reply(req_id, {})
+        complete_turn("completed")
+        return
+
+    if method == "turn/interrupt":
+        reply(req_id, {})
+        complete_turn("interrupted")
+        return
+
+    if method == "thread/loaded/list":
+        reply(req_id, {"data": [], "nextCursor": None})
+        return
+
+    reply_error(req_id, -32601, "unknown method: %s" % method)
+
+
+def handle_response(frame):
+    """The client answering one of OUR server->client requests."""
+    if PENDING_SERVER_REQ[0] is not None and frame.get("id") == PENDING_SERVER_REQ[0]:
+        PENDING_SERVER_REQ[0] = None
+        complete_turn("completed")
+
+
+# ---------------------------------------------------------------------------
+# main loop
+# ---------------------------------------------------------------------------
+
+
+def main():
+    dump = os.environ.get("FAKE_DUMP_ENV")
+    if dump:
+        with open(dump, "w") as f:
+            for k, v in sorted(os.environ.items()):
+                f.write("%s=%s\n" % (k, v))
+    if os.environ.get("FAKE_EMIT_UNPARSEABLE"):
+        send_raw("this line is not json {{{")
+
+    deferred = []  # responses held back one request, on purpose
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            frame = json.loads(line)
+        except ValueError:
+            record("in", raw=line)
+            continue
+        record("in", frame=frame)
+
+        if "method" in frame and "id" in frame:
+            method = frame["method"]
+            if method in DEFER:
+                deferred.append((frame["id"], method, frame.get("params") or {}))
+                continue
+            handle_request(frame["id"], method, frame.get("params") or {})
+        elif "method" in frame:
+            pass  # a client notification; nothing here needs one
+        else:
+            handle_response(frame)
+
+        while deferred:
+            req_id, method, params = deferred.pop(0)
+            handle_request(req_id, method, params)
+
+
+if __name__ == "__main__":
+    main()

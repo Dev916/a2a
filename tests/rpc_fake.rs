@@ -17,10 +17,13 @@ use a2a::protocol::{
     ThreadResumeParams, ThreadStartParams, ThreadStartResponse, TurnInterruptParams,
     TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams, UserInput,
 };
+use a2a::adapter::{self, AdapterRef, SendPath, TurnSpec};
+use a2a::config::{LaneConfig, SandboxMode};
 use a2a::responder::{self, Disposition};
 use a2a::rpc::{Client, Incoming, RpcError, UNPARSEABLE_METHOD};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 
@@ -155,6 +158,18 @@ impl Fake {
     async fn shutdown(mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+
+    /// Splits the fake into the handle the WorkerActor holds ([`AdapterRef`])
+    /// and the halves the demux keeps. `Arc<Client>` with no interior lock is
+    /// exactly what the actor discipline allows.
+    fn into_adapter(self) -> (AdapterRef, Incoming, Child) {
+        let Fake {
+            client,
+            incoming,
+            child,
+        } = self;
+        (AdapterRef::new(Arc::new(client)), incoming, child)
     }
 }
 
@@ -845,4 +860,525 @@ fn the_fidelity_helper_rejects_a_drifted_frame() {
         "turn": {"id": "u", "items": [], "status": "completed"}
     });
     fidelity::assert_valid(&good, "v2/TurnCompletedNotification.json", "control frame");
+}
+
+// ---------------------------------------------------------------------------
+// adapter: lifecycle calls, the steer decision table, AdapterRef, the probe
+// ---------------------------------------------------------------------------
+
+fn worker_dir(root: &Path) -> PathBuf {
+    let p = root.join("worker");
+    std::fs::create_dir_all(p.join("outbox")).unwrap();
+    p
+}
+
+fn lane_cfg(sandbox: SandboxMode, network: bool, effort: &str) -> LaneConfig {
+    LaneConfig {
+        sandbox,
+        network,
+        worktree_default: false,
+        model: "gpt-5.5".to_string(),
+        effort: effort.to_string(),
+        start_timeout_secs: 120,
+        task_timeout_secs: 3600,
+        blocked_timeout_secs: 1800,
+    }
+}
+
+/// Every `params` object the client sent for `method`, in wire order — read
+/// back off the fake's transcript, so these assertions are about what really
+/// crossed the pipe rather than about what the adapter says it built.
+fn sent_params(root: &Path, method: &str) -> Vec<Value> {
+    let raw = std::fs::read_to_string(transcript(root)).expect("transcript");
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|rec| rec["dir"] == "in")
+        .filter_map(|rec| rec.get("frame").cloned())
+        .filter(|f| f.get("method").and_then(|m| m.as_str()) == Some(method))
+        .map(|f| f.get("params").cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+async fn next_note_of(incoming: &mut Incoming) -> a2a::protocol::RpcNotification {
+    match tokio::time::timeout(WAIT, incoming.notifications.recv()).await {
+        Ok(Some(n)) => n,
+        Ok(None) => panic!("notification stream closed while a notification was expected"),
+        Err(_) => panic!("no notification within {WAIT:?}"),
+    }
+}
+
+async fn notes_until_of(incoming: &mut Incoming, terminal: &str) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        let m = next_note_of(incoming).await.method;
+        seen.push(m.clone());
+        if m == terminal {
+            return seen;
+        }
+    }
+}
+
+#[tokio::test]
+async fn adapter_initialize_opts_out_of_the_delta_stream_and_the_voice_channel() {
+    let root = root();
+    let f = Fake::start(root.path(), "happy", &[]).await;
+
+    let info = adapter::initialize(&f.client, RPC).await.expect("initialize");
+    assert!(
+        info.user_agent.starts_with("fake-app-server/"),
+        "got {}",
+        info.user_agent
+    );
+    assert_eq!(info.codex_home, state_dir(root.path()));
+    f.shutdown().await;
+
+    let sent = sent_params(root.path(), "initialize");
+    assert_eq!(sent.len(), 1, "exactly one handshake");
+    let p = &sent[0];
+    assert_eq!(p["clientInfo"]["name"], "a2a");
+    assert_eq!(p["clientInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    // The v2 thread/turn surface rides behind the experimental flag; attestation
+    // is never requested (a2a has no token to answer it with).
+    assert_eq!(p["capabilities"]["experimentalApi"], true);
+    assert_eq!(p["capabilities"]["requestAttestation"], false);
+
+    let opts: Vec<String> =
+        serde_json::from_value(p["capabilities"]["optOutNotificationMethods"].clone()).unwrap();
+    for delta in a2a::protocol::SUPPRESSED_NOTIFICATION_METHODS {
+        assert!(opts.contains(&delta.to_string()), "{delta} not suppressed");
+    }
+    for realtime in adapter::SUPPRESSED_REALTIME_METHODS {
+        assert!(
+            opts.contains(&realtime.to_string()),
+            "{realtime} not suppressed"
+        );
+    }
+    assert_eq!(opts, adapter::suppressed_notification_methods());
+
+    fidelity::audit(&transcript(root.path())).assert_covers(&[], &["initialize"]);
+}
+
+#[tokio::test]
+async fn adapter_thread_start_passes_the_worker_dir_as_cwd_for_outbox_only_lanes() {
+    let root = root();
+    let f = Fake::start(root.path(), "happy", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::OutboxOnly, false, "medium");
+    let info = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .expect("thread/start");
+
+    assert_eq!(
+        info.thread_id, info.session_id,
+        "thread.id must equal thread.sessionId — exec resume depends on it"
+    );
+    assert!(!info.thread_id.is_empty());
+    f.shutdown().await;
+
+    let sent = sent_params(root.path(), "thread/start");
+    assert_eq!(sent.len(), 1);
+    let p = &sent[0];
+    assert_eq!(
+        p["cwd"].as_str().unwrap(),
+        wd.to_str().unwrap(),
+        "an outbox-only lane is started on its WORKER DIR, never on the repo"
+    );
+    assert_eq!(p["sandbox"], "workspace-write");
+    assert_eq!(p["approvalPolicy"], "never");
+    assert_eq!(p["model"], "gpt-5.5");
+    assert!(
+        p.get("ephemeral").is_none(),
+        "ephemeral must never be sent: it breaks resumability"
+    );
+    fidelity::audit(&transcript(root.path())).assert_covers(&[], &["thread/start"]);
+}
+
+#[tokio::test]
+async fn adapter_thread_start_passes_the_target_cwd_for_workspace_write_lanes() {
+    let root = root();
+    let f = Fake::start(root.path(), "happy", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::WorkspaceWrite, false, "high");
+    let info = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .expect("thread/start");
+    // The echoed sandbox is the TYPED policy object, recorded as resolved.
+    assert!(matches!(
+        info.resolved_sandbox,
+        a2a::protocol::SandboxPolicy::WorkspaceWrite { .. }
+    ));
+    f.shutdown().await;
+
+    let p = &sent_params(root.path(), "thread/start")[0];
+    assert_eq!(p["cwd"].as_str().unwrap(), target.to_str().unwrap());
+}
+
+#[tokio::test]
+async fn adapter_turn_start_resupplies_the_sandbox_policy_and_output_schema_every_turn() {
+    let root = root();
+    let f = Fake::start(root.path(), "happy", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::OutboxOnly, true, "medium");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+
+    let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+    let spec = TurnSpec {
+        thread_id: &thread.thread_id,
+        text: "do the thing",
+        lane: &lane,
+        cwd: &target,
+        worker_dir: &wd,
+        output_schema: Some(&schema),
+    };
+    for _ in 0..2 {
+        adapter::turn_start(&f.client, &spec, RPC)
+            .await
+            .expect("turn/start");
+    }
+    f.shutdown().await;
+
+    let sent = sent_params(root.path(), "turn/start");
+    assert_eq!(sent.len(), 2, "two turns");
+    for (n, p) in sent.iter().enumerate() {
+        assert_eq!(p["threadId"], thread.thread_id.as_str(), "turn {n}");
+        assert_eq!(p["input"][0]["type"], "text", "turn {n}");
+        assert_eq!(p["input"][0]["text"], "do the thing", "turn {n}");
+        assert_eq!(p["effort"], "medium", "turn {n}");
+        // Per-turn and NOT sticky: both must be on the wire every single time.
+        assert_eq!(p["sandboxPolicy"]["type"], "workspaceWrite", "turn {n}");
+        assert_eq!(
+            p["sandboxPolicy"]["writableRoots"],
+            json!([wd.join("outbox").to_str().unwrap()]),
+            "an outbox-only lane may write to its outbox and nowhere else (turn {n})"
+        );
+        assert_eq!(p["sandboxPolicy"]["networkAccess"], true, "turn {n}");
+        assert_eq!(p["outputSchema"], schema, "turn {n}");
+        assert_eq!(p["approvalPolicy"], "never", "turn {n}");
+    }
+    fidelity::audit(&transcript(root.path())).assert_covers(&[], &["turn/start"]);
+}
+
+#[tokio::test]
+async fn send_message_steers_the_open_turn_when_one_is_known() {
+    let root = root();
+    let mut f = Fake::start(root.path(), "hang-turn", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::WorkspaceWrite, false, "high");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+    let spec = TurnSpec {
+        thread_id: &thread.thread_id,
+        text: "go",
+        lane: &lane,
+        cwd: &target,
+        worker_dir: &wd,
+        output_schema: None,
+    };
+    let open = adapter::turn_start(&f.client, &spec, RPC).await.unwrap();
+    assert_eq!(
+        f.notes_until("turn/started").await.last().unwrap(),
+        "turn/started"
+    );
+
+    let steer = TurnSpec {
+        text: "actually, do this instead",
+        ..spec
+    };
+    let outcome = adapter::send_message(&f.client, &steer, Some(&open.turn_id), RPC)
+        .await
+        .expect("steer");
+    assert_eq!(outcome.path, SendPath::Steered);
+    assert_eq!(outcome.turn_id, open.turn_id, "steering stays in the turn");
+
+    let seen = f.notes_until("turn/completed").await;
+    assert!(seen.contains(&"turn/completed".to_string()));
+    f.shutdown().await;
+
+    let sent = sent_params(root.path(), "turn/steer");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["expectedTurnId"], open.turn_id.as_str());
+    assert_eq!(sent[0]["input"][0]["text"], "actually, do this instead");
+    assert_eq!(
+        sent_params(root.path(), "turn/start").len(),
+        1,
+        "a successful steer must not also start a turn"
+    );
+    fidelity::audit(&transcript(root.path())).assert_covers(&[], &["turn/steer"]);
+}
+
+/// THE pin: the TOCTOU race at a turn boundary is expected, not exceptional.
+#[tokio::test]
+async fn send_message_retries_as_a_new_turn_when_the_steer_loses_the_race() {
+    let root = root();
+    let mut f = Fake::start(root.path(), "steer-race", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::WorkspaceWrite, false, "high");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+    let spec = TurnSpec {
+        thread_id: &thread.thread_id,
+        text: "go",
+        lane: &lane,
+        cwd: &target,
+        worker_dir: &wd,
+        output_schema: None,
+    };
+    let stale = adapter::turn_start(&f.client, &spec, RPC).await.unwrap();
+
+    let outcome = adapter::send_message(&f.client, &spec, Some(&stale.turn_id), RPC)
+        .await
+        .expect("a lost steer race is retried, never surfaced");
+    assert_eq!(outcome.path, SendPath::RetriedAsStart);
+    assert_ne!(
+        outcome.turn_id, stale.turn_id,
+        "the retry must report the NEW turn's id"
+    );
+
+    let seen = f.notes_until("turn/completed").await;
+    assert!(seen.contains(&"turn/completed".to_string()), "got {seen:?}");
+    f.shutdown().await;
+
+    assert_eq!(sent_params(root.path(), "turn/steer").len(), 1);
+    assert_eq!(
+        sent_params(root.path(), "turn/start").len(),
+        2,
+        "the rejected steer becomes a second turn/start"
+    );
+}
+
+#[tokio::test]
+async fn send_message_starts_a_turn_when_no_turn_is_known() {
+    let root = root();
+    let mut f = Fake::start(root.path(), "happy", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::WorkspaceWrite, false, "high");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+    let spec = TurnSpec {
+        thread_id: &thread.thread_id,
+        text: "first contact",
+        lane: &lane,
+        cwd: &target,
+        worker_dir: &wd,
+        output_schema: None,
+    };
+
+    let outcome = adapter::send_message(&f.client, &spec, None, RPC)
+        .await
+        .expect("turn/start");
+    assert_eq!(outcome.path, SendPath::Started);
+    assert!(!outcome.turn_id.is_empty());
+
+    let seen = f.notes_until("turn/completed").await;
+    assert!(seen.contains(&"turn/completed".to_string()));
+    f.shutdown().await;
+
+    assert!(sent_params(root.path(), "turn/steer").is_empty());
+    assert_eq!(sent_params(root.path(), "turn/start").len(), 1);
+}
+
+/// Only a steer *precondition* failure is retried. Anything else — a timeout, a
+/// different remote error — surfaces unchanged, because retrying it as a fresh
+/// turn would double-drive the worker.
+#[tokio::test]
+async fn send_message_surfaces_a_non_precondition_failure_unchanged() {
+    let root = root();
+    let f = Fake::start(
+        root.path(),
+        "hang-turn",
+        &[("FAKE_DEFER_METHODS", "turn/steer")],
+    )
+    .await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::WorkspaceWrite, false, "high");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+    let spec = TurnSpec {
+        thread_id: &thread.thread_id,
+        text: "go",
+        lane: &lane,
+        cwd: &target,
+        worker_dir: &wd,
+        output_schema: None,
+    };
+    let open = adapter::turn_start(&f.client, &spec, RPC).await.unwrap();
+
+    let err = adapter::send_message(
+        &f.client,
+        &spec,
+        Some(&open.turn_id),
+        Duration::from_millis(300),
+    )
+    .await
+    .expect_err("a deferred steer times out");
+    assert_eq!(err, RpcError::Timeout);
+    f.shutdown().await;
+
+    assert_eq!(
+        sent_params(root.path(), "turn/start").len(),
+        1,
+        "a timeout must NOT be retried as a new turn"
+    );
+}
+
+#[tokio::test]
+async fn the_adapter_ref_clones_and_drives_turn_start_and_interrupt() {
+    let root = root();
+    let f = Fake::start(root.path(), "hang-turn", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::WorkspaceWrite, false, "high");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+
+    let (adapter_ref, mut incoming, mut child) = f.into_adapter();
+    let cloned = adapter_ref.clone(); // one child, many worker actors
+    let spec = TurnSpec {
+        thread_id: &thread.thread_id,
+        text: "spin forever",
+        lane: &lane,
+        cwd: &target,
+        worker_dir: &wd,
+        output_schema: None,
+    };
+    let open = adapter_ref.turn_start(&spec, RPC).await.expect("turn/start");
+    assert_eq!(
+        notes_until_of(&mut incoming, "turn/started")
+            .await
+            .last()
+            .unwrap(),
+        "turn/started"
+    );
+
+    cloned
+        .turn_interrupt(&thread.thread_id, &open.turn_id, RPC)
+        .await
+        .expect("turn/interrupt");
+
+    let n = next_note_of(&mut incoming).await;
+    assert_eq!(n.method, "turn/completed");
+    assert_eq!(n.params["turn"]["status"], "interrupted");
+    let _ = child.kill().await;
+
+    let sent = sent_params(root.path(), "turn/interrupt");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["threadId"], thread.thread_id.as_str());
+    assert_eq!(sent[0]["turnId"], open.turn_id.as_str());
+    fidelity::audit(&transcript(root.path())).assert_covers(&[], &["turn/interrupt"]);
+}
+
+#[tokio::test]
+async fn adapter_thread_resume_carries_no_sandbox_policy() {
+    let root = root();
+    let f = Fake::start(root.path(), "happy", &[]).await;
+    adapter::initialize(&f.client, RPC).await.unwrap();
+    let target = work_dir(root.path());
+    let wd = worker_dir(root.path());
+    let lane = lane_cfg(SandboxMode::OutboxOnly, false, "medium");
+    let thread = adapter::thread_start(&f.client, &lane, &target, &wd, RPC)
+        .await
+        .unwrap();
+
+    let resumed = adapter::thread_resume(&f.client, &thread.thread_id, &lane, &target, &wd, RPC)
+        .await
+        .expect("thread/resume");
+    assert_eq!(resumed.thread_id, thread.thread_id);
+    f.shutdown().await;
+
+    let sent = sent_params(root.path(), "thread/resume");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["threadId"], thread.thread_id.as_str());
+    assert_eq!(sent[0]["cwd"].as_str().unwrap(), wd.to_str().unwrap());
+    assert!(
+        sent[0].get("sandboxPolicy").is_none(),
+        "resume takes no sandboxPolicy — it is re-supplied on the next turn"
+    );
+    fidelity::audit(&transcript(root.path())).assert_covers(&[], &["thread/resume"]);
+}
+
+// --- handshake_probe: the ONE sanctioned sync-CLI tokio exception -----------
+
+#[test]
+fn handshake_probe_completes_the_handshake_from_a_synchronous_caller() {
+    // Deliberately NOT a #[tokio::test]: the probe owns its own current_thread
+    // runtime, which is the whole point (doctor and transport selection are
+    // sync commands).
+    let info = adapter::handshake_probe(&fake_bin(), Duration::from_secs(10))
+        .expect("the fake answers the handshake");
+    assert!(
+        info.user_agent.starts_with("fake-app-server/"),
+        "got {}",
+        info.user_agent
+    );
+}
+
+#[test]
+fn handshake_probe_times_out_and_kills_the_child() {
+    let root = root();
+    let pidfile = root.path().join("pid");
+    let script = root.path().join("sleeper.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Long enough that the sleeper has certainly recorded its pid even under a
+    // loaded parallel suite — the assertion is about the leak, not the latency.
+    let budget = Duration::from_secs(3);
+    let t0 = Instant::now();
+    let err = adapter::handshake_probe(&script, budget)
+        .expect_err("a child that never answers must not hang the CLI");
+    assert_eq!(err, RpcError::Timeout);
+    assert!(
+        t0.elapsed() < budget * 5,
+        "the probe must be bounded by its timeout, took {:?}",
+        t0.elapsed()
+    );
+
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("the sleeper wrote its pid")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        a2a::exec::start_witness(pid).is_none(),
+        "the probe leaked child pid {pid} past its timeout"
+    );
+}
+
+#[test]
+fn handshake_probe_reports_a_missing_binary_rather_than_panicking() {
+    let err = adapter::handshake_probe(Path::new("/definitely/not/a/binary"), Duration::from_secs(2))
+        .expect_err("there is no such binary");
+    assert_eq!(err, RpcError::ChildDied);
 }

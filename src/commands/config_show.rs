@@ -15,6 +15,7 @@ pub fn run(home: &A2aHome, origin: bool, quiet: bool) -> Result<Value, AppError>
     let mut data = json!({
         "home": home.root(),
         "codex_bin": cfg.codex_bin,
+        "codex_version_range": cfg.codex_version_range,
         "allowed_roots": cfg.allowed_roots,
         "lanes": lanes,
     });

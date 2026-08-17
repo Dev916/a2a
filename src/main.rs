@@ -43,6 +43,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Kill { .. } => "kill",
         Cmd::Resume { .. } => "resume",
         Cmd::Gc { .. } => "gc",
+        Cmd::Doctor => "doctor",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
@@ -137,6 +138,13 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::gc::run(&home, *age, *dry_run, cli.global.json, cli.global.quiet)
         }
+        // The one command that resolves its own home: a layout mismatch is a
+        // finding doctor must report, not an error that stops it running.
+        Cmd::Doctor => a2a::commands::doctor::run(
+            cli.global.home.as_deref(),
+            cli.global.json,
+            cli.global.quiet,
+        ),
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;

@@ -14,6 +14,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
+/// The codex releases Phase 1's transport contract was written against
+/// (spec §9 risk table: the exec JSONL shape is version-coupled). `doctor`
+/// warns outside it — never fails, because a drifted codex is a thing to tell
+/// an operator about, not a reason to refuse to run.
+pub const DEFAULT_CODEX_VERSION_RANGE: &str = ">=0.140, <0.150";
 pub const DEFAULT_START_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_BLOCKED_TIMEOUT_SECS: u64 = 1800;
@@ -127,6 +132,9 @@ pub struct LaneConfig {
 pub struct Config {
     /// `A2A_CODEX_BIN` env / `codex_bin` config key; else `codex` on PATH.
     pub codex_bin: Option<PathBuf>,
+    /// Comma-separated version constraints (`>=0.140, <0.150`) that `doctor`
+    /// holds the resolved codex to.
+    pub codex_version_range: String,
     /// CANONICALIZED at load; default `[~/dev]`.
     pub allowed_roots: Vec<PathBuf>,
     pub lanes: BTreeMap<Lane, LaneConfig>,
@@ -191,6 +199,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     let mut warnings: Vec<String> = Vec::new();
     let mut origins: Origins = BTreeMap::new();
     origins.insert("codex_bin".to_string(), Origin::Default);
+    origins.insert("codex_version_range".to_string(), Origin::Default);
     origins.insert("allowed_roots".to_string(), Origin::Default);
 
     let mut lanes = BTreeMap::new();
@@ -202,6 +211,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     }
     let mut cfg = Config {
         codex_bin: None,
+        codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
         allowed_roots: default_allowed_roots(),
         lanes,
     };
@@ -263,6 +273,10 @@ fn apply_file(
             "codex_bin" => {
                 cfg.codex_bin = Some(PathBuf::from(want_str("codex_bin", value)?));
                 origins.insert("codex_bin".to_string(), Origin::File);
+            }
+            "codex_version_range" => {
+                cfg.codex_version_range = want_str("codex_version_range", value)?.to_string();
+                origins.insert("codex_version_range".to_string(), Origin::File);
             }
             "allowed_roots" => {
                 let arr = value.as_array().ok_or_else(|| {
@@ -376,6 +390,10 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
     if let Some(v) = std::env::var_os("A2A_CODEX_BIN") {
         cfg.codex_bin = Some(PathBuf::from(v));
         origins.insert("codex_bin".to_string(), Origin::Env);
+    }
+    if let Some(v) = std::env::var_os("A2A_CODEX_VERSION_RANGE") {
+        cfg.codex_version_range = v.to_string_lossy().into_owned();
+        origins.insert("codex_version_range".to_string(), Origin::Env);
     }
     if let Some(v) = std::env::var_os("A2A_ALLOWED_ROOTS") {
         let raw = v.to_string_lossy().into_owned();
@@ -528,6 +546,7 @@ mod tests {
         .unwrap();
         let mut cfg = Config {
             codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
         };
@@ -560,6 +579,7 @@ mod tests {
             .unwrap();
         let mut cfg = Config {
             codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
         };

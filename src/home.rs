@@ -4,9 +4,21 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const LAYOUT_VERSION: u32 = 1;
+/// The marker file that records the layout the tree was built at.
+pub const LAYOUT_VERSION_FILE: &str = "LAYOUT_VERSION";
 
 pub struct A2aHome {
     root: PathBuf,
+}
+
+/// The root this invocation would use — resolved, but neither created nor gated.
+///
+/// Split out of [`A2aHome::resolve`] because `doctor` has to be able to name the
+/// tree it is about to *diagnose* even when adopting it would fail.
+pub fn root_for(flag: Option<&Path>) -> PathBuf {
+    flag.map(PathBuf::from)
+        .or_else(|| std::env::var_os("A2A_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| dirs_home().join(".a2a"))
 }
 
 pub fn create_dir_0700(p: &Path) -> std::io::Result<()> {
@@ -33,14 +45,11 @@ pub fn write_new_0600(p: &Path) -> std::io::Result<File> {
 
 impl A2aHome {
     pub fn resolve(flag: Option<&Path>) -> Result<Self, AppError> {
-        let root = flag
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("A2A_HOME").map(PathBuf::from))
-            .unwrap_or_else(|| dirs_home().join(".a2a"));
+        let root = root_for(flag);
         create_dir_0700(&root).map_err(io_err)?;
         create_dir_0700(&root.join("workers")).map_err(io_err)?;
         create_dir_0700(&root.join("worktrees")).map_err(io_err)?;
-        let vf = root.join("LAYOUT_VERSION");
+        let vf = root.join(LAYOUT_VERSION_FILE);
         if vf.exists() {
             let v: u32 = fs::read_to_string(&vf)
                 .map_err(io_err)?
@@ -61,6 +70,24 @@ impl A2aHome {
         }
         Ok(Self { root })
     }
+    /// Adopt a root WITHOUT the layout gate.
+    ///
+    /// Exactly one caller is allowed to do this, and it is `doctor`: a home the
+    /// binary refuses to touch is the thing an operator most needs diagnosed, so
+    /// the mismatch has to come back as a *check* rather than as a command that
+    /// cannot run. Every other path goes through [`A2aHome::resolve`], which
+    /// gates first and hands out no handle at all on a mismatch.
+    pub fn adopt(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// The layout version recorded in the tree; `None` when the marker is
+    /// absent or unreadable (which is itself a finding, not a default).
+    pub fn recorded_layout_version(&self) -> Option<u32> {
+        let text = std::fs::read_to_string(self.root.join(LAYOUT_VERSION_FILE)).ok()?;
+        text.trim().parse().ok()
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

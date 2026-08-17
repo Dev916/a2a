@@ -124,6 +124,9 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Check the environment a worker would be spawned into: one line per
+    /// check, exit 9 if any of them fails
+    Doctor,
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

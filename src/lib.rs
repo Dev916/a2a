@@ -10,6 +10,7 @@ pub mod home;
 pub mod ids;
 pub mod inbox;
 pub mod output;
+pub mod protocol;
 pub mod reconcile;
 pub mod redact;
 pub mod state;

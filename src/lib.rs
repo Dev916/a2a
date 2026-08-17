@@ -13,6 +13,7 @@ pub mod output;
 pub mod protocol;
 pub mod reconcile;
 pub mod redact;
+pub mod responder;
 pub mod rpc;
 pub mod state;
 pub mod store;

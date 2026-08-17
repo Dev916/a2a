@@ -49,6 +49,11 @@ pub enum EventKind {
     AgentMessage,
     ToolCall,
     CommandExec,
+    /// One server→client request (an approval prompt, an elicitation, a dynamic
+    /// tool call) was answered by `crate::responder`. `raw` is the
+    /// `{method, disposition}` pair — never the request's params, which can
+    /// carry a command line.
+    ServerRequest,
     Blocked,
     OutboxNotice,
     /// A batch of `inbox/` messages was handed to the worker; carries the new
@@ -274,6 +279,33 @@ mod tests {
         let b: Envelope = serde_json::from_str(bare).unwrap();
         assert_eq!(b.transport, Transport::AppServer);
         assert_eq!(b.kind, EventKind::ToolCall);
+    }
+
+    /// The kind Task 3's responder logs. Pinned because it crosses the file
+    /// layer: an older binary reading a newer `events.jsonl` must still see the
+    /// same string.
+    #[test]
+    fn server_request_is_a_lifecycle_kind_spelled_snake_case() {
+        assert_eq!(
+            serde_json::to_value(EventKind::ServerRequest).unwrap(),
+            json!("server_request")
+        );
+        let back: EventKind = serde_json::from_value(json!("server_request")).unwrap();
+        assert_eq!(back, EventKind::ServerRequest);
+
+        let e = Envelope::new(
+            1,
+            Transport::AppServer,
+            EventClass::Lifecycle,
+            EventKind::ServerRequest,
+            json!({"method": "execCommandApproval", "disposition": "denied"}),
+            chrono::Utc::now(),
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], json!("server_request"));
+        assert_eq!(v["class"], json!("lifecycle"));
+        assert_eq!(v["transport"], json!("app-server"));
+        assert_eq!(v["raw"]["disposition"], json!("denied"));
     }
 
     #[test]

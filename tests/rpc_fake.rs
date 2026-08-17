@@ -17,6 +17,7 @@ use a2a::protocol::{
     ThreadResumeParams, ThreadStartParams, ThreadStartResponse, TurnInterruptParams,
     TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams, UserInput,
 };
+use a2a::responder::{self, Disposition};
 use a2a::rpc::{Client, Incoming, RpcError, UNPARSEABLE_METHOD};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -502,6 +503,101 @@ async fn an_errored_unknown_server_request_keeps_the_connection_usable() {
         .call("thread/loaded/list", &json!({}), RPC)
         .await
         .expect("connection still usable");
+    assert_eq!(probe["data"], json!([]));
+    f.shutdown().await;
+}
+
+/// The same exchange, driven by the real `responder` table rather than a
+/// hand-written payload: the deny that unblocks the turn is the one production
+/// will send, and it is produced well inside the 100ms budget.
+#[tokio::test]
+async fn the_responder_denies_the_exec_approval_and_only_then_does_the_turn_complete() {
+    let root = root();
+    let mut f = Fake::start(root.path(), "server-request", &[]).await;
+    f.init().await;
+    let ts = f.start_thread(&work_dir(root.path())).await;
+    f.start_turn(&ts.thread.id, "rm -rf /").await;
+    assert_eq!(f.notes_until("turn/started").await.last().unwrap(), "turn/started");
+
+    let req = tokio::time::timeout(WAIT, f.incoming.server_requests.recv())
+        .await
+        .expect("server request within the wait")
+        .expect("server request channel open");
+    assert_eq!(req.method, "execCommandApproval");
+
+    // Nothing moves until a2a answers.
+    f.assert_quiet().await;
+
+    let t0 = Instant::now();
+    let answer = responder::respond_to(&req);
+    f.client
+        .respond(req.id.clone(), answer.payload.clone())
+        .await
+        .expect("respond");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "answering must fit the 100ms budget, took {elapsed:?}"
+    );
+
+    assert_eq!(answer.method, "execCommandApproval");
+    assert_eq!(answer.disposition, Disposition::Denied);
+    assert_eq!(answer.payload, Ok(json!({"decision": "denied"})));
+    // What the caller logs as a lifecycle envelope: the pair, not the command.
+    assert_eq!(
+        answer.raw(),
+        json!({"method": "execCommandApproval", "disposition": "denied"})
+    );
+
+    let seen = f.notes_until("turn/completed").await;
+    assert_eq!(seen, vec!["item/completed", "turn/completed"]);
+    f.shutdown().await;
+}
+
+/// An unknown server→client request must still be answered — an error frame is
+/// an answer, a dropped frame is a permanent hang — and the connection must
+/// survive it.
+#[tokio::test]
+async fn the_responder_errors_an_unknown_server_request_and_the_connection_stays_usable() {
+    let root = root();
+    let mut f = Fake::start(root.path(), "unknown-request", &[]).await;
+    f.init().await;
+    let ts = f.start_thread(&work_dir(root.path())).await;
+    f.start_turn(&ts.thread.id, "go").await;
+
+    let req = tokio::time::timeout(WAIT, f.incoming.server_requests.recv())
+        .await
+        .expect("server request within the wait")
+        .expect("server request channel open");
+    assert_eq!(req.method, "sorcery/requestUnicorn");
+
+    let t0 = Instant::now();
+    let answer = responder::respond_to(&req);
+    assert_eq!(answer.disposition, Disposition::UnknownMethod);
+    let (code, message) = answer
+        .payload
+        .clone()
+        .expect_err("an unknown method has no payload to send");
+    assert_eq!(code, responder::METHOD_NOT_FOUND);
+    assert!(message.contains("sorcery/requestUnicorn"), "got {message}");
+    f.client
+        .respond(req.id.clone(), answer.payload.clone())
+        .await
+        .expect("respond with a JSON-RPC error");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "an unknown method must be errored within 100ms, took {elapsed:?}"
+    );
+
+    let seen = f.notes_until("turn/completed").await;
+    assert!(seen.contains(&"turn/completed".to_string()), "got {seen:?}");
+
+    let probe: Value = f
+        .client
+        .call("thread/loaded/list", &json!({}), RPC)
+        .await
+        .expect("connection still usable after an errored server request");
     assert_eq!(probe["data"], json!([]));
     f.shutdown().await;
 }

@@ -21,6 +21,12 @@ pub fn root_for(flag: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| dirs_home().join(".a2a"))
 }
 
+/// Create `p` (and its parents) at 0700, idempotently and **race-tolerantly**.
+///
+/// The `exists()` probe is an optimization, not a decision: twenty `broker run`
+/// processes cold-starting on the same home all see no directory and all try to
+/// create it, and the nineteen that lose that race wanted the directory to
+/// exist — which it does.
 pub fn create_dir_0700(p: &Path) -> std::io::Result<()> {
     if p.exists() {
         return Ok(());
@@ -30,7 +36,11 @@ pub fn create_dir_0700(p: &Path) -> std::io::Result<()> {
             create_dir_0700(parent)?;
         }
     }
-    fs::DirBuilder::new().mode(0o700).create(p)
+    match fs::DirBuilder::new().mode(0o700).create(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Create-or-truncate, 0600. Snapshots and one-shot files ONLY (streams use append helpers).
@@ -65,8 +75,11 @@ impl A2aHome {
                 .remedy("run `a2a migrate` (or move the old home aside)"));
             }
         } else {
-            use std::io::Write;
-            writeln!(write_new_0600(&vf).map_err(io_err)?, "{LAYOUT_VERSION}").map_err(io_err)?;
+            // Atomic: a concurrent cold start must either see no version file
+            // or see a complete one. A half-written marker reads as version 0
+            // and would fail the gate above for a tree that is perfectly fine.
+            crate::store::write_atomic(&vf, format!("{LAYOUT_VERSION}\n").as_bytes())
+                .map_err(io_err)?;
         }
         Ok(Self { root })
     }

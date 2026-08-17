@@ -110,6 +110,11 @@ pub struct ServeCtx {
     pub pid: u32,
     pub codex_bin: Option<PathBuf>,
     pub allowed_roots: Vec<PathBuf>,
+    /// What startup reconciliation did to the tree this daemon inherited
+    /// (`Value::Null` for a core with no daemon around it). Carried here rather
+    /// than in the core because it is a fact about this PROCESS's start, not
+    /// about the registry.
+    pub reconciled: Value,
     clients: Arc<AtomicUsize>,
 }
 
@@ -123,6 +128,7 @@ impl ServeCtx {
             pid: std::process::id(),
             codex_bin: None,
             allowed_roots: Vec::new(),
+            reconciled: Value::Null,
             clients: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -130,6 +136,11 @@ impl ServeCtx {
     pub fn with_config(mut self, codex_bin: Option<PathBuf>, allowed_roots: Vec<PathBuf>) -> ServeCtx {
         self.codex_bin = codex_bin;
         self.allowed_roots = allowed_roots;
+        self
+    }
+
+    pub fn with_startup(mut self, report: &super::StartupReport) -> ServeCtx {
+        self.reconciled = serde_json::to_value(report).unwrap_or(Value::Null);
         self
     }
 
@@ -613,6 +624,7 @@ async fn info(ctx: &ServeCtx) -> Value {
         },
         "codex_bin": ctx.codex_bin,
         "allowed_roots": ctx.allowed_roots,
+        "reconciled": ctx.reconciled,
     })
 }
 

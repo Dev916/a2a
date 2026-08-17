@@ -31,12 +31,27 @@ fn exit_for(state: WorkerState) -> ExitCode {
     }
 }
 
+/// `--broker` is the spec §4.1 spelling of `a2a broker status`, and it lives
+/// here rather than in `main` so the two commands cannot drift into two
+/// different answers: this function forwards, it does not reimplement.
 pub fn run(
     home: &A2aHome,
-    id_arg: &str,
+    id_arg: Option<&str>,
+    broker: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
+    if broker {
+        return crate::commands::broker_cmd::status(home, quiet);
+    }
+    let Some(id_arg) = id_arg else {
+        return Err(AppError::new(
+            "USAGE",
+            ExitCode::Usage,
+            "`a2a status` needs a worker id (or `--broker` for the daemon)",
+        )
+        .remedy("`a2a ls` lists every worker"));
+    };
     let (cfg, _origins, warnings) = config::load(home)?;
     if !quiet {
         for w in &warnings {

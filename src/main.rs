@@ -49,7 +49,9 @@ fn command_name(cmd: &Cmd) -> &'static str {
         },
         Cmd::Broker { cmd } => match cmd {
             BrokerCmd::Run { .. } => "broker run",
+            BrokerCmd::Status => "broker status",
             BrokerCmd::Shutdown => "broker shutdown",
+            BrokerCmd::Restart => "broker restart",
         },
         Cmd::BrokerCall { .. } => "__broker-call",
     }
@@ -68,9 +70,15 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             a2a::commands::spawn::run(&home, args, cli.global.json, cli.global.quiet)
                 .map(Outcome::from)
         }
-        Cmd::Status { id } => {
+        Cmd::Status { id, broker } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            a2a::commands::status::run(&home, id, cli.global.json, cli.global.quiet)
+            a2a::commands::status::run(
+                &home,
+                id.as_deref(),
+                *broker,
+                cli.global.json,
+                cli.global.quiet,
+            )
         }
         Cmd::Ls => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
@@ -165,7 +173,9 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 BrokerCmd::Run { foreground } => {
                     a2a::commands::broker_cmd::run(&home, *foreground, cli.global.quiet)
                 }
+                BrokerCmd::Status => a2a::commands::broker_cmd::status(&home, cli.global.quiet),
                 BrokerCmd::Shutdown => a2a::commands::broker_cmd::shutdown(&home),
+                BrokerCmd::Restart => a2a::commands::broker_cmd::restart(&home, cli.global.quiet),
             }
         }
         Cmd::BrokerCall { op, params } => {

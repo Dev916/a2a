@@ -44,7 +44,11 @@ pub enum Cmd {
     /// Reconcile one worker and report its state (exit code IS the state)
     Status {
         /// Worker id, or any unambiguous prefix of one
-        id: String,
+        id: Option<String>,
+        /// Report the broker daemon instead of a worker — the spec §4.1
+        /// spelling of `a2a broker status` (exit 7 when there is none)
+        #[arg(long, conflicts_with = "id")]
+        broker: bool,
     },
     /// List every worker (reconciling each): id, lane, state, dwell, last-event age
     Ls,
@@ -152,15 +156,20 @@ pub enum Cmd {
 
 #[derive(Subcommand)]
 pub enum BrokerCmd {
-    /// Run the broker daemon. Task 9 adds the flock singleton, the pidfile and
-    /// daemonization; today this always runs in the foreground.
+    /// Run the broker daemon: take `broker.lock`, detach, and serve. A second
+    /// one says `broker already running` and exits 0.
     Run {
-        /// Stay in the foreground (the only mode today)
+        /// Stay attached instead of double-forking into the background
         #[arg(long)]
         foreground: bool,
     },
+    /// Report the running broker: uptime, transport, pids, counts (exit 7 when
+    /// there is none)
+    Status,
     /// Ask a running broker to stop; exits 0 when there is none
     Shutdown,
+    /// Stop the running broker, then start a fresh one
+    Restart,
 }
 
 #[derive(clap::Args)]

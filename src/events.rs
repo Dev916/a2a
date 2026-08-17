@@ -132,14 +132,56 @@ pub fn map_exec_line(raw: &serde_json::Value) -> Option<(EventClass, EventKind)>
         return None;
     }
 
+    // ── `item.*` envelopes ────────────────────────────────────────────────
+    //
+    // Observed live against **codex-cli 0.140.0** (2026-08-16, by this repo's
+    // `tests/e2e_exec.rs::real_codex_smoke`). The real vocabulary of a turn is:
+    //
+    //   {"type":"thread.started","thread_id":"01a0…"}
+    //   {"type":"turn.started"}
+    //   {"type":"item.started",  "item":{"type":"command_execution", …}}
+    //   {"type":"item.completed","item":{"type":"command_execution","exit_code":0, …}}
+    //   {"type":"item.completed","item":{"type":"agent_message","text":"DONE"}}
+    //   {"type":"turn.completed","usage":{…}}
+    //
+    // i.e. everything a worker actually *says or does* is wrapped, and the real
+    // subject is the nested `item.type`. Dispatching on the outer type alone
+    // filed a worker's own answer as `trace/unknown`, which made `a2a tail`
+    // (lifecycle-only by default) silent about the one thing worth reading.
+    if ty.starts_with("item.") {
+        let item_ty = raw
+            .get("item")
+            .and_then(|i| i.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Some(match item_ty {
+            // Only the *completed* form carries the final text; the in-flight
+            // forms are the streaming shape and are dropped like any delta.
+            "agent_message" | "assistant_message" if ty == "item.completed" => {
+                (EventClass::Lifecycle, EventKind::AgentMessage)
+            }
+            "agent_message" | "assistant_message" => return None,
+            "command_execution" => (EventClass::Trace, EventKind::CommandExec),
+            t if t.contains("tool") => (EventClass::Trace, EventKind::ToolCall),
+            // `reasoning`, `file_change`, `web_search`, `todo_list`, … — pure
+            // observability, and deliberately open: a new item type in a newer
+            // codex is not an error, it is a trace line we do not name yet.
+            _ => (EventClass::Trace, EventKind::Unknown),
+        });
+    }
+
     Some(match ty {
         "session.created" | "session_configured" | "thread.started" => {
             (EventClass::Lifecycle, EventKind::SessionIdentified)
         }
         "agent_message" => (EventClass::Lifecycle, EventKind::AgentMessage),
+        // `turn.started`/`turn.completed` are the 0.140 spellings (observed);
+        // `task_*` are the older ones, kept so an older codex still reads.
         "turn.started" | "task_started" => (EventClass::Lifecycle, EventKind::TurnStarted),
         "turn.completed" | "task_complete" => (EventClass::Lifecycle, EventKind::TurnCompleted),
-        "error" => (EventClass::Lifecycle, EventKind::Error),
+        // `turn.failed` is the documented sibling of `turn.completed`; the
+        // happy-path smoke never provokes it, so it is mapped by name only.
+        "error" | "turn.failed" => (EventClass::Lifecycle, EventKind::Error),
         t if t.starts_with("exec_command") || t.starts_with("command") => {
             (EventClass::Trace, EventKind::CommandExec)
         }
@@ -287,13 +329,59 @@ mod tests {
                 "{t}"
             );
         }
-        assert_eq!(
-            map_exec_line(&json!({"type":"error","message":"boom"})),
-            Some((EventClass::Lifecycle, EventKind::Error))
-        );
+        for t in ["error", "turn.failed"] {
+            assert_eq!(
+                map_exec_line(&json!({ "type": t, "message": "boom" })),
+                Some((EventClass::Lifecycle, EventKind::Error)),
+                "{t}"
+            );
+        }
         // a valid JSON line with no `type` at all is still trace/unknown, never a panic
         assert_eq!(
             map_exec_line(&json!({"no_type_here":true})),
+            Some((EventClass::Trace, EventKind::Unknown))
+        );
+    }
+
+    /// The `item.*` envelopes exactly as codex-cli 0.140.0 emits them — these
+    /// literals are transcribed from the live run recorded in `map_exec_line`'s
+    /// doc comment, so this test fails if the unwrapping is ever undone.
+    #[test]
+    fn real_0_140_item_envelopes_are_unwrapped_by_their_inner_type() {
+        assert_eq!(
+            map_exec_line(&json!({"type":"item.completed",
+                                  "item":{"id":"item_1","type":"agent_message","text":"DONE"}})),
+            Some((EventClass::Lifecycle, EventKind::AgentMessage)),
+            "the worker's own answer must be a lifecycle event, not trace/unknown"
+        );
+        // the in-flight form of the same item is the streaming shape: dropped
+        assert_eq!(
+            map_exec_line(&json!({"type":"item.started",
+                                  "item":{"type":"agent_message","text":"DO"}})),
+            None
+        );
+        for ty in ["item.started", "item.completed"] {
+            assert_eq!(
+                map_exec_line(&json!({ "type": ty,
+                    "item":{"id":"item_0","type":"command_execution",
+                            "command":"/bin/zsh -lc 'echo hi'","exit_code":0}})),
+                Some((EventClass::Trace, EventKind::CommandExec)),
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            map_exec_line(&json!({"type":"item.completed",
+                                  "item":{"type":"mcp_tool_call","server":"x"}})),
+            Some((EventClass::Trace, EventKind::ToolCall))
+        );
+        // an item type from a newer codex is a trace line, never a hard failure
+        assert_eq!(
+            map_exec_line(&json!({"type":"item.completed","item":{"type":"web_search"}})),
+            Some((EventClass::Trace, EventKind::Unknown))
+        );
+        // a malformed `item.*` (no nested item) still maps, never panics
+        assert_eq!(
+            map_exec_line(&json!({"type":"item.completed"})),
             Some((EventClass::Trace, EventKind::Unknown))
         );
     }

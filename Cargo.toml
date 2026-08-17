@@ -6,7 +6,11 @@ edition = "2021"
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
-nix = { version = "0.29", features = ["process", "fs", "signal"] }
+# `socket` is what the broker's peer-uid check needs (LOCAL_PEERCRED on
+# macOS, SO_PEERCRED on linux) and `user` is `getuid`, which is the other half
+# of that comparison; the version prefix stays literal for the toolchain pin in
+# tests/cli_contract.rs.
+nix = { version = "0.29", features = ["process", "fs", "signal", "socket", "user"] }
 rand = "0.8"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }

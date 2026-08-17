@@ -501,7 +501,12 @@ fn mkdir_0700(p: &Path) -> Result<(), AppError> {
 /// Locate the `a2a` binary that hosts `__exec-shim`. Normally that is us; under
 /// `cargo test` the running executable is the test harness, so we look beside
 /// it (`target/debug/deps/…` → `target/debug/a2a`).
-fn shim_bin() -> Result<PathBuf, AppError> {
+///
+/// Public because the broker's autostart
+/// ([`crate::brokerclient::autostart`]) needs the SAME answer for `broker run`:
+/// two ways to find "the a2a binary" would eventually disagree, and the way
+/// they would disagree is a test harness being told to daemonize.
+pub fn shim_bin() -> Result<PathBuf, AppError> {
     if let Some(p) = std::env::var_os("A2A_SHIM_BIN").map(PathBuf::from) {
         if p.is_file() {
             return Ok(p);

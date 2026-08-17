@@ -22,7 +22,12 @@
 
 pub mod child;
 pub mod core;
+pub mod sockserv;
+pub mod wire;
 pub mod worker_actor;
+
+/// The CLI's front door: 0600, inside the 0700 home, peer-uid checked.
+pub const BROKER_SOCK: &str = "broker.sock";
 
 /// The daemon's stderr, and the child's: one file, because a broker log that
 /// omits what the app-server said about its own death is not a log.

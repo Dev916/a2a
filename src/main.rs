@@ -1,4 +1,4 @@
-use a2a::cli::{Cli, Cmd, ConfigCmd};
+use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd};
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
 use clap::Parser;
@@ -47,6 +47,11 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
         },
+        Cmd::Broker { cmd } => match cmd {
+            BrokerCmd::Run { .. } => "broker run",
+            BrokerCmd::Shutdown => "broker shutdown",
+        },
+        Cmd::BrokerCall { .. } => "__broker-call",
     }
 }
 
@@ -152,5 +157,20 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                     .map(Outcome::from)
             }
         },
+        Cmd::Broker { cmd } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            match cmd {
+                // The ONE async command: everything else in this table is
+                // synchronous, and stays that way (Global Constraints).
+                BrokerCmd::Run { foreground } => {
+                    a2a::commands::broker_cmd::run(&home, *foreground, cli.global.quiet)
+                }
+                BrokerCmd::Shutdown => a2a::commands::broker_cmd::shutdown(&home),
+            }
+        }
+        Cmd::BrokerCall { op, params } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::broker_cmd::call(&home, op, params.as_deref())
+        }
     }
 }

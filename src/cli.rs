@@ -132,7 +132,35 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Control the broker daemon (the app-server transport)
+    Broker {
+        #[command(subcommand)]
+        cmd: BrokerCmd,
+    },
+    /// (hidden) one request over the broker socket, autostarting one if
+    /// needed. The ops seam Task 8 tests the wire through; `broker status`
+    /// (Task 9) is the user-facing shape of the `info` op.
+    #[command(hide = true, name = "__broker-call")]
+    BrokerCall {
+        /// info|list|status|spawn|resume|send|interrupt|kill|shutdown
+        op: String,
+        /// The op's parameters, as one JSON object
+        params: Option<String>,
+    },
     // later tasks append variants here
+}
+
+#[derive(Subcommand)]
+pub enum BrokerCmd {
+    /// Run the broker daemon. Task 9 adds the flock singleton, the pidfile and
+    /// daemonization; today this always runs in the foreground.
+    Run {
+        /// Stay in the foreground (the only mode today)
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Ask a running broker to stop; exits 0 when there is none
+    Shutdown,
 }
 
 #[derive(clap::Args)]

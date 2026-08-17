@@ -12,9 +12,14 @@
 //! every test in this binary shares one environment, and a `set_var` race is
 //! exactly the kind of flake that gets a suite ignored.
 
+mod common;
+
 use a2a::adapter::SendPath;
 use a2a::broker::child::{ChildSpec, RestartPolicy, Supervision};
 use a2a::broker::core::{self, BrokerHealth, CoreHandle, CoreMsg};
+use a2a::broker::sockserv::{self, ServeCtx};
+use a2a::broker::wire;
+use a2a::brokerclient;
 use a2a::config::{self, Lane};
 use a2a::events::{Envelope, EventKind};
 use a2a::fold;
@@ -26,8 +31,11 @@ use a2a::state::WorkerSnapshot;
 use a2a::store::{self, EventLog};
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::io::{BufRead, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Bounded wait for a converged state. These tests assert WHICH state a worker
 /// (or the broker) converges on, never how fast.
@@ -105,24 +113,24 @@ impl Harness {
     /// A worker directory laid out exactly as `a2a spawn` leaves one: the
     /// subdirectories, the genesis event, and the checkpoint it folds to.
     fn seed_worker(&self, lane: Lane) -> (String, PathBuf) {
-        let id = format!("{}-0817t1200-aaaa", lane.as_str());
-        let dir = self.home.join("workers").join(&id);
-        for sub in ["outbox", "inbox", "inbox/delivered", "scratch", "context"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-        let mut log = EventLog::open(&dir).unwrap();
-        let snap = fold::append_and_fold(
-            &mut log,
-            &dir,
-            WorkerSnapshot::new_for_test(&id, &self.work),
-            EventKind::Spawned,
-            json!({"fsm":"Spawn","id":id,"lane":lane.as_str(),"cwd":self.work,
-                   "transport":"app-server"}),
-            Utc::now(),
+        seed_worker_dir(
+            &self.home,
+            lane,
+            &self.work,
+            &format!("{}-0817t1200-aaaa", lane.as_str()),
         )
-        .unwrap();
-        assert_eq!(snap.state, WorkerState::Spawned);
-        (id, dir)
+    }
+
+    /// Put a socket server in front of this broker's core. Returns the token
+    /// that stops it (`shutdown` over the wire cancels the same one).
+    fn listen(&self) -> CancellationToken {
+        let shutdown = CancellationToken::new();
+        let listener = sockserv::bind(&self.home)
+            .expect("the socket binds")
+            .expect("nothing else is listening on this temp home");
+        let ctx = ServeCtx::new(&self.home, self.core.clone(), shutdown.clone());
+        tokio::spawn(sockserv::serve(listener, ctx));
+        shutdown
     }
 
     async fn until_state(&self, id: &str, want: WorkerState) -> WorkerSnapshot {
@@ -183,6 +191,104 @@ impl Harness {
         let _ = tokio::time::timeout(WAIT, self.core.shutdown()).await;
         drop(self.tmp);
     }
+}
+
+/// A worker directory laid out exactly as `a2a spawn` leaves one. Free-standing
+/// so the socket tests — which drive a broker in another PROCESS — can seed one
+/// without a [`Harness`].
+fn seed_worker_dir(home: &Path, lane: Lane, cwd: &Path, id: &str) -> (String, PathBuf) {
+    let dir = home.join("workers").join(id);
+    for sub in ["outbox", "inbox", "inbox/delivered", "scratch", "context"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let mut log = EventLog::open(&dir).unwrap();
+    let snap = fold::append_and_fold(
+        &mut log,
+        &dir,
+        WorkerSnapshot::new_for_test(id, cwd),
+        EventKind::Spawned,
+        json!({"fsm":"Spawn","id":id,"lane":lane.as_str(),"cwd":cwd,
+               "transport":"app-server"}),
+        Utc::now(),
+    )
+    .unwrap();
+    assert_eq!(snap.state, WorkerState::Spawned);
+    (id.to_string(), dir)
+}
+
+/// A client that speaks the wire by hand, so the FRAME SHAPE is pinned as bytes
+/// rather than as whatever `wire::Frame` happens to serialize to today.
+struct RawConn {
+    stream: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl RawConn {
+    fn open(home: &Path) -> RawConn {
+        let stream = std::os::unix::net::UnixStream::connect(sockserv::socket_path(home))
+            .expect("the broker socket accepts a peer of our own uid");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        RawConn { stream, reader }
+    }
+
+    /// Hello with an arbitrary protocol version — the skew tests' whole lever.
+    fn hello(home: &Path, protocol_version: u32, binary_version: &str) -> (RawConn, Value) {
+        let mut conn = RawConn::open(home);
+        conn.send(&json!({"v": 1, "id": 0, "type": "hello",
+                          "body": {"protocol_version": protocol_version,
+                                   "binary_version": binary_version}}));
+        let reply = conn.recv().expect("the broker answers a hello");
+        (conn, reply)
+    }
+
+    fn send(&mut self, frame: &Value) {
+        writeln!(self.stream, "{frame}").unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    fn send_raw(&mut self, line: &[u8]) {
+        self.stream.write_all(line).unwrap();
+        self.stream.write_all(b"\n").unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    fn req(&mut self, id: u64, op: &str, params: Value) -> Value {
+        let mut body = json!({"op": op});
+        merge(&mut body, params);
+        self.send(&json!({"v": 1, "id": id, "type": "req", "body": body}));
+        self.recv().expect("the broker answers a request")
+    }
+
+    fn recv(&mut self) -> Option<Value> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(serde_json::from_str(&line).expect("every frame is one JSON object")),
+        }
+    }
+}
+
+fn merge(into: &mut Value, from: Value) {
+    if let (Some(a), Some(b)) = (into.as_object_mut(), from.as_object()) {
+        for (k, v) in b {
+            a.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// Poll a condition on the calling (blocking) thread. The socket tests that run
+/// a real daemon cannot await.
+fn until_blocking(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
+    for _ in 0..(secs * 20) {
+        if f() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
 }
 
 /// Requests the fake received, by method, after the LAST `initialize` — i.e.
@@ -686,4 +792,362 @@ async fn an_auth_expiry_error_fails_the_worker_as_auth_expired() {
     );
     assert_eq!(rebuilt.failure_class, Some(FailureClass::AuthExpired));
     h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// the socket: one frame shape, one skew key (Task 8)
+// ---------------------------------------------------------------------------
+
+/// The socket is 0600 inside the 0700 home, and the handshake is a frame like
+/// any other: `{v, id, type:"hello", body:{protocol_version, binary_version}}`
+/// in both directions.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_broker_socket_is_0600_and_the_handshake_is_one_frame_shape() {
+    let h = Harness::start("happy", &[], Harness::quick()).await;
+    let _serving = h.listen();
+    let sock = sockserv::socket_path(&h.home);
+
+    assert!(sock.exists(), "the daemon published its socket");
+    assert_eq!(
+        std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a world-writable broker socket is a remote shell for every local user"
+    );
+    assert_eq!(
+        std::fs::metadata(&h.home).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "... inside a 0700 home"
+    );
+
+    let home = h.home.clone();
+    let (hello, listed) = tokio::task::spawn_blocking(move || {
+        let (mut conn, hello) = RawConn::hello(&home, wire::protocol_version(), "9.9.9");
+        let listed = conn.req(1, "list", json!({}));
+        (hello, listed)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(hello["v"], json!(1), "every frame carries the wire version");
+    assert_eq!(hello["type"], json!("hello"));
+    assert_eq!(hello["body"]["protocol_version"], json!(wire::protocol_version()));
+    assert_eq!(hello["body"]["binary_version"], json!(wire::BINARY_VERSION));
+
+    assert_eq!(listed["type"], json!("resp"));
+    assert_eq!(listed["id"], json!(1));
+    assert_eq!(listed["body"]["workers"], json!([]));
+    h.stop().await;
+}
+
+/// A frame over the 1 MiB cap is a typed error and the end of the connection —
+/// never an allocation the sender chose the size of.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_over_the_cap_is_refused_with_a_typed_error_and_the_connection_closes() {
+    assert_eq!(
+        wire::MAX_FRAME_BYTES,
+        1024 * 1024,
+        "the cap is 1 MiB — a value, not whatever the constant happens to say"
+    );
+    let h = Harness::start("happy", &[], Harness::quick()).await;
+    let _serving = h.listen();
+
+    let home = h.home.clone();
+    let (err, after) = tokio::task::spawn_blocking(move || {
+        let (mut conn, _) = RawConn::hello(&home, wire::protocol_version(), "9.9.9");
+        let oversized = vec![b'x'; wire::MAX_FRAME_BYTES + 1];
+        conn.send_raw(&oversized);
+        let err = conn.recv().expect("the broker says why before it hangs up");
+        (err, conn.recv())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(err["type"], json!("err"));
+    assert_eq!(err["body"]["code"], json!(wire::ERR_FRAME_TOO_LARGE));
+    assert_eq!(
+        err["body"]["max_bytes"],
+        json!(wire::MAX_FRAME_BYTES),
+        "the error names the cap it hit"
+    );
+    assert!(after.is_none(), "the connection is closed, not merely scolded");
+    h.stop().await;
+}
+
+/// Skew, the broker's half: the hello-err carries the LIVE-WORKER COUNT, which
+/// is what tells the client whether it may retire this daemon. The refused peer
+/// can do exactly one thing afterwards — drain it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skewed_hello_is_refused_with_the_live_worker_count_and_can_only_drain() {
+    let h = Harness::start("happy", &[], Harness::quick()).await;
+    let (id, dir) = h.seed_worker(Lane::General);
+    h.core.spawn_worker(&dir).await.unwrap();
+    h.until_state(&id, WorkerState::Running).await;
+    let _serving = h.listen();
+
+    let home = h.home.clone();
+    let skewed = wire::protocol_version() + 41;
+    let (err, refused, drained) = tokio::task::spawn_blocking(move || {
+        let (mut conn, err) = RawConn::hello(&home, skewed, "0.0.1");
+        // Anything but a drain from a peer we cannot understand.
+        let refused = conn.req(1, "list", json!({}));
+        // ... and the drain itself, on a fresh connection.
+        let (mut drain, _) = RawConn::hello(&home, skewed, "0.0.1");
+        let drained = drain.req(1, "shutdown", json!({}));
+        (err, refused, drained)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(err["type"], json!("err"));
+    assert_eq!(err["body"]["code"], json!(wire::ERR_VERSION_SKEW));
+    assert_eq!(
+        err["body"]["live_workers"],
+        json!(1),
+        "the count is the whole point: a live worker forbids the respawn"
+    );
+    assert_eq!(err["body"]["broker_protocol_version"], json!(wire::protocol_version()));
+    assert_eq!(err["body"]["client_protocol_version"], json!(skewed));
+    assert_eq!(err["body"]["broker_binary_version"], json!(wire::BINARY_VERSION));
+    assert_eq!(err["body"]["client_binary_version"], json!("0.0.1"));
+    assert_eq!(err["body"]["exit"], json!(7));
+
+    assert_eq!(refused["type"], json!("err"));
+    assert_eq!(refused["body"]["code"], json!(wire::ERR_DRAIN_ONLY));
+    assert_eq!(drained["type"], json!("resp"));
+    assert_eq!(drained["body"]["shutting_down"], json!(true));
+
+    until_blocking("the drained broker to take its socket with it", 10, || {
+        !sockserv::socket_path(&h.home).exists()
+    });
+    h.stop().await;
+}
+
+/// One subscription per connection, and it carries a worker's envelopes as they
+/// are folded — the `tail --follow` transport.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_subscription_per_connection_streams_a_workers_envelopes() {
+    let h = Harness::start("happy", &[("FAKE_MESSAGE", "STREAMED")], Harness::quick()).await;
+    let (id, dir) = h.seed_worker(Lane::General);
+    h.core.spawn_worker(&dir).await.unwrap();
+    h.until_state(&id, WorkerState::Running).await;
+    let _serving = h.listen();
+
+    let home = h.home.clone();
+    let worker = id.clone();
+    let (second, path, kinds) = tokio::task::spawn_blocking(move || {
+        let mut client = brokerclient::connect(&home).expect("the sync client handshakes");
+        client.subscribe().expect("the first subscription is accepted");
+        let second = client.subscribe().expect_err("the second is not");
+
+        let path = client
+            .request("send", json!({"id": worker, "text": "do the thing"}))
+            .unwrap();
+
+        let mut kinds: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + WAIT;
+        while std::time::Instant::now() < deadline {
+            match client.next_event(Duration::from_millis(500)).unwrap() {
+                Some(event) => {
+                    assert_eq!(event.worker, worker, "events name the worker they belong to");
+                    kinds.push(format!("{:?}", event.envelope.kind));
+                    if event.envelope.kind == EventKind::TurnCompleted {
+                        break;
+                    }
+                }
+                None => continue,
+            }
+        }
+        (second, path, kinds)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(second.code, wire::ERR_ALREADY_SUBSCRIBED);
+    assert_eq!(path["path"], json!("started"));
+    assert!(
+        kinds.iter().any(|k| k == "TurnStarted") && kinds.iter().any(|k| k == "TurnCompleted"),
+        "the subscription carried the turn, start to finish: {kinds:?}"
+    );
+    h.until_state(&id, WorkerState::Done).await;
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// the sync client, against a real daemon (Task 8)
+// ---------------------------------------------------------------------------
+
+/// Autostart, end to end: a CLI that finds no broker starts one, hands it the
+/// environment it needs (its codex binary, its allowed roots), and talks to it —
+/// without ever touching the operator's real `~/.a2a`.
+#[test]
+fn an_autostarted_broker_answers_the_client_and_never_touches_the_real_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let fake_home = tmp.path().join("fake-HOME");
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let (mut cmd, guard) = common::a2a_broker(&home, tmp.path());
+
+    let out = cmd
+        .env("HOME", &fake_home)
+        .args(["--json", "__broker-call", "info"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let info = &v["data"];
+
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(info["protocol_version"], json!(wire::protocol_version()));
+    assert_eq!(info["binary_version"], json!(wire::BINARY_VERSION));
+    assert_eq!(info["workers"], json!(0));
+    assert_eq!(info["clients"], json!(1), "the asking client counts itself");
+    assert!(
+        info["child_pid"].is_u64(),
+        "the daemon got A2A_CODEX_BIN and owns a live app-server child: {info}"
+    );
+    assert_eq!(
+        info["allowed_roots"],
+        json!([tmp.path().canonicalize().unwrap()]),
+        "the daemon got A2A_ALLOWED_ROOTS — it is NOT under the child allowlist"
+    );
+    assert!(
+        !fake_home.join(".a2a").exists(),
+        "an autostarted broker resolves --home, never $HOME/.a2a"
+    );
+    assert_eq!(
+        std::fs::metadata(sockserv::socket_path(&home))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    drop(guard);
+    assert!(
+        !sockserv::socket_path(&home).exists(),
+        "`broker shutdown` takes the socket with it"
+    );
+    common::assert_no_broker_left(&home);
+}
+
+/// Skew branch one — nothing in flight: the client DRAINS the old daemon and
+/// respawns one from its own environment, then gets on with the job.
+#[test]
+fn a_version_skew_with_no_live_workers_drains_and_respawns_the_broker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (mut cmd, _guard) = common::a2a_broker(&home, tmp.path());
+    let first: Value = serde_json::from_slice(
+        &cmd.args(["--json", "__broker-call", "info"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    let first_pid = first["data"]["pid"].as_u64().unwrap();
+
+    // A client from a different generation: same socket, different protocol.
+    let (mut skewed, _guard2) = common::a2a_broker(&home, tmp.path());
+    let out: Value = serde_json::from_slice(
+        &skewed
+            .env(wire::PROTO_VERSION_ENV, "42")
+            .args(["--json", "__broker-call", "info"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+
+    assert_eq!(out["ok"], json!(true), "the respawn made the call work: {out}");
+    assert_eq!(
+        out["data"]["protocol_version"],
+        json!(42),
+        "the respawned daemon came up from the CLIENT's environment"
+    );
+    assert_ne!(
+        out["data"]["pid"].as_u64().unwrap(),
+        first_pid,
+        "a genuinely different daemon process"
+    );
+
+    // ... and exactly ONE of them survived the swap. A respawn that raced a
+    // second autostart leaves a daemon holding an unlinked socket: alive,
+    // unreachable, and outliving every guard in this file.
+    drop(_guard2);
+    drop(_guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// Skew branch two — work in flight: the client does NOT retire a broker that
+/// is holding live workers. Exit 7, both binary versions named, and a remedy.
+#[test]
+fn a_version_skew_with_a_live_worker_exits_7_and_leaves_the_broker_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    A2aHome::resolve(Some(&home)).unwrap();
+    let (_, dir) = seed_worker_dir(&home, Lane::General, &work, "general-0817t1300-bbbb");
+
+    let (mut cmd, _guard) = common::a2a_broker(&home, tmp.path());
+    cmd.args(["--json", "__broker-call", "spawn"])
+        .arg(json!({"dir": dir}).to_string())
+        .assert()
+        .success();
+    let (mut probe, _g) = common::a2a_broker(&home, tmp.path());
+    let before: Value = serde_json::from_slice(
+        &probe
+            .args(["--json", "__broker-call", "info"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(before["data"]["workers"], json!(1));
+    let pid = before["data"]["pid"].as_u64().unwrap();
+
+    let (mut skewed, _g2) = common::a2a_broker(&home, tmp.path());
+    let out: Value = serde_json::from_slice(
+        &skewed
+            .env(wire::PROTO_VERSION_ENV, "42")
+            .args(["--json", "__broker-call", "info"])
+            .assert()
+            .code(7)
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+
+    assert_eq!(out["ok"], json!(false));
+    assert_eq!(out["error"]["code"], json!(wire::ERR_VERSION_SKEW));
+    let message = out["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(wire::BINARY_VERSION),
+        "the message names both binaries: {message}"
+    );
+    assert!(message.contains("42") && message.contains(&wire::protocol_version().to_string()));
+    assert_eq!(out["error"]["remedy"], json!("`a2a broker restart`"));
+
+    // Untouched: a broker with work in flight is never drained out from under it.
+    let (mut after, _g3) = common::a2a_broker(&home, tmp.path());
+    let still: Value = serde_json::from_slice(
+        &after
+            .args(["--json", "__broker-call", "info"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(still["data"]["pid"].as_u64().unwrap(), pid);
+    assert_eq!(still["data"]["workers"], json!(1));
+
+    drop(_g3);
+    drop(_g2);
+    drop(_g);
+    drop(_guard);
+    common::assert_no_broker_left(&home);
 }

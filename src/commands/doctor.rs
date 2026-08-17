@@ -624,6 +624,7 @@ mod tests {
             codex_version_range: crate::config::DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Default::default(),
+            broker: Default::default(),
         };
         assert_eq!(resolve_codex(&cfg), Some(bin));
         cfg.codex_bin = Some(PathBuf::from("/nonexistent/codex"));

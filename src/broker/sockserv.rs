@@ -29,6 +29,7 @@
 //! bounded mpsc, so a cancelled future can never leave half a line on the wire.
 
 use crate::broker::core::{CoreHandle, TailFrame};
+use crate::broker::shutdown::{self, Cause, Liveness};
 use crate::broker::wire::{self, Frame, FrameType, Incoming, WireError};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
@@ -50,6 +51,11 @@ pub const WRITER_CAPACITY: usize = 256;
 /// How long `serve` waits for in-flight connections after cancellation before
 /// it removes the socket and returns.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a connection waits for its subscription's farewell frame to reach
+/// the writer. Short: the frame is one line into a bounded channel that is
+/// being drained, and a connection that will not take it is already gone.
+pub const FAREWELL_GRACE: Duration = Duration::from_secs(1);
 
 pub fn socket_path(home: &Path) -> PathBuf {
     home.join(super::BROKER_SOCK)
@@ -116,6 +122,20 @@ pub struct ServeCtx {
     /// about the registry.
     pub reconciled: Value,
     clients: Arc<AtomicUsize>,
+    /// Connections with a live tail. Counted separately from `clients` because
+    /// it is the pinned half of the idle timer's liveness question: a `status`
+    /// call comes and goes, a tail is somebody *watching*.
+    subscribers: Arc<AtomicUsize>,
+    /// Where a connection reports WHY the daemon is stopping. `None` when
+    /// nothing is listening (an in-process core with no daemon around it), in
+    /// which case cancelling the token is the whole message.
+    causes: Option<mpsc::Sender<Cause>>,
+    /// Whether `serve` unlinks the socket when it returns.
+    ///
+    /// True for a bare server (nothing else is going to do it). The DAEMON sets
+    /// it false: its teardown order puts the socket *after* the child, and a
+    /// socket unlinked here would jump the queue.
+    unlink_on_exit: bool,
 }
 
 impl ServeCtx {
@@ -130,7 +150,43 @@ impl ServeCtx {
             allowed_roots: Vec::new(),
             reconciled: Value::Null,
             clients: Arc::new(AtomicUsize::new(0)),
+            subscribers: Arc::new(AtomicUsize::new(0)),
+            causes: None,
+            unlink_on_exit: true,
         }
+    }
+
+    /// Report shutdown causes through `tx` as well as through the token.
+    pub fn with_causes(mut self, tx: mpsc::Sender<Cause>) -> ServeCtx {
+        self.causes = Some(tx);
+        self
+    }
+
+    /// Hand the socket's removal to the caller (see [`ServeCtx::unlink_on_exit`]).
+    pub fn with_deferred_unlink(mut self) -> ServeCtx {
+        self.unlink_on_exit = false;
+        self
+    }
+
+    /// The counters the idle timer reads.
+    pub fn liveness(&self) -> Liveness {
+        Liveness {
+            clients: self.clients.clone(),
+            subscribers: self.subscribers.clone(),
+        }
+    }
+
+    pub fn subscribers(&self) -> usize {
+        self.subscribers.load(Ordering::Relaxed)
+    }
+
+    /// Say why, then stop. The token is cancelled either way: a cause nobody is
+    /// listening for must never be the difference between stopping and not.
+    async fn stop(&self, cause: Cause) {
+        if let Some(tx) = &self.causes {
+            let _ = tx.try_send(cause);
+        }
+        self.shutdown.cancel();
     }
 
     pub fn with_config(mut self, codex_bin: Option<PathBuf>, allowed_roots: Vec<PathBuf>) -> ServeCtx {
@@ -177,8 +233,11 @@ pub async fn serve(listener: UnixListener, ctx: ServeCtx) {
     tracker.close();
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, tracker.wait()).await;
     // The address is ours to remove: we bound it, and nothing else may have
-    // taken it while we held it.
-    let _ = std::fs::remove_file(socket_path(&ctx.home));
+    // taken it while we held it. The daemon defers this so the socket outlives
+    // the workers and the child (see [`ServeCtx::unlink_on_exit`]).
+    if ctx.unlink_on_exit {
+        let _ = std::fs::remove_file(socket_path(&ctx.home));
+    }
 }
 
 /// The uid on the other end, straight from the kernel.
@@ -352,7 +411,7 @@ async fn drain_only(
         let _ = out
             .send(Frame::resp(frame.id, json!({"shutting_down": true})))
             .await;
-        ctx.shutdown.cancel();
+        ctx.stop(Cause::Op).await;
         return;
     }
     let _ = out
@@ -411,10 +470,12 @@ async fn request_loop(
             match ctx.core.subscribe().await {
                 Ok(rx) => {
                     let _ = out.send(Frame::resp(frame.id, json!({"subscribed": true}))).await;
+                    ctx.subscribers.fetch_add(1, Ordering::Relaxed);
                     subscription = Some(tokio::spawn(pump_subscription(
                         rx,
                         out.clone(),
                         frame.id,
+                        ctx.shutdown.clone(),
                     )));
                 }
                 Err(e) => {
@@ -433,12 +494,19 @@ async fn request_loop(
             break;
         }
         if op == "shutdown" {
-            ctx.shutdown.cancel();
+            ctx.stop(Cause::Op).await;
             break;
         }
     }
-    if let Some(handle) = subscription {
+    if let Some(mut handle) = subscription {
+        // Awaited, not aborted, when the daemon is going down: the pump's LAST
+        // act is the farewell frame, and aborting it here would deliver exactly
+        // the silent EOF that frame exists to prevent.
+        if ctx.shutdown.is_cancelled() {
+            let _ = tokio::time::timeout(FAREWELL_GRACE, &mut handle).await;
+        }
         handle.abort();
+        ctx.subscribers.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -491,19 +559,36 @@ async fn next_frame(
     }
 }
 
-/// Forward one subscription's envelopes until the connection or the tail ends.
+/// Forward one subscription's envelopes until the connection, the tail, or the
+/// daemon ends.
 ///
 /// A lagged subscriber is TOLD, with the last seq it actually received: a tail
 /// that silently skips is worse than one that admits a gap, because the reader
 /// cannot tell the difference between "nothing happened" and "I missed it".
+/// The same argument is why a shutdown ends with a `broker_shutdown` frame
+/// rather than with a closed socket.
 pub async fn pump_subscription(
     mut rx: broadcast::Receiver<TailFrame>,
     out: mpsc::Sender<Frame>,
     id: u64,
+    shutdown: CancellationToken,
 ) {
     let mut last_seq: u64 = 0;
     loop {
-        match rx.recv().await {
+        // Both branches are cancel-safe: `broadcast::Receiver::recv` may be
+        // dropped mid-poll without losing a message it has not yet returned,
+        // and the frame below is handed to the writer task, never written here.
+        let received = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                let _ = out
+                    .send(Frame::broker_shutdown(id, shutdown::GRACE.as_secs()))
+                    .await;
+                return;
+            }
+            received = rx.recv() => received,
+        };
+        match received {
             Ok(tail) => {
                 last_seq = tail.envelope.seq;
                 let body = json!({"worker": tail.worker_id, "envelope": tail.envelope});
@@ -688,7 +773,7 @@ mod tests {
 
         // One frame is delivered, then the channel overruns while nobody pumps.
         tx.send(tail(1)).unwrap();
-        let pump = tokio::spawn(pump_subscription(rx, out, 9));
+        let pump = tokio::spawn(pump_subscription(rx, out, 9, CancellationToken::new()));
         let first = frames.recv().await.expect("the first event went out");
         assert_eq!(first.ty, FrameType::Event);
         assert_eq!(first.body["envelope"]["seq"], json!(1));

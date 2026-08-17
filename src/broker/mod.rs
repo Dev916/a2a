@@ -27,6 +27,7 @@
 
 pub mod child;
 pub mod core;
+pub mod shutdown;
 pub mod sockserv;
 pub mod wire;
 pub mod worker_actor;
@@ -225,6 +226,24 @@ pub async fn adopt_previous_workers(
     let _ = tokio::task::spawn_blocking(move || record_phase(&home, "adopt", &snapshot)).await;
 }
 
+/// Exec workers that are still somebody's problem.
+///
+/// The broker owns none of them — their processes belong to their own shims —
+/// but they ARE work in flight, and the idle timer must not retire a daemon out
+/// from under a CLI that is about to come back for one. The predicate matches
+/// the registry's own `settled`: terminal or escalated is nobody's problem any
+/// more; everything else is.
+pub fn live_exec_workers(home: &Path) -> usize {
+    scan(home)
+        .into_iter()
+        .filter(|(_, s)| {
+            s.transport == Transport::Exec
+                && !s.state.is_terminal()
+                && s.state != WorkerState::Escalated
+        })
+        .count()
+}
+
 /// Every worker directory with a readable snapshot, oldest first.
 ///
 /// `created_at` order is not cosmetic — it IS the re-enqueue order — and the id
@@ -256,7 +275,8 @@ fn record_phase(home: &Path, phase: &str, report: &StartupReport) {
     };
     let line = json!({"ts": Utc::now(), "broker": "startup", "phase": phase,
                       "report": report});
-    let _ = writeln!(f, "{line}");
+    // One whole line per syscall — see [`core::line_bytes`].
+    let _ = f.write_all(&core::line_bytes(&line));
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ pub fn run(home: &A2aHome, origin: bool, quiet: bool) -> Result<Value, AppError>
         "codex_version_range": cfg.codex_version_range,
         "allowed_roots": cfg.allowed_roots,
         "lanes": lanes,
+        "broker": serde_json::to_value(cfg.broker).map_err(internal)?,
     });
     if origin {
         data["origins"] = serde_json::to_value(&origins).map_err(internal)?;

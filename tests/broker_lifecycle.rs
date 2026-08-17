@@ -1151,3 +1151,248 @@ fn a_version_skew_with_a_live_worker_exits_7_and_leaves_the_broker_alone() {
     drop(_guard);
     common::assert_no_broker_left(&home);
 }
+
+// ---------------------------------------------------------------------------
+// three-phase shutdown, against a real daemon (Task 10)
+// ---------------------------------------------------------------------------
+
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "pid=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Every `{"broker":"shutdown"}` line the daemon wrote, in the order it wrote
+/// them — the teardown order as a fact on disk rather than a claim in a report.
+fn shutdown_phases(home: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(home.join("broker.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|l| l["broker"] == json!("shutdown"))
+        .filter_map(|l| l["phase"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn state_of(home: &Path, id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(home.join("workers").join(id).join("state.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v["state"].as_str().map(str::to_string)
+}
+
+/// One `__broker-call`, with no [`common::BrokerGuard`] attached: these tests
+/// own the daemon's lifetime themselves (that IS the subject), and a guard
+/// dropped at the end of a helper would retire it mid-test.
+fn broker_call(home: &Path, root: &Path, op: &str, params: Value) -> Value {
+    let out = common::a2a(home, root)
+        .env_remove("A2A_BROKER_DISABLE")
+        .env("A2A_CODEX_BIN", common::fake_app_server_path())
+        .args(["--json", "__broker-call", op])
+        .arg(params.to_string())
+        .assert()
+        .success();
+    serde_json::from_slice::<Value>(&out.get_output().stdout).unwrap()["data"].clone()
+}
+
+/// SIGTERM with work in flight — the whole three-phase teardown, observed from
+/// outside:
+///
+/// * both live workers are flushed to `orphaned` inside the grace (their state
+///   is *recorded*, not lost with the daemon that held it),
+/// * the app-server child dies with its parent — no surviving process, scoped
+///   to the pids this test owns,
+/// * socket, pidfile and lock are gone, and the ORDER is on disk,
+/// * and the tail subscriber is TOLD (`broker_shutdown`) rather than left with
+///   an EOF it cannot tell apart from a crash.
+#[test]
+fn sigterm_orphans_live_workers_tells_tails_and_leaves_nothing_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    A2aHome::resolve(Some(&home)).unwrap();
+    let ids = ["general-0817t1400-aaaa", "general-0817t1400-bbbb"];
+    for id in ids {
+        seed_worker_dir(&home, Lane::General, &work, id);
+    }
+
+    for id in ids {
+        let dir = home.join("workers").join(id);
+        broker_call(&home, tmp.path(), "spawn", json!({"dir": dir}));
+    }
+    let info = broker_call(&home, tmp.path(), "info", json!({}));
+    let pid = info["pid"].as_u64().unwrap() as u32;
+    let child_pid = info["child_pid"].as_u64().unwrap() as u32;
+    assert_eq!(info["workers"], json!(2));
+
+    // Both workers have a live turn before anything is signalled: orphaning a
+    // worker that never started would prove nothing.
+    until_blocking("both workers to be running", 20, || {
+        ids.iter().all(|id| state_of(&home, id).as_deref() == Some("running"))
+    });
+
+    // A tail, on a raw connection, collecting until the far end goes away.
+    let sub_home = home.clone();
+    let tail = std::thread::spawn(move || {
+        let (mut conn, _) = RawConn::hello(&sub_home, wire::protocol_version(), "9.9.9");
+        let ok = conn.req(1, "subscribe", json!({}));
+        assert_eq!(ok["body"]["subscribed"], json!(true));
+        let mut frames = Vec::new();
+        while let Some(frame) = conn.recv() {
+            let last = frame["body"]["event"] == json!("broker_shutdown");
+            frames.push(frame);
+            if last {
+                break;
+            }
+        }
+        frames
+    });
+    // The subscription must be established before the signal, or the test is
+    // asserting nothing.
+    until_blocking("the tail subscription to reach the daemon", 20, || {
+        // Two: the tail, and the process doing the asking.
+        broker_call(&home, tmp.path(), "info", json!({}))["clients"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    });
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("the daemon takes a SIGTERM");
+
+    until_blocking("the daemon to finish its teardown", 30, || !alive(pid));
+
+    for id in ids {
+        assert_eq!(
+            state_of(&home, id).as_deref(),
+            Some("orphaned"),
+            "{id} was live when the broker went down: that fact belongs in its snapshot"
+        );
+    }
+    assert!(
+        !alive(child_pid),
+        "the app-server child ({child_pid}) outlived the broker that owned it"
+    );
+    assert!(!sockserv::socket_path(&home).exists(), "the socket is gone");
+    assert!(!home.join("broker.pid").exists(), "the pidfile is gone");
+    assert!(!home.join("broker.lock").exists(), "the lock is gone");
+
+    let phases = shutdown_phases(&home);
+    assert_eq!(
+        phases,
+        a2a::broker::shutdown::PHASES.to_vec(),
+        // The whole log on failure: an out-of-order teardown and a CORRUPTED
+        // one (two appenders interleaving mid-line) look identical from a list
+        // of phases, and they have different fixes.
+        "the teardown order is the point, and it is on disk\nJSONL:\n{}\nLOG:\n{}",
+        std::fs::read_to_string(home.join("broker.jsonl")).unwrap_or_default(),
+        std::fs::read_to_string(home.join("broker.log")).unwrap_or_default()
+    );
+
+    let frames = tail.join().expect("the tail thread finishes");
+    let farewell = frames
+        .iter()
+        .find(|f| f["body"]["event"] == json!("broker_shutdown"))
+        .unwrap_or_else(|| panic!("the tail was told the broker was going: {frames:?}"));
+    assert_eq!(farewell["type"], json!("event"));
+    assert_eq!(farewell["id"], json!(1), "on the subscription's own id");
+
+    common::assert_no_broker_left(&home);
+}
+
+/// The leaked-daemon safety net: a broker nobody is using retires itself, says
+/// why, and takes its whole footprint with it.
+#[test]
+fn an_idle_broker_with_nothing_live_retires_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (mut cmd, guard) = common::a2a_broker(&home, tmp.path());
+    cmd.env("A2A_BROKER_IDLE_TIMEOUT_SECS", "1")
+        .args(["broker", "run"])
+        .assert()
+        .success();
+
+    let pid = until_blocking_value("the broker to publish its pidfile", 20, || {
+        std::fs::read_to_string(home.join("broker.pid"))
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+    });
+    until_blocking("the idle broker to retire itself", 30, || !alive(pid));
+
+    assert!(!sockserv::socket_path(&home).exists());
+    assert!(!home.join("broker.pid").exists());
+    let causes: Vec<String> = std::fs::read_to_string(home.join("broker.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|l| l["cause"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        causes.iter().any(|c| c == "idle"),
+        "the daemon says WHY it went: {causes:?}"
+    );
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// ... and a worker waiting for an answer is work in flight. A safety net that
+/// cuts a blocked worker's transport out from under it is not a safety net.
+#[test]
+fn a_worker_awaiting_input_keeps_an_idle_broker_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    A2aHome::resolve(Some(&home)).unwrap();
+    let (id, dir) = seed_worker_dir(&home, Lane::General, &work, "general-0817t1500-cccc");
+
+    let (mut cmd, guard) = common::a2a_broker(&home, tmp.path());
+    cmd.env("A2A_BROKER_IDLE_TIMEOUT_SECS", "1")
+        // A turn that never ends on its own, so the interrupt below is what
+        // puts this worker where the acceptance criterion wants it.
+        .env("FAKE_SCENARIO", "hang-turn")
+        .args(["broker", "run"])
+        .assert()
+        .success();
+    let pid = until_blocking_value("the broker to publish its pidfile", 20, || {
+        std::fs::read_to_string(home.join("broker.pid"))
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+    });
+
+    broker_call(&home, tmp.path(), "spawn", json!({"dir": dir}));
+    broker_call(&home, tmp.path(), "send", json!({"id": id, "text": "which one?"}));
+    broker_call(&home, tmp.path(), "interrupt", json!({"id": id}));
+    until_blocking("the worker to reach awaiting-input", 20, || {
+        state_of(&home, &id).as_deref() == Some("awaiting-input")
+    });
+
+    // Four times the timeout with no client connected: an empty registry would
+    // have retired twice over by now.
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        alive(pid),
+        "a broker holding a worker that is waiting for a human is not idle"
+    );
+    assert!(sockserv::socket_path(&home).exists());
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// [`until_blocking`], for a poll that produces a value.
+fn until_blocking_value<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..(secs * 20) {
+        if let Some(v) = f() {
+            return v;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
+}

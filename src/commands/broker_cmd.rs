@@ -27,12 +27,22 @@
 //! is why [`sockserv::bind`]'s stale-socket check is now a *consequence* of
 //! holding the lock rather than the thing that decides ownership.
 //!
-//! Teardown runs the same order backwards: the socket is unlinked by
-//! [`sockserv::serve`], then the pidfile, and the lock is released LAST, so a
-//! `broker restart` that sees the lock free knows everything else is already
-//! gone.
+//! Teardown runs the same order backwards, and [`broker::shutdown`] owns it:
+//!
+//! ```text
+//!   stop accepting ─▶ workers flushed to orphaned ─▶ child SIGTERM→SIGKILL
+//!                  ─▶ socket unlinked ─▶ pidfile removed ─▶ flock released LAST
+//! ```
+//!
+//! Every step's absence is meaningful to whoever comes next, which is why the
+//! order is pinned and each step writes a line to `broker.jsonl`: a socket that
+//! outlives the child hands a live address to a CLI whose transport is already
+//! gone, and a lock released early lets a successor start into a home this
+//! daemon has not finished leaving. So a `broker restart` that sees the lock
+//! free knows everything else is already gone.
 
 use crate::broker::child::{self, ChildSpec, Supervision};
+use crate::broker::shutdown::{self, Cause, IdleWatch, Shutdown};
 use crate::broker::sockserv::{self, ServeCtx};
 use crate::broker::{self, core, StartupReport};
 use crate::brokerclient;
@@ -48,10 +58,6 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
-
-/// How long the daemon waits for the core's tasks after the socket is down.
-pub const CORE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// How long `broker restart` waits for the retired daemon to release the lock
 /// before it gives up rather than racing it.
@@ -95,12 +101,44 @@ pub fn run(home: &A2aHome, foreground: bool, quiet: bool) -> Result<Outcome, App
             )
         })?;
     let outcome = runtime.block_on(daemon(root.clone(), cfg, quiet, startup));
-    drop(runtime);
+    // Bounded: a blocking task that will not finish must not become a daemon
+    // that will not exit.
+    runtime.shutdown_timeout(Duration::from_secs(2));
 
-    // Teardown, in the order that makes each step's absence meaningful.
+    // The last two phases, out here because the lock is not the runtime's to
+    // hold and must be released LAST of all.
+    let (data, cause) = match outcome {
+        Ok((data, cause)) => (Ok(data), cause),
+        Err(e) => (Err(e), Cause::Internal("the daemon could not start".into())),
+    };
+    if data.as_ref().map(|d| d["started"] == json!(true)).unwrap_or(true) {
+        let _ = std::fs::remove_file(sockserv::socket_path(&root));
+        shutdown::record_phase(&root, shutdown::PHASE_SOCKET_UNLINKED, &cause, json!({}));
+    }
     let _ = std::fs::remove_file(broker::pid_path(&root));
+    shutdown::record_phase(&root, shutdown::PHASE_LOCK_RELEASED, &cause, json!({}));
+    // Unlinked by the HOLDER, and only ever by the holder: nobody else can have
+    // replaced the file while this process held the flock on it, because every
+    // other acquirer is refused (EWOULDBLOCK) until the `drop` below.
+    let _ = std::fs::remove_file(broker::lock_path(&root));
     drop(lock);
-    outcome.map(Outcome::from)
+
+    // The forced exit. Everything the daemon owned is released above, so a task
+    // that outlived [`shutdown::GRACE`] is holding nothing an operator can see —
+    // and a daemon that will not exit is worse than one that exits loudly. The
+    // final envelope is the price, and it is only ever paid here.
+    if data
+        .as_ref()
+        .map(|d| d["shutdown"]["report"]["graceful"] == json!(false))
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "a2a broker: forcing exit after {}s — some tasks did not stop",
+            shutdown::GRACE.as_secs()
+        );
+        std::process::exit(0);
+    }
+    data.map(Outcome::from)
 }
 
 async fn daemon(
@@ -108,7 +146,7 @@ async fn daemon(
     cfg: Config,
     quiet: bool,
     mut startup: StartupReport,
-) -> Result<Value, AppError> {
+) -> Result<(Value, Cause), AppError> {
     let Some(listener) = sockserv::bind(&home)? else {
         // Belt and braces: with the lock held this is close to unreachable, but
         // a live socket we did not bind is still someone else's, and taking it
@@ -116,7 +154,10 @@ async fn daemon(
         if !quiet {
             eprintln!("a2a: broker already running");
         }
-        return Ok(json!({"started": false, "already_running": true}));
+        return Ok((
+            json!({"started": false, "already_running": true}),
+            Cause::Op,
+        ));
     };
 
     let codex_bin = cfg
@@ -138,42 +179,34 @@ async fn daemon(
     // the survivors to.
     broker::adopt_previous_workers(&home, &core, &mut startup).await;
 
-    let shutdown = CancellationToken::new();
-    let ctx = ServeCtx::new(&home, core.clone(), shutdown.clone())
+    // ONE root token — the core's own, which every `WorkerActor` already holds
+    // a `child_token` of. The front door hangs off it as a child, so closing
+    // the door and stopping the house are separate acts with one root.
+    let mut sd = Shutdown::rooted(core.cancel_token());
+    let ctx = ServeCtx::new(&home, core.clone(), sd.accepting())
         .with_config(Some(codex_bin), cfg.allowed_roots.clone())
-        .with_startup(&startup);
+        .with_startup(&startup)
+        .with_causes(sd.causes())
+        .with_deferred_unlink();
     let pid = ctx.pid;
+    let idle_timeout = Duration::from_secs(cfg.broker.idle_timeout_secs);
+    let watch = (!idle_timeout.is_zero())
+        .then(|| IdleWatch::new(core.clone(), &home, idle_timeout, ctx.liveness()));
     let serving = tokio::spawn(sockserv::serve(listener, ctx));
 
-    wait_for_stop(&shutdown).await;
-    shutdown.cancel();
-    let _ = serving.await;
-    let _ = tokio::time::timeout(CORE_SHUTDOWN_GRACE, core.shutdown()).await;
-    Ok(json!({"started": true, "pid": pid}))
-}
-
-/// A `shutdown` op, a SIGTERM or a SIGINT — whichever comes first.
-async fn wait_for_stop(shutdown: &CancellationToken) {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            shutdown.cancelled().await;
-            return;
-        }
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => {
-            shutdown.cancelled().await;
-            return;
-        }
-    };
-    tokio::select! {
-        _ = shutdown.cancelled() => {}
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+    // 1. DETECT.
+    let cause = sd.detect(watch).await;
+    if !quiet {
+        eprintln!("a2a broker: shutting down ({})", cause.as_str());
     }
+    // 2/3. TELL, then WAIT — the accept loop first, the root token last.
+    let report = shutdown::teardown(&home, core, &sd, &cause).await;
+    let _ = tokio::time::timeout(sockserv::SHUTDOWN_GRACE, serving).await;
+    Ok((
+        json!({"started": true, "pid": pid,
+               "shutdown": {"cause": cause.as_str(), "report": report}}),
+        cause,
+    ))
 }
 
 // ---------------------------------------------------------------------------

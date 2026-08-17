@@ -55,6 +55,14 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// The id every hello carries: a hello answers no request.
 pub const HELLO_ID: u64 = 0;
 
+/// The last frame a subscription ever gets: the broker is going down.
+///
+/// A tail that ends in a bare EOF is indistinguishable from a broker that
+/// crashed, from a socket that was unlinked underneath it, and from a worker
+/// that simply stopped saying anything — three incidents with three different
+/// remedies. One frame, on the subscription's own id, removes the ambiguity.
+pub const EVENT_BROKER_SHUTDOWN: &str = "broker_shutdown";
+
 // -- error codes ------------------------------------------------------------
 
 pub const ERR_VERSION_SKEW: &str = "BROKER_VERSION_SKEW";
@@ -170,6 +178,14 @@ impl Frame {
 
     pub fn event(id: u64, body: Value) -> Frame {
         Frame::new(id, FrameType::Event, body)
+    }
+
+    /// The farewell every live subscription gets, on its own id.
+    pub fn broker_shutdown(id: u64, grace_secs: u64) -> Frame {
+        Frame::event(
+            id,
+            json!({"event": EVENT_BROKER_SHUTDOWN, "grace_secs": grace_secs}),
+        )
     }
 
     pub fn err(id: u64, err: WireError) -> Frame {

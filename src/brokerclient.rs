@@ -54,10 +54,19 @@ pub const DAEMON_ENV_KEYS: [&str; 4] = [
     "A2A_SHIM_BIN",
 ];
 
-/// ... and by prefix: lane overrides, admission caps, and the two test seams
-/// (`A2A_TEST_*` carries the protocol-skew override, `FAKE_*` drives the
-/// scripted app-server through the daemon into its child).
-pub const DAEMON_ENV_PREFIXES: [&str; 4] = ["A2A_LANES_", "A2A_ADMISSION_", "A2A_TEST_", "FAKE_"];
+/// ... and by prefix: lane overrides, admission caps, the daemon's own
+/// `[broker]` keys (`A2A_BROKER_IDLE_TIMEOUT_SECS` — a safety net the operator
+/// sets in their shell must survive an autostart, or it only applies to the
+/// daemons they start by hand), and the two test seams (`A2A_TEST_*` carries
+/// the protocol-skew override, `FAKE_*` drives the scripted app-server through
+/// the daemon into its child).
+pub const DAEMON_ENV_PREFIXES: [&str; 5] = [
+    "A2A_LANES_",
+    "A2A_ADMISSION_",
+    "A2A_BROKER_",
+    "A2A_TEST_",
+    "FAKE_",
+];
 
 /// A connected, handshaken broker client.
 pub struct BrokerClient {

@@ -109,3 +109,53 @@ fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
     );
     assert_eq!(v["data"]["origins"], serde_json::Value::Null);
 }
+
+/// The broker's own section: one key, a default of 300 (the leaked-daemon
+/// safety net), and the same defaults < file < env precedence every other key
+/// obeys — named in `--origin` as `broker.idle_timeout_secs`.
+#[test]
+fn broker_idle_timeout_defaults_to_300_and_names_its_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["broker"]["idle_timeout_secs"], 300);
+    assert_eq!(
+        v["data"]["origins"]["broker.idle_timeout_secs"],
+        "default",
+        "a value nobody set still says where it came from"
+    );
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[broker]\nidle_timeout_secs = 60\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["broker"]["idle_timeout_secs"], 60);
+    assert_eq!(v["data"]["origins"]["broker.idle_timeout_secs"], "file");
+
+    let v = show(tmp.path(), &[("A2A_BROKER_IDLE_TIMEOUT_SECS", "5")], true);
+    assert_eq!(v["data"]["broker"]["idle_timeout_secs"], 5);
+    assert_eq!(v["data"]["origins"]["broker.idle_timeout_secs"], "env");
+}
+
+/// An unknown key under `[broker]` warns like every other unknown key — a
+/// typo in a safety net must not take the CLI down with it.
+#[test]
+fn unknown_broker_key_warns_but_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[broker]\nidle_timeout_secs = 7\nidle_timeout = 9\n",
+    )
+    .unwrap();
+    let mut c = Command::cargo_bin("a2a").unwrap();
+    let out = c
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("broker.idle_timeout"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["broker"]["idle_timeout_secs"], 7);
+}

@@ -767,3 +767,250 @@ fn the_child_environment_is_scrubbed_while_the_daemon_keeps_its_own() {
     drop(guard);
     common::assert_no_broker_left(&home);
 }
+
+// ---------------------------------------------------------------------------
+// source-scan gates (Task 10)
+// ---------------------------------------------------------------------------
+//
+// Three properties of the async half of `a2a` that no runtime test can catch,
+// because their failure mode is a rare interleaving rather than a wrong answer:
+// a lock where a message belongs, a `write_all` a cancelled future can abandon
+// half-written, and a blocking sleep on a reactor thread. Each is cheap to
+// avoid and expensive to find later, so they are checked as source.
+//
+// The scan reads CODE, not comments: this very file's neighbours document the
+// forbidden constructs by name, and a gate that cannot tell a rule from its
+// violation is a gate nobody keeps.
+
+/// Every file the async discipline binds: the broker's actor tree, plus the
+/// JSON-RPC codec underneath it.
+fn async_sources() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("src/broker"))
+        .expect("src/broker exists")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "rs").unwrap_or(false))
+        .collect();
+    files.push(root.join("src/rpc.rs"));
+    files.sort();
+    assert!(
+        files.len() >= 7,
+        "the scan lost track of the broker's modules: {files:?}"
+    );
+    files
+        .into_iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+            let name = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .into_owned();
+            (name, code_only(&text))
+        })
+        .collect()
+}
+
+/// `src` with every comment blanked out, string literals (raw ones included)
+/// left alone. Newlines are preserved so a hit can still be located by line.
+fn code_only(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        // line comment
+        if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // block comment (nesting, as rustc does)
+        if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+            let mut depth = 1;
+            i += 2;
+            while i < b.len() && depth > 0 {
+                if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == '*' && i + 1 < b.len() && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    if b[i] == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // raw string: r"…", r#"…"#, br##"…"##
+        if b[i] == 'r' || (b[i] == 'b' && i + 1 < b.len() && b[i + 1] == 'r') {
+            let start = i;
+            let mut j = if b[i] == 'b' { i + 2 } else { i + 1 };
+            let mut hashes = 0;
+            while j < b.len() && b[j] == '#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < b.len() && b[j] == '"' {
+                out.extend(&b[start..=j]);
+                i = j + 1;
+                loop {
+                    if i >= b.len() {
+                        break;
+                    }
+                    if b[i] == '"' && b[i + 1..].iter().take(hashes).all(|c| *c == '#') {
+                        out.push('"');
+                        i += 1 + hashes;
+                        break;
+                    }
+                    out.push(b[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // ordinary string
+        if b[i] == '"' {
+            out.push('"');
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' && i + 1 < b.len() {
+                    out.push(b[i]);
+                    out.push(b[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if b[i - 1] == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Every `select!` block in `code`, as (line number, block text).
+fn select_blocks(code: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(found) = code[at..].find("select!") {
+        let start = at + found;
+        let line = code[..start].matches('\n').count() + 1;
+        // Byte offset → char index, so brace matching walks characters.
+        let char_start = code[..start].chars().count();
+        let mut i = char_start;
+        while i < chars.len() && chars[i] != '{' {
+            i += 1;
+        }
+        let mut depth = 0;
+        let block_start = i;
+        while i < chars.len() {
+            match chars[i] {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push((line, chars[block_start..=i.min(chars.len() - 1)].iter().collect()));
+        at = start + "select!".len();
+    }
+    out
+}
+
+/// The registry is reached by messages. A lock in `src/broker/` would be a
+/// second owner of state that has exactly one — and the bugs that follow are
+/// interleavings, not wrong answers.
+#[test]
+fn the_broker_holds_no_shared_locks() {
+    for (name, code) in async_sources() {
+        for (n, line) in code.lines().enumerate() {
+            assert!(
+                !line.contains("Arc<Mutex") && !line.contains("Arc<RwLock"),
+                "{name}:{}: shared lock in the actor tree — send a message instead:\n{line}",
+                n + 1
+            );
+        }
+    }
+}
+
+/// A `write_all` inside a `select!` is a half-written line waiting for the
+/// first cancellation: every write goes through a dedicated writer task fed by
+/// a bounded channel.
+#[test]
+fn no_write_all_inside_a_select() {
+    let mut checked = 0;
+    for (name, code) in async_sources() {
+        for (line, block) in select_blocks(&code) {
+            checked += 1;
+            assert!(
+                !block.contains("write_all"),
+                "{name}:{line}: a write inside a select! can be cancelled half-done:\n{block}"
+            );
+        }
+    }
+    assert!(checked >= 5, "the select! scan found nothing to scan");
+}
+
+/// A blocking sleep on a reactor thread stalls every task that thread owns.
+/// `broker_cmd.rs` is deliberately out of scope: it is a SYNC command that
+/// waits on a flock before the runtime exists.
+#[test]
+fn no_blocking_sleep_in_the_async_modules() {
+    for (name, code) in async_sources() {
+        for (n, line) in code.lines().enumerate() {
+            assert!(
+                !line.contains("std::thread::sleep") && !line.contains("thread::sleep("),
+                "{name}:{}: a blocking sleep on a reactor thread:\n{line}",
+                n + 1
+            );
+        }
+    }
+}
+
+/// The gates are only worth having if they can see a violation: each pattern is
+/// checked against a sample the scanner must reject, and against the comment
+/// that describes it, which it must not.
+#[test]
+fn the_scan_reads_code_and_not_comments() {
+    let sample = r##"
+//! A doc comment naming Arc<Mutex<T>> and std::thread::sleep.
+/* a block comment with write_all inside a select! */
+fn f() {
+    let banner = "select! { write_all }";  // a string is not code either
+    let raw = r#"Arc<Mutex<Fake>>"#;
+}
+"##;
+    let code = code_only(sample);
+    assert!(
+        !code.contains("Arc<Mutex<T>>") && !code.contains("std::thread::sleep"),
+        "comments must not be scanned: {code}"
+    );
+    assert!(
+        code.contains("let banner"),
+        "code around the comments survives: {code}"
+    );
+    // ... and the positive control: real code IS seen.
+    let real = code_only("fn g() { let x: Arc<Mutex<u8>> = todo!(); }");
+    assert!(real.contains("Arc<Mutex"), "{real}");
+    let blocks = select_blocks(&code_only(
+        "async fn h() { tokio::select! { _ = a => { w.write_all(b).await; } } }",
+    ));
+    assert_eq!(blocks.len(), 1);
+    assert!(blocks[0].1.contains("write_all"));
+}

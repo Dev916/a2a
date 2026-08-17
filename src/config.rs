@@ -23,6 +23,19 @@ pub const DEFAULT_START_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_BLOCKED_TIMEOUT_SECS: u64 = 1800;
 
+/// How long a broker with nothing live may sit before it retires itself.
+///
+/// This is the **leaked-daemon safety net**, not a performance knob: a broker
+/// autostarted by one `a2a spawn` in a directory nobody returns to would
+/// otherwise hold a socket, a lock and an app-server child forever. Five
+/// minutes is long enough that an operator working in bursts never notices a
+/// restart, and short enough that a forgotten daemon is gone before it is
+/// mysterious. `0` disables the timer entirely.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Every `[broker]` key, in the order `config show --origin` reports them.
+pub const BROKER_FIELDS: [&str; 1] = ["idle_timeout_secs"];
+
 /// Every per-lane key, in the order `config show --origin` reports them.
 pub const LANE_FIELDS: [&str; 8] = [
     "sandbox",
@@ -128,6 +141,22 @@ pub struct LaneConfig {
     pub blocked_timeout_secs: u64,
 }
 
+/// The `[broker]` section: what the daemon does about itself.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+pub struct BrokerConfig {
+    /// Seconds with nothing live before the daemon self-exits; `0` disables it.
+    /// See [`DEFAULT_IDLE_TIMEOUT_SECS`] for why this exists at all.
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        BrokerConfig {
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `A2A_CODEX_BIN` env / `codex_bin` config key; else `codex` on PATH.
@@ -138,6 +167,7 @@ pub struct Config {
     /// CANONICALIZED at load; default `[~/dev]`.
     pub allowed_roots: Vec<PathBuf>,
     pub lanes: BTreeMap<Lane, LaneConfig>,
+    pub broker: BrokerConfig,
 }
 
 #[derive(Serialize, PartialEq, Clone, Copy, Debug)]
@@ -201,6 +231,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     origins.insert("codex_bin".to_string(), Origin::Default);
     origins.insert("codex_version_range".to_string(), Origin::Default);
     origins.insert("allowed_roots".to_string(), Origin::Default);
+    for field in BROKER_FIELDS {
+        origins.insert(format!("broker.{field}"), Origin::Default);
+    }
 
     let mut lanes = BTreeMap::new();
     for lane in Lane::ALL {
@@ -214,6 +247,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
         codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
         allowed_roots: default_allowed_roots(),
         lanes,
+        broker: BrokerConfig::default(),
     };
 
     let path = home.root().join("config.toml");
@@ -292,6 +326,23 @@ fn apply_file(
                 cfg.allowed_roots = roots;
                 origins.insert("allowed_roots".to_string(), Origin::File);
             }
+            "broker" => {
+                let fields = value.as_table().ok_or_else(|| {
+                    cfg_err(format!(
+                        "broker: expected a table, got {}",
+                        value.type_str()
+                    ))
+                })?;
+                for (field, v) in fields {
+                    let dotted = format!("broker.{field}");
+                    if !BROKER_FIELDS.contains(&field.as_str()) {
+                        warnings.push(format!("unknown config key: {dotted}"));
+                        continue;
+                    }
+                    apply_broker_toml(&mut cfg.broker, &dotted, field, v)?;
+                    origins.insert(dotted, Origin::File);
+                }
+            }
             "lanes" => {
                 let lanes = value.as_table().ok_or_else(|| {
                     cfg_err(format!("lanes: expected a table, got {}", value.type_str()))
@@ -351,6 +402,19 @@ fn want_u64(key: &str, v: &toml::Value) -> Result<u64, AppError> {
     }
 }
 
+fn apply_broker_toml(
+    bc: &mut BrokerConfig,
+    dotted: &str,
+    field: &str,
+    v: &toml::Value,
+) -> Result<(), AppError> {
+    match field {
+        "idle_timeout_secs" => bc.idle_timeout_secs = want_u64(dotted, v)?,
+        _ => unreachable!("field membership checked by caller"),
+    }
+    Ok(())
+}
+
 fn apply_lane_toml(
     lc: &mut LaneConfig,
     dotted: &str,
@@ -375,6 +439,11 @@ fn apply_lane_toml(
 }
 
 // ----------------------------------------------------------------- env layer
+
+/// `A2A_BROKER_<FIELD>` (upper-cased) — the env spelling of one `[broker]` key.
+pub fn broker_env_key(field: &str) -> String {
+    format!("A2A_BROKER_{}", field.to_ascii_uppercase())
+}
 
 /// `A2A_LANES_<LANE>_<FIELD>` (upper-cased) plus top-level `A2A_ALLOWED_ROOTS`
 /// (colon-separated) and `A2A_CODEX_BIN`.
@@ -403,6 +472,20 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
             .map(PathBuf::from)
             .collect();
         origins.insert("allowed_roots".to_string(), Origin::Env);
+    }
+    for field in BROKER_FIELDS {
+        let key = broker_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        match field {
+            "idle_timeout_secs" => {
+                cfg.broker.idle_timeout_secs = parse_u64_str(&key, raw.trim())?
+            }
+            _ => unreachable!("field membership fixed by BROKER_FIELDS"),
+        }
+        origins.insert(format!("broker.{field}"), Origin::Env);
     }
     for lane in Lane::ALL {
         for field in LANE_FIELDS {
@@ -503,6 +586,38 @@ mod tests {
         }
     }
 
+    /// The leaked-daemon safety net is 300 seconds, and it is a *value* — not
+    /// whatever the constant happens to say today.
+    #[test]
+    fn the_broker_idle_timeout_defaults_to_five_minutes() {
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 300);
+        assert_eq!(BrokerConfig::default().idle_timeout_secs, 300);
+        assert_eq!(broker_env_key("idle_timeout_secs"), "A2A_BROKER_IDLE_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn the_broker_section_walks_its_keys_and_warns_on_unknown() {
+        let table: toml::Table = "[broker]\nidle_timeout_secs = 45\nbogus = 1\n"
+            .parse()
+            .unwrap();
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert_eq!(cfg.broker.idle_timeout_secs, 45);
+        assert_eq!(origins.get("broker.idle_timeout_secs"), Some(&Origin::File));
+        assert!(
+            warnings.iter().any(|w| w.contains("broker.bogus")),
+            "{warnings:?}"
+        );
+    }
+
     #[test]
     fn lane_env_keys_are_upper_cased_dotted_paths() {
         assert_eq!(
@@ -549,6 +664,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -582,6 +698,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");

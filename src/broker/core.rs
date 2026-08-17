@@ -169,6 +169,15 @@ pub enum CoreMsg {
     IdleCheck {
         reply: oneshot::Sender<IdleReport>,
     },
+    /// **The tell half of shutdown.** Flush every live worker to `orphaned`,
+    /// wait for the actors to have written it, then stop the child
+    /// (SIGTERM→SIGKILL). Handled inline on the registry task because it is the
+    /// one message that must see the registry stop changing underneath it.
+    Drain {
+        flush_grace: Duration,
+        child_grace: Duration,
+        reply: oneshot::Sender<DrainReport>,
+    },
     /// A worker reached a state nobody is waiting on. Wraps the `Settled`
     /// channel every `WorkerActor` announces on.
     WorkerSettled(Settled),
@@ -210,6 +219,34 @@ pub struct TailFrame {
     pub worker_id: String,
     pub envelope: Envelope,
 }
+
+/// What a [`CoreMsg::Drain`] did, phase by phase.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    /// Workers that were live and are now recorded `orphaned`.
+    pub orphaned: Vec<String>,
+    /// Workers whose actor was told to stop (a superset of `orphaned`: a
+    /// worker that had already settled is stopped without a state change).
+    pub stopped: Vec<String>,
+    /// False when the flush grace ran out with actors still running — their
+    /// snapshots may be a step behind, and that is worth knowing.
+    pub actors_finished: bool,
+    /// `terminated` | `killed` | `already-gone` | `none`
+    pub child: &'static str,
+}
+
+/// The states in which "the broker went away" is news worth recording.
+///
+/// Everything else either has no process to lose (`queued`, `spawned`) or has
+/// already stopped caring (`done`, `failed`, `cancelled`) — and the FSM would
+/// reject the row, which would turn a clean shutdown into a log full of
+/// rejections.
+pub const ORPHANABLE: [WorkerState; 4] = [
+    WorkerState::Running,
+    WorkerState::AwaitingInput,
+    WorkerState::Escalated,
+    WorkerState::Orphaned,
+];
 
 /// What the core knows about itself, for idle-shutdown (Task 10), `broker
 /// status` and tests.
@@ -289,6 +326,28 @@ impl CoreHandle {
 
     pub async fn idle(&self) -> Result<IdleReport, AppError> {
         self.ask(|reply| CoreMsg::IdleCheck { reply }).await
+    }
+
+    /// Flush every live worker and stop the child — the *tell* phase of
+    /// shutdown, before anything is cancelled.
+    pub async fn drain(
+        &self,
+        flush_grace: Duration,
+        child_grace: Duration,
+    ) -> Result<DrainReport, AppError> {
+        self.ask(move |reply| CoreMsg::Drain {
+            flush_grace,
+            child_grace,
+            reply,
+        })
+        .await
+    }
+
+    /// The root token. Every `WorkerActor` holds a `child_token` of it, so the
+    /// daemon can hang its own subsystem tokens off the same root instead of
+    /// growing a second tree that can be half-cancelled.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     /// Cancel everything and wait for every task the broker spawned — actors,
@@ -579,7 +638,13 @@ fn write_log(home: &Path, msg: LogMsg) {
     match msg {
         LogMsg::Line(value) => {
             if let Ok(mut f) = crate::exec::open_append_0600(&home.join(super::BROKER_JSONL)) {
-                let _ = writeln!(f, "{value}");
+                // ONE `write_all` of a whole line, never `writeln!`: the format
+                // machinery issues a syscall per piece, and `broker.jsonl` has
+                // more than one appender (the shutdown phases are written
+                // outside the runtime). Two interleaved partial writes produce
+                // a file whose lines are individually unparseable — the exact
+                // failure a "never dropped" log exists to prevent.
+                let _ = f.write_all(line_bytes(&value).as_slice());
             }
         }
         LogMsg::Health(health) => {
@@ -588,6 +653,13 @@ fn write_log(home: &Path, msg: LogMsg) {
             }
         }
     }
+}
+
+/// One JSON line, newline included — the unit every appender writes atomically.
+pub fn line_bytes(value: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    bytes.push(b'\n');
+    bytes
 }
 
 /// Redact every string in a value before it reaches `broker.jsonl`.
@@ -900,6 +972,14 @@ impl BrokerCore {
             CoreMsg::IdleCheck { reply } => {
                 let _ = reply.send(self.idle_report());
             }
+            CoreMsg::Drain {
+                flush_grace,
+                child_grace,
+                reply,
+            } => {
+                let report = self.drain(flush_grace, child_grace).await;
+                let _ = reply.send(report);
+            }
             CoreMsg::WorkerSettled(settled) => {
                 if let Some(worker) = self.workers.get_mut(&settled.id) {
                     worker.settled = true;
@@ -1083,6 +1163,101 @@ impl BrokerCore {
             });
         }
         self.publish_health().await;
+    }
+
+    // -- shutdown -----------------------------------------------------------
+
+    /// Flush the workers, then stop the child.
+    ///
+    /// The order inside is the whole value of this method:
+    ///
+    /// 1. every worker that still had something to lose is told it is being
+    ///    orphaned, then told to stop — through its own mailbox, so the two
+    ///    arrive in that order;
+    /// 2. the actors are *awaited*, because the snapshot is not on disk until
+    ///    the actor that owns the directory has folded it;
+    /// 3. and only then does the child die. A child killed first would fail
+    ///    every in-flight `thread/resume` and turn a graceful shutdown into a
+    ///    log full of transport errors.
+    async fn drain(&mut self, flush_grace: Duration, child_grace: Duration) -> DrainReport {
+        let mut report = DrainReport {
+            actors_finished: true,
+            child: "none",
+            ..DrainReport::default()
+        };
+        let workers: Vec<(String, WorkerHandle)> = self
+            .workers
+            .iter()
+            .map(|(id, w)| (id.clone(), w.handle.clone()))
+            .collect();
+
+        for (id, handle) in workers {
+            let snap = tokio::time::timeout(WORKER_HANDOFF_GRACE, handle.snapshot())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            if let Some(snap) = snap.filter(|s| ORPHANABLE.contains(&s.state)) {
+                let env = Envelope::new(
+                    snap.epoch,
+                    Transport::AppServer,
+                    EventClass::Lifecycle,
+                    EventKind::Orphaned,
+                    json!({"fsm": "OrphanDetected",
+                           "detail": "the broker shut down while this worker was live"}),
+                    Utc::now(),
+                );
+                if tokio::time::timeout(WORKER_HANDOFF_GRACE, handle.send(WorkerMsg::Envelope(env)))
+                    .await
+                    .is_ok()
+                {
+                    report.orphaned.push(id.clone());
+                }
+            }
+            let _ = tokio::time::timeout(WORKER_HANDOFF_GRACE, handle.shutdown()).await;
+            report.stopped.push(id);
+        }
+
+        let deadline = Instant::now() + flush_grace;
+        while !self.actors.is_empty() {
+            match tokio::time::timeout_at(deadline, self.actors.join_next_with_id()).await {
+                Ok(Some(exited)) => self.on_actor_exit(exited).await,
+                Ok(None) => break,
+                Err(_) => {
+                    report.actors_finished = false;
+                    break;
+                }
+            }
+        }
+        report.child = self.stop_child(child_grace).await;
+        report
+    }
+
+    /// SIGTERM, then SIGKILL if it insists.
+    ///
+    /// `kill_on_drop` would eventually do the SIGKILL half, but only the half:
+    /// an app-server that is mid-write to a rollout file deserves the chance to
+    /// finish, and a shutdown that only ever SIGKILLs is one that corrupts
+    /// state on every restart.
+    async fn stop_child(&mut self, grace: Duration) -> &'static str {
+        let Some(mut child) = self.child.take() else {
+            return "none";
+        };
+        self.health.child_pid = None;
+        let Some(pid) = child.id() else {
+            let _ = child.wait().await;
+            return "already-gone";
+        };
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        match tokio::time::timeout(grace, child.wait()).await {
+            Ok(_) => "terminated",
+            Err(_) => {
+                let _ = child.kill().await;
+                "killed"
+            }
+        }
     }
 
     fn idle_report(&self) -> IdleReport {

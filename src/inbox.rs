@@ -254,7 +254,11 @@ fn session_unknown() -> AppError {
 
 /// One block per message, tagged with its seq so the worker can tell a batch of
 /// two apart from one long message.
-fn render(pending: &[(u64, PathBuf, String)]) -> String {
+///
+/// `pub(crate)` because the app-server transport batches the same way: `send`
+/// hands the broker the rendered backlog rather than only the newest message,
+/// so `--queue-only` staging means the same thing on both transports.
+pub(crate) fn render(pending: &[(u64, PathBuf, String)]) -> String {
     let mut out = String::new();
     for (i, (seq, _, body)) in pending.iter().enumerate() {
         if i > 0 {

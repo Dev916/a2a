@@ -5,6 +5,7 @@ pub mod broker_cmd;
 pub mod config_show;
 pub mod doctor;
 pub mod gc;
+pub mod interrupt;
 pub mod kill;
 pub mod ls;
 pub mod result;

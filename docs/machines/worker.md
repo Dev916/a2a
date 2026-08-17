@@ -62,7 +62,7 @@ an explicit `Rejected` with an actionable reason (see [Rejections](#rejections))
 | `spawned` | `timeout` | `kind = start` | `failed{never_started}` | — | The start deadline; an exec/fork failure must not look healthy. |
 | `spawned` | `kill` | — | `cancelled` | — | Never `failed`. |
 | `running` | `session_identified` | — | `running` *(reason preserved)* | — | Self-loop; records `session_id` / `rollout_path` for resume. |
-| `running` | `send` | — | `running` *(reason preserved)* | **none** | The message only **queues**; delivery happens at the next turn boundary (§4.3). |
+| `running` | `send` | — | `running` *(reason preserved)* | **none** | On the exec transport the message only **queues**; delivery happens at the next turn boundary. The FSM emits no action; the app-server transport additionally steers the live turn broker-side (§4.3). |
 | `running` | `turn_ended` | `has_result` | `done` | — | Result wins over a question in the same turn. |
 | `running` | `turn_ended` | `!has_result && has_question` | `awaiting-input{blocked}` | — | The `outbox/<seq>.question.json` file, not the prose, drives this. |
 | `running` | `turn_ended` | `!has_result && !has_question` | `awaiting-input{turn_ended_without_result}` | — | Turn ended with nothing to show. |

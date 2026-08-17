@@ -681,7 +681,11 @@ impl WorkerActor {
                 snap.transport,
                 EventClass::Lifecycle,
                 EventKind::InboxDelivered,
-                json!({"watermark": watermark, "seqs": seqs, "path": path.as_str(),
+                // `send_path` names the door the message went through —
+                // `steered` (mid-turn), `started` (a fresh turn) or
+                // `retried_as_start` (a steer whose turn had already closed).
+                // It is the only durable record of which one it was.
+                json!({"watermark": watermark, "seqs": seqs, "send_path": path.as_str(),
                        "turn_id": turn_id, "pid": pid, "start_witness": witness}),
                 Utc::now(),
             );

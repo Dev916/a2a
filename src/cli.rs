@@ -100,6 +100,13 @@ pub enum Cmd {
         #[arg(long, value_enum, default_value_t = MsgKindArg::Answer)]
         kind: MsgKindArg,
     },
+    /// End the turn a worker is running right now, parking it in
+    /// awaiting-input{interrupted}. App-server transport only (exec workers
+    /// exit 9); a turn that already ended exits 0 with `data.noop`.
+    Interrupt {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+    },
     /// Stop a worker: witnessed group-kill, state → cancelled (never failed).
     /// Idempotent — a worker that is already terminal exits 0.
     Kill {

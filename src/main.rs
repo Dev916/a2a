@@ -40,6 +40,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Result { .. } => "result",
         Cmd::Wait { .. } => "wait",
         Cmd::Send { .. } => "send",
+        Cmd::Interrupt { .. } => "interrupt",
         Cmd::Kill { .. } => "kill",
         Cmd::Resume { .. } => "resume",
         Cmd::Gc { .. } => "gc",
@@ -132,6 +133,10 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.json,
                 cli.global.quiet,
             )
+        }
+        Cmd::Interrupt { id } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::interrupt::run(&home, id, cli.global.json, cli.global.quiet)
         }
         Cmd::Kill { id } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;

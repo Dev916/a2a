@@ -1,27 +1,41 @@
-//! `a2a send <id> <message>` — queue a message, deliver it at the turn
-//! boundary (spec §4.3, §4.7).
+//! `a2a send <id> <message>` — queue a message, deliver it as soon as the
+//! transport allows (spec §4.3, §4.7).
 //!
-//! Sending is two separable things, and the state machine decides which one
-//! happens:
+//! Sending is two separable things, and the state machine plus the transport
+//! decide which one happens:
 //!
 //! * **Queue** always. The message lands in `inbox/` before anything else can
 //!   fail, so `send` never loses an operator's words.
-//! * **Deliver** only from a turn boundary. `awaiting-input`/`escalated` carry
-//!   `Action::DeliverInbox`, so the message goes out immediately as a resumed
-//!   turn. A `running` worker is mid-turn and the exec transport has no way in:
-//!   the FSM row is `Running + Send → Running` with no action, and the queued
-//!   message is picked up by whoever observes the next turn end (`reconcile`).
+//! * **Deliver** at a turn boundary — or, on the live transport, *now*.
+//!   `awaiting-input`/`escalated` carry `Action::DeliverInbox`, so the message
+//!   goes out immediately as a resumed turn on either transport. A `running`
+//!   worker is mid-turn, and there the two transports genuinely differ: the
+//!   exec transport has no way in (the FSM row is `Running + Send → Running`
+//!   with no action, and the queued message is picked up by whoever observes
+//!   the next turn end), while the app-server transport steers the live turn
+//!   through the broker (`turn/steer`, spec §4.3).
+//!
+//! **Who delivers** follows from ownership, not from taste: an app-server
+//! worker's directory belongs to the broker's `WorkerActor`, and the CLI's
+//! reconcile is read-only over it. So this command queues and the *broker*
+//! delivers. With no broker to route through, it falls back to the Phase-1
+//! path, which queues without delivering — the worker's messages are still
+//! durable, and `a2a resume` picks them up.
 //!
 //! `--queue-only` is the batching escape hatch: a pure enqueue with no
-//! reconcile and no `step()` at all, so an orchestrator can stage several
-//! messages and let the final plain `send` carry the whole backlog in one turn.
+//! reconcile, no `step()` and no broker at all, so an orchestrator can stage
+//! several messages and let the final plain `send` carry the whole backlog in
+//! one turn. That holds on both transports — the broker is handed the rendered
+//! backlog, not just the newest message.
 //!
 //! A terminal worker rejects `Send` and the rejection is surfaced verbatim as
 //! `ILLEGAL_TRANSITION` (exit 9) — including the FSM's own remedy, which names
-//! `a2a resume` as the command that WOULD work.
+//! `a2a resume` as the command that WOULD work. That check runs BEFORE anything
+//! is queued, on both paths.
 
+use crate::brokerclient::{self, Handshake};
 use crate::config;
-use crate::events::EventKind;
+use crate::events::{EventKind, Transport};
 use crate::fold::append_and_fold;
 use crate::fsm::{self, Action, FsmEvent};
 use crate::home::A2aHome;
@@ -29,10 +43,11 @@ use crate::ids;
 use crate::inbox::{self, MsgKind};
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::{self, reconcile};
-use crate::state::{load_snapshot, save_snapshot};
+use crate::state::{load_snapshot, save_snapshot, WorkerSnapshot};
 use crate::store::EventLog;
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::path::Path;
 
 pub fn run(
     home: &A2aHome,
@@ -62,7 +77,7 @@ pub fn run(
         if !quiet {
             eprintln!("a2a: {id}: queued message {seq} (not delivered: --queue-only)");
         }
-        return Ok(Outcome::from(payload(&id, seq, false, json_mode)));
+        return Ok(Outcome::from(payload(&id, seq, false, None, json_mode)));
     }
 
     let snap = reconcile(home, &cfg, &id, Utc::now())?;
@@ -76,6 +91,18 @@ pub fn run(
             .remedy(rejected.reason)
         })?;
     let deliver_now = transition.actions.contains(&Action::DeliverInbox);
+
+    // The live transport: this worker's files AND its open turn belong to the
+    // broker, so the message is queued here and delivered there — mid-turn when
+    // a turn is open, as a fresh turn when one is not. `None` means there was no
+    // broker to route through, and the Phase-1 path below takes over.
+    if snap.transport == Transport::AppServer {
+        if let Some(outcome) =
+            send_via_broker(home, &id, &dir, &snap, message, from, kind, json_mode, quiet)?
+        {
+            return Ok(outcome);
+        }
+    }
 
     // Preconditions BEFORE the queue and the WAL: a `send` that cannot possibly
     // be delivered must not first move the worker to `running`.
@@ -143,17 +170,114 @@ pub fn run(
             }
         );
     }
-    Ok(Outcome::from(payload(&id, seq, deliver_now, json_mode)))
+    Ok(Outcome::from(payload(
+        &id,
+        seq,
+        deliver_now,
+        None,
+        json_mode,
+    )))
+}
+
+/// Hand the message to the broker that owns this worker.
+///
+/// `Ok(None)` = "not the broker's problem after all": the socket is switched
+/// off, no daemon is listening, or the one that is speaks another protocol.
+/// Each of those falls through to the Phase-1 path, and each is decided BEFORE
+/// anything is queued — so a fall-through cannot queue the message twice.
+///
+/// The queue leads the request on purpose: delivering, broker-side, also
+/// *acknowledges* this worker's inbox, so the operator's words must already be
+/// in it. Handing over the rendered backlog rather than the single new message
+/// is what keeps `--queue-only` staging meaningful on this transport.
+#[allow(clippy::too_many_arguments)]
+fn send_via_broker(
+    home: &A2aHome,
+    id: &str,
+    dir: &Path,
+    snap: &WorkerSnapshot,
+    message: &str,
+    from: &str,
+    kind: MsgKind,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Option<Outcome>, AppError> {
+    if brokerclient::disabled() {
+        return Ok(None);
+    }
+    let Ok(Some(handshake)) = brokerclient::try_handshake(home.root()) else {
+        return Ok(None); // no broker: the message waits in the queue
+    };
+    let Handshake::Ready(mut client) = handshake else {
+        return Ok(None); // a broker we cannot speak to: queue and say so
+    };
+
+    let seq = inbox::queue_message(dir, from, kind, message)
+        .map_err(|e| io_err("queueing the message", e))?;
+    let pending = inbox::undelivered(dir, snap.last_delivered_seq)
+        .map_err(|e| io_err("reading the inbox", e))?;
+    let text = inbox::render(&pending);
+
+    let answer = match client.request("send", json!({"id": id, "text": text})) {
+        Ok(v) => v,
+        // The daemon is up but does not own this worker (it was spawned against
+        // a previous instance). The message is already durable; whoever adopts
+        // the worker next delivers it.
+        Err(e) if e.code == "NO_SUCH_WORKER" => {
+            if !quiet {
+                eprintln!(
+                    "a2a: {id}: queued message {seq} (the broker is not tracking this worker yet)"
+                );
+            }
+            return Ok(Some(Outcome::from(payload(
+                id, seq, false, None, json_mode,
+            ))));
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Which door it went through is the broker's answer, and it is the same
+    // string the `inbox_delivered` envelope records.
+    let send_path = answer
+        .get("send_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if !quiet {
+        eprintln!(
+            "a2a: {id}: queued message {seq} and delivered it via the broker ({})",
+            send_path.as_deref().unwrap_or("delivered")
+        );
+    }
+    Ok(Some(Outcome::from(payload(
+        id,
+        seq,
+        true,
+        send_path.as_deref(),
+        json_mode,
+    ))))
 }
 
 /// stdout stays machine-readable: the full record under `--json`, the queued
 /// seq otherwise (an orchestrator's cursor into its own messages).
-fn payload(id: &str, seq: u64, delivered: bool, json_mode: bool) -> Value {
-    if json_mode {
-        json!({"id": id, "seq": seq, "queued": true, "delivered": delivered})
-    } else {
-        Value::String(seq.to_string())
+///
+/// `send_path` appears only when something was actually delivered over the live
+/// transport — an absent key means "nothing was steered", which is exactly what
+/// the exec transport and `--queue-only` mean.
+fn payload(
+    id: &str,
+    seq: u64,
+    delivered: bool,
+    send_path: Option<&str>,
+    json_mode: bool,
+) -> Value {
+    if !json_mode {
+        return Value::String(seq.to_string());
     }
+    let mut v = json!({"id": id, "seq": seq, "queued": true, "delivered": delivered});
+    if let (Some(obj), Some(path)) = (v.as_object_mut(), send_path) {
+        obj.insert("send_path".to_string(), json!(path));
+    }
+    v
 }
 
 fn io_err(ctx: &str, e: std::io::Error) -> AppError {

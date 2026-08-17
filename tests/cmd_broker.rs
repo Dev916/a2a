@@ -1084,6 +1084,55 @@ fn write_brief(dir: &Path, body: &str) -> PathBuf {
     p
 }
 
+/// **The convergence gate for steering (Task 12).** Poll the shipped
+/// `a2a --json tail` until the worker's WAL carries a `turn_started` envelope,
+/// so a `send` that follows is aimed at a turn that demonstrably exists. ≤10s
+/// at 50ms — never an instant assertion on an async turn.
+fn until_turn_started(home: &Path, allowed: &Path, scratch: &Path, id: &str) {
+    let deadline = Instant::now() + CONVERGE;
+    loop {
+        let tailed = run(a2a(home, allowed, &["--json", "tail", id]), scratch, "gate");
+        if tailed.code == 0
+            && tailed.data()["events"]
+                .as_array()
+                .is_some_and(|es| es.iter().any(|e| e["kind"] == json!("turn_started")))
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for a turn_started envelope for {id}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Files (not directories) directly under `inbox/` — the messages that are
+/// queued but not yet acknowledged.
+fn inbox_files(home: &Path, id: &str) -> usize {
+    std::fs::read_dir(home.join("workers").join(id).join("inbox"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn delivered_files(home: &Path, id: &str) -> usize {
+    std::fs::read_dir(home.join("workers").join(id).join("inbox/delivered"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+}
+
+/// The `inbox_delivered` rows a worker's WAL carries, newest last.
+fn deliveries_of(home: &Path, id: &str) -> Vec<Value> {
+    events_of(home, id)
+        .into_iter()
+        .filter(|e| e["kind"] == json!("inbox_delivered"))
+        .collect()
+}
+
 /// A client that speaks the wire by hand — the only way to send the broker a
 /// frame the CLI would never send (an out-of-roots cwd, for one).
 struct Raw {
@@ -1635,6 +1684,260 @@ fn a_dead_broker_orphans_its_workers_and_kill_never_signals_the_shared_child() {
     );
     let _ = stand_in.kill();
     let _ = stand_in.wait();
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+// ---------------------------------------------------------------------------
+// send, per transport (Task 12)
+// ---------------------------------------------------------------------------
+
+/// The live transport's headline: a message reaches a worker that is **already
+/// mid-turn**, through `turn/steer`, and the WAL says which door it went
+/// through.
+///
+/// The `hang-turn` fake holds its turn open until it is steered, so "the turn
+/// was live" is a fact the gate below establishes rather than a hope — and the
+/// worker converging to `done` afterwards is proof the steer landed.
+#[test]
+fn send_steers_a_running_app_server_worker_mid_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("FAKE_SCENARIO", "hang-turn");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    assert_eq!(spawned.data()["transport"], json!("app-server"));
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+
+    until_state(&home, &id, "running");
+    until_turn_started(&home, tmp.path(), &scratch, &id);
+
+    let sent = run(
+        a2a(&home, tmp.path(), &["--json", "send", &id, "use option B"]),
+        &scratch,
+        "send",
+    );
+    assert_eq!(sent.code, 0, "send: {}", sent.stderr);
+    let d = sent.data();
+    assert_eq!(d["queued"], json!(true), "{d}");
+    assert_eq!(d["delivered"], json!(true), "a live turn takes the message now: {d}");
+    assert_eq!(d["send_path"], json!("steered"), "mid-turn is the steer path: {d}");
+
+    // The event is the durable half of the same claim.
+    let deliveries = deliveries_of(&home, &id);
+    assert_eq!(deliveries.len(), 1, "one delivery: {deliveries:?}");
+    assert_eq!(deliveries[0]["raw"]["send_path"], json!("steered"), "{}", deliveries[0]);
+    assert_eq!(deliveries[0]["raw"]["seqs"], json!([1]), "{}", deliveries[0]);
+    assert_eq!(inbox_files(&home, &id), 0, "the message was acknowledged");
+    assert_eq!(delivered_files(&home, &id), 1);
+
+    // The steered turn completes, so the worker finishes — which is only
+    // possible if the steer actually reached the held-open turn.
+    until_state(&home, &id, "done");
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// Off a turn boundary there is no turn to steer, so the same command opens the
+/// answer turn instead — one `send`, two transports of one idea.
+#[test]
+fn send_to_a_parked_app_server_worker_starts_the_answer_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let scratch = tmp.path().join("scratch");
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "A or B?\n");
+
+    // The research lane is outbox-only, so the fake's question lands in the
+    // worker dir it was handed as `cwd`.
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "research", "--brief"],
+    );
+    cmd.arg(&brief).env("FAKE_SCENARIO", "blocked");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+
+    let parked = until_state(&home, &id, "awaiting-input");
+    assert_eq!(parked["state_reason"], json!("blocked"), "{parked}");
+
+    let sent = run(
+        a2a(&home, tmp.path(), &["--json", "send", &id, "option B"]),
+        &scratch,
+        "send",
+    );
+    assert_eq!(sent.code, 0, "send: {}", sent.stderr);
+    let d = sent.data();
+    assert_eq!(d["delivered"], json!(true), "{d}");
+    assert_eq!(
+        d["send_path"], json!("started"),
+        "no open turn means a new one, not a steer: {d}"
+    );
+
+    let deliveries = deliveries_of(&home, &id);
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert_eq!(deliveries[0]["raw"]["send_path"], json!("started"), "{}", deliveries[0]);
+    assert_eq!(inbox_files(&home, &id), 0, "the answer was acknowledged");
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// The regression pin: routing keys off the WORKER's transport, not off whether
+/// a broker happens to be reachable. An exec worker with a live broker in the
+/// same home still takes the Phase-1 queue path — running means queue-only, and
+/// no `send_path` is claimed, because nothing was steered.
+#[test]
+fn send_to_a_running_exec_worker_keeps_the_phase_one_queue_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    // A broker is up and reachable for the whole test; the exec worker below
+    // must never reach it.
+    run(a2a(&home, tmp.path(), &["broker", "run"]), &scratch, "run");
+    wait_for_broker(&home);
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--transport", "exec", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("A2A_CODEX_BIN", common::stub_path())
+        .env("STUB_SLEEP", "5");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    assert_eq!(spawned.data()["transport"], json!("exec"));
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+    until_state(&home, &id, "running");
+
+    let mut cmd = a2a(&home, tmp.path(), &["--json", "send", &id, "fyi: keep going"]);
+    cmd.env("A2A_CODEX_BIN", common::stub_path());
+    let sent = run(cmd, &scratch, "send");
+    assert_eq!(sent.code, 0, "send: {}", sent.stderr);
+    let d = sent.data();
+    assert_eq!(d["queued"], json!(true), "{d}");
+    assert_eq!(
+        d["delivered"], json!(false),
+        "exec has no way into a live turn: the message waits for the boundary: {d}"
+    );
+    assert!(
+        d.get("send_path").is_none(),
+        "nothing was steered, so nothing claims a steer path: {d}"
+    );
+    assert_eq!(inbox_files(&home, &id), 1, "the message is queued, not delivered");
+    assert!(
+        deliveries_of(&home, &id).is_empty(),
+        "no delivery was recorded: {:?}",
+        kinds_of(&home, &id)
+    );
+    // The broker never heard of it, either.
+    let list = run(
+        a2a(&home, tmp.path(), &["--json", "__broker-call", "list"]),
+        &scratch,
+        "list",
+    );
+    assert_eq!(
+        list.data()["workers"], json!([]),
+        "an exec worker is not the broker's: {}", list.stdout
+    );
+
+    drop(guard);
+    common::assert_no_broker_left(&home);
+}
+
+/// `--queue-only` is unchanged by the live transport: still a pure enqueue,
+/// still no delivery — and the next plain `send` carries the whole backlog into
+/// one steered turn, in seq order, exactly as the exec transport batches it.
+#[test]
+fn queue_only_stays_a_pure_enqueue_and_the_next_send_carries_the_backlog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&work).unwrap();
+    let guard = common::BrokerGuard::new(&home);
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "spawn", "--lane", "general", "--cwd"],
+    );
+    cmd.arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .env("FAKE_SCENARIO", "hang-turn");
+    let spawned = run(cmd, &scratch, "spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let id = spawned.data()["id"].as_str().unwrap().to_string();
+    until_state(&home, &id, "running");
+    until_turn_started(&home, tmp.path(), &scratch, &id);
+
+    for (tag, text) in [("q1", "part one"), ("q2", "part two")] {
+        let queued = run(
+            a2a(&home, tmp.path(), &["--json", "send", &id, text, "--queue-only"]),
+            &scratch,
+            tag,
+        );
+        assert_eq!(queued.code, 0, "{tag}: {}", queued.stderr);
+        assert_eq!(queued.data()["delivered"], json!(false), "{}", queued.stdout);
+        assert!(queued.data().get("send_path").is_none(), "{}", queued.stdout);
+    }
+    assert_eq!(inbox_files(&home, &id), 2, "two staged messages, nothing delivered");
+    assert!(
+        deliveries_of(&home, &id).is_empty(),
+        "--queue-only delivers nothing: {:?}",
+        kinds_of(&home, &id)
+    );
+    assert_eq!(
+        snap_of(&home, &id).unwrap()["state"], json!("running"),
+        "a staged message does not end the turn"
+    );
+
+    let sent = run(
+        a2a(&home, tmp.path(), &["--json", "send", &id, "part three"]),
+        &scratch,
+        "send",
+    );
+    assert_eq!(sent.code, 0, "send: {}", sent.stderr);
+    assert_eq!(sent.data()["send_path"], json!("steered"), "{}", sent.stdout);
+
+    let deliveries = deliveries_of(&home, &id);
+    assert_eq!(deliveries.len(), 1, "one delivery carried all three: {deliveries:?}");
+    assert_eq!(
+        deliveries[0]["raw"]["seqs"], json!([1, 2, 3]),
+        "the backlog travels in seq order: {}", deliveries[0]
+    );
+    assert_eq!(inbox_files(&home, &id), 0);
+    assert_eq!(delivered_files(&home, &id), 3);
+
+    until_state(&home, &id, "done");
 
     drop(guard);
     common::assert_no_broker_left(&home);

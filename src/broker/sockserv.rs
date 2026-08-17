@@ -672,7 +672,7 @@ async fn dispatch(
                 .send(&string_arg(body, "id")?, string_arg(body, "text")?)
                 .await
                 .map_err(|e| WireError::from_app(&e))?;
-            Ok(json!({"path": path.as_str()}))
+            Ok(json!({"send_path": path.as_str()}))
         }
         "interrupt" => {
             let outcome = ctx

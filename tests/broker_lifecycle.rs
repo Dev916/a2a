@@ -963,7 +963,7 @@ async fn one_subscription_per_connection_streams_a_workers_envelopes() {
     .unwrap();
 
     assert_eq!(second.code, wire::ERR_ALREADY_SUBSCRIBED);
-    assert_eq!(path["path"], json!("started"));
+    assert_eq!(path["send_path"], json!("started"));
     assert!(
         kinds.iter().any(|k| k == "TurnStarted") && kinds.iter().any(|k| k == "TurnCompleted"),
         "the subscription carried the turn, start to finish: {kinds:?}"

@@ -35,7 +35,7 @@
 //!    A task timeout also group-kills, via the recorded pid + start witness.
 
 use crate::config::Config;
-use crate::events::{map_exec_line, Envelope, EventClass, EventKind};
+use crate::events::{map_exec_line, Envelope, EventClass, EventKind, Transport};
 use crate::exec::{self, Liveness};
 use crate::fold::{self, append_and_fold, LivenessInput};
 use crate::fsm::{self, Action, FsmEvent, TimeoutKind, WorkerState};
@@ -142,75 +142,21 @@ fn reconcile_locked(
     //     process is confirmed gone falls through to the death branch, where it
     //     becomes `failed{no_result}` rather than a worker parked in
     //     awaiting-input with nobody home.
+    //
+    //     The conclusion itself lives in [`conclude_turn`], which the broker's
+    //     `WorkerActor` calls too. What stays HERE is the exec-only liveness
+    //     input: `death_observed` comes from `run.lock` and an `exit_code`
+    //     sentinel, neither of which an app-server worker has.
     let mut turn_concluded = false;
     if ingested.turn_completed && snap.state == WorkerState::Running {
-        // Turn-boundary delivery FIRST (spec §4.3): if the operator queued
-        // anything, this instant is when the transport can accept it, so the
-        // batch goes out and the worker keeps running. No `TurnEnded` is
-        // computed — a queued steer must not have to be followed by a manual
-        // `a2a send` to un-park the worker it was meant to steer.
-        if let Some(next) = deliver_at_turn_boundary(&mut log, dir, &snap, cfg, now)? {
-            snap = next;
-            // A worker we just restarted is emphatically not dead.
+        let has_result = has_result(dir);
+        let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
+        // A queued message concludes the turn by RESTARTING the worker, so it
+        // outranks the liveness verdict: a worker we are about to resume is
+        // emphatically not dead.
+        if has_pending_delivery(dir, &snap) || has_result || has_question || !death_observed {
+            snap = conclude_turn(&mut log, dir, snap, cfg, now, has_result, has_question)?;
             turn_concluded = true;
-        } else {
-            let has_result = has_result(dir);
-            let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
-            if has_result || has_question || !death_observed {
-                // The gate runs only when this turn actually produced a result
-                // AND the worker was spawned with a schema; everything else
-                // keeps the plain `result.md`-is-the-result rule (spec §4.3).
-                let gate = match (has_result, snap.schema_path.clone()) {
-                    (true, Some(schema)) => Some(schema_gate(dir, &schema)?),
-                    _ => None,
-                };
-                snap = match gate {
-                    // Failed the gate: the raw text is preserved, the worker
-                    // fails *resumably*, and `done` is never reached.
-                    Some(Gate::Violation { detail }) => {
-                        let detail = redact::redact_egress(&detail);
-                        commit(
-                            &mut log,
-                            dir,
-                            snap,
-                            EventKind::StateChange,
-                            json!({"fsm": "ResultInvalid", "detail": detail}),
-                            &FsmEvent::ResultInvalid {
-                                detail: detail.clone(),
-                            },
-                            now,
-                        )?
-                    }
-                    passed => {
-                        if let Some(Gate::Pass { path, rotated }) = passed {
-                            // Bookkeeping, not a transition: no `fsm` key, so
-                            // the fold consumes the seq and changes nothing.
-                            snap = append_and_fold(
-                                &mut log,
-                                dir,
-                                snap,
-                                EventKind::ResultWritten,
-                                json!({"path": path, "rotated_prior_to": rotated}),
-                                now,
-                            )?;
-                        }
-                        commit(
-                            &mut log,
-                            dir,
-                            snap,
-                            EventKind::StateChange,
-                            json!({"fsm": "TurnEnded", "has_result": has_result,
-                                   "has_question": has_question}),
-                            &FsmEvent::TurnEnded {
-                                has_result,
-                                has_question,
-                            },
-                            now,
-                        )?
-                    }
-                };
-                turn_concluded = true;
-            }
         }
     }
 
@@ -310,6 +256,104 @@ pub fn lock_state(dir: &Path) -> Result<Flock<File>, AppError> {
         ),
     )
     .remedy("re-run once the other command finishes; `a2a doctor` lists stale locks"))
+}
+
+// -------------------------------------------------------- the turn conclusion
+
+/// Conclude a turn that has ended: deliver at the boundary if anything is
+/// queued, otherwise run the §4.3 **schema gate** and commit `TurnEnded`.
+///
+/// Lifted out of [`reconcile_locked`] so the broker's `WorkerActor` concludes an
+/// app-server turn through *exactly* this code. The ordering is the part that
+/// must never diverge between transports: the gate runs BEFORE the `TurnEnded`
+/// commit, because a result that does not satisfy `--schema` has to land the
+/// worker in `failed{schema_violation}` — and `done` is absorbing, so there is
+/// no second chance to demote it afterwards.
+///
+/// `has_result`/`has_question` are inputs rather than observations so the caller
+/// can supply what it knows: reconcile reads `result.md` off disk
+/// ([`has_result`]), the actor writes `result.md` from the turn's own agent
+/// message first and then reads the same file. `has_question` must come from
+/// [`has_unanswered_question`] with the worker's delivery watermark — an
+/// ANSWERED question must not re-park the worker.
+///
+/// Exec-only liveness inputs stay at reconcile's call site: `run.lock` and the
+/// `exit_code` sentinel say nothing about a worker whose transport is a shared
+/// app-server child.
+///
+/// Preconditions the caller owns: `state.lock` is held, the worker is `running`,
+/// and its turn has ended.
+pub fn conclude_turn(
+    log: &mut EventLog,
+    dir: &Path,
+    snap: WorkerSnapshot,
+    cfg: &Config,
+    now: DateTime<Utc>,
+    has_result: bool,
+    has_question: bool,
+) -> Result<WorkerSnapshot, AppError> {
+    // Turn-boundary delivery FIRST (spec §4.3): if the operator queued
+    // anything, this instant is when the transport can accept it, so the batch
+    // goes out and the worker keeps running. No `TurnEnded` is computed — a
+    // queued steer must not have to be followed by a manual `a2a send` to
+    // un-park the worker it was meant to steer.
+    if let Some(next) = deliver_at_turn_boundary(log, dir, &snap, cfg, now)? {
+        return Ok(next);
+    }
+
+    // The gate runs only when this turn actually produced a result AND the
+    // worker was spawned with a schema; everything else keeps the plain
+    // `result.md`-is-the-result rule (spec §4.3).
+    let gate = match (has_result, snap.schema_path.clone()) {
+        (true, Some(schema)) => Some(schema_gate(dir, &schema)?),
+        _ => None,
+    };
+    match gate {
+        // Failed the gate: the raw text is preserved, the worker fails
+        // *resumably*, and `done` is never reached.
+        Some(Gate::Violation { detail }) => {
+            let detail = redact::redact_egress(&detail);
+            commit(
+                log,
+                dir,
+                snap,
+                EventKind::StateChange,
+                json!({"fsm": "ResultInvalid", "detail": detail}),
+                &FsmEvent::ResultInvalid {
+                    detail: detail.clone(),
+                },
+                now,
+            )
+        }
+        passed => {
+            let mut snap = snap;
+            if let Some(Gate::Pass { path, rotated }) = passed {
+                // Bookkeeping, not a transition: no `fsm` key, so the fold
+                // consumes the seq and changes nothing.
+                snap = append_and_fold(
+                    log,
+                    dir,
+                    snap,
+                    EventKind::ResultWritten,
+                    json!({"path": path, "rotated_prior_to": rotated}),
+                    now,
+                )?;
+            }
+            commit(
+                log,
+                dir,
+                snap,
+                EventKind::StateChange,
+                json!({"fsm": "TurnEnded", "has_result": has_result,
+                       "has_question": has_question}),
+                &FsmEvent::TurnEnded {
+                    has_result,
+                    has_question,
+                },
+                now,
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the ingest
@@ -449,7 +493,11 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
 /// that moment; without `--schema` nothing rewrites it, and reconcile is a read
 /// path that must not silently mutate modes. `doctor` (Task 19) is where a
 /// world-readable `result.md` gets reported.
-fn has_result(dir: &Path) -> bool {
+///
+/// `pub(crate)` for the broker: an app-server `WorkerActor` synthesizes
+/// `result.md` from the turn's final agent message and then asks this exact
+/// question about it, so "what counts as a result" keeps one definition.
+pub(crate) fn has_result(dir: &Path) -> bool {
     std::fs::metadata(dir.join("result.md"))
         .map(|m| m.len() > 0)
         .unwrap_or(false)
@@ -459,7 +507,13 @@ fn has_result(dir: &Path) -> bool {
 /// we delivered. A question whose seq cannot be determined counts as
 /// unanswered: parking a worker for a human is always recoverable, silently
 /// failing one that asked a question is not.
-fn has_unanswered_question(dir: &Path, last_answer_seq: u64) -> bool {
+///
+/// **The watermark argument is load-bearing** and both transports pass it: a
+/// worker that asked `outbox/1.question.json`, was answered, and ran another
+/// turn must reach `done` — dropping the argument would re-park it on the
+/// question it already had answered, forever. `pub` for the broker's
+/// `WorkerActor`, which asks the same question about the same files.
+pub fn has_unanswered_question(dir: &Path, last_answer_seq: u64) -> bool {
     let Ok(entries) = std::fs::read_dir(dir.join("outbox")) else {
         return false;
     };
@@ -534,6 +588,9 @@ fn session_missing(dir: &Path, epoch: u32) -> bool {
 /// A delivery that *starts* and then fails (no prompt file, no fork) IS an
 /// error: the worker's transport is broken, and silently reporting `done` on a
 /// turn we tried to extend would be a lie.
+///
+/// See [`has_pending_delivery`] for why an app-server worker never takes this
+/// path at all.
 fn deliver_at_turn_boundary(
     log: &mut EventLog,
     dir: &Path,
@@ -541,13 +598,8 @@ fn deliver_at_turn_boundary(
     cfg: &Config,
     now: DateTime<Utc>,
 ) -> Result<Option<WorkerSnapshot>, AppError> {
-    if snap.session_id.is_none() {
+    if !has_pending_delivery(dir, snap) {
         return Ok(None);
-    }
-    match inbox::undelivered(dir, snap.last_delivered_seq) {
-        Ok(pending) if pending.is_empty() => return Ok(None),
-        Err(_) => return Ok(None),
-        Ok(_) => {}
     }
     let delivery = inbox::deliver(dir, cfg, snap)?;
     Ok(Some(append_and_fold(
@@ -563,6 +615,29 @@ fn deliver_at_turn_boundary(
         }),
         now,
     )?))
+}
+
+/// Is there anything the turn boundary could hand to this worker right now?
+///
+/// Split out of [`deliver_at_turn_boundary`] so the ONE predicate answers both
+/// "should we deliver?" and reconcile's "does this turn conclude even though
+/// the process looks dead?" — two call sites that must never disagree.
+///
+/// Two deliberate `false`s: **no session id** (nothing to resume, so the
+/// messages stay queued and the worker parks where an operator can see them)
+/// and an **unreadable inbox** (park it; `doctor` reports the directory).
+///
+/// And one transport rule: an **app-server** worker is delivered to by its
+/// `WorkerActor` over the live transport (`turn/steer`), never by forking an
+/// exec child at the boundary. Its inbox is drained by the broker, so a
+/// reconcile that also forked one would double-drive the worker.
+fn has_pending_delivery(dir: &Path, snap: &WorkerSnapshot) -> bool {
+    if snap.transport == Transport::AppServer || snap.session_id.is_none() {
+        return false;
+    }
+    inbox::undelivered(dir, snap.last_delivered_seq)
+        .map(|pending| !pending.is_empty())
+        .unwrap_or(false)
 }
 
 // ------------------------------------------------------------ the schema gate
@@ -764,7 +839,11 @@ fn perform(snap: &WorkerSnapshot, action: Action) {
 
 /// Which deadline the current state is guarded by; `None` = no deadline is
 /// armed in this state, so an expiry is not ours to fire.
-fn timeout_kind(state: WorkerState) -> Option<TimeoutKind> {
+///
+/// `pub(crate)` for the broker: the `WorkerActor` fires ITS deadlines from the
+/// same table [`arm_deadline`] arms them from, so a broker-side timeout can
+/// never name a kind the FSM would reject.
+pub(crate) fn timeout_kind(state: WorkerState) -> Option<TimeoutKind> {
     match state {
         WorkerState::Spawned => Some(TimeoutKind::Start),
         WorkerState::Running => Some(TimeoutKind::Task),
@@ -773,7 +852,8 @@ fn timeout_kind(state: WorkerState) -> Option<TimeoutKind> {
     }
 }
 
-fn timeout_name(kind: TimeoutKind) -> &'static str {
+/// The wire spelling `fold::envelope_to_fsm_event` parses back.
+pub(crate) fn timeout_name(kind: TimeoutKind) -> &'static str {
     match kind {
         TimeoutKind::Start => "start",
         TimeoutKind::Task => "task",
@@ -813,6 +893,7 @@ fn io_err(ctx: &str, e: std::io::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::config::Lane;
+    use crate::fsm::StateReason;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -993,6 +1074,134 @@ mod tests {
         };
         assert!(detail.contains("gone.json"), "{detail}");
         assert!(tmp.path().join(RESULT_RAW).exists());
+    }
+
+    // ── conclude_turn: the extraction both transports share ───────────────
+
+    /// A worker dir with a `running` snapshot, its genesis event on disk, and
+    /// an open `EventLog` — the state `conclude_turn` is always called from.
+    fn running_worker(transport: Transport) -> (tempfile::TempDir, Config, WorkerSnapshot) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let (cfg, _, _) = crate::config::load(&home).unwrap();
+        let mut snap = WorkerSnapshot::new_for_test("general-0814t1300-aaaa", tmp.path());
+        snap.lane = Lane::General;
+        snap.transport = transport;
+        snap.state = WorkerState::Running;
+        snap.session_id = Some("sess-1".to_string());
+        std::fs::create_dir_all(tmp.path().join("outbox")).unwrap();
+        (tmp, cfg, snap)
+    }
+
+    fn ask_question(dir: &Path, seq: u64) {
+        std::fs::write(
+            dir.join(format!("outbox/{seq}.question.json")),
+            format!(r#"{{"seq":{seq},"question":"A or B?"}}"#).as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// The parity AC, at the level both transports go through: a question parks
+    /// the worker, and once the answer's seq is under the delivery watermark the
+    /// NEXT turn's result reaches `done`. The watermark is what makes the
+    /// difference — an answered question must not re-park the worker.
+    #[test]
+    fn an_answered_question_lets_the_next_turn_reach_done() {
+        let (tmp, cfg, snap) = running_worker(Transport::Exec);
+        let dir = tmp.path();
+        let mut log = EventLog::open(dir).unwrap();
+        ask_question(dir, 1);
+
+        // Turn 1: no result, one unanswered question → parked, blocked.
+        let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
+        assert!(has_question);
+        let mut snap = conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), false, has_question)
+            .unwrap();
+        assert_eq!(snap.state, WorkerState::AwaitingInput);
+        assert_eq!(snap.state_reason, Some(StateReason::Blocked));
+
+        // The answer is delivered: the watermark moves past the question's seq.
+        snap.state = WorkerState::Running;
+        snap.last_delivered_seq = 1;
+
+        // Turn 2 produced a result, and the SAME question file is still on disk.
+        std::fs::write(dir.join(RESULT_MD), b"the answer\n").unwrap();
+        let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
+        assert!(!has_question, "seq 1 was answered by delivery watermark 1");
+        let snap =
+            conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), has_result(dir), has_question)
+                .unwrap();
+        assert_eq!(snap.state, WorkerState::Done);
+        assert!(snap.extra.get("fold_rejections").is_none());
+    }
+
+    /// The gate runs BEFORE the `TurnEnded` commit, because `done` is absorbing.
+    #[test]
+    fn conclude_turn_gates_the_result_before_it_can_reach_done() {
+        let (tmp, cfg, mut snap) = running_worker(Transport::Exec);
+        let dir = tmp.path();
+        let schema = dir.join("schema.json");
+        std::fs::write(&schema, br#"{"type":"object","required":["status"]}"#).unwrap();
+        snap.schema_path = Some(schema);
+        std::fs::write(dir.join(RESULT_MD), b"not json at all").unwrap();
+        let mut log = EventLog::open(dir).unwrap();
+
+        let snap = conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), true, false).unwrap();
+        assert_eq!(snap.state, WorkerState::Failed);
+        assert_eq!(snap.failure_class, Some(crate::fsm::FailureClass::SchemaViolation));
+        assert!(dir.join(RESULT_RAW).exists(), "the raw text is preserved");
+        // `done` was never reached, so no `result.json` was ever published.
+        assert!(!dir.join(RESULT_JSON).exists());
+    }
+
+    /// A conforming result rotates, records `ResultWritten`, THEN commits the
+    /// transition — the ordering the exec path has always had.
+    #[test]
+    fn conclude_turn_records_result_written_before_turn_ended() {
+        let (tmp, cfg, mut snap) = running_worker(Transport::Exec);
+        let dir = tmp.path();
+        let schema = dir.join("schema.json");
+        std::fs::write(&schema, br#"{"type":"object","required":["status"]}"#).unwrap();
+        snap.schema_path = Some(schema);
+        std::fs::write(dir.join(RESULT_MD), br#"{"status":"pass"}"#).unwrap();
+        let mut log = EventLog::open(dir).unwrap();
+
+        let snap = conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), true, false).unwrap();
+        assert_eq!(snap.state, WorkerState::Done);
+        let kinds: Vec<EventKind> = crate::store::read_events(dir, 0)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec![EventKind::ResultWritten, EventKind::StateChange]);
+        assert!(dir.join(RESULT_JSON).exists());
+    }
+
+    /// An app-server worker's inbox is drained by its `WorkerActor` over the
+    /// live transport; reconcile must never fork an exec child for one.
+    #[test]
+    fn an_app_server_worker_is_never_delivered_to_by_forking() {
+        let (tmp, _cfg, snap) = running_worker(Transport::AppServer);
+        crate::inbox::queue_message(tmp.path(), "o", crate::inbox::MsgKind::Answer, "B").unwrap();
+        assert!(
+            !has_pending_delivery(tmp.path(), &snap),
+            "the broker owns this worker's inbox"
+        );
+        // The same queue on an exec worker IS reconcile's to deliver.
+        let exec = WorkerSnapshot {
+            transport: Transport::Exec,
+            ..snap
+        };
+        assert!(has_pending_delivery(tmp.path(), &exec));
+    }
+
+    #[test]
+    fn nothing_is_delivered_without_a_session_or_a_queue() {
+        let (tmp, _cfg, mut snap) = running_worker(Transport::Exec);
+        assert!(!has_pending_delivery(tmp.path(), &snap), "empty queue");
+        crate::inbox::queue_message(tmp.path(), "o", crate::inbox::MsgKind::Answer, "B").unwrap();
+        snap.session_id = None;
+        assert!(!has_pending_delivery(tmp.path(), &snap), "nothing to resume");
     }
 
     #[test]

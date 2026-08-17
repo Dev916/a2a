@@ -483,18 +483,55 @@ pub async fn send_message(
 /// its pending-call map lives inside the dispatcher task rather than behind a
 /// mutex. That is what lets the broker's source scan forbid `Arc<Mutex<…>>`
 /// outright.
+///
+/// The child's identity travels WITH the connection rather than beside it,
+/// because the two are replaced together: supervision restarts the child and
+/// publishes a fresh `AdapterRef` on a `watch` channel, so an actor that reads
+/// the current value gets the new pid and the new stdin in one atomic step —
+/// there is no window in which it could record the old pid against the new
+/// connection.
 #[derive(Clone)]
-pub struct AdapterRef(Arc<Client>);
+pub struct AdapterRef {
+    client: Arc<Client>,
+    pid: Option<u32>,
+    start_witness: String,
+}
 
 impl AdapterRef {
+    /// Without a recorded child identity — for probes and tests that never
+    /// write a `ProcessStarted` row.
     pub fn new(client: Arc<Client>) -> Self {
-        AdapterRef(client)
+        AdapterRef {
+            client,
+            pid: None,
+            start_witness: String::new(),
+        }
+    }
+
+    /// With the shared child's pid and its start-time witness
+    /// ([`crate::exec::start_witness`]). Recorded for observability: an
+    /// app-server worker's kill/timeout paths route through the broker and
+    /// NEVER group-kill this pid — it is shared by every worker.
+    pub fn with_child(client: Arc<Client>, pid: u32, start_witness: impl Into<String>) -> Self {
+        AdapterRef {
+            client,
+            pid: Some(pid),
+            start_witness: start_witness.into(),
+        }
     }
 
     /// The underlying connection, for the calls the actor does not make
     /// (`respond`, thread lifecycle).
     pub fn client(&self) -> &Arc<Client> {
-        &self.0
+        &self.client
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    pub fn start_witness(&self) -> &str {
+        &self.start_witness
     }
 
     pub async fn send_message(
@@ -503,7 +540,7 @@ impl AdapterRef {
         last_turn_id: Option<&str>,
         timeout: Duration,
     ) -> Result<SendOutcome, RpcError> {
-        send_message(&self.0, spec, last_turn_id, timeout).await
+        send_message(&self.client, spec, last_turn_id, timeout).await
     }
 
     pub async fn turn_start(
@@ -511,7 +548,7 @@ impl AdapterRef {
         spec: &TurnSpec<'_>,
         timeout: Duration,
     ) -> Result<TurnStarted, RpcError> {
-        turn_start(&self.0, spec, timeout).await
+        turn_start(&self.client, spec, timeout).await
     }
 
     pub async fn turn_interrupt(
@@ -520,7 +557,7 @@ impl AdapterRef {
         turn_id: &str,
         timeout: Duration,
     ) -> Result<(), RpcError> {
-        turn_interrupt(&self.0, thread_id, turn_id, timeout).await
+        turn_interrupt(&self.client, thread_id, turn_id, timeout).await
     }
 }
 

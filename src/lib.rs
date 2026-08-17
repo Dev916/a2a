@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod brief;
+pub mod broker;
 pub mod cli;
 pub mod commands;
 pub mod config;

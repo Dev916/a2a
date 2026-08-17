@@ -260,6 +260,10 @@ fn record_rejection(snap: &mut WorkerSnapshot, env: &Envelope, rejected: &fsm::R
 /// The WAL helper every mutating command goes through: append + fsync FIRST,
 /// then fold, then checkpoint (spec §4.6 ordering — the log leads, the
 /// snapshot follows, so a crash between them costs only a replay).
+///
+/// A convenience over [`append_envelope_and_fold`] for the overwhelmingly
+/// common case: a **lifecycle** envelope built from `snap`'s own epoch and
+/// transport, carrying an `{"fsm": …}` payload.
 pub fn append_and_fold(
     log: &mut store::EventLog,
     worker_dir: &Path,
@@ -276,9 +280,36 @@ pub fn append_and_fold(
         fsm_payload,
         now,
     );
-    log.append(&mut env)
+    append_envelope_and_fold(log, worker_dir, snap, &mut env, now)
+}
+
+/// The same append → fold → checkpoint sequence for an envelope the **caller**
+/// built, of any [`EventClass`].
+///
+/// The broker's `WorkerActor` needs this: an app-server notification arrives as
+/// a whole envelope (its `raw` is the notification's own params, which is what
+/// [`events::synthesize_result`] later reads), so there is nothing for
+/// [`append_and_fold`] to construct. `env` is taken by `&mut` because
+/// [`store::EventLog::append`] stamps the seq into it, and the caller needs the
+/// stamped envelope back (a trace-tail subscriber forwards exactly what was
+/// written).
+///
+/// Folding a non-lifecycle envelope is safe by construction:
+/// [`envelope_to_fsm_event`] returns `None` for anything that is not
+/// `lifecycle`, so a trace envelope routed here consumes its seq and changes no
+/// state. Pure trace envelopes should still go through
+/// [`store::EventLog::append`] directly — observability must never pay for a
+/// snapshot write, let alone drive the machine.
+pub fn append_envelope_and_fold(
+    log: &mut store::EventLog,
+    worker_dir: &Path,
+    snap: WorkerSnapshot,
+    env: &mut Envelope,
+    now: DateTime<Utc>,
+) -> Result<WorkerSnapshot, AppError> {
+    log.append(env)
         .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("appending event: {e}")))?;
-    let snap = fold(snap, std::slice::from_ref(&env), now);
+    let snap = fold(snap, std::slice::from_ref(env), now);
     save_snapshot(worker_dir, &snap)
         .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}")))?;
     Ok(snap)
@@ -506,6 +537,77 @@ mod tests {
         let on_disk = load_snapshot(dir).unwrap();
         assert_eq!(on_disk.state, WorkerState::Running);
         assert_eq!(on_disk.pid, Some(9));
+    }
+
+    /// The broker path: a caller-built envelope of ANY class goes through the
+    /// same append → fold → checkpoint sequence, and comes back stamped.
+    #[test]
+    fn append_envelope_and_fold_takes_a_caller_built_envelope_of_any_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let snap = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", dir);
+        let mut log = store::EventLog::open(dir).unwrap();
+
+        // An app-server notification envelope: `raw` is the notification's own
+        // params, and the fsm payload is merged into it.
+        let mut lifecycle = Envelope::new(
+            1,
+            Transport::AppServer,
+            EventClass::Lifecycle,
+            EventKind::StateChange,
+            json!({"fsm":"ProcessStarted","pid":31337,"start_witness":"w",
+                   "threadId":"t1"}),
+            Utc::now(),
+        );
+        let snap =
+            append_envelope_and_fold(&mut log, dir, snap, &mut lifecycle, Utc::now()).unwrap();
+        assert_eq!(lifecycle.seq, 1, "the caller's envelope is stamped in place");
+        assert_eq!(snap.state, WorkerState::Running);
+        assert_eq!(snap.pid, Some(31337));
+        assert_eq!(snap.last_applied_seq, 1);
+
+        // A trace envelope routed here consumes its seq and moves nothing:
+        // only `lifecycle` envelopes can ever reach the machine.
+        let mut trace = Envelope::new(
+            1,
+            Transport::AppServer,
+            EventClass::Trace,
+            EventKind::CommandExec,
+            json!({"fsm":"Kill","item":{"type":"commandExecution"}}),
+            Utc::now(),
+        );
+        let snap = append_envelope_and_fold(&mut log, dir, snap, &mut trace, Utc::now()).unwrap();
+        assert_eq!(trace.seq, 2);
+        assert_eq!(snap.state, WorkerState::Running, "trace never drives the FSM");
+        assert_eq!(snap.last_applied_seq, 2);
+        assert!(snap.extra.get("fold_rejections").is_none());
+
+        // Both halves of the WAL are on disk and agree.
+        assert_eq!(store::read_events(dir, 0).unwrap().len(), 2);
+        assert_eq!(load_snapshot(dir).unwrap().pid, Some(31337));
+    }
+
+    /// `append_and_fold` is now a thin wrapper: same log, same snapshot.
+    #[test]
+    fn append_and_fold_delegates_to_append_envelope_and_fold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let snap = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", dir);
+        let mut log = store::EventLog::open(dir).unwrap();
+        let snap = append_and_fold(
+            &mut log,
+            dir,
+            snap,
+            EventKind::StateChange,
+            json!({"fsm":"ProcessStarted","pid":9,"start_witness":"w"}),
+            Utc::now(),
+        )
+        .unwrap();
+        let written = &store::read_events(dir, 0).unwrap()[0];
+        assert_eq!(written.class, EventClass::Lifecycle);
+        assert_eq!(written.epoch, snap.epoch);
+        assert_eq!(written.transport, snap.transport);
+        assert_eq!(written.seq, 1);
     }
 
     #[test]

@@ -83,7 +83,7 @@ Design rule carried from the spec: `step()` and `fold()` are pure (clock injecte
 **Interfaces:**
 - Produces: `output::ExitCode` (repr(i32), the 11 pinned codes), `output::AppError { code: &'static str, message: String, retryable: bool, remedy: Option<String>, exit: ExitCode }` with `AppError::new(code, exit, msg)` and builder `.remedy(text)`, `output::emit_ok(json: bool, command: &str, data: serde_json::Value)`, `output::emit_err(json: bool, command: &str, err: &AppError) -> i32`, `cli::GlobalArgs { json: bool, home: Option<PathBuf>, quiet: bool }`. Every later command returns `Result<serde_json::Value, AppError>`; `main` does the only exit-code mapping.
 
-- [ ] **Step 1: Scaffold with pinned toolchain assumptions**
+- [x] **Step 1: Scaffold with pinned toolchain assumptions**
 
 ```bash
 cd ~/dev/a2a && cargo init --name a2a --edition 2021
@@ -96,7 +96,7 @@ cargo add --dev assert_cmd predicates tempfile
 grep -q 'edition = "2021"' Cargo.toml || sed -i '' 's/edition = ".*"/edition = "2021"/' Cargo.toml
 ```
 
-- [ ] **Step 2: Write the failing contract test**
+- [x] **Step 2: Write the failing contract test**
 
 ```rust
 // tests/cli_contract.rs
@@ -145,12 +145,12 @@ fn toolchain_is_pinned() {
 }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Run: `cargo test --test cli_contract`
 Expected: compile failure — `a2a::output` does not exist.
 
-- [ ] **Step 4: Implement output.rs, cli.rs, main.rs, lib.rs**
+- [x] **Step 4: Implement output.rs, cli.rs, main.rs, lib.rs**
 
 ```rust
 // src/output.rs
@@ -267,12 +267,12 @@ fn run(cli: &Cli) -> Result<serde_json::Value, AppError> {
 
 `src/lib.rs`: `pub mod output; pub mod cli;` (grows with each task).
 
-- [ ] **Step 5: Run tests to verify pass**
+- [x] **Step 5: Run tests to verify pass**
 
 Run: `cargo test --test cli_contract`
 Expected: 5 passed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -m "feat: scaffold a2a crate (edition 2021, pinned deps) with exit-code contract"
@@ -299,7 +299,7 @@ git add -A && git commit -m "feat: scaffold a2a crate (edition 2021, pinned deps
 **Interfaces:**
 - Produces: `home::A2aHome` with `pub fn resolve(flag: Option<&Path>) -> Result<A2aHome, AppError>` (flag > `$A2A_HOME` > `~/.a2a`; creates tree; gates on layout version), `pub fn root(&self) -> &Path`, `pub fn workers_dir(&self) -> PathBuf`, `pub fn worker_dir(&self, id: &str) -> PathBuf`, `pub fn worktrees_dir(&self) -> PathBuf`, `pub fn list_worker_ids(&self) -> std::io::Result<Vec<String>>`, `pub const LAYOUT_VERSION: u32 = 1`, `pub fn create_dir_0700(p: &Path) -> std::io::Result<()>`, and `pub fn write_new_0600(p: &Path) -> std::io::Result<std::fs::File>` (create+write+**truncate** — used for snapshots and one-shot files ONLY; the exec transport uses `exec::open_append_0600`, Task 11, for its streams).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 // tests/home_layout.rs
@@ -346,11 +346,11 @@ fn layout_version_mismatch_exits_9() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --test home_layout` — FAIL (`config show` unknown / home.rs missing).
 
-- [ ] **Step 3: Implement home.rs and wire the `config show` stub**
+- [x] **Step 3: Implement home.rs and wire the `config show` stub**
 
 ```rust
 // src/home.rs
@@ -417,9 +417,9 @@ fn io_err(e: std::io::Error) -> AppError { AppError::new("IO", ExitCode::Interna
 
 In `cli.rs` add `Config { #[command(subcommand)] cmd: ConfigCmd }` with `ConfigCmd::Show { #[arg(long)] origin: bool }`; in `main.rs` route it (for now) to `Ok(serde_json::json!({"home": home.root()}))` after `A2aHome::resolve(cli.global.home.as_deref())?`.
 
-- [ ] **Step 4: Run tests** — `cargo test --test home_layout` — 3 passed.
+- [x] **Step 4: Run tests** — `cargo test --test home_layout` — 3 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: A2A_HOME resolution with 0700 tree and layout-version gate"
@@ -477,7 +477,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, BTreeMap<String, Origin>, Vec<Str
 ```
 Lane defaults (spec §4.9, with the Phase-1 worktree exception): impl = workspace-write / network false / worktree_default **false** / gpt-5.5 / high; review = outbox-only / network false / gpt-5.5 / medium; research = outbox-only / network **true** / gpt-5.5 / medium; general = workspace-write / network false / gpt-5.5 / medium. Timeouts default 120/3600/1800. Env keys: `A2A_LANES_<LANE>_<FIELD>` (upper-cased) and top-level `A2A_ALLOWED_ROOTS` (colon-separated) / `A2A_CODEX_BIN`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/config_layering.rs
@@ -542,15 +542,15 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 2: Run to verify failure** — FAIL.
 
-- [ ] **Step 3: Implement config.rs + commands/config_show.rs**
+- [x] **Step 3: Implement config.rs + commands/config_show.rs**
 
 Mechanics (shape fixed by the Interfaces block): parse TOML into `toml::Value`, walk known keys into the typed struct collecting unknown key paths as warnings (no `deny_unknown_fields`); apply env overrides per key; track origins in a dotted-path map at each layer; `pub(crate) fn canonicalize_roots(raw: Vec<PathBuf>, warnings: &mut Vec<String>) -> Vec<PathBuf>` canonicalizes each entry and drops+warns on missing ones. `config_show::run` serializes `{home, lanes, allowed_roots, codex_bin}` (+ `origins` with `--origin`) and prints warnings to stderr as `a2a: warning: unknown config key: <key>`.
 
-- [ ] **Step 4: Run tests** — `cargo test --test config_layering && cargo test config::` — passed.
+- [x] **Step 4: Run tests** — `cargo test --test config_layering && cargo test config::` — passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: layered config with canonicalized roots, per-lane model/effort, origins"
@@ -574,7 +574,7 @@ git add -A && git commit -m "feat: layered config with canonicalized roots, per-
 **Interfaces:**
 - Produces: `ids::generate(lane: Lane, now: chrono::DateTime<chrono::Utc>) -> String`, `ids::is_valid(id: &str) -> bool` (also the gc traversal guard, Task 18), `ids::resolve(home: &A2aHome, prefix: &str) -> Result<String, AppError>`. Collision policy: `generate` is pure-random; **Task 12's spawn flow owns uniqueness** (retry loop against live dirs + tombstones).
 
-- [ ] **Step 1: Write failing unit tests (no process-env mutation — pass the home explicitly)**
+- [x] **Step 1: Write failing unit tests (no process-env mutation — pass the home explicitly)**
 
 ```rust
 // in src/ids.rs
@@ -608,9 +608,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test ids` — FAIL.
+- [x] **Step 2: Run to verify failure** — `cargo test ids` — FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 // src/ids.rs
@@ -646,9 +646,9 @@ pub fn resolve(home: &A2aHome, prefix: &str) -> Result<String, AppError> {
 
 (`Lane::Display` from Task 3 emits the lowercase name.)
 
-- [ ] **Step 4: Run tests** — `cargo test ids` — 2 passed.
+- [x] **Step 4: Run tests** — `cargo test ids` — 2 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: worker id generation and prefix resolution"
@@ -707,7 +707,7 @@ pub fn map_exec_line(raw: &serde_json::Value) -> Option<(EventClass, EventKind)>
 ```
 Mapping table (single source; Task 20's live run corrects it against the real vocabulary): any type containing `delta` → `None`; `session.created` | `session_configured` | `thread.started` → `(Lifecycle, SessionIdentified)`; `agent_message` → `(Lifecycle, AgentMessage)`; `turn.started` | `task_started` → `(Lifecycle, TurnStarted)`; `turn.completed` | `task_complete` → `(Lifecycle, TurnCompleted)`; types starting `exec_command`/`command` → `(Trace, CommandExec)`; types containing `tool` → `(Trace, ToolCall)`; `error` → `(Lifecycle, Error)`; anything else → `(Trace, Unknown)`.
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 ```rust
 #[cfg(test)]
@@ -737,10 +737,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test events` — FAIL.
-- [ ] **Step 3: Implement** per the interface block.
-- [ ] **Step 4: Run tests** — 2 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — `cargo test events` — FAIL.
+- [x] **Step 3: Implement** per the interface block.
+- [x] **Step 4: Run tests** — 2 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: normalized event envelope with open enums and exec-JSONL mapping"
@@ -777,7 +777,7 @@ impl EventLog {
 pub fn read_events(worker_dir: &Path, since_seq: u64) -> io::Result<Vec<events::Envelope>>;
 ```
 
-- [ ] **Step 1: Write the failing torture test**
+- [x] **Step 1: Write the failing torture test**
 
 ```rust
 // tests/store_torture.rs
@@ -842,9 +842,9 @@ fn open_repairs_torn_tail_so_later_appends_stay_readable() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL (store missing).
+- [x] **Step 2: Run to verify failure** — FAIL (store missing).
 
-- [ ] **Step 3: Implement store.rs**
+- [x] **Step 3: Implement store.rs**
 
 ```rust
 // src/store.rs
@@ -942,8 +942,8 @@ fn trailing_fragment(data: &[u8]) -> Option<&[u8]> {
 }
 ```
 
-- [ ] **Step 4: Run tests** — `cargo test --test store_torture` — 3 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Run tests** — `cargo test --test store_torture` — 3 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: crash-safe store (atomic writes; torn-tail-tolerant, self-repairing WAL)"
@@ -977,7 +977,7 @@ pub fn redact_egress(text: &str) -> String;                         // every mat
 ```
 Filename rules: `.env` + `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa*`, `credentials*`, `secrets*`. Value shapes (one compiled set shared by scan and redact): `sk-[A-Za-z0-9_-]{20,}`, `ghp_[A-Za-z0-9]{36}`, `xox[bcdp]-[A-Za-z0-9-]{10,}`, `AKIA[0-9A-Z]{16}`, `(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`, `-----BEGIN [A-Z ]*PRIVATE KEY-----`.
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 ```rust
 #[cfg(test)]
@@ -1021,10 +1021,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement** (`std::sync::LazyLock<Vec<(&'static str, Regex)>>`; `redact_egress` via `replace_all` with `|m: &regex::Captures| format!("[REDACTED:{}]", m[0].len())`).
-- [ ] **Step 4: Run tests** — 4 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement** (`std::sync::LazyLock<Vec<(&'static str, Regex)>>`; `redact_egress` via `replace_all` with `|m: &regex::Captures| format!("[REDACTED:{}]", m[0].len())`).
+- [x] **Step 4: Run tests** — 4 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: redaction module (ingress scan, filename refusal, egress masking)"
@@ -1107,7 +1107,7 @@ Complete row set (mirrored 1:1 in `docs/machines/worker.md`; anything not listed
 - `Orphaned + Resume → Running` (epoch+1) · `Orphaned + Kill → Cancelled` · `Orphaned + OrphanDetected → Orphaned` (idempotent).
 - `Done|Failed|Cancelled + Resume → Running` (epoch+1); everything else on terminal → Rejected ("worker is <state> — use `a2a resume`").
 
-- [ ] **Step 1: Write the failing table tests**
+- [x] **Step 1: Write the failing table tests**
 
 ```rust
 // tests/fsm_table.rs
@@ -1224,11 +1224,11 @@ fn every_state_reaches_terminal() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement `step()`** as one exhaustive match over per-state blocks — every event named in each block, no catch-alls (the source-scan test enforces it).
-- [ ] **Step 4: Write `docs/machines/worker.md`** — every Ok row + per-state Rejections section + Mermaid `stateDiagram-v2`. Header rule: *any PR changing `step()` updates this table and the tests; totality break = no merge.*
-- [ ] **Step 5: Run tests** — `cargo test --test fsm_table` — 7 passed.
-- [ ] **Step 6: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement `step()`** as one exhaustive match over per-state blocks — every event named in each block, no catch-alls (the source-scan test enforces it).
+- [x] **Step 4: Write `docs/machines/worker.md`** — every Ok row + per-state Rejections section + Mermaid `stateDiagram-v2`. Header rule: *any PR changing `step()` updates this table and the tests; totality break = no merge.*
+- [x] **Step 5: Run tests** — `cargo test --test fsm_table` — 7 passed.
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -m "feat: pure worker FSM with source-enforced totality + docs/machines/worker.md"
@@ -1307,7 +1307,7 @@ pub fn recover(worker_dir: &Path, live: LivenessInput, now: DateTime<Utc>)
     -> Result<WorkerSnapshot, AppError>;
 ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/fold_model.rs
@@ -1412,10 +1412,10 @@ fn recovery_table_cases() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement state.rs + fold.rs** per the Interfaces (the genesis special-case and rejection-recording are spelled out there; `recover` = `load_snapshot` (Corrupt → start from None) → fold events → if final state Running and `!process_alive` → apply `OrphanDetected`; truly empty dir → synthesize `Failed{NeverStarted}`).
-- [ ] **Step 4: Run tests** — `cargo test --test fold_model` — 5 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement state.rs + fold.rs** per the Interfaces (the genesis special-case and rejection-recording are spelled out there; `recover` = `load_snapshot` (Corrupt → start from None) → fold events → if final state Running and `!process_alive` → apply `OrphanDetected`; truly empty dir → synthesize `Failed{NeverStarted}`).
+- [x] **Step 4: Run tests** — `cargo test --test fold_model` — 5 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: versioned snapshot + WAL fold (genesis seeding, epoch fencing, recovery)"
@@ -1448,7 +1448,7 @@ pub fn validate(brief: &Brief, lane: Lane) -> Result<(), Vec<&'static str>>;  //
 pub fn sha256_hex(text: &str) -> String;
 ```
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 ```rust
 #[cfg(test)]
@@ -1488,10 +1488,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement** (front matter = leading `---\n…\n---\n` split; `serde_yaml` into an all-optional intermediate; `sha2::Sha256`).
-- [ ] **Step 4: Run tests** — 3 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement** (front matter = leading `---\n…\n---\n` split; `serde_yaml` into an all-optional intermediate; `sha2::Sha256`).
+- [x] **Step 4: Run tests** — 3 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: brief front-matter parsing with explicit per-lane validation table"
@@ -1547,7 +1547,7 @@ pub fn build_argv(spec: &SpawnSpec) -> Vec<String>;  // pure; pinned by tests
 `build_argv` argv elements, in order: `exec` (+ `resume <session>` when resuming), `--json`, `-C <cwd-or-scratch>`, `--output-last-message <worker>/result.md`, `-s workspace-write`, `--add-dir <worker>/outbox`, `["-c","approval_policy=\"never\""]`, `["-c","features.hooks=false"]`, `["-c","sandbox_workspace_write.network_access=<true|false>"]`, `-m <model>`, `["-c","model_reasoning_effort=\"<effort>\""]`, `--skip-git-repo-check`, (`--output-schema <path>` when set), `-`. For OutboxOnly the `-C` value is `<worker>/scratch` (spawn creates it) and the intended repo path is conveyed to the worker inside the brief as read-only context. NEVER `--ephemeral`.
 Shim contract (`__exec-shim <worker-dir> <epoch> <prompt-file> -- <bin> <args…>`): setsid'd group leader; opens+flocks `run.lock` (0600, exclusive, nonblock — a second shim for the same worker aborts); opens `exec.<epoch>.jsonl` and `stderr.log` via `open_append_0600`; opens the prompt file as the child's stdin; spawns the codex argv directly (`Command::arg`, no shell); waits; writes the exit code to `exit_code` via `write_atomic`; exits (kernel releases the lock).
 
-- [ ] **Step 1: Create the stub codex fixture**
+- [x] **Step 1: Create the stub codex fixture**
 
 ```bash
 mkdir -p tests/fixtures && cat > tests/fixtures/stub-codex <<'EOF'
@@ -1587,7 +1587,7 @@ EOF
 chmod +x tests/fixtures/stub-codex
 ```
 
-- [ ] **Step 2: Write the failing lifecycle tests**
+- [x] **Step 2: Write the failing lifecycle tests**
 
 ```rust
 // tests/exec_lifecycle.rs
@@ -1684,10 +1684,10 @@ fn kill_refuses_on_witness_mismatch_and_kills_group_on_match() {
 }
 ```
 
-- [ ] **Step 3: Run to verify failure** — FAIL.
-- [ ] **Step 4: Implement exec.rs + `__exec-shim`** per the Interfaces contract. Scrub list applied via `cmd.env_remove` in BOTH `spawn_detached` (shim) and the shim (codex child), AFTER applying `spec.env` — the scrub always wins. `spawn_detached` polls `liveness` (20ms × 250) before returning `SpawnedProc`; expiry → `AppError::new("NEVER_STARTED", ExitCode::Precondition, …)`.
-- [ ] **Step 5: Run tests** — `cargo test --test exec_lifecycle` — 3 passed.
-- [ ] **Step 6: Commit**
+- [x] **Step 3: Run to verify failure** — FAIL.
+- [x] **Step 4: Implement exec.rs + `__exec-shim`** per the Interfaces contract. Scrub list applied via `cmd.env_remove` in BOTH `spawn_detached` (shim) and the shim (codex child), AFTER applying `spec.env` — the scrub always wins. `spawn_detached` polls `liveness` (20ms × 250) before returning `SpawnedProc`; expiry → `AppError::new("NEVER_STARTED", ExitCode::Precondition, …)`.
+- [x] **Step 5: Run tests** — `cargo test --test exec_lifecycle` — 3 passed.
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -m "feat: detached exec transport (prompt-file stdin, per-epoch streams, env scrub, witnessed kill)"
@@ -1781,7 +1781,7 @@ fn a2a_lib_write_atomic(p: &Path, b: &[u8]) { a2a::store::write_atomic(p, b).unw
 ```
 (Note: `tests/common/mod.rs` is a module, not a test binary — cargo compiles it into each test crate that declares `mod common;`. The nix dev-dependency is needed: add `cargo add --dev nix@0.29 --features fs` in this task.)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_spawn.rs
@@ -1887,10 +1887,10 @@ fn brief_transport_and_elevation_gates() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement `commands/spawn.rs`** following the flow in the Interfaces block.
-- [ ] **Step 4: Run tests** — `cargo test --test cmd_spawn` — 7 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement `commands/spawn.rs`** following the flow in the Interfaces block.
+- [x] **Step 4: Run tests** — `cargo test --test cmd_spawn` — 7 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: a2a spawn (canonical allowlist, context staging, lane gates) + shared test helpers"
@@ -1939,7 +1939,7 @@ pub fn reconcile(home: &A2aHome, cfg: &Config, id: &str, now: DateTime<Utc>)
 ```
 `status` exit codes: done→0, failed→4, awaiting-input/escalated→5, spawned/queued/running→0, orphaned→10, cancelled→0.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_status.rs
@@ -2006,10 +2006,10 @@ fn just_spawned_worker_is_not_declared_dead_by_grace_rule() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement reconcile.rs + status.rs** per the Interfaces contract.
-- [ ] **Step 4: Run tests** — `cargo test --test cmd_status` — 6 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement reconcile.rs + status.rs** per the Interfaces contract.
+- [x] **Step 4: Run tests** — `cargo test --test cmd_status` — 6 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: reconcile-on-read (session capture, grace-guarded death, deadlines) + a2a status"
@@ -2032,7 +2032,7 @@ git add -A && git commit -m "feat: reconcile-on-read (session capture, grace-gua
 - Modify: `src/cli.rs`, `src/main.rs`, `src/commands/mod.rs`
 - Test: `tests/cmd_ls_tail.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_ls_tail.rs
@@ -2082,10 +2082,10 @@ fn tail_formats_filters_and_redacts_everywhere() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement ls.rs + tail.rs** (ls: reconcile each id, tolerate per-worker errors by showing `state: "unknown"` with the error in stderr; tail: `store::read_events` + kind filter unless `--raw`).
-- [ ] **Step 4: Run tests** — 2 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement ls.rs + tail.rs** (ls: reconcile each id, tolerate per-worker errors by showing `state: "unknown"` with the error in stderr; tail: `store::read_events` + kind filter unless `--raw`).
+- [x] **Step 4: Run tests** — 2 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: a2a ls (reconciled, dwell columns) and a2a tail (filtered, redacted, cursored)"
@@ -2109,7 +2109,7 @@ git add -A && git commit -m "feat: a2a ls (reconciled, dwell columns) and a2a ta
 - Modify: `src/cli.rs`, `src/main.rs`, `src/commands/mod.rs`, `src/reconcile.rs` (schema-gate + rotation on turn completion)
 - Test: `tests/cmd_result_wait.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_result_wait.rs
@@ -2187,10 +2187,10 @@ fn wait_any_returns_first_changed_id() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement** (wait = 500ms reconcile poll via `std::thread::sleep`; duration parser for `Ns/Nm/Nh` unit-tested in wait.rs; the schema gate lives in reconcile's TurnEnded handling).
-- [ ] **Step 4: Run tests** — 4 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement** (wait = 500ms reconcile poll via `std::thread::sleep`; duration parser for `Ns/Nm/Nh` unit-tested in wait.rs; the schema gate lives in reconcile's TurnEnded handling).
+- [x] **Step 4: Run tests** — 4 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: a2a result (schema gate + rotation) and a2a wait (state-encoded exits, multi-id)"
@@ -2234,7 +2234,7 @@ pub fn deliver_pending(home: &A2aHome, cfg: &Config, snap: &WorkerSnapshot)
 ```
 `send` flow: resolve → reconcile → `step(Send)`; on `Rejected` map to `ILLEGAL_TRANSITION` (exit 9, remedy from the rejection); on Ok queue the message; if the transition carried `Action::DeliverInbox` (awaiting-input/escalated), call `deliver_pending` and WAL-append the Send event; while RUNNING, queue only. `--queue-only` skips reconcile and `step()` entirely — it is a pure enqueue (no state transition, no delivery); the NEXT plain `send` (or turn boundary) delivers the whole backlog. Reconcile addition: when a turn ends and `undelivered(last_delivered_seq)` is non-empty, deliver before computing TurnEnded (a queued steer keeps the worker moving without operator action).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_send.rs
@@ -2323,11 +2323,11 @@ fn two_sends_one_delivery_in_order() {
 
 (`--queue-only` is a real flag on `send` — queue without triggering delivery; the orchestrator uses it to batch. Add it to the CLI surface.)
 
-- [ ] **Step 2: Extend the stub** — already done in Task 11 (question emission, resume recording, `--add-dir` parsing).
-- [ ] **Step 3: Run to verify failure** — FAIL.
-- [ ] **Step 4: Implement inbox.rs + send.rs + reconcile guard.**
-- [ ] **Step 5: Run tests** — 5 passed.
-- [ ] **Step 6: Commit**
+- [x] **Step 2: Extend the stub** — already done in Task 11 (question emission, resume recording, `--add-dir` parsing).
+- [x] **Step 3: Run to verify failure** — FAIL.
+- [x] **Step 4: Implement inbox.rs + send.rs + reconcile guard.**
+- [x] **Step 5: Run tests** — 5 passed.
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -m "feat: a2a send (file-authoritative BLOCKED, stdin delivery, delivered/ ack, batching)"
@@ -2354,7 +2354,7 @@ git add -A && git commit -m "feat: a2a send (file-authoritative BLOCKED, stdin d
 - Consumes: `exec::kill_worker`, `inbox::deliver_pending`, FSM `Kill`/`Resume` rows, reconcile.
 - Produces: `kill` = resolve → reconcile → if `snap.state.is_terminal()` return `Ok(json!({"already_terminal": true, "state": snap.state}))` → else `step(Kill)` → witnessed group-kill → WAL `Killed` event → snapshot. `resume` = resolve → reconcile → `session_id` presence gate (`SESSION_UNKNOWN`, exit 9) → `step(Resume)` (epoch_bump) → WAL `Resumed` (the fold applies the bump) → write the message (if any) to `prompt.md` → `spawn_detached` with `resume_session` + the NEW epoch → `ProcessStarted` event. Reconcile addition: for an epoch entered via Resume, `ProcessExited` with zero TurnStarted events ingested this epoch emits `SessionMissing` instead.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_kill_resume.rs
@@ -2422,10 +2422,10 @@ fn resume_that_dies_pre_turn_is_session_missing() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement kill.rs + resume.rs + the reconcile SessionMissing rule.**
-- [ ] **Step 4: Run tests** — 4 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement kill.rs + resume.rs + the reconcile SessionMissing rule.**
+- [x] **Step 4: Run tests** — 4 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: a2a kill (idempotent, witnessed) and a2a resume (epoch streams, session gates)"
@@ -2452,7 +2452,7 @@ git add -A && git commit -m "feat: a2a kill (idempotent, witnessed) and a2a resu
 **Interfaces:**
 - Consumes: reconcile (each candidate is reconciled first, so dead-but-unobserved workers become terminal before the decision), `ids::is_valid` (names failing it are skipped+warned; symlinked entries are skipped+warned via `symlink_metadata`), tombstone append O_APPEND to `index.jsonl`. `--age <dur>` uses the Task 15 duration parser.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_gc.rs
@@ -2513,10 +2513,10 @@ fn codex_home_is_never_touched() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement gc.rs.**
-- [ ] **Step 4: Run tests** — 4 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement gc.rs.**
+- [x] **Step 4: Run tests** — 4 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: a2a gc (terminal-only, tombstoned, traversal/symlink-guarded)"
@@ -2543,7 +2543,7 @@ git add -A && git commit -m "feat: a2a gc (terminal-only, tombstoned, traversal/
 - Modify: `src/cli.rs`, `src/main.rs`, `src/commands/mod.rs`
 - Test: `tests/cmd_doctor.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // tests/cmd_doctor.rs
@@ -2624,10 +2624,10 @@ fn orphaned_worker_surfaces_in_workers_health() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — FAIL.
-- [ ] **Step 3: Implement doctor.rs** (checks as a `Vec<fn(&Ctx) -> Check>` so later phases append without touching the runner).
-- [ ] **Step 4: Run tests** — 5 passed.
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify failure** — FAIL.
+- [x] **Step 3: Implement doctor.rs** (checks as a `Vec<fn(&Ctx) -> Check>` so later phases append without touching the runner).
+- [x] **Step 4: Run tests** — 5 passed.
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat: machine-readable a2a doctor with six phase-1 checks"
@@ -2651,8 +2651,8 @@ git add -A && git commit -m "feat: machine-readable a2a doctor with six phase-1 
 - Modify: `src/events.rs` (mapping fixes from the live run, if any)
 - Test: `tests/e2e_exec.rs`
 
-- [ ] **Step 1: Write the two always-on pipeline tests** (compose `common::*` helpers; assertions per the criteria above — full command sequences, no new helpers).
-- [ ] **Step 2: Write the gated smoke**
+- [x] **Step 1: Write the two always-on pipeline tests** (compose `common::*` helpers; assertions per the criteria above — full command sequences, no new helpers).
+- [x] **Step 2: Write the gated smoke**
 
 ```rust
 #[test]
@@ -2685,11 +2685,11 @@ fn real_codex_smoke() {
 }
 ```
 
-- [ ] **Step 3: Run `cargo test`** — all green, smoke skipped.
-- [ ] **Step 4: Run the smoke for real:** `A2A_E2E=1 cargo test --test e2e_exec -- --ignored --nocapture`. Fix `events::map_exec_line` against the observed vocabulary; comment the real type names next to the table; re-run to green.
-- [ ] **Step 5: Write README.md Quick Start.**
-- [ ] **Step 6: Install and hand-verify:** `cargo install --path . --root ~/.local && a2a doctor` (real machine, default home created, doctor reports codex 0.140 in range).
-- [ ] **Step 7: Commit**
+- [x] **Step 3: Run `cargo test`** — all green, smoke skipped.
+- [x] **Step 4: Run the smoke for real:** `A2A_E2E=1 cargo test --test e2e_exec -- --ignored --nocapture`. Fix `events::map_exec_line` against the observed vocabulary; comment the real type names next to the table; re-run to green.
+- [x] **Step 5: Write README.md Quick Start.**
+- [x] **Step 6: Install and hand-verify:** `cargo install --path . --root ~/.local && a2a doctor` (real machine, default home created, doctor reports codex 0.140 in range).
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A && git commit -m "feat: e2e pipelines (stub + gated real-codex smoke) and Quick Start docs"

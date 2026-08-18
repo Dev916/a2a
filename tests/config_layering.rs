@@ -242,3 +242,124 @@ fn unknown_broker_key_warns_but_succeeds() {
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["data"]["broker"]["idle_timeout_secs"], 7);
 }
+
+/// The `[sync]` section (spec §6): two allowlists and a path, with the same
+/// defaults < file < env precedence every other key obeys, named in `--origin`
+/// as `sync.allow_skills`, `sync.allow_http_header_servers` and
+/// `sync.claude_config_dir`.
+#[test]
+fn sync_allowlists_default_to_empty_and_name_their_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["sync"]["allow_skills"], serde_json::json!([]));
+    assert_eq!(
+        v["data"]["sync"]["allow_http_header_servers"],
+        serde_json::json!([]),
+        "nothing is allowlisted until an operator says so"
+    );
+    assert_eq!(v["data"]["sync"]["claude_config_dir"], serde_json::Value::Null);
+    for key in [
+        "sync.allow_skills",
+        "sync.allow_http_header_servers",
+        "sync.claude_config_dir",
+    ] {
+        assert_eq!(
+            v["data"]["origins"][key], "default",
+            "a value nobody set still says where it came from: {key}"
+        );
+    }
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[sync]\nallow_skills = [\"slack-cli\"]\nallow_http_header_servers = [\"ghl\"]\n\
+         claude_config_dir = \"/tmp/claude-from-file\"\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(
+        v["data"]["sync"]["allow_skills"],
+        serde_json::json!(["slack-cli"])
+    );
+    assert_eq!(
+        v["data"]["sync"]["allow_http_header_servers"],
+        serde_json::json!(["ghl"])
+    );
+    assert_eq!(v["data"]["sync"]["claude_config_dir"], "/tmp/claude-from-file");
+    assert_eq!(v["data"]["origins"]["sync.allow_skills"], "file");
+    assert_eq!(v["data"]["origins"]["sync.claude_config_dir"], "file");
+
+    // Env wins, and a list is comma-separated with blanks trimmed and empties
+    // dropped — a trailing comma is a typo, not an empty allowlist entry.
+    let v = show(
+        tmp.path(),
+        &[
+            ("A2A_SYNC_ALLOW_SKILLS", " x-cli , docusign ,"),
+            ("A2A_SYNC_ALLOW_HTTP_HEADER_SERVERS", "ghl,linear"),
+            ("A2A_SYNC_CLAUDE_CONFIG_DIR", "/tmp/claude-from-env"),
+        ],
+        true,
+    );
+    assert_eq!(
+        v["data"]["sync"]["allow_skills"],
+        serde_json::json!(["x-cli", "docusign"])
+    );
+    assert_eq!(
+        v["data"]["sync"]["allow_http_header_servers"],
+        serde_json::json!(["ghl", "linear"])
+    );
+    assert_eq!(v["data"]["sync"]["claude_config_dir"], "/tmp/claude-from-env");
+    for key in [
+        "sync.allow_skills",
+        "sync.allow_http_header_servers",
+        "sync.claude_config_dir",
+    ] {
+        assert_eq!(v["data"]["origins"][key], "env", "{key}");
+    }
+}
+
+/// An unknown key under `[sync]` warns like every other unknown key, and the
+/// allowlist beside it still applies.
+#[test]
+fn unknown_sync_key_warns_but_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[sync]\nallow_skills = [\"pr\"]\nallow_http_headers = [\"ghl\"]\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("sync.allow_http_headers"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["sync"]["allow_skills"], serde_json::json!(["pr"]));
+    assert_eq!(
+        v["data"]["sync"]["allow_http_header_servers"],
+        serde_json::json!([]),
+        "the near-miss spelling sets nothing"
+    );
+}
+
+/// A wrong-typed `[sync]` value fails loudly and names its dotted key — the
+/// same contract every other section carries.
+#[test]
+fn a_malformed_sync_allowlist_fails_naming_its_dotted_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("config.toml"), "[sync]\nallow_skills = 3\n").unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["config", "show"])
+        .assert()
+        .code(9);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("CONFIG_INVALID"), "{stderr}");
+    assert!(
+        stderr.contains("sync.allow_skills: expected an array of strings, got integer"),
+        "{stderr}"
+    );
+}

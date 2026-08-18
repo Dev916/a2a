@@ -63,6 +63,13 @@ pub const ADMISSION_FIELDS: [&str; 2] = ["global_cap", "queue_cap"];
 /// Every `[admission.lanes.<lane>]` key.
 pub const ADMISSION_LANE_FIELDS: [&str; 1] = ["cap"];
 
+/// Every `[sync]` key, in the order `config show --origin` reports them.
+pub const SYNC_FIELDS: [&str; 3] = [
+    "allow_skills",
+    "allow_http_header_servers",
+    "claude_config_dir",
+];
+
 /// Every per-lane key, in the order `config show --origin` reports them.
 pub const LANE_FIELDS: [&str; 8] = [
     "sandbox",
@@ -232,6 +239,38 @@ impl AdmissionConfig {
     }
 }
 
+/// The `[sync]` section: what `a2a sync` is allowed to mirror, and where it
+/// reads the Claude side from (spec §6).
+///
+/// Both lists are empty by default because both are *overrides of a refusal*:
+/// a skill is only mirrored into approval-free workers once somebody says it is
+/// safe to, and a server's literal headers only reach a git-published file once
+/// somebody says that file may carry them.
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone, Debug)]
+pub struct SyncConfig {
+    /// Skill directory names whose side-effecting classification is overridden.
+    pub allow_skills: Vec<String>,
+    /// SERVER names (e.g. `"ghl"`), **not** header names.
+    ///
+    /// The `_servers` suffix is deliberate: `header_env_var(server, header)`
+    /// sits right beside this key, and an allowlist that matched header names
+    /// would silently invert the decision — `["locationId"]` would allowlist
+    /// nothing at all while reading as though it had allowlisted the header it
+    /// names. A unit test pins both readings.
+    pub allow_http_header_servers: Vec<String>,
+    /// Where the Claude side lives (`~/.claude-revenium` for a second account).
+    /// `None` means "the home", which is the default account.
+    pub claude_config_dir: Option<PathBuf>,
+}
+
+impl SyncConfig {
+    /// Whether `server` may carry extra HTTP headers into the codex config.
+    /// Takes a SERVER name — see [`SyncConfig::allow_http_header_servers`].
+    pub fn allows_http_headers(&self, server: &str) -> bool {
+        self.allow_http_header_servers.iter().any(|s| s == server)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `A2A_CODEX_BIN` env / `codex_bin` config key; else `codex` on PATH.
@@ -244,6 +283,7 @@ pub struct Config {
     pub lanes: BTreeMap<Lane, LaneConfig>,
     pub broker: BrokerConfig,
     pub admission: AdmissionConfig,
+    pub sync: SyncConfig,
 }
 
 #[derive(Serialize, PartialEq, Clone, Copy, Debug)]
@@ -313,6 +353,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     for field in ADMISSION_FIELDS {
         origins.insert(format!("admission.{field}"), Origin::Default);
     }
+    for field in SYNC_FIELDS {
+        origins.insert(format!("sync.{field}"), Origin::Default);
+    }
 
     let mut lanes = BTreeMap::new();
     for lane in Lane::ALL {
@@ -331,6 +374,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
         lanes,
         broker: BrokerConfig::default(),
         admission: AdmissionConfig::default(),
+        sync: SyncConfig::default(),
     };
 
     let path = home.root().join("config.toml");
@@ -457,8 +501,44 @@ fn apply_file(
                     }
                 }
             }
+            "sync" => apply_sync_file(cfg, origins, warnings, value)?,
             other => warnings.push(format!("unknown config key: {other}")),
         }
+    }
+    Ok(())
+}
+
+/// `[sync]` — two allowlists and a path.
+///
+/// Walked by hand like every other section, for the same reason: a typo in an
+/// allowlist warns and the keys beside it still apply, so a misspelled skill
+/// name cannot take `a2a config show` (or a spawn) down with it.
+fn apply_sync_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value
+        .as_table()
+        .ok_or_else(|| cfg_err(format!("sync: expected a table, got {}", value.type_str())))?;
+    for (field, v) in fields {
+        let dotted = format!("sync.{field}");
+        if !SYNC_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        match field.as_str() {
+            "allow_skills" => cfg.sync.allow_skills = want_str_array(&dotted, v)?,
+            "allow_http_header_servers" => {
+                cfg.sync.allow_http_header_servers = want_str_array(&dotted, v)?
+            }
+            "claude_config_dir" => {
+                cfg.sync.claude_config_dir = Some(PathBuf::from(want_str(&dotted, v)?))
+            }
+            _ => unreachable!("field membership fixed by SYNC_FIELDS"),
+        }
+        origins.insert(dotted, Origin::File);
     }
     Ok(())
 }
@@ -534,6 +614,32 @@ fn want_str<'a>(key: &str, v: &'a toml::Value) -> Result<&'a str, AppError> {
         .ok_or_else(|| cfg_err(format!("{key}: expected a string, got {}", v.type_str())))
 }
 
+/// An array of strings, with the element that is not one named by the same
+/// dotted key as the array itself — `sync.allow_skills` is what an operator has
+/// to go and fix, not `sync.allow_skills[2]`.
+fn want_str_array(key: &str, v: &toml::Value) -> Result<Vec<String>, AppError> {
+    let arr = v.as_array().ok_or_else(|| {
+        cfg_err(format!(
+            "{key}: expected an array of strings, got {}",
+            v.type_str()
+        ))
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        out.push(
+            item.as_str()
+                .ok_or_else(|| {
+                    cfg_err(format!(
+                        "{key}: expected an array of strings, got {}",
+                        item.type_str()
+                    ))
+                })?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
 fn want_bool(key: &str, v: &toml::Value) -> Result<bool, AppError> {
     v.as_bool()
         .ok_or_else(|| cfg_err(format!("{key}: expected a boolean, got {}", v.type_str())))
@@ -607,6 +713,15 @@ pub fn admission_lane_env_key(lane: Lane, field: &str) -> String {
         lane.as_str().to_ascii_uppercase(),
         field.to_ascii_uppercase()
     )
+}
+
+/// `A2A_SYNC_<FIELD>` — the env spelling of one `[sync]` key.
+///
+/// Note what this does NOT cover: `A2A_SYNC_ALLOW_REAL_HOME` is a run-time
+/// opt-in read by `sync` itself, not a config key, so it never appears in
+/// `config show` and cannot be set from a config file.
+pub fn sync_env_key(field: &str) -> String {
+    format!("A2A_SYNC_{}", field.to_ascii_uppercase())
 }
 
 /// `A2A_LANES_<LANE>_<FIELD>` (upper-cased) plus top-level `A2A_ALLOWED_ROOTS`
@@ -687,7 +802,45 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
             origins.insert(format!("lanes.{lane}.{field}"), Origin::Env);
         }
     }
+    for field in SYNC_FIELDS {
+        let key = sync_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        match field {
+            "allow_skills" => cfg.sync.allow_skills = comma_list(&raw.to_string_lossy()),
+            "allow_http_header_servers" => {
+                cfg.sync.allow_http_header_servers = comma_list(&raw.to_string_lossy())
+            }
+            "claude_config_dir" => {
+                // An empty value is "unset", not "the current directory" —
+                // the same reading `doctor` gives an empty `CODEX_HOME`, and
+                // the one that cannot turn an exported-but-blank variable into
+                // a sync against a relative path. Taken as an OsString: a path
+                // is not required to be UTF-8.
+                if raw.is_empty() {
+                    continue;
+                }
+                cfg.sync.claude_config_dir = Some(PathBuf::from(raw));
+            }
+            _ => unreachable!("field membership fixed by SYNC_FIELDS"),
+        }
+        origins.insert(format!("sync.{field}"), Origin::Env);
+    }
     Ok(())
+}
+
+/// `A2A_SYNC_*` list values: comma-separated, blanks trimmed, empties dropped.
+///
+/// A trailing comma is a typo rather than an allowlist entry named "", and an
+/// allowlist with an empty name in it would match nothing while looking like it
+/// matched something.
+fn comma_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_bool_str(key: &str, s: &str) -> Result<bool, AppError> {
@@ -795,6 +948,7 @@ mod tests {
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -854,6 +1008,7 @@ mod tests {
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -893,6 +1048,7 @@ mod tests {
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
@@ -947,6 +1103,7 @@ mod tests {
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -982,6 +1139,7 @@ mod tests {
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
@@ -990,5 +1148,108 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// The `[sync]` section walks its keys like every other section: an
+    /// unknown one warns and the allowlist beside it still applies.
+    #[test]
+    fn the_sync_section_walks_its_keys_and_warns_on_unknown() {
+        let table: toml::Table = "[sync]\nallow_skills = [\"slack-cli\", \"pr\"]\n\
+                                  allow_http_header_servers = [\"ghl\"]\n\
+                                  claude_config_dir = \"/home/mike/.claude-revenium\"\n\
+                                  allow_http_headers = [\"locationId\"]\n"
+            .parse()
+            .unwrap();
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert_eq!(cfg.sync.allow_skills, ["slack-cli", "pr"]);
+        assert_eq!(cfg.sync.allow_http_header_servers, ["ghl"]);
+        assert_eq!(
+            cfg.sync.claude_config_dir,
+            Some(PathBuf::from("/home/mike/.claude-revenium"))
+        );
+        assert_eq!(origins.get("sync.allow_skills"), Some(&Origin::File));
+        assert_eq!(origins.get("sync.claude_config_dir"), Some(&Origin::File));
+        assert!(
+            warnings.iter().any(|w| w.contains("sync.allow_http_headers")),
+            "the near-miss spelling warns rather than silently doing nothing: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_sync_allowlist_names_its_dotted_key() {
+        for text in [
+            "[sync]\nallow_skills = 3\n",
+            "[sync]\nallow_skills = [\"ok\", 3]\n",
+        ] {
+            let table: toml::Table = text.parse().unwrap();
+            let mut cfg = Config {
+                codex_bin: None,
+                codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+                allowed_roots: vec![],
+                lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+                broker: BrokerConfig::default(),
+                admission: AdmissionConfig::default(),
+                sync: SyncConfig::default(),
+            };
+            let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
+            assert_eq!(err.code, "CONFIG_INVALID");
+            assert!(
+                err.message
+                    .contains("sync.allow_skills: expected an array of strings, got integer"),
+                "{}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn sync_env_keys_are_upper_cased_field_names() {
+        assert_eq!(SYNC_FIELDS.len(), 3);
+        assert_eq!(sync_env_key("allow_skills"), "A2A_SYNC_ALLOW_SKILLS");
+        assert_eq!(
+            sync_env_key("allow_http_header_servers"),
+            "A2A_SYNC_ALLOW_HTTP_HEADER_SERVERS"
+        );
+        assert_eq!(
+            sync_env_key("claude_config_dir"),
+            "A2A_SYNC_CLAUDE_CONFIG_DIR"
+        );
+        assert_eq!(comma_list(" x-cli , docusign ,"), ["x-cli", "docusign"]);
+        assert!(comma_list("  ").is_empty());
+    }
+
+    /// The allowlist holds SERVER names, not header names. Both readings are
+    /// plausible to somebody skimming the key, and they differ in the direction
+    /// that matters: matching header names would allowlist nothing while
+    /// reading as though it had allowlisted something.
+    #[test]
+    fn the_http_header_allowlist_holds_server_names_not_header_names() {
+        let by_server = SyncConfig {
+            allow_http_header_servers: vec!["ghl".to_string()],
+            ..Default::default()
+        };
+        assert!(by_server.allows_http_headers("ghl"));
+        assert!(!by_server.allows_http_headers("linear"));
+
+        let by_header = SyncConfig {
+            allow_http_header_servers: vec!["locationId".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !by_header.allows_http_headers("ghl"),
+            "naming the HEADER allowlists no server at all"
+        );
+        assert!(SyncConfig::default().allow_http_header_servers.is_empty());
     }
 }

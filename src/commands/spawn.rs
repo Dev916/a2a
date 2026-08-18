@@ -58,6 +58,7 @@
 use crate::brief::{self, Brief};
 use crate::brokerclient::{self, BrokerClient};
 use crate::cli::SpawnArgs;
+use crate::commands::owner;
 use crate::config::{self, Lane, LaneConfig, SandboxMode};
 use crate::events::{EventKind, Transport};
 use crate::exec::{self, SpawnSpec};
@@ -169,7 +170,7 @@ pub fn run(
     let model = args.model.clone().unwrap_or_else(|| lane_cfg.model.clone());
     let effort = args.effort.clone().unwrap_or_else(|| lane_cfg.effort.clone());
     let brief_sha = brief::sha256_hex(&brief_text);
-    let owner = resolve_owner();
+    let owner = owner::resolve(args.owner.as_deref());
     let now = Utc::now();
     let id = allocate_id(home, lane, now)?;
 
@@ -492,20 +493,6 @@ fn select_transport(home: &Path, requested: Requested) -> Result<Selected, AppEr
         Requested::AppServer if brokerclient::disabled() => Err(brokerclient::disabled_error()),
         Requested::AppServer => brokerclient::connect_or_start(home).map(Selected::AppServer),
     }
-}
-
-/// Who this worker belongs to.
-///
-/// Phase 2 records it at genesis so a rebuild is lossless; the `--owner` flag
-/// and the cross-owner guards land in Task 15. `anon-<uid>` rather than `None`
-/// because "unowned" already means something else on disk: a worker from before
-/// owners existed, which every caller may touch.
-fn resolve_owner() -> String {
-    std::env::var("A2A_OWNER")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("anon-{}", nix::unistd::getuid().as_raw()))
 }
 
 /// Ask the broker whether this worker may run yet (spec §4.9).

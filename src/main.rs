@@ -35,7 +35,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::ExecShim { .. } => "__exec-shim",
         Cmd::Spawn(_) => "spawn",
         Cmd::Status { .. } => "status",
-        Cmd::Ls => "ls",
+        Cmd::Ls { .. } => "ls",
         Cmd::Tail { .. } => "tail",
         Cmd::Result { .. } => "result",
         Cmd::Wait { .. } => "wait",
@@ -81,9 +81,9 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.quiet,
             )
         }
-        Cmd::Ls => {
+        Cmd::Ls { all } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            a2a::commands::ls::run(&home, cli.global.json, cli.global.quiet)
+            a2a::commands::ls::run(&home, *all, cli.global.json, cli.global.quiet)
         }
         Cmd::Tail {
             id,
@@ -133,6 +133,7 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             queue_only,
             from,
             kind,
+            force,
         } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::send::run(
@@ -142,31 +143,44 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 from,
                 (*kind).into(),
                 *queue_only,
+                *force,
                 cli.global.json,
                 cli.global.quiet,
             )
         }
-        Cmd::Interrupt { id } => {
+        Cmd::Interrupt { id, force } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            a2a::commands::interrupt::run(&home, id, cli.global.json, cli.global.quiet)
+            a2a::commands::interrupt::run(&home, id, *force, cli.global.json, cli.global.quiet)
         }
-        Cmd::Kill { id } => {
+        Cmd::Kill { id, force } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            a2a::commands::kill::run(&home, id, cli.global.json, cli.global.quiet)
+            a2a::commands::kill::run(&home, id, *force, cli.global.json, cli.global.quiet)
         }
-        Cmd::Resume { id, message } => {
+        Cmd::Resume {
+            id,
+            message,
+            force,
+        } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::resume::run(
                 &home,
                 id,
                 message.as_deref(),
+                *force,
                 cli.global.json,
                 cli.global.quiet,
             )
         }
-        Cmd::Gc { age, dry_run } => {
+        Cmd::Gc { age, dry_run, all } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            a2a::commands::gc::run(&home, *age, *dry_run, cli.global.json, cli.global.quiet)
+            a2a::commands::gc::run(
+                &home,
+                *age,
+                *dry_run,
+                *all,
+                cli.global.json,
+                cli.global.quiet,
+            )
         }
         // The one command that resolves its own home: a layout mismatch is a
         // finding doctor must report, not an error that stops it running.

@@ -57,11 +57,19 @@
 //! `doctor` reports their size; gc does not touch them, which is why nothing in
 //! this file so much as reads the variable.
 //!
+//! **Somebody else's worker is not gc's to reclaim** (spec §4.8). The sweep
+//! covers the caller's own workers plus every unowned one — the same population
+//! `ls` shows by default and the same one the mutating commands allow — and
+//! `--all` widens it to the machine. A worker held back for that reason is
+//! reported in `kept`, exactly like a non-terminal one: gc that silently skips
+//! things is gc that leaves an operator wondering where their disk went.
+//!
 //! Phase 4 adds the worktree rule from spec §7 (refuse to reclaim a worker whose
 //! git worktree is dirty or unmerged without `--force`); Phase 1 workers have no
 //! worktrees, so there is nothing yet to refuse.
 
 use crate::commands::ls::last_event_ts;
+use crate::commands::owner;
 use crate::config;
 use crate::home::A2aHome;
 use crate::ids;
@@ -83,10 +91,16 @@ pub const INDEX_FILE: &str = "index.jsonl";
 /// once so the stderr line and the `--json` payload cannot drift apart.
 const NON_TERMINAL_REMEDY: &str = "stop it first with `a2a kill <id>` (or let it finish), then re-run gc — gc never removes a worker that is still actionable";
 
+/// ...and for a worker that belongs to somebody else. Same shape, same reason:
+/// the `kept` row has to say what would change the answer.
+const NOT_OWNER_REMEDY: &str =
+    "re-run with `--all` to sweep the whole machine, or as that owner (`A2A_OWNER=<owner> a2a gc`)";
+
 pub fn run(
     home: &A2aHome,
     age: Duration,
     dry_run: bool,
+    all: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
@@ -104,6 +118,9 @@ pub fn run(
     // a long gc cannot reap a worker that was too young when it started.
     let now = Utc::now();
     let age_secs = age.as_secs() as i64;
+    // One caller identity for the whole sweep, for the same reason there is one
+    // clock: a scope that could shift mid-sweep is not a scope.
+    let caller = owner::caller();
 
     let mut reclaimable: Vec<Candidate> = Vec::new();
     let mut kept: Vec<Value> = Vec::new();
@@ -155,6 +172,18 @@ pub fn run(
                 continue;
             }
         };
+        // Ownership before terminality: a worker somebody else owns is not this
+        // caller's to judge, whatever state it is in.
+        if !all && !owner::permitted(snap.owner.as_deref(), &caller) {
+            kept.push(json!({
+                "id": name,
+                "state": snap.state.as_str(),
+                "owner": snap.owner,
+                "reason": "not owner",
+                "remedy": NOT_OWNER_REMEDY,
+            }));
+            continue;
+        }
         if !snap.state.is_terminal() {
             kept.push(json!({
                 "id": name,
@@ -228,6 +257,8 @@ pub fn run(
         json!({
             "dry_run": dry_run,
             "age_secs": age_secs,
+            "all": all,
+            "caller": caller,
             "reclaimable": reclaimable.iter().map(Candidate::to_json).collect::<Vec<_>>(),
             "reclaimable_bytes": reclaimable_bytes,
             "eligible": eligible.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),

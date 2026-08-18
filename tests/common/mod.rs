@@ -18,12 +18,22 @@ pub fn stub_path() -> PathBuf {
 /// these tests still assert Phase-1 behaviour rather than "whatever the broker
 /// happened to do". Broker tests opt in through [`a2a_broker`], which removes
 /// it.
+///
+/// `A2A_OWNER=test-owner` is the other determinism pin (spec §4.8): without it
+/// a worker's owner would be `anon-<uid>` — different on every machine, and
+/// different again inside a container — and every test that spawns then mutates
+/// would depend on the *ambient* environment agreeing with itself. One fixed
+/// owner for both halves means the owner guard is exercised on the happy path
+/// by every existing test, and asserted deliberately in `tests/owner_scope.rs`.
+pub const TEST_OWNER: &str = "test-owner";
+
 pub fn a2a(home: &Path, allowed_root: &Path) -> Command {
     let mut c = Command::cargo_bin("a2a").unwrap();
     c.env("A2A_HOME", home)
         .env("A2A_CODEX_BIN", stub_path())
         .env("A2A_ALLOWED_ROOTS", allowed_root)
         .env("A2A_BROKER_DISABLE", "1")
+        .env("A2A_OWNER", TEST_OWNER)
         // Determinism under the test harness: `exec::spawn_detached` would
         // otherwise resolve the shim relative to the running executable.
         .env("A2A_SHIM_BIN", assert_cmd::cargo::cargo_bin("a2a"));

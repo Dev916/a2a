@@ -34,6 +34,7 @@
 //! is queued, on both paths.
 
 use crate::brokerclient::{self, Handshake};
+use crate::commands::owner;
 use crate::config;
 use crate::events::{EventKind, Transport};
 use crate::fold::append_and_fold;
@@ -49,6 +50,10 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::path::Path;
 
+// Every argument here is a distinct CLI flag; bundling them into a struct would
+// move the same list one file to the left (the same call the two helpers below
+// already make).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     home: &A2aHome,
     id_arg: &str,
@@ -56,6 +61,7 @@ pub fn run(
     from: &str,
     kind: MsgKind,
     queue_only: bool,
+    force: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
@@ -72,6 +78,16 @@ pub fn run(
     // it is legal from ANY state, including one that would reject `Send`. The
     // orchestrator uses it to batch; nothing about the worker changes.
     if queue_only {
+        // The one guard on this path, and it deliberately does NOT reconcile:
+        // `--queue-only` is legal from any state, so the snapshot is read only
+        // for its owner. A worker with no readable snapshot is treated as
+        // unowned — the same way the fold treats a missing owner key — because
+        // an unreadable checkpoint must not become an accidental lock.
+        owner::guard(
+            &id,
+            load_snapshot(&dir).ok().and_then(|s| s.owner).as_deref(),
+            force,
+        )?;
         let seq = inbox::queue_message(&dir, from, kind, message)
             .map_err(|e| io_err("queueing the message", e))?;
         if !quiet {
@@ -81,6 +97,10 @@ pub fn run(
     }
 
     let snap = reconcile(home, &cfg, &id, Utc::now())?;
+    // Before the machine is consulted: a caller who does not own this worker
+    // must not learn its state from an `ILLEGAL_TRANSITION` remedy, and must
+    // certainly not have their message queued on the way to being refused.
+    owner::guard(&id, snap.owner.as_deref(), force)?;
     let transition = fsm::step(snap.state, snap.state_reason, &FsmEvent::Send)
         .map_err(|rejected| {
             AppError::new(

@@ -40,6 +40,7 @@
 //! out when this resumed turn ends. `answer_queued` in the WAL records that a
 //! backlog was waiting when the resume happened.
 
+use crate::commands::owner;
 use crate::config;
 use crate::events::EventKind;
 use crate::exec::{self, SpawnSpec};
@@ -66,6 +67,7 @@ pub fn run(
     home: &A2aHome,
     id_arg: &str,
     message: Option<&str>,
+    force: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
@@ -79,6 +81,9 @@ pub fn run(
     let dir = home.worker_dir(&id);
 
     let snap = reconcile(home, &cfg, &id, Utc::now())?;
+    // Ahead of the session gate: whether this worker COULD be resumed is not
+    // the caller's business until it is established that they may (spec §4.8).
+    owner::guard(&id, snap.owner.as_deref(), force)?;
     session_of(&snap, &id)?;
     let answer_queued = inbox::undelivered(&dir, snap.last_delivered_seq)
         .map(|pending| !pending.is_empty())

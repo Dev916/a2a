@@ -51,7 +51,13 @@ pub enum Cmd {
         broker: bool,
     },
     /// List every worker (reconciling each): id, lane, state, dwell, last-event age
-    Ls,
+    Ls {
+        /// Include workers owned by somebody else, and print an OWNER column.
+        /// Without it the listing is your own workers plus every unowned one
+        /// (spec §4.8).
+        #[arg(long)]
+        all: bool,
+    },
     /// Print a worker's events: `<seq> <ts> <kind>`, lifecycle only by default
     Tail {
         /// Worker id, or any unambiguous prefix of one
@@ -111,6 +117,9 @@ pub enum Cmd {
         /// answer (responds to an outbox question) | steer (mid-flight guidance)
         #[arg(long, value_enum, default_value_t = MsgKindArg::Answer)]
         kind: MsgKindArg,
+        /// Act on a worker owned by somebody else (spec §4.8)
+        #[arg(long)]
+        force: bool,
     },
     /// End the turn a worker is running right now, parking it in
     /// awaiting-input{interrupted}. App-server transport only (exec workers
@@ -118,12 +127,18 @@ pub enum Cmd {
     Interrupt {
         /// Worker id, or any unambiguous prefix of one
         id: String,
+        /// Act on a worker owned by somebody else (spec §4.8)
+        #[arg(long)]
+        force: bool,
     },
     /// Stop a worker: witnessed group-kill, state → cancelled (never failed).
     /// Idempotent — a worker that is already terminal exits 0.
     Kill {
         /// Worker id, or any unambiguous prefix of one
         id: String,
+        /// Act on a worker owned by somebody else (spec §4.8)
+        #[arg(long)]
+        force: bool,
     },
     /// Continue a parked or terminal worker in a NEW epoch, resuming its codex
     /// session
@@ -133,6 +148,9 @@ pub enum Cmd {
         /// Extra instruction for the resumed turn. Never appears in argv of the
         /// codex child — it travels through a 0600 prompt file on stdin.
         message: Option<String>,
+        /// Act on a worker owned by somebody else (spec §4.8)
+        #[arg(long)]
+        force: bool,
     },
     /// Reclaim finished workers' directories, leaving a tombstone per removal.
     /// Terminal states only — a worker that is still actionable is never
@@ -146,6 +164,10 @@ pub enum Cmd {
         /// List what would be reclaimed and exit, deleting nothing
         #[arg(long)]
         dry_run: bool,
+        /// Also reclaim workers owned by somebody else. Without it gc sweeps
+        /// your own workers plus every unowned one (spec §4.8).
+        #[arg(long)]
+        all: bool,
     },
     /// Check the environment a worker would be spawned into: one line per
     /// check, exit 9 if any of them fails
@@ -224,6 +246,10 @@ pub struct SpawnArgs {
     /// Fail rather than queue at the admission cap (Phase 2; no-op today)
     #[arg(long)]
     pub no_queue: bool,
+    /// Who this worker belongs to (default: `$A2A_OWNER`, else `anon-<uid>`).
+    /// Recorded at genesis, so it survives losing `state.json` (spec §4.8).
+    #[arg(long)]
+    pub owner: Option<String>,
 }
 
 /// clap-facing mirror of [`crate::inbox::MsgKind`]; the domain enum stays free

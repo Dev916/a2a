@@ -19,10 +19,16 @@
 //! filesystem observation that does not depend on reconcile succeeding, and it
 //! is exactly the column you want when diagnosing a stuck worker.
 //!
-//! Owner filtering (`--all`, spec §4.8) lands with the broker in Phase 2, when
-//! `A2A_OWNER` is first recorded at spawn; today every worker is unowned and a
-//! filter flag would be surface with nothing behind it.
+//! **Owner filtering (`--all`, spec §4.8).** The default listing is the
+//! caller's own workers plus every *unowned* one, because a fleet view that
+//! shows another orchestrator's forty workers is a fleet view nobody reads. It
+//! is a projection, not a permission: `--all` shows everything (with an OWNER
+//! column), and the `owner` field is in the `--json` payload either way, so a
+//! caller who wants to reason about ownership never has to guess from a filter.
+//! Unowned workers — everything spawned before owners existed — are listed for
+//! everyone, which is the same rule the mutating commands use.
 
+use crate::commands::owner;
 use crate::config;
 use crate::events::Envelope;
 use crate::home::A2aHome;
@@ -40,7 +46,7 @@ use std::path::Path;
 /// megabyte-long WAL must not cost a megabyte of IO per poll.
 const TAIL_WINDOW_BYTES: u64 = 64 * 1024;
 
-pub fn run(home: &A2aHome, json_mode: bool, quiet: bool) -> Result<Outcome, AppError> {
+pub fn run(home: &A2aHome, all: bool, json_mode: bool, quiet: bool) -> Result<Outcome, AppError> {
     let (cfg, _origins, warnings) = config::load(home)?;
     if !quiet {
         for w in &warnings {
@@ -49,6 +55,9 @@ pub fn run(home: &A2aHome, json_mode: bool, quiet: bool) -> Result<Outcome, AppE
     }
     // One clock for the whole listing: two workers' dwells are then comparable.
     let now = Utc::now();
+    // ...and one caller identity, resolved once: a listing whose filter could
+    // change halfway through is a listing that cannot be reasoned about.
+    let caller = owner::caller();
     let ids = home
         .list_worker_ids()
         .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("listing workers: {e}")))?;
@@ -56,14 +65,19 @@ pub fn run(home: &A2aHome, json_mode: bool, quiet: bool) -> Result<Outcome, AppE
     let mut rows: Vec<Row> = Vec::with_capacity(ids.len());
     for id in ids {
         let dir = home.worker_dir(&id);
-        match reconcile(home, &cfg, &id, now) {
-            Ok(snap) => rows.push(Row::reconciled(&id, &snap, &dir, now)),
+        let row = match reconcile(home, &cfg, &id, now) {
+            Ok(snap) => Row::reconciled(&id, &snap, &dir, now),
             Err(e) => {
                 if !quiet {
                     eprintln!("a2a: warning: {id}: {}: {}", e.code, e.message);
                 }
-                rows.push(Row::unreadable(&id, &dir, now));
+                // An unreadable worker keeps its stale owner if it has one, so a
+                // wedged worker does not leak into everybody's default listing.
+                Row::unreadable(&id, &dir, now)
             }
+        };
+        if all || owner::permitted(row.owner.as_deref(), &caller) {
+            rows.push(row);
         }
     }
     // Creation order is the orchestrator's mental order — the worker it
@@ -90,9 +104,12 @@ pub fn run(home: &A2aHome, json_mode: bool, quiet: bool) -> Result<Outcome, AppE
     if !quiet {
         // Header is decoration, so it goes to stderr: stdout stays a clean
         // machine payload that `awk`/`cut` can read without a skip rule.
-        eprintln!("ID  LANE  STATE  DWELL  LAST-EVENT");
+        eprintln!(
+            "ID  LANE  STATE  {}DWELL  LAST-EVENT",
+            if all { "OWNER  " } else { "" }
+        );
     }
-    Ok(Outcome::from(Value::String(render_table(&rows))))
+    Ok(Outcome::from(Value::String(render_table(&rows, all))))
 }
 
 /// One listed worker. Every age is optional because "we could not tell" is a
@@ -102,6 +119,9 @@ struct Row {
     lane: String,
     state: String,
     sandbox: String,
+    /// Who this worker belongs to — `None` for a worker spawned before owners
+    /// existed, which is the value that makes it everybody's (spec §4.8).
+    owner: Option<String>,
     /// Which transport owns this worker — the fleet view's answer to "why is
     /// `status` not advancing this one?" (an app-server worker is the broker's).
     transport: String,
@@ -121,6 +141,7 @@ impl Row {
             lane: snap.lane.as_str().to_string(),
             state: snap.state.as_str().to_string(),
             sandbox: snap.sandbox.as_str().to_string(),
+            owner: snap.owner.clone(),
             transport: transport_of(Some(snap)),
             queue_position: snap.queue_position,
             created_at: Some(snap.created_at),
@@ -145,6 +166,7 @@ impl Row {
                 .as_ref()
                 .map(|s| s.sandbox.as_str().to_string())
                 .unwrap_or_else(|| "unknown".into()),
+            owner: stale.as_ref().and_then(|s| s.owner.clone()),
             transport: transport_of(stale.as_ref()),
             queue_position: stale.as_ref().and_then(|s| s.queue_position),
             created_at: stale.as_ref().map(|s| s.created_at),
@@ -161,9 +183,17 @@ impl Row {
             "dwell_secs": self.dwell_secs,
             "last_event_age_secs": self.last_event_age_secs,
             "sandbox": self.sandbox,
+            "owner": self.owner,
             "transport": self.transport,
             "queue_position": self.queue_position,
         })
+    }
+
+    /// The OWNER column. `-` is "nobody" — the value that makes this worker
+    /// everybody's — and it is deliberately the same dash the age columns use
+    /// for "not known", because both mean "there is no value here to act on".
+    fn owner_cell(&self) -> &str {
+        self.owner.as_deref().unwrap_or("-")
     }
 }
 
@@ -217,14 +247,22 @@ fn humanize(secs: Option<i64>) -> String {
     }
 }
 
-fn render_table(rows: &[Row]) -> String {
+/// The five-column projection, plus OWNER when `--all` widened the question
+/// from "my fleet" to "this machine's fleet".
+fn render_table(rows: &[Row], all: bool) -> String {
     let idw = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
     let lanew = rows.iter().map(|r| r.lane.len()).max().unwrap_or(0);
     let statew = rows.iter().map(|r| r.state.len()).max().unwrap_or(0);
+    let ownerw = rows.iter().map(|r| r.owner_cell().len()).max().unwrap_or(0);
     rows.iter()
         .map(|r| {
+            let owner = if all {
+                format!("{:<ownerw$}  ", r.owner_cell())
+            } else {
+                String::new()
+            };
             format!(
-                "{:<idw$}  {:<lanew$}  {:<statew$}  {}  {}",
+                "{:<idw$}  {:<lanew$}  {:<statew$}  {owner}{}  {}",
                 r.id,
                 r.lane,
                 r.state,
@@ -248,6 +286,7 @@ mod tests {
             lane: "general".into(),
             state: state.into(),
             sandbox: "workspace-write".into(),
+            owner: None,
             transport: "exec".into(),
             queue_position: None,
             created_at: None,
@@ -276,10 +315,13 @@ mod tests {
 
     #[test]
     fn table_columns_align_and_carry_every_field() {
-        let text = render_table(&[
-            row("general-0814t1300-aaaa", "done", Some(240)),
-            row("impl-0814t1301-bb", "running", Some(5)),
-        ]);
+        let text = render_table(
+            &[
+                row("general-0814t1300-aaaa", "done", Some(240)),
+                row("impl-0814t1301-bb", "running", Some(5)),
+            ],
+            false,
+        );
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("general-0814t1300-aaaa  general  done"));
@@ -321,6 +363,34 @@ mod tests {
             .unwrap();
         f.write_all(br#"{"schema_version":1,"seq":3,"ts":"20"#).unwrap();
         assert_eq!(last_event_ts(tmp.path()), Some(expected));
+    }
+
+    /// `--all` inserts OWNER between STATE and DWELL, padded like every other
+    /// column, and an unowned worker prints the same `-` the age columns use.
+    #[test]
+    fn the_all_view_adds_an_aligned_owner_column() {
+        let mut mine = row("general-0814t1300-aaaa", "done", Some(240));
+        mine.owner = Some("alice".into());
+        let legacy = row("impl-0814t1301-bb", "running", Some(5));
+        let text = render_table(&[mine, legacy], true);
+        let lines: Vec<_> = text.lines().collect();
+        assert!(lines[0].ends_with("alice  4m  -"), "{}", lines[0]);
+        assert!(lines[1].ends_with("-      5s  -"), "{}", lines[1]);
+        // OWNER is padded like every other column, so the column after it still
+        // starts at the same offset on both rows.
+        assert_eq!(
+            lines[0].find("4m"),
+            lines[1].find("5s"),
+            "columns must align:\n{}\n{}",
+            lines[0],
+            lines[1]
+        );
+        // ...and without the flag the projection is exactly the Phase-1 one.
+        let plain = render_table(
+            &[row("general-0814t1300-aaaa", "done", Some(240))],
+            false,
+        );
+        assert!(plain.ends_with("done  4m  -"), "{plain}");
     }
 
     #[test]

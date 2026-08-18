@@ -27,6 +27,7 @@
 //!   fresh daemon has never heard of this worker's turn.
 
 use crate::brokerclient;
+use crate::commands::owner;
 use crate::config;
 use crate::events::Transport;
 use crate::home::A2aHome;
@@ -40,6 +41,7 @@ use serde_json::{json, Value};
 pub fn run(
     home: &A2aHome,
     id_arg: &str,
+    force: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
@@ -55,6 +57,9 @@ pub fn run(
     // state this command reports) must come from a worker that has been read
     // rather than remembered.
     let snap = reconcile(home, &cfg, &id, Utc::now())?;
+    // Who is asking, before what they asked for: "not yours" is the truer
+    // answer than "your transport cannot do that" (spec §4.8).
+    owner::guard(&id, snap.owner.as_deref(), force)?;
     if snap.transport != Transport::AppServer {
         return Err(AppError::new(
             "TRANSPORT_UNSUPPORTED",

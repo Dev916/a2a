@@ -24,6 +24,7 @@
 //! `kill -pgid` there would take the whole fleet's transport with it.
 
 use crate::brokerclient::{self, Handshake};
+use crate::commands::owner;
 use crate::config;
 use crate::events::{EventKind, Transport};
 use crate::exec::{self, KillOutcome, Liveness};
@@ -41,6 +42,7 @@ use serde_json::{json, Value};
 pub fn run(
     home: &A2aHome,
     id_arg: &str,
+    force: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
@@ -56,6 +58,11 @@ pub fn run(
     // Reconcile first: killing a worker that finished a millisecond ago must
     // report the state it actually reached, not overwrite it with `cancelled`.
     let snap = reconcile(home, &cfg, &id, Utc::now())?;
+    // The owner guard comes BEFORE the idempotent short-circuit: a caller with
+    // no business here gets the same answer whatever state the worker is in,
+    // rather than an exit 0 that reads as "you may kill this, it was just
+    // already over" (spec §4.8).
+    owner::guard(&id, snap.owner.as_deref(), force)?;
     if snap.state.is_terminal() {
         return Ok(Outcome::from(already_terminal(&id, &snap, json_mode, quiet)));
     }

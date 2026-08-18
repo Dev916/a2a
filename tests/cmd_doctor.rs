@@ -2,14 +2,38 @@
 mod common;
 use common::*;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
+/// The ten checks, in report order: Phase 1's six (unchanged ids, unchanged
+/// order) then Phase 2's four. This list IS the contract `doctor --json`
+/// publishes — a phase that adds a check adds it here in the same commit.
+const CHECK_IDS: [&str; 10] = [
+    "codex_present",
+    "codex_version",
+    "layout_version",
+    "home_perms",
+    "workers_health",
+    "env_inheritance",
+    "app_server_handshake",
+    "codex_home_match",
+    "broker_status",
+    "auth_mode",
+];
+
+/// `a2a --json doctor` with the two ambient facts the Phase-2 checks read
+/// pinned to the temp tree: a `CODEX_HOME` that is nobody's real one, and no
+/// `OPENAI_API_KEY` inherited from whoever ran the suite. Both are overridable
+/// through the closure — that is how the tests below drive them.
 fn checks(
     home: &std::path::Path,
     root: &std::path::Path,
     f: impl FnOnce(&mut assert_cmd::Command),
 ) -> (serde_json::Value, i32) {
     let mut c = a2a(home, root);
-    c.args(["--json", "doctor"]);
+    c.args(["--json", "doctor"])
+        .env("CODEX_HOME", root.join("codex-home"))
+        .env_remove("OPENAI_API_KEY");
     f(&mut c);
     let out = c.assert();
     let code = out.get_output().status.code().unwrap();
@@ -26,15 +50,40 @@ fn check<'a>(v: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
         .find(|c| c["id"] == id)
         .unwrap()
 }
+fn detail(v: &serde_json::Value, id: &str) -> String {
+    check(v, id)["detail"].as_str().unwrap().to_string()
+}
 
 #[test]
-fn all_ok_with_stub_exits_zero_and_lists_six_checks() {
+fn all_ok_with_stub_exits_zero_and_lists_ten_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |_| {});
     assert_eq!(code, 0);
-    assert_eq!(v["data"]["checks"].as_array().unwrap().len(), 6);
+    let ids: Vec<&str> = v["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, CHECK_IDS, "the published check list, in report order");
     assert_eq!(check(&v, "codex_present")["status"], "ok");
     assert_eq!(check(&v, "env_inheritance")["status"], "warn");
+    // The stub speaks exec JSONL, not JSON-RPC: the probe fails, and a failed
+    // probe is a WARN because the exec transport still works.
+    assert_eq!(check(&v, "app_server_handshake")["status"], "warn");
+    // ... and with no codexHome in hand, the match check refuses to guess.
+    assert_eq!(check(&v, "codex_home_match")["status"], "warn");
+    assert!(
+        detail(&v, "codex_home_match").contains("not checked"),
+        "absence is reported as absence: {}",
+        detail(&v, "codex_home_match")
+    );
+    // A2A_BROKER_DISABLE=1 (every Phase-1 test) is a standing choice an
+    // operator should be told about, not a silent ok.
+    assert_eq!(check(&v, "broker_status")["status"], "warn");
+    assert!(detail(&v, "broker_status").contains("A2A_BROKER_DISABLE"));
+    // no auth.json under the temp CODEX_HOME
+    assert_eq!(check(&v, "auth_mode")["status"], "warn");
 }
 
 #[test]
@@ -45,6 +94,11 @@ fn missing_codex_fails_exit_9() {
     });
     assert_eq!(code, 9);
     assert_eq!(check(&v, "codex_present")["status"], "fail");
+    // No binary to probe: the handshake is not attempted, and the two checks
+    // that depend on it say so rather than inventing a verdict.
+    assert_eq!(check(&v, "app_server_handshake")["status"], "warn");
+    assert!(detail(&v, "app_server_handshake").contains("not checked"));
+    assert_eq!(check(&v, "codex_home_match")["status"], "warn");
 }
 
 #[test]
@@ -92,4 +146,157 @@ fn orphaned_worker_surfaces_in_workers_health() {
             .len()
             > 0
     );
+}
+
+// ------------------------------------------------------- the phase-2 checks
+
+/// A real handshake against a real app-server: the probe answers, the codexHome
+/// it reports is the one this machine is configured with, and the login is
+/// where codex keeps it.
+///
+/// The fake reports `FAKE_STATE or cwd` as its codexHome, and the probe spawns
+/// its child under the env ALLOWLIST — which carries `CODEX_HOME` and not
+/// `FAKE_*` — so the working directory is how these tests choose what the
+/// server answers. That is the production shape too: the only channel between
+/// this CLI and the server's idea of its home is `CODEX_HOME`.
+#[test]
+fn a_real_handshake_reports_ok_and_a_matching_codex_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_home = tmp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
+    let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |c| {
+        c.env("A2A_CODEX_BIN", fake_app_server_path())
+            .env("CODEX_HOME", &codex_home)
+            .current_dir(&codex_home);
+    });
+    assert_eq!(code, 0);
+    assert_eq!(check(&v, "app_server_handshake")["status"], "ok");
+    assert_eq!(check(&v, "codex_home_match")["status"], "ok");
+    assert_eq!(check(&v, "auth_mode")["status"], "ok");
+}
+
+/// The one new way to FAIL: two known homes that disagree. Every worker's
+/// session would then be written somewhere the exec fallback cannot resume it
+/// from, which is a spawn-is-broken-now fact.
+#[test]
+fn a_codex_home_mismatch_is_the_one_new_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let theirs = tmp.path().join("server-home");
+    let ours = tmp.path().join("configured-home");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::create_dir_all(&ours).unwrap();
+    let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |c| {
+        c.env("A2A_CODEX_BIN", fake_app_server_path())
+            .env("CODEX_HOME", &ours)
+            .current_dir(&theirs); // what the app-server will report
+    });
+    assert_eq!(code, 9, "a real mismatch is fatal");
+    assert_eq!(check(&v, "codex_home_match")["status"], "fail");
+    let d = detail(&v, "codex_home_match");
+    assert!(d.contains("server-home") && d.contains("configured-home"), "{d}");
+}
+
+/// An exported `OPENAI_API_KEY` is the billing hazard spec §4.2 names: the
+/// broker scrubs it from every child, but a human running `codex` by hand in
+/// the same shell is billing the API key.
+#[test]
+fn an_exported_api_key_warns_in_auth_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_home = tmp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
+    let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |c| {
+        c.env("CODEX_HOME", &codex_home)
+            .env("OPENAI_API_KEY", "sk-not-a-real-key");
+    });
+    assert_eq!(code, 0, "a billing warning is not a spawn blocker");
+    assert_eq!(check(&v, "auth_mode")["status"], "warn");
+    let d = detail(&v, "auth_mode");
+    assert!(d.contains("OPENAI_API_KEY"), "{d}");
+    assert!(
+        !d.contains("sk-not-a-real-key"),
+        "doctor names the variable, never its value: {d}"
+    );
+}
+
+/// With no daemon listening, "down" is not a problem — it is the normal state
+/// of a start-on-demand broker, and doctor must not start one by asking.
+#[test]
+fn a_down_but_startable_broker_is_ok_and_doctor_never_autostarts_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("h");
+    let (v, code) = checks(&home, tmp.path(), |c| {
+        c.env_remove("A2A_BROKER_DISABLE")
+            .env("A2A_BROKER_BIN", assert_cmd::cargo::cargo_bin("a2a"));
+    });
+    assert_eq!(code, 0);
+    assert_eq!(check(&v, "broker_status")["status"], "ok");
+    let d = detail(&v, "broker_status");
+    assert!(d.contains("not running"), "{d}");
+    assert!(
+        !home.join("broker.sock").exists() && !home.join("broker.pid").exists(),
+        "a question that changes the answer by being asked is not one"
+    );
+    assert_no_broker_left(&home);
+}
+
+/// ... and with one up, doctor says so from the handshake it already has to
+/// perform — never from the health file alone, which outlives its writer.
+#[test]
+fn a_running_broker_is_reported_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("h");
+    let codex_home = tmp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(codex_home.join("auth.json"), "{}").unwrap();
+    let guard = BrokerGuard::new(&home);
+
+    let a2a_bin = assert_cmd::cargo::cargo_bin("a2a");
+    let started = std::process::Command::new(&a2a_bin)
+        .arg("--home")
+        .arg(&home)
+        .args(["broker", "run"])
+        .env_remove("A2A_HOME")
+        .env_remove("A2A_BROKER_DISABLE")
+        .env("A2A_CODEX_BIN", fake_app_server_path())
+        .env("A2A_ALLOWED_ROOTS", tmp.path())
+        .env("A2A_BROKER_BIN", &a2a_bin)
+        .env("A2A_SHIM_BIN", &a2a_bin)
+        .env("FAKE_STATE", &codex_home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the a2a binary runs");
+    assert!(started.success());
+    wait_for_socket(&home);
+
+    let (v, code) = checks(&home, tmp.path(), |c| {
+        c.env_remove("A2A_BROKER_DISABLE")
+            .env("A2A_CODEX_BIN", fake_app_server_path())
+            .env("A2A_BROKER_BIN", &a2a_bin)
+            .env("CODEX_HOME", &codex_home)
+            .current_dir(&codex_home);
+    });
+    assert_eq!(code, 0);
+    assert_eq!(check(&v, "broker_status")["status"], "ok");
+    let d = detail(&v, "broker_status");
+    assert!(d.contains("up"), "{d}");
+    assert!(d.contains("protocol"), "the skew fact is reported up front: {d}");
+    // A live daemon is always nameable: the health file is written by a task
+    // and may still be in flight, but the pidfile predates the listener.
+    let pid = std::fs::read_to_string(home.join("broker.pid")).unwrap();
+    assert!(d.contains(&format!("pid {}", pid.trim())), "{d}");
+
+    drop(guard);
+    assert_no_broker_left(&home);
+}
+
+fn wait_for_socket(home: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !home.join("broker.sock").exists() {
+        assert!(Instant::now() < deadline, "the broker never bound its socket");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

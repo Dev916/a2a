@@ -7,15 +7,19 @@
 //!
 //! **The checks are data, not control flow.** [`CHECKS`] is a slice of
 //! `fn(&Ctx) -> Check`; the runner maps over it and knows nothing about any
-//! individual check. Phase 2's broker checks (socket reachable, version skew,
-//! managed-daemon contention) are appended to that slice and the runner is not
-//! touched. Six is the Phase-1 count, and it is pinned by a test.
+//! individual check. Phase 2's four (app-server handshake, codex-home
+//! agreement, broker status, auth mode) were appended to that slice and the
+//! runner was not touched. Ten is the count, and it is pinned by a test.
 //!
 //! **Only `fail` is fatal.** `fail` means "a worker spawned right now would
 //! not work" and exits 9 (precondition); `warn` means "this will bite you
 //! later" and exits 0. The version check is the sharp case: an unrecognizable
 //! `codex --version` is a warn, never a fail, because refusing to run over a
 //! string we could not parse would make every codex release a hard outage.
+//! Phase 2 keeps that discipline everywhere it can: a handshake that does not
+//! answer is a *warn*, because the exec transport still spawns workers, and an
+//! absent codexHome is a warn rather than a fail — [`codex_home_match`] fails
+//! only when it holds two known values that disagree.
 //!
 //! **Doctor adopts a home that other commands refuse.** Every other command
 //! goes through [`A2aHome::resolve`], which gates on `LAYOUT_VERSION` and errors
@@ -24,16 +28,22 @@
 //! about. So a mismatch is caught, the root is adopted ungated, and it comes
 //! back as the `layout_version` check with a remedy.
 
+use crate::adapter::{self, InitInfo};
+use crate::broker::core::BrokerHealth;
+use crate::broker::wire;
+use crate::brokerclient::{self, Handshake};
 use crate::config::{self, Config};
 use crate::exec::{self, Liveness};
 use crate::home::{self, A2aHome, LAYOUT_VERSION};
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
+use crate::rpc::RpcError;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// What one check concluded. `Fail` is the only status that changes the exit
 /// code, and only `fail` may claim that spawning right now is impossible.
@@ -108,15 +118,24 @@ impl Check {
 ///
 /// The codex path in particular is resolved a single time and shared: two
 /// checks asking the filesystem the same question independently could report
-/// "present" and "cannot run it" about two different binaries.
+/// "present" and "cannot run it" about two different binaries. The handshake is
+/// gathered here for the same reason and a sharper one — it spawns a child, and
+/// two checks that each spawned their own app-server would be both slower and
+/// capable of disagreeing.
 pub struct Ctx {
     pub home: A2aHome,
     pub cfg: Config,
     pub codex: Option<PathBuf>,
+    /// `None` = never attempted (there was no binary to probe), which is a
+    /// different report from `Some(Err(_))` and must stay distinguishable.
+    pub probe: Option<Result<InitInfo, RpcError>>,
+    /// `CODEX_HOME`, else `$HOME/.codex`; `None` when neither is set.
+    pub codex_home: Option<PathBuf>,
     pub now: DateTime<Utc>,
 }
 
-/// The Phase-1 check list, in report order. Append-only across phases.
+/// The check list, in report order. Append-only across phases: Phase 1's six,
+/// then Phase 2's four.
 const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_present,
     codex_version,
@@ -124,7 +143,26 @@ const CHECKS: &[fn(&Ctx) -> Check] = &[
     home_perms,
     workers_health,
     env_inheritance,
+    app_server_handshake,
+    codex_home_match,
+    broker_status,
+    auth_mode,
 ];
+
+/// The whole handshake — spawn, `initialize`, response — not each call.
+///
+/// Two seconds is long enough for a cold app-server on a loaded machine and
+/// short enough that `doctor` still answers like a command. The child is killed
+/// when it expires ([`adapter::handshake_probe`]): a preflight that leaks a live
+/// app-server is worse than one that fails.
+pub const HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
+
+/// The variable that decides which plan the *humans* in this shell bill to.
+/// a2a's own children never see it (it is on the scrub list).
+const API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// Where codex keeps the login every worker shares (spec §4.2).
+const AUTH_JSON: &str = "auth.json";
 
 pub fn run(home_flag: Option<&Path>, json_mode: bool, quiet: bool) -> Result<Outcome, AppError> {
     let home = match A2aHome::resolve(home_flag) {
@@ -140,8 +178,17 @@ pub fn run(home_flag: Option<&Path>, json_mode: bool, quiet: bool) -> Result<Out
             eprintln!("a2a: warning: {w}");
         }
     }
+    // Gathered before the runner, in report order's stead: the probe is the one
+    // check input that costs a process, and two of the four Phase-2 checks read
+    // its result.
+    let codex = resolve_codex(&cfg);
+    let probe = codex
+        .as_deref()
+        .map(|bin| adapter::handshake_probe(bin, HANDSHAKE_BUDGET));
     let ctx = Ctx {
-        codex: resolve_codex(&cfg),
+        codex,
+        probe,
+        codex_home: effective_codex_home(),
         home,
         cfg,
         now: Utc::now(),
@@ -394,7 +441,339 @@ fn env_inheritance(_ctx: &Ctx) -> Check {
     .remedy("keep secrets out of the environment a2a itself runs in until the broker lands")
 }
 
+// ------------------------------------------------------- the phase-2 checks
+
+/// Does this codex answer the app-server protocol at all?
+///
+/// Warn, never fail, when it does not: Phase 2 demoted exec to a fallback, it
+/// did not remove it, so a codex that cannot be driven over JSON-RPC still
+/// spawns workers. What the operator needs to know is that every spawn will
+/// quietly take the slower path — which is exactly what a warn says.
+fn app_server_handshake(ctx: &Ctx) -> Check {
+    let (Some(bin), Some(probe)) = (&ctx.codex, &ctx.probe) else {
+        return Check::warn(
+            "app_server_handshake",
+            "not checked — no codex binary to probe",
+        )
+        .remedy("fix `codex_present` first");
+    };
+    match probe {
+        Ok(info) => Check::ok(
+            "app_server_handshake",
+            format!(
+                "`{} {}` completed initialize as {}",
+                bin.display(),
+                adapter::APP_SERVER_ARGS.join(" "),
+                info.user_agent
+            ),
+        ),
+        Err(e) => Check::warn(
+            "app_server_handshake",
+            format!(
+                "`{} {}` did not complete initialize ({}s budget): {e} — spawns fall back to the exec transport",
+                bin.display(),
+                adapter::APP_SERVER_ARGS.join(" "),
+                HANDSHAKE_BUDGET.as_secs(),
+            ),
+        )
+        .remedy(format!(
+            "run `{} {}` by hand and read its stderr; `a2a spawn --transport exec` keeps working meanwhile",
+            bin.display(),
+            adapter::APP_SERVER_ARGS.join(" ")
+        )),
+    }
+}
+
+/// Do the app-server and this CLI mean the same directory by `CODEX_HOME`?
+///
+/// It matters because the thread the broker starts is only resumable — by
+/// `codex exec resume`, i.e. by the exec fallback — from the home the *server*
+/// wrote its rollout into. Two homes means work that silently cannot be picked
+/// up again, so a real disagreement is the one new `fail`.
+///
+/// Absence is never that: no handshake means no second value, and a check that
+/// failed on "I could not look" would take every stub-codex, offline or
+/// not-logged-in machine down with it.
+fn codex_home_match(ctx: &Ctx) -> Check {
+    let probed = ctx
+        .probe
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|info| info.codex_home.as_path());
+    codex_home_verdict(probed, ctx.codex_home.as_deref())
+}
+
+fn codex_home_verdict(probed: Option<&Path>, configured: Option<&Path>) -> Check {
+    let Some(probed) = probed else {
+        return Check::warn(
+            "codex_home_match",
+            "not checked — no handshake, so there is no server-side codexHome to compare",
+        )
+        .remedy("fix `app_server_handshake` first — the exec transport is unaffected");
+    };
+    let Some(configured) = configured else {
+        return Check::warn(
+            "codex_home_match",
+            format!(
+                "not checked — the app-server reports {}, but this process has neither CODEX_HOME nor HOME set",
+                probed.display()
+            ),
+        )
+        .remedy("export CODEX_HOME (or HOME) so the two can be compared");
+    };
+    if same_dir(probed, configured) {
+        return Check::ok(
+            "codex_home_match",
+            format!("app-server and CLI agree on {}", probed.display()),
+        );
+    }
+    Check::fail(
+        "codex_home_match",
+        format!(
+            "the app-server writes its rollouts to {}, but this CLI resolves CODEX_HOME to {} — a thread started over the broker could not be resumed by the exec fallback",
+            probed.display(),
+            configured.display()
+        ),
+    )
+    .remedy(format!(
+        "export CODEX_HOME={} for both, or start the broker from the environment the CLI runs in",
+        probed.display()
+    ))
+}
+
+/// Is there a broker, and is it one this binary can talk to?
+///
+/// **Asking never starts one.** `doctor` is the command an operator runs to find
+/// out what is there; a preflight that autostarts a daemon answers a question
+/// nobody asked and leaves it running.
+fn broker_status(ctx: &Ctx) -> Check {
+    broker_verdict(probe_broker(ctx.home.root()))
+}
+
+/// What the socket said, as a value — so the verdict below is a pure function
+/// of it and can be tested at every branch without a daemon.
+enum BrokerProbe {
+    /// `A2A_BROKER_DISABLE` is set, so no socket was touched at all.
+    Disabled,
+    Down {
+        startable: Result<PathBuf, String>,
+    },
+    Up {
+        peer: wire::Hello,
+        health: Option<Box<BrokerHealth>>,
+        /// The health file is written by a task, so a broker that has just
+        /// bound its socket may not have published one yet — the pidfile is
+        /// there from before the listener existed, and a report of a live
+        /// daemon should always be able to name it.
+        pid: Option<u32>,
+    },
+    Skewed {
+        peer: wire::Hello,
+        mine: u32,
+    },
+    /// Something is listening and the handshake did not survive it.
+    Unreachable(String),
+}
+
+fn probe_broker(home: &Path) -> BrokerProbe {
+    // The disable switch is a hard one (see `brokerclient::DISABLE_ENV`): with
+    // it set, no `a2a` command opens the socket — not even to look.
+    if brokerclient::disabled() {
+        return BrokerProbe::Disabled;
+    }
+    match brokerclient::try_handshake(home) {
+        Ok(None) => BrokerProbe::Down {
+            startable: brokerclient::broker_bin().map_err(|e| e.message),
+        },
+        Ok(Some(Handshake::Ready(client))) => {
+            let health = BrokerHealth::read(home).map(Box::new);
+            let pid = health.as_ref().map(|h| h.pid).or_else(|| read_pidfile(home));
+            BrokerProbe::Up {
+                peer: client.peer.clone(),
+                health,
+                pid,
+            }
+        }
+        Ok(Some(Handshake::Skewed { client, .. })) => BrokerProbe::Skewed {
+            peer: client.peer.clone(),
+            mine: wire::protocol_version(),
+        },
+        Err(e) => BrokerProbe::Unreachable(e.message),
+    }
+}
+
+fn broker_verdict(probe: BrokerProbe) -> Check {
+    match probe {
+        BrokerProbe::Disabled => Check::warn(
+            "broker_status",
+            format!(
+                "{} is set: no a2a command will open the broker socket, so every spawn takes the exec transport",
+                brokerclient::DISABLE_ENV
+            ),
+        )
+        .remedy(format!(
+            "unset {} to let spawns use the app-server transport",
+            brokerclient::DISABLE_ENV
+        )),
+        BrokerProbe::Down { startable: Ok(bin) } => Check::ok(
+            "broker_status",
+            format!(
+                "not running — start-on-demand from {} (a2a starts one on the first spawn)",
+                bin.display()
+            ),
+        ),
+        BrokerProbe::Down {
+            startable: Err(why),
+        } => Check::warn(
+            "broker_status",
+            format!("not running, and there is no a2a binary to start one with: {why}"),
+        )
+        .remedy(format!(
+            "point {} at the installed a2a binary",
+            brokerclient::BROKER_BIN_ENV
+        )),
+        BrokerProbe::Up { peer, health, pid } => {
+            let who = describe_broker(&peer, health.as_deref(), pid);
+            match health.as_deref() {
+                // The latch, not a transient: the child's restart budget is
+                // spent, so new spawns take the exec path until the promotion
+                // probe wins. Live work is unaffected, hence warn.
+                Some(h) if h.degraded.is_some() => Check::warn(
+                    "broker_status",
+                    format!(
+                        "{who} is DEGRADED to `{}` since {} ({}) — new spawns take the exec transport",
+                        h.degraded.clone().unwrap_or_default(),
+                        h.degraded_since
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "an unrecorded time".into()),
+                        h.degraded_reason.clone().unwrap_or_else(|| "no reason recorded".into()),
+                    ),
+                )
+                .remedy("read broker.log for the child's exit, then `a2a broker restart`"),
+                _ => Check::ok("broker_status", who),
+            }
+        }
+        BrokerProbe::Skewed { peer, mine } => Check::warn(
+            "broker_status",
+            format!(
+                "up, but it speaks protocol v{} and this binary speaks v{mine} (broker binary {}, this one {}) — a spawn will refuse rather than guess",
+                peer.protocol_version,
+                display_or(&peer.binary_version, "unknown"),
+                env!("CARGO_PKG_VERSION"),
+            ),
+        )
+        .remedy("`a2a broker restart` once its workers are done — an idle skewed broker is replaced automatically"),
+        BrokerProbe::Unreachable(why) => Check::warn(
+            "broker_status",
+            format!("something is listening on the broker socket but the handshake failed: {why}"),
+        )
+        .remedy("read broker.log, then `a2a broker restart`"),
+    }
+}
+
+/// Built from parts rather than by concatenation: every fact here is optional,
+/// and a sentence assembled with `push_str` grows an empty slot the day one of
+/// them is missing.
+fn describe_broker(peer: &wire::Hello, health: Option<&BrokerHealth>, pid: Option<u32>) -> String {
+    let mut parts = Vec::new();
+    if let Some(pid) = pid {
+        parts.push(format!("pid {pid}"));
+    }
+    parts.push(format!("protocol v{}", peer.protocol_version));
+    parts.push(format!(
+        "binary {}",
+        display_or(&peer.binary_version, "unknown")
+    ));
+    if let Some(h) = health {
+        parts.push(format!("{} worker(s)", h.workers));
+    }
+    format!("broker up ({})", parts.join(", "))
+}
+
+fn read_pidfile(home: &Path) -> Option<u32> {
+    std::fs::read_to_string(crate::broker::pid_path(home))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn display_or<'a>(s: &'a str, fallback: &'a str) -> &'a str {
+    if s.is_empty() {
+        fallback
+    } else {
+        s
+    }
+}
+
+/// Which plan the fleet bills to, from the two facts that decide it — and only
+/// from facts this process can read without touching the network.
+///
+/// Spec §4.2 wants doctor to assert the expected auth mode; Phase 2 reports it
+/// (warn) rather than refusing dispatch (fail), because "no auth.json" is also
+/// what a brand-new machine looks like ten seconds before `codex login`.
+fn auth_mode(ctx: &Ctx) -> Check {
+    let exported = std::env::var_os(API_KEY_ENV).is_some_and(|v| !v.is_empty());
+    auth_mode_verdict(
+        exported,
+        ctx.codex_home.as_deref().map(|h| h.join(AUTH_JSON)).as_deref(),
+    )
+}
+
+fn auth_mode_verdict(api_key_exported: bool, auth_json: Option<&Path>) -> Check {
+    let mut problems: Vec<String> = Vec::new();
+    if api_key_exported {
+        problems.push(format!(
+            "{API_KEY_ENV} is exported — a2a scrubs it from every child so workers bill the ChatGPT plan, but anything else run from this shell bills the key"
+        ));
+    }
+    match auth_json {
+        None => problems.push(
+            "could not locate a codex home (neither CODEX_HOME nor HOME is set), so the login could not be checked".into(),
+        ),
+        Some(p) if !p.is_file() => problems.push(format!(
+            "{} is missing — nothing is logged in, and every worker fails on its first turn",
+            p.display()
+        )),
+        Some(_) => {}
+    }
+    if problems.is_empty() {
+        let path = auth_json.map(Path::display);
+        return Check::ok(
+            "auth_mode",
+            format!(
+                "ChatGPT plan auth: {} present, {API_KEY_ENV} not exported",
+                path.map(|d| d.to_string()).unwrap_or_default()
+            ),
+        );
+    }
+    Check::warn("auth_mode", problems.join("; ")).remedy(format!(
+        "`codex login` for the shared login; `unset {API_KEY_ENV}` to keep billing on the plan"
+    ))
+}
+
 // -------------------------------------------------------------------- helpers
+
+/// `CODEX_HOME`, else `$HOME/.codex` — codex's own resolution, and the one the
+/// child env allowlist forwards.
+fn effective_codex_home() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("CODEX_HOME") {
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|h| PathBuf::from(h).join(".codex"))
+}
+
+/// Same directory, symlinks and `/private/var` vs `/var` included — but a path
+/// that does not exist is compared as written rather than declared different,
+/// so "both are `~/.codex` and neither exists yet" is agreement, not a fail.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    a == b || real(a) == real(b)
+}
 
 /// `A2A_CODEX_BIN` / config `codex_bin` / PATH, in that order — the same
 /// resolution `spawn` performs, plus the executability check spawn learns the
@@ -525,10 +904,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_phase_1_check_list_is_exactly_six_named_checks() {
+    fn the_check_list_is_exactly_ten_named_checks() {
         // The list is the contract `doctor --json` publishes; a phase that adds
         // a check adds it here and to the acceptance test in the same commit.
-        assert_eq!(CHECKS.len(), 6);
+        // Six in Phase 1, four in Phase 2 — the ids and their order are pinned
+        // end-to-end by `tests/cmd_doctor.rs`.
+        assert_eq!(CHECKS.len(), 10);
     }
 
     #[test]
@@ -630,6 +1011,157 @@ mod tests {
         assert_eq!(resolve_codex(&cfg), Some(bin));
         cfg.codex_bin = Some(PathBuf::from("/nonexistent/codex"));
         assert_eq!(resolve_codex(&cfg), None);
+    }
+
+    fn hello(protocol_version: u32, binary_version: &str) -> wire::Hello {
+        wire::Hello {
+            protocol_version,
+            binary_version: binary_version.to_string(),
+        }
+    }
+
+    /// Absence is reported as absence. Only two *known* homes that disagree may
+    /// fail — anything else would take every machine without a working
+    /// app-server down with it, which is the opposite of what doctor is for.
+    #[test]
+    fn codex_home_only_fails_on_two_known_values_that_disagree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = tmp.path().join("a");
+        let ours = tmp.path().join("b");
+
+        assert_eq!(codex_home_verdict(None, None).status, Status::Warn);
+        assert_eq!(codex_home_verdict(None, Some(&ours)).status, Status::Warn);
+        assert!(codex_home_verdict(None, Some(&ours))
+            .detail
+            .contains("not checked"));
+        assert_eq!(codex_home_verdict(Some(&theirs), None).status, Status::Warn);
+
+        assert_eq!(
+            codex_home_verdict(Some(&theirs), Some(&theirs)).status,
+            Status::Ok
+        );
+        // ... including when neither exists yet: equal strings are agreement.
+        assert!(!theirs.exists());
+        let mismatch = codex_home_verdict(Some(&theirs), Some(&ours));
+        assert_eq!(mismatch.status, Status::Fail);
+        assert!(mismatch.remedy.is_some(), "a fail always says what to type");
+    }
+
+    /// `/var` and `/private/var` are the same directory on macOS, and a symlink
+    /// is the ordinary way `CODEX_HOME` gets set to a second name for one home.
+    #[test]
+    fn the_same_directory_under_two_names_is_not_a_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_dir(&real, &link));
+        assert!(same_dir(&real, &real.join(".").join("")));
+        assert!(!same_dir(&real, &tmp.path().join("other")));
+    }
+
+    #[test]
+    fn auth_mode_warns_on_the_api_key_on_a_missing_login_and_on_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = tmp.path().join(AUTH_JSON);
+
+        let missing = auth_mode_verdict(false, Some(&auth));
+        assert_eq!(missing.status, Status::Warn);
+        assert!(missing.detail.contains(AUTH_JSON));
+
+        std::fs::write(&auth, "{}").unwrap();
+        assert_eq!(auth_mode_verdict(false, Some(&auth)).status, Status::Ok);
+
+        let keyed = auth_mode_verdict(true, Some(&auth));
+        assert_eq!(keyed.status, Status::Warn);
+        assert!(keyed.detail.contains(API_KEY_ENV));
+
+        // both problems are reported in ONE check — a total report never makes
+        // an operator run the command twice to see the second thing.
+        std::fs::remove_file(&auth).unwrap();
+        let both = auth_mode_verdict(true, Some(&auth));
+        assert!(both.detail.contains(API_KEY_ENV) && both.detail.contains(AUTH_JSON));
+
+        // no home at all is still a warn, never a fail
+        assert_eq!(auth_mode_verdict(false, None).status, Status::Warn);
+    }
+
+    /// Every branch of the broker verdict, including the two an integration
+    /// test cannot stage without corrupting a live daemon's own health file.
+    #[test]
+    fn the_broker_verdict_fails_on_nothing_and_warns_on_exactly_four_things() {
+        let disabled = broker_verdict(BrokerProbe::Disabled);
+        assert_eq!(disabled.status, Status::Warn);
+        assert!(disabled.detail.contains(brokerclient::DISABLE_ENV));
+
+        let down = broker_verdict(BrokerProbe::Down {
+            startable: Ok(PathBuf::from("/usr/local/bin/a2a")),
+        });
+        assert_eq!(down.status, Status::Ok, "start-on-demand is the normal state");
+        assert!(down.detail.contains("not running"));
+
+        let unstartable = broker_verdict(BrokerProbe::Down {
+            startable: Err("no a2a next to the running executable".into()),
+        });
+        assert_eq!(unstartable.status, Status::Warn);
+
+        let up = broker_verdict(BrokerProbe::Up {
+            peer: hello(wire::PROTOCOL_VERSION, "0.1.0"),
+            health: Some(Box::new(BrokerHealth::default())),
+            pid: Some(4321),
+        });
+        assert_eq!(up.status, Status::Ok);
+        assert!(up.detail.contains("up") && up.detail.contains("protocol"));
+        assert!(up.detail.contains("pid 4321") && up.detail.contains("0 worker(s)"));
+
+        // the latch: the child's restart budget is spent, new spawns take exec
+        let degraded = broker_verdict(BrokerProbe::Up {
+            peer: hello(wire::PROTOCOL_VERSION, "0.1.0"),
+            health: Some(Box::new(BrokerHealth {
+                degraded: Some("exec".into()),
+                degraded_since: Some(Utc::now()),
+                degraded_reason: Some("the app-server child died 3 times".into()),
+                ..BrokerHealth::default()
+            })),
+            pid: Some(4321),
+        });
+        assert_eq!(degraded.status, Status::Warn);
+        assert!(degraded.detail.contains("DEGRADED") && degraded.detail.contains("died 3 times"));
+
+        let skewed = broker_verdict(BrokerProbe::Skewed {
+            peer: hello(wire::PROTOCOL_VERSION + 1, "0.2.0"),
+            mine: wire::PROTOCOL_VERSION,
+        });
+        assert_eq!(skewed.status, Status::Warn);
+        assert!(skewed.detail.contains("0.2.0"));
+
+        let unreachable = broker_verdict(BrokerProbe::Unreachable("connection reset".into()));
+        assert_eq!(unreachable.status, Status::Warn);
+
+        // A broker is never a `fail`: exec still spawns workers without one.
+        for c in [disabled, down, unstartable, up, degraded, skewed, unreachable] {
+            assert_ne!(c.status, Status::Fail, "{}", c.detail);
+        }
+    }
+
+    /// A broker that has bound its socket but not yet published a health file
+    /// (and a peer that names no binary version) still reads as a sentence —
+    /// no empty slot where a missing fact would have gone.
+    #[test]
+    fn a_broker_with_nothing_but_a_hello_is_still_described_in_words() {
+        let up = broker_verdict(BrokerProbe::Up {
+            peer: hello(wire::PROTOCOL_VERSION, ""),
+            health: None,
+            pid: None,
+        });
+        assert!(up.detail.contains("unknown"), "{}", up.detail);
+        assert!(!up.detail.contains("(,"), "{}", up.detail);
+        assert!(!up.detail.contains(", )"), "{}", up.detail);
+        assert_eq!(
+            up.detail,
+            format!("broker up (protocol v{}, binary unknown)", wire::PROTOCOL_VERSION)
+        );
     }
 
     #[test]

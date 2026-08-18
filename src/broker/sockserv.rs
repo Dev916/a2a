@@ -451,9 +451,12 @@ async fn request_loop(
         }
         let op = frame.op().unwrap_or_default().to_string();
         if op == "subscribe" {
-            // ONE subscription per connection: a second one would need a second
-            // stream of ids on a wire that has exactly one.
-            if subscription.is_some() {
+            // ONE *live* subscription per connection: a second concurrent one
+            // would need a second stream of ids on a wire that has exactly one.
+            // A subscription whose pump has ENDED — which is what a lag cut
+            // leaves behind — is not live, and refusing to replace it would
+            // strand the one client that has a legitimate reason to resubscribe.
+            if !may_subscribe(subscription.as_ref()) {
                 let _ = out
                     .send(Frame::err(
                         frame.id,
@@ -470,7 +473,13 @@ async fn request_loop(
             match ctx.core.subscribe().await {
                 Ok(rx) => {
                     let _ = out.send(Frame::resp(frame.id, json!({"subscribed": true}))).await;
-                    ctx.subscribers.fetch_add(1, Ordering::Relaxed);
+                    // Counted once per CONNECTION, not once per subscribe: the
+                    // decrement below is also once, and a resubscribing tail
+                    // must not leave the idle timer believing in a watcher that
+                    // has gone home.
+                    if subscription.is_none() {
+                        ctx.subscribers.fetch_add(1, Ordering::Relaxed);
+                    }
                     subscription = Some(tokio::spawn(pump_subscription(
                         rx,
                         out.clone(),
@@ -507,6 +516,15 @@ async fn request_loop(
         }
         handle.abort();
         ctx.subscribers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// May this connection open a subscription? Only if it has none, or the one it
+/// had is over (a lag cut, a closed broadcast) — see the `subscribe` arm above.
+fn may_subscribe(current: Option<&tokio::task::JoinHandle<()>>) -> bool {
+    match current {
+        None => true,
+        Some(handle) => handle.is_finished(),
     }
 }
 
@@ -810,6 +828,31 @@ mod tests {
             err.extra
         );
         let _ = pump.await;
+    }
+
+    /// A connection may hold ONE live subscription — and a pump that has ended
+    /// (which is what the lag cut above leaves behind) is not one. Without this,
+    /// the only client with a legitimate reason to resubscribe is the one client
+    /// that cannot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_subscription_may_be_replaced_but_a_live_one_may_not() {
+        assert!(may_subscribe(None), "a connection with no tail may open one");
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        let live = tokio::spawn(async move {
+            let _ = tx;
+            std::future::pending::<()>().await;
+        });
+        assert!(!may_subscribe(Some(&live)), "a live tail is not replaced");
+
+        let done = tokio::spawn(async {});
+        done.await.unwrap();
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(may_subscribe(Some(&done)), "a finished tail is replaceable");
+        live.abort();
     }
 
     #[test]

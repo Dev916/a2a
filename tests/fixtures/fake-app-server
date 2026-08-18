@@ -29,6 +29,10 @@ into the child — production spawns pass zero extra pairs):
                        cannot pass by luck of arrival ordering
   FAKE_EMIT_UNPARSEABLE  emit one non-JSON line at startup
   FAKE_MESSAGE         text of the agentMessage item (default "done")
+  FAKE_FLOOD           emit this many extra agentMessage items right after
+                       turn/started, as fast as the pipe takes them — the burst
+                       a `tail --follow` has to carry with no gaps and no
+                       duplicates
 
 SCENARIOS
   happy            thread/started -> turn/started -> item/completed{agentMessage}
@@ -74,6 +78,7 @@ STATE = os.environ.get("FAKE_STATE") or ""
 TRANSCRIPT = os.environ.get("FAKE_TRANSCRIPT") or ""
 DEFER = [m for m in (os.environ.get("FAKE_DEFER_METHODS") or "").split(",") if m]
 MESSAGE = os.environ.get("FAKE_MESSAGE", "done")
+FLOOD = int(os.environ.get("FAKE_FLOOD") or 0)
 CLI_VERSION = "0.140.0"
 
 # `--version` answers and exits, BEFORE any state is touched — exactly as the
@@ -373,6 +378,8 @@ def handle_request(req_id, method, params):
         reply(req_id, {"turn": turn_obj(turn_id, "inProgress")})
         OPEN.update({"threadId": thread_id, "turnId": turn_id})
         notify("turn/started", {"threadId": thread_id, "turn": turn_obj(turn_id, "inProgress")})
+        for _ in range(FLOOD):
+            emit_agent_message(thread_id, turn_id)
 
         if SCENARIO == "crash-mid-turn" and LAUNCH == 1:
             die(70)

@@ -113,7 +113,7 @@ pub struct BrokerClient {
     /// exactly one thing, and it is `shutdown`.
     skewed: bool,
     subscription: Option<u64>,
-    events: VecDeque<TailEvent>,
+    updates: VecDeque<TailUpdate>,
 }
 
 /// One envelope, as a subscriber sees it.
@@ -121,6 +121,29 @@ pub struct BrokerClient {
 pub struct TailEvent {
     pub worker: String,
     pub envelope: Envelope,
+}
+
+/// What arrived on a subscription — every way a tail can be interrupted, as a
+/// value rather than as an error.
+///
+/// The three non-event variants are the ones a follower has to tell apart, and
+/// each has a different answer: a **lag** is recoverable (re-read the worker's
+/// log from the cursor and carry on), a **farewell** is the broker leaving on
+/// purpose, and a bare **close** is anything else — a crash, a killed daemon, a
+/// socket pulled out from underneath. Collapsing them into one `Err` is exactly
+/// the ambiguity `broker_shutdown` was added to remove.
+#[derive(Clone, Debug)]
+pub enum TailUpdate {
+    Event(Box<TailEvent>),
+    /// The subscription fell behind and was cut. `last_seq` is the last
+    /// envelope that actually arrived — the cursor to re-read from.
+    Lagged { last_seq: u64 },
+    /// The daemon is shutting down and said so.
+    BrokerShutdown { grace_secs: u64 },
+    /// The connection ended without a farewell.
+    Closed,
+    /// Nothing arrived inside the timeout.
+    Idle,
 }
 
 /// What a handshake produced.
@@ -265,7 +288,7 @@ fn handshake(stream: UnixStream, home: &Path) -> Result<Handshake, AppError> {
         },
         skewed: false,
         subscription: None,
-        events: VecDeque::new(),
+        updates: VecDeque::new(),
     };
     client.write(&Frame::hello())?;
     let frame = client.read(home)?;
@@ -324,7 +347,7 @@ impl BrokerClient {
         loop {
             let frame = self.read(Path::new(""))?;
             if frame.ty == FrameType::Event {
-                self.buffer_event(frame);
+                self.buffer_frame(&frame);
                 continue;
             }
             if frame.id != id {
@@ -347,9 +370,10 @@ impl BrokerClient {
         }
     }
 
-    /// Start this connection's one subscription. Returns its frame id — the id
-    /// every `event` frame on this connection will carry, which is the id
-    /// `request` is about to spend.
+    /// Start (or, after a lag cut this connection's pump short, restart) this
+    /// connection's one subscription. Returns its frame id — the id every
+    /// `event` frame on this connection will carry, which is the id `request`
+    /// is about to spend.
     pub fn subscribe(&mut self) -> Result<u64, AppError> {
         let id = self.next_id;
         self.request("subscribe", json!({}))?;
@@ -363,9 +387,33 @@ impl BrokerClient {
     }
 
     /// The next envelope, or `None` if none arrived inside `timeout`.
+    ///
+    /// The narrow view of [`BrokerClient::next_update`]: a lag or a closed
+    /// connection is an error here, which is what a caller that only wants
+    /// envelopes wants. A **follower** wants the difference and uses
+    /// `next_update`.
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<TailEvent>, AppError> {
-        if let Some(event) = self.events.pop_front() {
-            return Ok(Some(event));
+        match self.next_update(timeout)? {
+            TailUpdate::Event(event) => Ok(Some(*event)),
+            TailUpdate::Lagged { last_seq } => Err(AppError::new(
+                wire::static_code(wire::ERR_LAGGED),
+                ExitCode::Internal,
+                format!("this tail fell behind and was cut after seq {last_seq}"),
+            )
+            .remedy("re-read the worker's events.jsonl from `last_seq`")),
+            TailUpdate::Closed => Err(AppError::new(
+                wire::ERR_BROKER_UNAVAILABLE,
+                ExitCode::BrokerUnavailable,
+                "the broker closed the tail",
+            )),
+            TailUpdate::BrokerShutdown { .. } | TailUpdate::Idle => Ok(None),
+        }
+    }
+
+    /// The next thing the subscription has to say, whatever it is.
+    pub fn next_update(&mut self, timeout: Duration) -> Result<TailUpdate, AppError> {
+        if let Some(update) = self.updates.pop_front() {
+            return Ok(update);
         }
         self.stream
             .set_read_timeout(Some(timeout))
@@ -373,24 +421,13 @@ impl BrokerClient {
         let outcome = wire::read_frame_sync(&mut self.reader);
         let _ = self.stream.set_read_timeout(None);
         match outcome {
-            Ok(Incoming::Frame(frame)) => match frame.ty {
-                FrameType::Event => {
-                    self.buffer_event(*frame);
-                    Ok(self.events.pop_front())
-                }
-                FrameType::Err => Err(self.wire_error(&frame)),
-                _ => Ok(None),
-            },
-            Ok(Incoming::Eof) => Err(AppError::new(
-                wire::ERR_BROKER_UNAVAILABLE,
-                ExitCode::BrokerUnavailable,
-                "the broker closed the tail",
-            )),
+            Ok(Incoming::Frame(frame)) => Ok(classify(&frame)?.unwrap_or(TailUpdate::Idle)),
+            Ok(Incoming::Eof) => Ok(TailUpdate::Closed),
             Ok(Incoming::TooLarge) => Err(internal("the broker sent an oversized frame")),
             Ok(Incoming::Malformed(detail)) => {
                 Err(internal(format!("unreadable frame from the broker: {detail}")))
             }
-            Err(e) if would_block(&e) => Ok(None),
+            Err(e) if would_block(&e) => Ok(TailUpdate::Idle),
             Err(e) => Err(AppError::new(
                 wire::ERR_BROKER_UNAVAILABLE,
                 ExitCode::BrokerUnavailable,
@@ -411,9 +448,9 @@ impl BrokerClient {
         }
     }
 
-    fn buffer_event(&mut self, frame: Frame) {
-        if let Ok(event) = serde_json::from_value::<TailEvent>(frame.body) {
-            self.events.push_back(event);
+    fn buffer_frame(&mut self, frame: &Frame) {
+        if let Ok(Some(update)) = classify(frame) {
+            self.updates.push_back(update);
         }
     }
 
@@ -447,6 +484,45 @@ impl BrokerClient {
             }
             Err(e) => Err(unavailable(home, format!("reading: {e}"))),
         }
+    }
+}
+
+/// One inbound frame → what it means to a subscriber.
+///
+/// `Ok(None)` is "nothing a tail can use" — a response frame, or an event body
+/// this build cannot read. `Err` is reserved for the frames that end a
+/// subscription for a reason the caller has to act on; a **lag** is deliberately
+/// NOT one of them, because it is recoverable and a follower that treated it as
+/// fatal would stop watching a worker that is still running.
+fn classify(frame: &Frame) -> Result<Option<TailUpdate>, AppError> {
+    match frame.ty {
+        FrameType::Event => {
+            if frame.body.get("event").and_then(Value::as_str) == Some(wire::EVENT_BROKER_SHUTDOWN)
+            {
+                return Ok(Some(TailUpdate::BrokerShutdown {
+                    grace_secs: frame
+                        .body
+                        .get("grace_secs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                }));
+            }
+            Ok(serde_json::from_value::<TailEvent>(frame.body.clone())
+                .ok()
+                .map(|e| TailUpdate::Event(Box::new(e))))
+        }
+        FrameType::Err => {
+            let err = WireError::from_value(&frame.body).ok_or_else(|| {
+                internal(format!("the broker sent an unreadable error: {}", frame.body))
+            })?;
+            if err.code == wire::ERR_LAGGED {
+                return Ok(Some(TailUpdate::Lagged {
+                    last_seq: err.get("last_seq").and_then(Value::as_u64).unwrap_or(0),
+                }));
+            }
+            Err(err.to_app())
+        }
+        _ => Ok(None),
     }
 }
 
@@ -690,6 +766,52 @@ mod tests {
             "A2A_HOME travels as `--home` (not as inherited state), and nothing \
              else is smuggled in because it happens to start with `A2A_`"
         );
+    }
+
+    /// The four things a subscription can say, told apart from the frame alone
+    /// — the classification a follower's whole recovery policy turns on.
+    #[test]
+    fn a_subscriber_tells_an_envelope_a_lag_and_a_farewell_apart() {
+        let envelope = crate::events::Envelope::synthetic(crate::events::EventKind::TurnStarted);
+        let event = Frame::event(9, json!({"worker": "impl-0817t1200-aaaa", "envelope": envelope}));
+        match classify(&event).unwrap() {
+            Some(TailUpdate::Event(e)) => assert_eq!(e.worker, "impl-0817t1200-aaaa"),
+            other => panic!("expected an envelope, got {other:?}"),
+        }
+
+        match classify(&Frame::broker_shutdown(9, 10)).unwrap() {
+            Some(TailUpdate::BrokerShutdown { grace_secs }) => assert_eq!(grace_secs, 10),
+            other => panic!("expected the farewell, got {other:?}"),
+        }
+
+        // A lag is DATA, not an error: it names the cursor to resume from, and
+        // a follower that treated it as fatal would stop watching a worker that
+        // is still running.
+        let lagged = Frame::err(
+            9,
+            WireError::new(wire::ERR_LAGGED, ExitCode::Internal, "cut")
+                .with("last_seq", json!(41))
+                .with("missed", json!(7)),
+        );
+        match classify(&lagged).unwrap() {
+            Some(TailUpdate::Lagged { last_seq }) => assert_eq!(last_seq, 41),
+            other => panic!("expected a lag, got {other:?}"),
+        }
+
+        // ... and every other error still is one, with its exit code intact.
+        let refused = Frame::err(
+            9,
+            WireError::new("NO_SUCH_WORKER", ExitCode::NoSuchWorker, "gone"),
+        );
+        let err = classify(&refused).expect_err("an unrelated error ends the tail");
+        assert_eq!(err.exit, ExitCode::NoSuchWorker);
+        assert_eq!(err.code, "NO_SUCH_WORKER");
+
+        // A response frame carries nothing a tail can use, and says so without
+        // pretending the subscription ended.
+        assert!(classify(&Frame::resp(9, json!({"ok": true})))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

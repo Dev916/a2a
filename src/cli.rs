@@ -62,6 +62,18 @@ pub enum Cmd {
         /// Print full event envelopes as JSONL instead of the projection
         #[arg(long)]
         raw: bool,
+        /// Keep printing as the worker writes: live frames from the broker on
+        /// the app-server transport, a 500ms poll of the log otherwise. Always
+        /// bounded — it ends by itself when the worker reaches a terminal state
+        /// (exit 0), when `--timeout` expires (exit 6), or when the broker that
+        /// was feeding it shuts down (exit 0).
+        #[arg(long)]
+        follow: bool,
+        /// Stop following after this long and exit 6 — `30s`, `5m`, `2h`
+        /// (default: 1h, matching `a2a wait`)
+        #[arg(long, value_name = "DUR", requires = "follow",
+              value_parser = crate::commands::wait::parse_duration)]
+        timeout: Option<std::time::Duration>,
     },
     /// Print a worker's final result (exit code encodes its state)
     Result {

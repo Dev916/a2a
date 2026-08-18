@@ -85,13 +85,25 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::ls::run(&home, cli.global.json, cli.global.quiet)
         }
-        Cmd::Tail { id, since, raw } => {
+        Cmd::Tail {
+            id,
+            since,
+            raw,
+            follow,
+            timeout,
+        } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            // The default bound is `wait`'s, for the same reason: a follow that
+            // can block forever is one an orchestrator cannot supervise.
+            let follow = follow.then(|| a2a::commands::tail::Follow {
+                timeout: timeout.unwrap_or(a2a::commands::wait::DEFAULT_TIMEOUT),
+            });
             a2a::commands::tail::run(
                 &home,
                 id,
                 *since,
                 *raw,
+                follow,
                 cli.global.json,
                 cli.global.quiet,
             )

@@ -760,7 +760,7 @@ fn auth_mode_verdict(api_key_exported: bool, auth_json: Option<&Path>) -> Check 
 
 /// `CODEX_HOME`, else `$HOME/.codex` — codex's own resolution, and the one the
 /// child env allowlist forwards.
-fn effective_codex_home() -> Option<PathBuf> {
+pub(crate) fn effective_codex_home() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("CODEX_HOME") {
         if !v.is_empty() {
             return Some(PathBuf::from(v));
@@ -783,7 +783,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// resolution `spawn` performs, plus the executability check spawn learns the
 /// hard way. A bare name is searched on PATH; anything with a separator is
 /// taken literally.
-fn resolve_codex(cfg: &Config) -> Option<PathBuf> {
+pub(crate) fn resolve_codex(cfg: &Config) -> Option<PathBuf> {
     let raw = cfg
         .codex_bin
         .clone()
@@ -796,7 +796,7 @@ fn resolve_codex(cfg: &Config) -> Option<PathBuf> {
         .find(|c| is_executable(c))
 }
 
-fn is_executable(p: &Path) -> bool {
+pub(crate) fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)

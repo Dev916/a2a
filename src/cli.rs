@@ -192,6 +192,11 @@ pub enum Cmd {
         /// The op's parameters, as one JSON object
         params: Option<String>,
     },
+    /// Mirror Claude-side capabilities into the Codex home (spec §6.1/§6.2)
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
+    },
     // later tasks append variants here
 }
 
@@ -278,5 +283,34 @@ pub enum ConfigCmd {
         /// Annotate each value with the layer it came from
         #[arg(long)]
         origin: bool,
+    },
+}
+
+/// The two halves of `a2a sync`, both declared from the release that ships
+/// either: a subcommand that appears in a later build is indistinguishable, to
+/// a caller reading `--help`, from one they typed wrong.
+#[derive(Subcommand)]
+pub enum SyncCmd {
+    /// Mirror ~/.claude/skills into $CODEX_HOME/skills (flat, manifest-tracked)
+    Skills {
+        /// Decide everything, write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read the Claude side from this directory instead of $HOME
+        #[arg(long, value_name = "DIR")]
+        claude_config_dir: Option<PathBuf>,
+    },
+    /// Translate ~/.claude.json mcpServers into $CODEX_HOME/config.toml
+    Mcp {
+        /// Decide everything, write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Read the Claude side from this directory instead of $HOME
+        #[arg(long, value_name = "DIR")]
+        claude_config_dir: Option<PathBuf>,
+        /// One-time: `git rm --cached config.toml` + gitignore it, so stdio
+        /// secrets may be written to a file git no longer publishes
+        #[arg(long)]
+        migrate_untrack: bool,
     },
 }

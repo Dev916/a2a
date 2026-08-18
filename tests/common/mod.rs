@@ -209,3 +209,38 @@ pub fn rewrite_deadline_to_past(home: &Path, id: &str) {
 fn a2a_lib_write_atomic(p: &Path, b: &[u8]) {
     a2a::store::write_atomic(p, b).unwrap()
 }
+
+/// The Phase-3-owned `codex mcp list --json` answerer. Emphatically NOT
+/// [`stub_path`]: that fixture falls through its argument loop and answers
+/// `mcp list --json` with exec NDJSON and exit 0, which would make a sync
+/// validation "pass" for reasons that have nothing to do with the config.
+pub fn stub_codex_mcp_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sync/stub-codex-mcp")
+}
+
+/// The ONE entry point every `sync` test builds its command with.
+///
+/// [`a2a`] sets neither `CODEX_HOME` nor any Claude pointer, and a sync test
+/// that forgot one of them would resolve to the developer's REAL `~/.codex`
+/// submodule and `~/.claude/skills` — a mistake nothing on disk would undo.
+/// This helper is half of the answer (the other half is `sync`'s own runtime
+/// guard, which refuses the real `$HOME` unless `A2A_SYNC_ALLOW_REAL_HOME` is
+/// set — and which is why this removes that variable rather than trusting the
+/// ambient environment to be free of it).
+///
+/// `claude_dir` is passed through the config layer's env spelling, so the
+/// resolved account is the fixture's and `--claude-config-dir` is left free for
+/// tests that want to assert the flag outranks it.
+pub fn sync_a2a(home: &Path, codex_home: &Path, claude_dir: &Path, allowed_root: &Path) -> Command {
+    let mut c = a2a(home, allowed_root);
+    c.env("CODEX_HOME", codex_home)
+        .env("A2A_SYNC_CLAUDE_CONFIG_DIR", claude_dir)
+        .env("A2A_CODEX_BIN", stub_codex_mcp_path())
+        // Both pointers below would otherwise be inherited from whoever ran
+        // `cargo test` — and this developer's shell really does set
+        // `CLAUDE_CONFIG_DIR` for the second account.
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("A2A_SYNC_ALLOW_REAL_HOME")
+        .env_remove("A2A_SYNC_ALLOW_SKILLS");
+    c
+}

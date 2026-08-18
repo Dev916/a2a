@@ -1,4 +1,4 @@
-use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd};
+use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd, SyncCmd};
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
 use clap::Parser;
@@ -55,6 +55,10 @@ fn command_name(cmd: &Cmd) -> &'static str {
             BrokerCmd::Restart => "broker restart",
         },
         Cmd::BrokerCall { .. } => "__broker-call",
+        Cmd::Sync { cmd } => match cmd {
+            SyncCmd::Skills { .. } => "sync skills",
+            SyncCmd::Mcp { .. } => "sync mcp",
+        },
     }
 }
 
@@ -212,6 +216,22 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
         Cmd::BrokerCall { op, params } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::broker_cmd::call(&home, op, params.as_deref())
+        }
+        Cmd::Sync { cmd } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            match cmd {
+                SyncCmd::Skills {
+                    dry_run,
+                    claude_config_dir,
+                } => a2a::commands::sync_cmd::skills(
+                    &home,
+                    *dry_run,
+                    claude_config_dir.as_deref(),
+                    cli.global.json,
+                    cli.global.quiet,
+                ),
+                SyncCmd::Mcp { .. } => a2a::commands::sync_cmd::mcp(),
+            }
         }
     }
 }

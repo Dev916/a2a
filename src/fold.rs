@@ -212,6 +212,14 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
             repo: repo.into(),
         });
     }
+    // Why a worker whose lane defaults to a worktree has none. Bookkeeping the
+    // snapshot carries verbatim, like `transport_selection`: it explains an
+    // absence, and an explanation only `state.json` knew would not survive the
+    // rebuild that makes the absence visible again.
+    if let Some(reason) = raw.get("worktree_skipped") {
+        snap.extra
+            .insert("worktree_skipped".to_string(), reason.clone());
+    }
     // The diff anchor, recorded whether or not there is a worktree. When only
     // the worktree keys are present it is derived from them, so the "a worktree
     // implies its base ref" invariant holds after a fold from zero too.

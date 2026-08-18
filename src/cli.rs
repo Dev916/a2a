@@ -241,7 +241,7 @@ pub struct SpawnArgs {
     /// exec otherwise; `app-server` demands the broker and exits 7 without one)
     #[arg(long)]
     pub transport: Option<String>,
-    /// Run in a git worktree (Phase 4; warns and is ignored today)
+    /// Run in a git worktree at $A2A_HOME/worktrees/<id> on branch a2a/<lane>/<id>
     #[arg(long)]
     pub worktree: bool,
     /// Fail rather than queue at the admission cap (app-server transport only)
@@ -251,6 +251,12 @@ pub struct SpawnArgs {
     /// Recorded at genesis, so it survives losing `state.json` (spec §4.8).
     #[arg(long)]
     pub owner: Option<String>,
+    /// Never create a worktree, even when the lane defaults to one
+    #[arg(long, conflicts_with = "worktree")]
+    pub no_worktree: bool,
+    /// Branch the worktree from this ref instead of the target repo's HEAD
+    #[arg(long, value_name = "REF")]
+    pub base_ref: Option<String>,
 }
 
 /// clap-facing mirror of [`crate::inbox::MsgKind`]; the domain enum stays free

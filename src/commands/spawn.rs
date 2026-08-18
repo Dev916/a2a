@@ -8,14 +8,28 @@
 //!
 //! ```text
 //! home+config → transport gate → elevation gate → cwd resolution
+//!   → WORKTREE GATE (--worktree | lane default | --no-worktree; base ref pinned)
 //!   → brief parse+validate → secret scan → TRANSPORT SELECTION → id allocation
 //!   ───────────────────────── first write ─────────────────────────
 //!   → dir tree (0700) → context staging → brief.md + prompt.md
+//!   → WORKTREE CREATE (+ .git/info/exclude)
 //!   → ADMISSION (broker only: admit | queue | refuse)
 //!   → genesis event (WAL, carrying `queued` when the answer was "wait")
 //!   → detached spawn / broker Spawn frame
 //!                         → ProcessStarted (WAL, exec only)
 //! ```
+//!
+//! **The worktree is created here, CLI-side, and never by the broker**
+//! (spec §4.8). Its two halves sit on opposite sides of the first write for a
+//! reason: everything that can *refuse* — a cwd that is not a git work tree
+//! under an explicit `--worktree`, a `--base-ref` that names no commit, a repo
+//! with no commit to branch from — is decided in the gate, while the tree itself
+//! cannot be created until the id exists, because the id is its name. A failure
+//! in that window removes the worker dir *and* the half-made tree: it is the
+//! pre-genesis boundary, and the rule there is that nothing is left behind.
+//! From the create onwards the worker's `cwd` **is** the worktree — which is how
+//! `codex -C` and the broker's spawn frame both land in it without either of
+//! them knowing worktrees exist.
 //!
 //! **Admission is asked before genesis and answered by the broker** (spec §4.9),
 //! because the answer is part of genesis: a worker born at the cap is born
@@ -67,8 +81,9 @@ use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::ids;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
-use crate::state::WorkerSnapshot;
+use crate::state::{WorkerSnapshot, WorktreeRef};
 use crate::store::EventLog;
+use crate::worktree;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -110,9 +125,6 @@ pub fn run(
     for w in &warnings {
         warn(w);
     }
-    if args.worktree {
-        warn("--worktree is not implemented in Phase 1 (worktrees land in Phase 4); spawning directly in --cwd");
-    }
 
     // ---- gates: nothing below this block has touched the filesystem --------
     let requested = transport_gate(args.transport.as_deref())?;
@@ -126,6 +138,7 @@ pub fn run(
     elevation_gate(lane, &lane_cfg)?;
 
     let cwd_plan = resolve_cwd(lane, args.cwd.as_deref(), &cfg.allowed_roots)?;
+    let wt_gate = worktree_gate(args, &lane_cfg, &cwd_plan, &warn)?;
 
     let brief_text = std::fs::read_to_string(&args.brief).map_err(|e| {
         AppError::new(
@@ -191,6 +204,42 @@ pub fn run(
         }
     };
 
+    // ---- the worker's own tree (spec §4.8) ---------------------------------
+    //
+    // After the id (which names the branch and the directory) and before
+    // genesis (which records it), so the fold is lossless from the first row.
+    // Still pre-genesis: a failure here takes the worker dir AND the half-made
+    // tree with it.
+    let worktree = match wt_gate.create_from.as_deref() {
+        Some(base) => match worktree::create(home, &id, lane, &cwd, Some(base)) {
+            Ok(wt) => Some(wt),
+            Err(e) => {
+                discard_pre_genesis(home, &wdir, &id, worktree::repo_root(&cwd).as_deref());
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let cwd = match &worktree {
+        // The worktree IS the workspace from here on: `snap.cwd` is what
+        // `exec::build_argv` turns into `-C`, and what the broker's spawn frame
+        // carries as the worker's cwd.
+        Some(wt) => {
+            // Belt-and-braces (spec §4.8), and never fatal: a missing exclude
+            // line has never made a worktree wrong.
+            if let Err(e) = worktree::add_to_info_exclude(&wt.repo, &wt.path) {
+                warn(&format!(
+                    "could not add {} to the repo's info/exclude ({}): {}",
+                    wt.path.display(),
+                    e.code,
+                    e.message
+                ));
+            }
+            wt.path.clone()
+        }
+        None => cwd,
+    };
+
     // ---- admission: the last thing that can refuse, and the first thing
     //      genesis has to record (spec §4.9) ---------------------------------
     //
@@ -204,7 +253,12 @@ pub fn run(
             match request_admission(client, &wdir, &cwd, lane, args.no_queue) {
                 Ok(admitted) => admitted,
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(&wdir);
+                    discard_pre_genesis(
+                        home,
+                        &wdir,
+                        &id,
+                        worktree.as_ref().map(|w| w.repo.as_path()),
+                    );
                     return Err(e);
                 }
             }
@@ -216,6 +270,15 @@ pub fn run(
     let mut snap = WorkerSnapshot::blank(&id, &cwd);
     snap.writable_roots = vec![wdir.join("outbox")];
     snap.schema_path = args.schema.clone();
+    // The diff anchor `a2a verify` needs — recorded whether or not there is a
+    // worktree, and equal to the worktree's own base ref when there is one.
+    snap.base_ref = wt_gate.base_ref.clone();
+    snap.worktree = worktree.as_ref().map(|w| WorktreeRef {
+        path: w.path.clone(),
+        branch: w.branch.clone(),
+        base_ref: w.base_ref.clone(),
+        repo: w.repo.clone(),
+    });
     let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
     let mut genesis = json!({
             "fsm": "Spawn",
@@ -237,6 +300,24 @@ pub fn run(
             "schema_path": args.schema,
             "created_at": now.to_rfc3339(),
     });
+    // The worktree, in genesis rather than only on the snapshot: `state.json` is
+    // a derived checkpoint, and a worktree only `state.json` knew about would be
+    // lost by a rebuild from zero — leaving a tree on disk that no `gc` could
+    // ever address. All four keys or none (the fold refuses a partial object).
+    if let Some(wt) = &worktree {
+        genesis["worktree_path"] = json!(wt.path);
+        genesis["worktree_branch"] = json!(wt.branch);
+        genesis["worktree_base_ref"] = json!(wt.base_ref);
+        genesis["worktree_repo"] = json!(wt.repo);
+    }
+    if let Some(base) = &wt_gate.base_ref {
+        genesis["base_ref"] = json!(base);
+    }
+    // Why a worker the lane would have given a tree has none — same reasoning:
+    // written where a rebuild can still read it (it reaches `snap.extra`).
+    if let Some(reason) = wt_gate.skipped {
+        genesis["worktree_skipped"] = json!(reason);
+    }
     // The admission answer, and ONLY when it is "wait": genesis stays the
     // Phase-1 shape for every worker that was admitted straight away, and the
     // fold reads an absent marker exactly as it reads `false`.
@@ -274,6 +355,16 @@ pub fn run(
         )?;
     }
 
+    // The tree a caller can `git -C` into, in the same four fields
+    // `status --json` reports — `null` for a worker that has none.
+    let worktree_payload = json!(snap.worktree);
+    // ` on a2a/<lane>/<id>`, appended to the human line: the branch IS the
+    // deliverable, so the one place a human sees the spawn should name it.
+    let on_branch = worktree
+        .as_ref()
+        .map(|w| format!(" on {}", w.branch))
+        .unwrap_or_default();
+
     // ---- hand the worker to its transport ---------------------------------
     if let Selected::AppServer(client) = selected {
         let snap = attach_to_broker(client, &mut log, &wdir, snap, lane, &cwd)?;
@@ -284,7 +375,7 @@ pub fn run(
                      the broker is at its admission cap"
                 ),
                 None => eprintln!(
-                    "a2a: spawned {id} ({lane} lane, app-server) in {}",
+                    "a2a: spawned {id} ({lane} lane, app-server) in {}{on_branch}",
                     cwd.display()
                 ),
             }
@@ -309,6 +400,7 @@ pub fn run(
                 // `null` unless this worker is waiting: the 1-based place in the
                 // admission queue (spec §4.9).
                 "queue_position": snap.queue_position,
+                "worktree": worktree_payload,
                 "deadline_at": snap.deadline_at,
             })
         } else {
@@ -372,7 +464,10 @@ pub fn run(
     )?;
 
     if !quiet {
-        eprintln!("a2a: spawned {id} ({lane} lane) in {}", cwd.display());
+        eprintln!(
+            "a2a: spawned {id} ({lane} lane) in {}{on_branch}",
+            cwd.display()
+        );
     }
     // stdout carries the machine payload: the envelope's `data` under --json,
     // the bare id otherwise.
@@ -391,6 +486,7 @@ pub fn run(
             "network": lane_cfg.network,
             "model": model,
             "effort": effort,
+            "worktree": worktree_payload,
             "deadline_at": snap.deadline_at,
         })
     } else {
@@ -584,6 +680,109 @@ fn elevation_gate(lane: Lane, lane_cfg: &LaneConfig) -> Result<(), AppError> {
         .remedy("give the lane a non-elevated sandbox in $A2A_HOME/config.toml"));
     }
     Ok(())
+}
+
+/// The worktree decision, taken before the first byte is written.
+///
+/// Everything here is read-only on the workspace: the git probes are
+/// `rev-parse`, and the only thing they can do is refuse.
+#[derive(Debug, Default)]
+struct WorktreeGate {
+    /// The 40-hex commit to cut the branch from — `Some` exactly when a
+    /// worktree is to be created.
+    create_from: Option<String>,
+    /// The diff anchor to record, worktree or not (spec §4.5): the target
+    /// repo's `HEAD` at spawn, or `--base-ref` resolved.
+    base_ref: Option<String>,
+    /// Why a lane that defaults to a worktree did not get one.
+    skipped: Option<&'static str>,
+}
+
+/// `--worktree` ⇒ yes; `--no-worktree` ⇒ no; neither ⇒ the lane default.
+///
+/// The two-rule split on a cwd that is not a git work tree is deliberate and
+/// pinned: an **explicit** `--worktree` is a request, and a request that cannot
+/// be honoured is an error; a **lane default** is a policy, and refusing every
+/// legitimate non-repo impl worker in its name would be worse than proceeding
+/// without one. The skip is recorded (genesis, then `snap.extra`) rather than
+/// left as a stderr line nobody keeps.
+fn worktree_gate(
+    args: &SpawnArgs,
+    lane_cfg: &LaneConfig,
+    cwd_plan: &CwdPlan,
+    warn: &dyn Fn(&str),
+) -> Result<WorktreeGate, AppError> {
+    if args.no_worktree {
+        warn("--no-worktree: spawning directly in --cwd");
+    }
+    let wanted = args.worktree || (!args.no_worktree && lane_cfg.worktree_default);
+    // The research lane's cwd is inside the worker dir and does not exist yet;
+    // it is never a git work tree, and `--worktree` on it is the same refusal a
+    // non-repo `--cwd` gets.
+    let target = match cwd_plan {
+        CwdPlan::Fixed(p) => Some(p.as_path()),
+        CwdPlan::Scratch => None,
+    };
+    let repo = target.and_then(worktree::repo_root);
+    let Some(repo) = repo else {
+        if args.worktree {
+            let shown = target
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the research lane's scratch dir".to_string());
+            return Err(AppError::new(
+                "WORKTREE_NOT_A_REPO",
+                ExitCode::Precondition,
+                format!("--worktree: {shown} is not inside a git work tree"),
+            )
+            .remedy("run `git init` in --cwd, or pass --no-worktree to spawn directly in it"));
+        }
+        if wanted {
+            warn(&format!(
+                "the {} lane defaults to a worktree, but {} is not inside a git work tree — \
+                 spawning directly in it",
+                args.lane,
+                target.map(|p| p.display().to_string()).unwrap_or_default()
+            ));
+            return Ok(WorktreeGate {
+                skipped: Some("not-a-git-repo"),
+                ..WorktreeGate::default()
+            });
+        }
+        return Ok(WorktreeGate::default());
+    };
+    // Pinned here, in the gate, so an unresolvable `--base-ref` and a repo with
+    // no commit both refuse before anything is written — and so the commit the
+    // branch is cut from is the same one the snapshot records.
+    let base = match args.base_ref.as_deref() {
+        Some(r) => Some(worktree::resolve_commit(&repo, r)?),
+        None if wanted => Some(worktree::head_ref(&repo)?),
+        // No worktree and no explicit ref: the anchor is still worth recording,
+        // but an empty repo is not this spawn's problem.
+        None => worktree::head_ref(&repo).ok(),
+    };
+    Ok(WorktreeGate {
+        create_from: base.clone().filter(|_| wanted),
+        base_ref: base,
+        skipped: None,
+    })
+}
+
+/// Pre-genesis cleanup: this id never became a worker, so the worker dir AND
+/// any half-made tree go with it (an id with no `state.json` is a ghost, and a
+/// tree with no worker is one `gc` can never reach).
+///
+/// Best-effort by construction — the error already on its way out is the one
+/// worth reporting. The BRANCH is never touched: a2a does not delete branches.
+fn discard_pre_genesis(home: &A2aHome, wdir: &Path, id: &str, repo: Option<&Path>) {
+    let _ = std::fs::remove_dir_all(wdir);
+    let path = home.worktrees_dir().join(id);
+    if !path.exists() {
+        return;
+    }
+    if let Some(repo) = repo {
+        let _ = worktree::remove(repo, &path, true);
+    }
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// Research runs in its own scratch dir, never a repo and never `$HOME`

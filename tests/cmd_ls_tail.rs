@@ -46,43 +46,47 @@ fn tail_formats_filters_and_redacts_everywhere() {
 
 // --------------------------------------------------------------- WT column
 
-/// Spawn one more general-lane worker into an existing home.
-fn spawn_into(home: &std::path::Path, tmp: &std::path::Path) -> String {
-    let work = tmp.join("proj");
-    std::fs::create_dir_all(&work).unwrap();
+/// `git -C <dir> <args…>`, asserting success.
+fn git_ok(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git is on PATH");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Spawn one more general-lane worker into an existing home, in its own git
+/// worktree — the real thing `a2a spawn` now creates, not a staged genesis row.
+/// Returns its id and the branch, which is what `--json` must carry.
+fn spawn_with_a_worktree(home: &std::path::Path, tmp: &std::path::Path) -> (String, String) {
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
+    git_ok(&repo, &["config", "user.email", "a2a@example.invalid"]);
+    git_ok(&repo, &["config", "user.name", "a2a test"]);
+    git_ok(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git_ok(&repo, &["add", "a.txt"]);
+    git_ok(&repo, &["commit", "-q", "-m", "init"]);
     let brief = write_brief(tmp, "do the thing\n");
     let out = a2a(home, tmp)
-        .args(["--json", "spawn", "--lane", "general", "--cwd"])
-        .arg(&work)
+        .args(["--json", "spawn", "--lane", "general", "--worktree", "--cwd"])
+        .arg(&repo)
         .arg("--brief")
         .arg(&brief)
         .assert()
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    v["data"]["id"].as_str().unwrap().to_string()
-}
-
-/// Give `id` a worktree the only lossless way: write it into genesis and drop
-/// the checkpoint, so the next read rebuilds it from the WAL. (Task 3 is what
-/// makes `a2a spawn` do this for real.)
-fn give_it_a_worktree(home: &std::path::Path, id: &str) -> String {
-    let dir = home.join("workers").join(id);
-    let events = dir.join("events.jsonl");
-    let text = std::fs::read_to_string(&events).unwrap();
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut genesis: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-    assert_eq!(genesis["raw"]["fsm"], "Spawn");
-    let branch = format!("a2a/general/{id}");
-    let base = "0123456789abcdef0123456789abcdef01234567";
-    genesis["raw"]["worktree_path"] = serde_json::json!(home.join("worktrees").join(id));
-    genesis["raw"]["worktree_branch"] = serde_json::json!(branch);
-    genesis["raw"]["worktree_base_ref"] = serde_json::json!(base);
-    genesis["raw"]["worktree_repo"] = serde_json::json!(home.join("proj"));
-    genesis["raw"]["base_ref"] = serde_json::json!(base);
-    lines[0] = genesis.to_string();
-    std::fs::write(&events, lines.join("\n") + "\n").unwrap();
-    std::fs::remove_file(dir.join("state.json")).unwrap();
-    branch
+    (
+        v["data"]["id"].as_str().unwrap().to_string(),
+        v["data"]["worktree"]["branch"].as_str().unwrap().to_string(),
+    )
 }
 
 fn ls_stderr_and_stdout(home: &std::path::Path, tmp: &std::path::Path, all: bool) -> (String, String) {
@@ -124,14 +128,12 @@ fn an_all_plain_fleet_keeps_the_phase_one_header() {
 fn a_mixed_fleet_grows_a_wt_column_with_markers_and_a_json_branch() {
     let (home, tmp, plain) = spawn_with(&[]);
     wait_dead(&home, &plain, 10);
-    let treed = spawn_into(&home, tmp.path());
+    let (treed, branch) = spawn_with_a_worktree(&home, tmp.path());
     wait_dead(&home, &treed, 10);
-    // Reading a worker is what advances it: both are terminal in the WAL
-    // before the checkpoint is dropped, so the rebuild replays cleanly.
     for id in [&plain, &treed] {
         a2a(&home, tmp.path()).args(["status", id]).assert().success();
     }
-    let branch = give_it_a_worktree(&home, &treed);
+    assert_eq!(branch, format!("a2a/general/{treed}"));
 
     let (stderr, stdout) = ls_stderr_and_stdout(&home, tmp.path(), false);
     assert!(

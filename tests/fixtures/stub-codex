@@ -16,6 +16,9 @@ while [ $# -gt 0 ]; do
     --add-dir)             shift; outbox="$1";;
   esac; shift
 done
+# STUB_ARGV_FILE: the whole argv, every run — the witness for `-C <workspace>`
+# (a2a derives it from the worker's cwd, so a worktree spawn must land here).
+[ -n "$STUB_ARGV_FILE" ] && printf '%s\n' "$argv" > "$STUB_ARGV_FILE"
 if [ "$resume" = 1 ] && [ -n "$STUB_RECORD" ]; then
   printf '%s\n' "$0 $argv" > "$STUB_RECORD/resume-argv.txt"
   cat > "$STUB_RECORD/resume-stdin.txt"

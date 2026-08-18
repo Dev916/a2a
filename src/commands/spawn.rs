@@ -11,9 +11,19 @@
 //!   → brief parse+validate → secret scan → TRANSPORT SELECTION → id allocation
 //!   ───────────────────────── first write ─────────────────────────
 //!   → dir tree (0700) → context staging → brief.md + prompt.md
-//!   → genesis event (WAL) → detached spawn / broker Spawn frame
+//!   → ADMISSION (broker only: admit | queue | refuse)
+//!   → genesis event (WAL, carrying `queued` when the answer was "wait")
+//!   → detached spawn / broker Spawn frame
 //!                         → ProcessStarted (WAL, exec only)
 //! ```
+//!
+//! **Admission is asked before genesis and answered by the broker** (spec §4.9),
+//! because the answer is part of genesis: a worker born at the cap is born
+//! `queued`, and the fold reads that from the spawn row alone. It sits after the
+//! layout and before the WAL, so its two refusals (`QUEUE_FULL`, `AT_CAPACITY`)
+//! land on the pre-genesis side of the failure boundary below — nothing is left
+//! behind — while a "wait" answer produces a worker that is real, readable, and
+//! doing nothing until a slot frees.
 //!
 //! **Transport selection is a gate, not a fallback inside the write path**
 //! (spec §4.4). It sits with the other gates, before the first byte is written,
@@ -102,9 +112,6 @@ pub fn run(
     if args.worktree {
         warn("--worktree is not implemented in Phase 1 (worktrees land in Phase 4); spawning directly in --cwd");
     }
-    if args.no_queue {
-        warn("--no-queue is a no-op in Phase 1 (there is no broker, so there is no admission queue)");
-    }
 
     // ---- gates: nothing below this block has touched the filesystem --------
     let requested = transport_gate(args.transport.as_deref())?;
@@ -141,7 +148,7 @@ pub fn run(
 
     // The last gate: which transport will own this worker. A refusal here still
     // leaves nothing behind, and the answer is what the genesis event records.
-    let selected = select_transport(home.root(), requested)?;
+    let mut selected = select_transport(home.root(), requested)?;
     let transport = selected.transport();
     if let Selected::Exec {
         degraded: Some(err),
@@ -151,6 +158,12 @@ pub fn run(
             "the broker is not reachable ({}: {}) — falling back to the exec transport",
             err.code, err.message
         ));
+    }
+    // Admission control is the BROKER's (spec §4.9). An exec spawn takes no
+    // slot and cannot be queued: its process is its own, and counting it
+    // against a cap the broker cannot release is deferred to Phase 3.
+    if args.no_queue && matches!(selected, Selected::Exec { .. }) {
+        warn("--no-queue has no effect on the exec transport: there is no admission queue to refuse");
     }
 
     let model = args.model.clone().unwrap_or_else(|| lane_cfg.model.clone());
@@ -177,17 +190,33 @@ pub fn run(
         }
     };
 
+    // ---- admission: the last thing that can refuse, and the first thing
+    //      genesis has to record (spec §4.9) ---------------------------------
+    //
+    // Asked BEFORE genesis because the answer is *part* of genesis: a worker
+    // born at the cap is born `queued`, and the fold reads that from the spawn
+    // row alone. Still pre-genesis, so a refusal leaves nothing behind — the
+    // directory laid out above is removed, exactly as any other failure in this
+    // window is.
+    let queued = match &mut selected {
+        Selected::AppServer(client) => {
+            match request_admission(client, &wdir, &cwd, lane, args.no_queue) {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&wdir);
+                    return Err(e);
+                }
+            }
+        }
+        Selected::Exec { .. } => false,
+    };
+
     // ---- genesis: from here the worker exists and is readable --------------
     let mut snap = WorkerSnapshot::blank(&id, &cwd);
     snap.writable_roots = vec![wdir.join("outbox")];
     snap.schema_path = args.schema.clone();
     let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
-    let mut snap = append_and_fold(
-        &mut log,
-        &wdir,
-        snap,
-        EventKind::Spawned,
-        json!({
+    let mut genesis = json!({
             "fsm": "Spawn",
             "id": id,
             "lane": lane.as_str(),
@@ -206,7 +235,19 @@ pub fn run(
             "owner": owner,
             "schema_path": args.schema,
             "created_at": now.to_rfc3339(),
-        }),
+    });
+    // The admission answer, and ONLY when it is "wait": genesis stays the
+    // Phase-1 shape for every worker that was admitted straight away, and the
+    // fold reads an absent marker exactly as it reads `false`.
+    if queued {
+        genesis["queued"] = json!(true);
+    }
+    let mut snap = append_and_fold(
+        &mut log,
+        &wdir,
+        snap,
+        EventKind::Spawned,
+        genesis,
         now,
     )?;
 
@@ -236,10 +277,16 @@ pub fn run(
     if let Selected::AppServer(client) = selected {
         let snap = attach_to_broker(client, &mut log, &wdir, snap, lane, &cwd)?;
         if !quiet {
-            eprintln!(
-                "a2a: spawned {id} ({lane} lane, app-server) in {}",
-                cwd.display()
-            );
+            match snap.queue_position {
+                Some(position) => eprintln!(
+                    "a2a: queued {id} ({lane} lane, app-server) at position {position} — \
+                     the broker is at its admission cap"
+                ),
+                None => eprintln!(
+                    "a2a: spawned {id} ({lane} lane, app-server) in {}",
+                    cwd.display()
+                ),
+            }
         }
         return Ok(if json_mode {
             json!({
@@ -258,6 +305,9 @@ pub fn run(
                 "network": lane_cfg.network,
                 "model": model,
                 "effort": effort,
+                // `null` unless this worker is waiting: the 1-based place in the
+                // admission queue (spec §4.9).
+                "queue_position": snap.queue_position,
                 "deadline_at": snap.deadline_at,
             })
         } else {
@@ -456,6 +506,35 @@ fn resolve_owner() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| format!("anon-{}", nix::unistd::getuid().as_raw()))
+}
+
+/// Ask the broker whether this worker may run yet (spec §4.9).
+///
+/// Returns `true` when the answer is "wait" — which is the value genesis
+/// records, and therefore the value the fold turns into `queued`. The two
+/// refusals (`QUEUE_FULL`, `AT_CAPACITY`) come back as typed errors with their
+/// exit code and their `data` intact, because an orchestrator meeting a full
+/// queue branches on `retry_after_secs` rather than on the sentence.
+///
+/// A broker from before admission control existed answers `UNKNOWN_OP`. That is
+/// a version skew the CLI does not have to lose a spawn over: an uncapped
+/// broker admits everything anyway, so the spawn proceeds unqueued.
+fn request_admission(
+    client: &mut BrokerClient,
+    wdir: &Path,
+    cwd: &Path,
+    lane: Lane,
+    no_queue: bool,
+) -> Result<bool, AppError> {
+    let answer = client.request(
+        "admit",
+        json!({"dir": wdir, "cwd": cwd, "lane": lane.as_str(), "no_queue": no_queue}),
+    );
+    match answer {
+        Ok(v) => Ok(v.get("decision").and_then(Value::as_str) == Some("queue")),
+        Err(e) if e.code == crate::broker::wire::ERR_UNKNOWN_OP => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Hand a laid-out, genesis-written worker to the broker.

@@ -19,6 +19,7 @@ pub fn run(home: &A2aHome, origin: bool, quiet: bool) -> Result<Value, AppError>
         "allowed_roots": cfg.allowed_roots,
         "lanes": lanes,
         "broker": serde_json::to_value(cfg.broker).map_err(internal)?,
+        "admission": serde_json::to_value(&cfg.admission).map_err(internal)?,
     });
     if origin {
         data["origins"] = serde_json::to_value(&origins).map_err(internal)?;

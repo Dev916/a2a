@@ -23,6 +23,14 @@ pub struct AppError {
     pub retryable: bool,
     pub remedy: Option<String>,
     pub exit: ExitCode,
+    /// Structured detail a caller BRANCHES on, as opposed to prose it prints.
+    ///
+    /// `QUEUE_FULL` carries `{"retry_after_secs": …}` here: an orchestrator that
+    /// meets a full admission queue has to decide when to try again, and parsing
+    /// that number out of a human sentence is the kind of thing that works until
+    /// the sentence is improved. Serialized as `error.data` in the envelope, and
+    /// carried across the broker socket by [`crate::broker::wire::WireError`].
+    pub data: Option<Value>,
 }
 
 impl AppError {
@@ -33,10 +41,16 @@ impl AppError {
             retryable: false,
             remedy: None,
             exit,
+            data: None,
         }
     }
     pub fn remedy(mut self, r: impl Into<String>) -> Self {
         self.remedy = Some(r.into());
+        self
+    }
+    /// Attach the machine-readable half of this error.
+    pub fn data(mut self, data: Value) -> Self {
+        self.data = Some(data);
         self
     }
 }
@@ -87,7 +101,8 @@ pub fn emit_err(json_mode: bool, command: &str, err: &AppError) -> i32 {
         println!(
             "{}",
             json!({"schema_version":1,"ok":false,"command":command,
-            "error":{"code":err.code,"message":err.message,"retryable":err.retryable,"remedy":err.remedy}})
+            "error":{"code":err.code,"message":err.message,"retryable":err.retryable,
+                     "remedy":err.remedy,"data":err.data}})
         );
     } else {
         eprintln!(

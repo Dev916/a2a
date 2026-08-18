@@ -36,6 +36,33 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Every `[broker]` key, in the order `config show --origin` reports them.
 pub const BROKER_FIELDS: [&str; 1] = ["idle_timeout_secs"];
 
+/// How many workers one broker will run at once (spec §4.9 admission control).
+///
+/// Eight is a *concurrency* limit, not a licence: every admitted worker is a
+/// live model conversation against one shared app-server child, and the thing
+/// that breaks first when this is too high is not a2a but the account's rate
+/// limit. Spawns past the cap queue rather than fail, because an orchestrator
+/// dispatching a fleet should not have to implement backpressure itself.
+pub const DEFAULT_ADMISSION_GLOBAL_CAP: u64 = 8;
+
+/// How many spawns may WAIT at once. The queue is bounded for the same reason
+/// every channel in this system is: an unbounded backlog is a slower way to run
+/// out of memory, and a caller who is 33 deep needs to know now rather than in
+/// an hour.
+pub const DEFAULT_ADMISSION_QUEUE_CAP: u64 = 32;
+
+/// Per-lane share of the global cap. Half of it by default: one lane's fleet
+/// must not be able to starve every other lane, which is the failure a single
+/// global cap has no way to prevent.
+pub const DEFAULT_ADMISSION_LANE_CAP: u64 = 4;
+
+/// Every `[admission]` key, in the order `config show --origin` reports them.
+/// `lanes` is a nested TABLE, not a value, and is handled separately.
+pub const ADMISSION_FIELDS: [&str; 2] = ["global_cap", "queue_cap"];
+
+/// Every `[admission.lanes.<lane>]` key.
+pub const ADMISSION_LANE_FIELDS: [&str; 1] = ["cap"];
+
 /// Every per-lane key, in the order `config show --origin` reports them.
 pub const LANE_FIELDS: [&str; 8] = [
     "sandbox",
@@ -157,6 +184,54 @@ impl Default for BrokerConfig {
     }
 }
 
+/// One lane's slice of the admission cap.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+pub struct LaneAdmission {
+    pub cap: u64,
+}
+
+/// The `[admission]` section: how many workers may run, and how many may wait
+/// (spec §4.9).
+///
+/// Every cap is a `u64` and `0` means "admit nothing" rather than "unbounded" —
+/// the value an operator types to close the door is the same value a mis-set
+/// environment variable produces, so it must be the SAFE reading. Uncapping is
+/// spelled with a large number, which is a thing you can only do on purpose.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct AdmissionConfig {
+    pub global_cap: u64,
+    pub queue_cap: u64,
+    pub lanes: BTreeMap<Lane, LaneAdmission>,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        AdmissionConfig {
+            global_cap: DEFAULT_ADMISSION_GLOBAL_CAP,
+            queue_cap: DEFAULT_ADMISSION_QUEUE_CAP,
+            lanes: Lane::ALL
+                .iter()
+                .map(|l| {
+                    (
+                        *l,
+                        LaneAdmission {
+                            cap: DEFAULT_ADMISSION_LANE_CAP,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// This lane's cap, falling back to the global one for a lane the map
+    /// somehow does not carry (a config written by a newer binary).
+    pub fn lane_cap(&self, lane: Lane) -> u64 {
+        self.lanes.get(&lane).map(|l| l.cap).unwrap_or(self.global_cap)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `A2A_CODEX_BIN` env / `codex_bin` config key; else `codex` on PATH.
@@ -168,6 +243,7 @@ pub struct Config {
     pub allowed_roots: Vec<PathBuf>,
     pub lanes: BTreeMap<Lane, LaneConfig>,
     pub broker: BrokerConfig,
+    pub admission: AdmissionConfig,
 }
 
 #[derive(Serialize, PartialEq, Clone, Copy, Debug)]
@@ -234,12 +310,18 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     for field in BROKER_FIELDS {
         origins.insert(format!("broker.{field}"), Origin::Default);
     }
+    for field in ADMISSION_FIELDS {
+        origins.insert(format!("admission.{field}"), Origin::Default);
+    }
 
     let mut lanes = BTreeMap::new();
     for lane in Lane::ALL {
         lanes.insert(lane, default_lane(lane));
         for field in LANE_FIELDS {
             origins.insert(format!("lanes.{lane}.{field}"), Origin::Default);
+        }
+        for field in ADMISSION_LANE_FIELDS {
+            origins.insert(format!("admission.lanes.{lane}.{field}"), Origin::Default);
         }
     }
     let mut cfg = Config {
@@ -248,6 +330,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
         allowed_roots: default_allowed_roots(),
         lanes,
         broker: BrokerConfig::default(),
+        admission: AdmissionConfig::default(),
     };
 
     let path = home.root().join("config.toml");
@@ -343,6 +426,7 @@ fn apply_file(
                     origins.insert(dotted, Origin::File);
                 }
             }
+            "admission" => apply_admission_file(cfg, origins, warnings, value)?,
             "lanes" => {
                 let lanes = value.as_table().ok_or_else(|| {
                     cfg_err(format!("lanes: expected a table, got {}", value.type_str()))
@@ -375,6 +459,72 @@ fn apply_file(
             }
             other => warnings.push(format!("unknown config key: {other}")),
         }
+    }
+    Ok(())
+}
+
+/// `[admission]` and its ONE nested table, `[admission.lanes.<lane>]`.
+///
+/// Walked by hand rather than deserialized so that an unknown key warns and the
+/// rest of the section still applies — the same rule every other section obeys,
+/// and the reason a typo in a cap cannot take the CLI down with it.
+fn apply_admission_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value.as_table().ok_or_else(|| {
+        cfg_err(format!(
+            "admission: expected a table, got {}",
+            value.type_str()
+        ))
+    })?;
+    for (field, v) in fields {
+        if field == "lanes" {
+            let lanes = v.as_table().ok_or_else(|| {
+                cfg_err(format!(
+                    "admission.lanes: expected a table, got {}",
+                    v.type_str()
+                ))
+            })?;
+            for (lane_name, lane_val) in lanes {
+                let Ok(lane) = Lane::from_str(lane_name) else {
+                    warnings.push(format!("unknown config key: admission.lanes.{lane_name}"));
+                    continue;
+                };
+                let lane_fields = lane_val.as_table().ok_or_else(|| {
+                    cfg_err(format!(
+                        "admission.lanes.{lane}: expected a table, got {}",
+                        lane_val.type_str()
+                    ))
+                })?;
+                for (lane_field, lv) in lane_fields {
+                    let dotted = format!("admission.lanes.{lane}.{lane_field}");
+                    if !ADMISSION_LANE_FIELDS.contains(&lane_field.as_str()) {
+                        warnings.push(format!("unknown config key: {dotted}"));
+                        continue;
+                    }
+                    let cap = want_u64(&dotted, lv)?;
+                    cfg.admission
+                        .lanes
+                        .insert(lane, LaneAdmission { cap });
+                    origins.insert(dotted, Origin::File);
+                }
+            }
+            continue;
+        }
+        let dotted = format!("admission.{field}");
+        if !ADMISSION_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        match field.as_str() {
+            "global_cap" => cfg.admission.global_cap = want_u64(&dotted, v)?,
+            "queue_cap" => cfg.admission.queue_cap = want_u64(&dotted, v)?,
+            _ => unreachable!("field membership fixed by ADMISSION_FIELDS"),
+        }
+        origins.insert(dotted, Origin::File);
     }
     Ok(())
 }
@@ -445,6 +595,20 @@ pub fn broker_env_key(field: &str) -> String {
     format!("A2A_BROKER_{}", field.to_ascii_uppercase())
 }
 
+/// `A2A_ADMISSION_<FIELD>` — the env spelling of one `[admission]` key.
+pub fn admission_env_key(field: &str) -> String {
+    format!("A2A_ADMISSION_{}", field.to_ascii_uppercase())
+}
+
+/// `A2A_ADMISSION_LANES_<LANE>_<FIELD>` — one `[admission.lanes.<lane>]` key.
+pub fn admission_lane_env_key(lane: Lane, field: &str) -> String {
+    format!(
+        "A2A_ADMISSION_LANES_{}_{}",
+        lane.as_str().to_ascii_uppercase(),
+        field.to_ascii_uppercase()
+    )
+}
+
 /// `A2A_LANES_<LANE>_<FIELD>` (upper-cased) plus top-level `A2A_ALLOWED_ROOTS`
 /// (colon-separated) and `A2A_CODEX_BIN`.
 pub fn lane_env_key(lane: Lane, field: &str) -> String {
@@ -487,7 +651,31 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         }
         origins.insert(format!("broker.{field}"), Origin::Env);
     }
+    for field in ADMISSION_FIELDS {
+        let key = admission_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        let value = parse_u64_str(&key, raw.trim())?;
+        match field {
+            "global_cap" => cfg.admission.global_cap = value,
+            "queue_cap" => cfg.admission.queue_cap = value,
+            _ => unreachable!("field membership fixed by ADMISSION_FIELDS"),
+        }
+        origins.insert(format!("admission.{field}"), Origin::Env);
+    }
     for lane in Lane::ALL {
+        for field in ADMISSION_LANE_FIELDS {
+            let key = admission_lane_env_key(lane, field);
+            let Some(raw) = std::env::var_os(&key) else {
+                continue;
+            };
+            let raw = raw.to_string_lossy().into_owned();
+            let cap = parse_u64_str(&key, raw.trim())?;
+            cfg.admission.lanes.insert(lane, LaneAdmission { cap });
+            origins.insert(format!("admission.lanes.{lane}.{field}"), Origin::Env);
+        }
         for field in LANE_FIELDS {
             let key = lane_env_key(lane, field);
             let Some(raw) = std::env::var_os(&key) else {
@@ -606,6 +794,7 @@ mod tests {
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -616,6 +805,98 @@ mod tests {
             warnings.iter().any(|w| w.contains("broker.bogus")),
             "{warnings:?}"
         );
+    }
+
+    /// The admission surface is PINNED (spec §4.9): three numbers, three env
+    /// spellings, and a per-lane table that does not disturb `LANE_FIELDS`.
+    #[test]
+    fn the_admission_surface_is_the_one_the_spec_pins() {
+        let a = AdmissionConfig::default();
+        assert_eq!(a.global_cap, 8);
+        assert_eq!(a.queue_cap, 32);
+        for lane in Lane::ALL {
+            assert_eq!(a.lane_cap(lane), 4, "{lane} lane");
+        }
+        assert_eq!(ADMISSION_FIELDS, ["global_cap", "queue_cap"]);
+        assert_eq!(ADMISSION_LANE_FIELDS, ["cap"]);
+        assert_eq!(admission_env_key("global_cap"), "A2A_ADMISSION_GLOBAL_CAP");
+        assert_eq!(admission_env_key("queue_cap"), "A2A_ADMISSION_QUEUE_CAP");
+        assert_eq!(
+            admission_lane_env_key(Lane::Impl, "cap"),
+            "A2A_ADMISSION_LANES_IMPL_CAP"
+        );
+        // The layering test's key set is stable: admission is its own section.
+        assert_eq!(LANE_FIELDS.len(), 8);
+        assert!(!LANE_FIELDS.contains(&"cap"));
+    }
+
+    /// A lane the map does not carry (a config from a newer binary) falls back
+    /// to the global cap rather than to zero — "unknown lane" must not mean
+    /// "admit nothing".
+    #[test]
+    fn a_lane_with_no_entry_falls_back_to_the_global_cap() {
+        let mut a = AdmissionConfig::default();
+        a.lanes.remove(&Lane::Review);
+        assert_eq!(a.lane_cap(Lane::Review), a.global_cap);
+    }
+
+    #[test]
+    fn the_admission_section_walks_its_keys_and_warns_on_unknown() {
+        let table: toml::Table = "[admission]\nglobal_cap = 3\nqueue_cap = 5\nbogus = 1\n\
+                                  [admission.lanes.impl]\ncap = 2\nnope = 1\n\
+                                  [admission.lanes.nosuchlane]\ncap = 9\n"
+            .parse()
+            .unwrap();
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert_eq!(cfg.admission.global_cap, 3);
+        assert_eq!(cfg.admission.queue_cap, 5);
+        assert_eq!(cfg.admission.lane_cap(Lane::Impl), 2);
+        assert_eq!(
+            cfg.admission.lane_cap(Lane::Review),
+            DEFAULT_ADMISSION_LANE_CAP,
+            "one lane's override leaves the others alone"
+        );
+        assert_eq!(origins.get("admission.global_cap"), Some(&Origin::File));
+        assert_eq!(
+            origins.get("admission.lanes.impl.cap"),
+            Some(&Origin::File)
+        );
+        for unknown in [
+            "admission.bogus",
+            "admission.lanes.impl.nope",
+            "admission.lanes.nosuchlane",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(unknown)),
+                "{unknown} warns: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_cap_names_its_dotted_key() {
+        let table: toml::Table = "[admission]\nglobal_cap = \"lots\"\n".parse().unwrap();
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+        };
+        let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        assert!(err.message.contains("admission.global_cap"), "{}", err.message);
     }
 
     #[test]
@@ -665,6 +946,7 @@ mod tests {
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -699,6 +981,7 @@ mod tests {
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
             broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");

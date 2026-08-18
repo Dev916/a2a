@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 20] = [
+pub const KNOWN_CODES: [&str; 22] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -98,6 +98,10 @@ pub const KNOWN_CODES: [&str; 20] = [
     // broker's own allowlist re-check, and the codex drift gate (spec §4.2/§5).
     "CWD_NOT_ALLOWED",
     "CODEX_DRIFT",
+    // ... and the two admission refusals (spec §4.9): the queue is full, or the
+    // caller said `--no-queue` and the broker is at its cap.
+    "QUEUE_FULL",
+    "AT_CAPACITY",
     "BROKER_GONE",
     "APP_SERVER",
     "APP_SERVER_START",
@@ -273,14 +277,27 @@ impl WireError {
         self.extra.get(key)
     }
 
+    /// The structured half of an error, under one key.
+    ///
+    /// Nested rather than flattened alongside `live_workers`/`last_seq`: those
+    /// are the WIRE's own fields, minted here and read here, while `data` is the
+    /// CLI's — it travels through unchanged and comes out of `a2a --json` as
+    /// `error.data`. Keeping the two namespaces apart is what stops a future
+    /// wire field from silently renaming something an orchestrator branches on.
+    pub const DATA_KEY: &'static str = "data";
+
     pub fn from_app(err: &AppError) -> WireError {
+        let mut extra = Map::new();
+        if let Some(data) = err.data.clone() {
+            extra.insert(WireError::DATA_KEY.to_string(), data);
+        }
         WireError {
             code: err.code.to_string(),
             message: err.message.clone(),
             retryable: err.retryable,
             remedy: err.remedy.clone(),
             exit: err.exit as i32,
-            extra: Map::new(),
+            extra,
         }
     }
 
@@ -292,6 +309,7 @@ impl WireError {
         );
         err.retryable = self.retryable;
         err.remedy = self.remedy.clone();
+        err.data = self.get(WireError::DATA_KEY).cloned();
         err
     }
 
@@ -539,6 +557,26 @@ mod tests {
         assert_eq!(app.code, ERR_VERSION_SKEW);
         assert_eq!(app.exit, ExitCode::BrokerUnavailable);
         assert_eq!(app.remedy.as_deref(), Some("`a2a broker restart`"));
+    }
+
+    /// `error.data` is the CLI's field, not the wire's: it goes over the socket
+    /// untouched and comes back out of `to_app` as the same value, because an
+    /// orchestrator meeting a full admission queue branches on
+    /// `retry_after_secs` rather than on the sentence around it.
+    #[test]
+    fn structured_error_data_crosses_the_socket_unchanged() {
+        let app = AppError::new("QUEUE_FULL", ExitCode::Precondition, "the queue is full")
+            .data(json!({"retry_after_secs": 30, "queue_cap": 32}));
+        let back = WireError::from_value(&WireError::from_app(&app).to_value())
+            .unwrap()
+            .to_app();
+        assert_eq!(back.code, "QUEUE_FULL");
+        assert_eq!(back.exit, ExitCode::Precondition);
+        assert_eq!(back.data, Some(json!({"retry_after_secs": 30, "queue_cap": 32})));
+        // An error with nothing structured to say carries no key at all.
+        let plain = AppError::new("NO_SUCH_WORKER", ExitCode::NoSuchWorker, "who?");
+        assert_eq!(WireError::from_app(&plain).get(WireError::DATA_KEY), None);
+        assert_eq!(WireError::from_app(&plain).to_app().data, None);
     }
 
     #[test]

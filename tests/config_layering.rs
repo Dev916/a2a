@@ -138,6 +138,89 @@ fn broker_idle_timeout_defaults_to_300_and_names_its_layer() {
     assert_eq!(v["data"]["origins"]["broker.idle_timeout_secs"], "env");
 }
 
+/// The admission section (spec §4.9): three numbers with the same
+/// defaults < file < env precedence every other key obeys, named in `--origin`
+/// as `admission.global_cap`, `admission.queue_cap` and
+/// `admission.lanes.<lane>.cap`.
+#[test]
+fn admission_caps_default_to_8_32_4_and_name_their_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["admission"]["global_cap"], 8);
+    assert_eq!(v["data"]["admission"]["queue_cap"], 32);
+    assert_eq!(v["data"]["admission"]["lanes"]["impl"]["cap"], 4);
+    assert_eq!(v["data"]["admission"]["lanes"]["research"]["cap"], 4);
+    for key in [
+        "admission.global_cap",
+        "admission.queue_cap",
+        "admission.lanes.impl.cap",
+    ] {
+        assert_eq!(
+            v["data"]["origins"][key], "default",
+            "a value nobody set still says where it came from: {key}"
+        );
+    }
+    // The lane table is its own section: `lanes.*` is untouched by any of this.
+    assert_eq!(v["data"]["lanes"]["impl"]["model"], "gpt-5.5");
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[admission]\nglobal_cap = 3\nqueue_cap = 5\n\n[admission.lanes.impl]\ncap = 2\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["admission"]["global_cap"], 3);
+    assert_eq!(v["data"]["admission"]["queue_cap"], 5);
+    assert_eq!(v["data"]["admission"]["lanes"]["impl"]["cap"], 2);
+    assert_eq!(
+        v["data"]["admission"]["lanes"]["review"]["cap"], 4,
+        "one lane's override leaves the others on the default"
+    );
+    assert_eq!(v["data"]["origins"]["admission.global_cap"], "file");
+    assert_eq!(v["data"]["origins"]["admission.lanes.impl.cap"], "file");
+    assert_eq!(v["data"]["origins"]["admission.lanes.review.cap"], "default");
+
+    let v = show(
+        tmp.path(),
+        &[
+            ("A2A_ADMISSION_GLOBAL_CAP", "1"),
+            ("A2A_ADMISSION_QUEUE_CAP", "2"),
+            ("A2A_ADMISSION_LANES_IMPL_CAP", "1"),
+        ],
+        true,
+    );
+    assert_eq!(v["data"]["admission"]["global_cap"], 1);
+    assert_eq!(v["data"]["admission"]["queue_cap"], 2);
+    assert_eq!(v["data"]["admission"]["lanes"]["impl"]["cap"], 1);
+    assert_eq!(v["data"]["origins"]["admission.global_cap"], "env");
+    assert_eq!(v["data"]["origins"]["admission.queue_cap"], "env");
+    assert_eq!(v["data"]["origins"]["admission.lanes.impl.cap"], "env");
+}
+
+/// An unknown key under `[admission]` warns like every other unknown key, and
+/// the caps around it still apply.
+#[test]
+fn unknown_admission_key_warns_but_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[admission]\nglobal_cap = 6\ncap = 9\n\n[admission.lanes.impl]\nlimit = 1\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("admission.cap"), "{stderr}");
+    assert!(stderr.contains("admission.lanes.impl.limit"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["admission"]["global_cap"], 6);
+    assert_eq!(v["data"]["admission"]["lanes"]["impl"]["cap"], 4);
+}
+
 /// An unknown key under `[broker]` warns like every other unknown key — a
 /// typo in a safety net must not take the CLI down with it.
 #[test]

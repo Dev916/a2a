@@ -214,7 +214,17 @@ pub async fn adopt_previous_workers(
                     }
                 }
             }
-            WorkerState::Queued => report.requeued.push(snap.id.clone()),
+            // Re-ENQUEUED, not admitted: this instance's admission queue takes
+            // them in the order the previous one left them (`created_at`,
+            // oldest first — `scan` is what makes that an order rather than a
+            // directory listing), and they wait for a slot like anyone else.
+            WorkerState::Queued => match core.enqueue_worker(dir).await {
+                Ok(()) => report.requeued.push(snap.id.clone()),
+                Err(e) => eprintln!(
+                    "a2a broker: re-enqueueing {}: {}: {}",
+                    snap.id, e.code, e.message
+                ),
+            },
             _ => {}
         }
     }

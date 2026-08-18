@@ -625,6 +625,7 @@ mod tests {
             allowed_roots: vec![],
             lanes: Default::default(),
             broker: Default::default(),
+            admission: Default::default(),
         };
         assert_eq!(resolve_codex(&cfg), Some(bin));
         cfg.codex_bin = Some(PathBuf::from("/nonexistent/codex"));

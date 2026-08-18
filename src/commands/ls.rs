@@ -105,6 +105,10 @@ struct Row {
     /// Which transport owns this worker — the fleet view's answer to "why is
     /// `status` not advancing this one?" (an app-server worker is the broker's).
     transport: String,
+    /// Where this worker is in the broker's admission queue, when it is in one
+    /// (spec §4.9). `None` for every worker that is not `queued` — which is the
+    /// difference between "waiting third" and "waiting, position unknown".
+    queue_position: Option<u64>,
     created_at: Option<DateTime<Utc>>,
     dwell_secs: Option<i64>,
     last_event_age_secs: Option<i64>,
@@ -118,6 +122,7 @@ impl Row {
             state: snap.state.as_str().to_string(),
             sandbox: snap.sandbox.as_str().to_string(),
             transport: transport_of(Some(snap)),
+            queue_position: snap.queue_position,
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -141,6 +146,7 @@ impl Row {
                 .map(|s| s.sandbox.as_str().to_string())
                 .unwrap_or_else(|| "unknown".into()),
             transport: transport_of(stale.as_ref()),
+            queue_position: stale.as_ref().and_then(|s| s.queue_position),
             created_at: stale.as_ref().map(|s| s.created_at),
             dwell_secs: None,
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -156,6 +162,7 @@ impl Row {
             "last_event_age_secs": self.last_event_age_secs,
             "sandbox": self.sandbox,
             "transport": self.transport,
+            "queue_position": self.queue_position,
         })
     }
 }
@@ -242,6 +249,7 @@ mod tests {
             state: state.into(),
             sandbox: "workspace-write".into(),
             transport: "exec".into(),
+            queue_position: None,
             created_at: None,
             dwell_secs: dwell,
             last_event_age_secs: None,

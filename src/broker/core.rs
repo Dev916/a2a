@@ -120,8 +120,21 @@ pub const HEALTH_NOTICE_CAPACITY: usize = 20;
 /// as everyone else, because a second door into the registry would be a second
 /// owner.
 pub enum CoreMsg {
+    /// **The first half of a spawn**: may this worker run yet (spec §4.9)?
+    ///
+    /// Asked BEFORE the CLI writes genesis, because the answer is what genesis
+    /// records — a worker born at the cap is born `queued`, and a marker written
+    /// after the fact would make `state.json` the authority on a state the WAL
+    /// is supposed to own. The broker holds the granted slot (or queue place)
+    /// against this directory until the matching [`CoreMsg::Spawn`] claims it,
+    /// so two callers racing for the last slot cannot both win it.
+    Admit {
+        req: SpawnRequest,
+        reply: oneshot::Sender<Result<Admitted, AppError>>,
+    },
     /// Adopt an already-laid-out worker directory (genesis written, `state.json`
-    /// present) and give it a `WorkerActor`.
+    /// present) and give it a `WorkerActor` — or, when its genesis says
+    /// `queued`, a place in the admission queue and no actor at all.
     Spawn {
         req: SpawnRequest,
         reply: oneshot::Sender<Result<WorkerSnapshot, AppError>>,
@@ -142,9 +155,23 @@ pub enum CoreMsg {
     /// Re-attach an existing worker directory to the live child: `thread/resume`
     /// then register. A resume that the server refuses leaves the worker
     /// `orphaned`, exactly as a failed re-attach after a restart does.
+    ///
+    /// `capped` separates the two callers. A resume off the SOCKET is new work
+    /// and is held to the admission cap — and refused rather than queued, because
+    /// there is no `terminal → queued` row and the FSM is frozen (spec §4.9).
+    /// Adoption at broker start is not new work: those workers were already
+    /// running, and refusing to re-attach them would strand exactly the fleet
+    /// this daemon exists to recover.
     Resume {
         dir: PathBuf,
+        capped: bool,
         reply: oneshot::Sender<Result<WorkerSnapshot, AppError>>,
+    },
+    /// Put a worker whose genesis already says `queued` back in the queue, in
+    /// the order the previous instance left it (`broker::adopt_previous_workers`).
+    Enqueue {
+        dir: PathBuf,
+        reply: oneshot::Sender<Result<(), AppError>>,
     },
     List {
         reply: oneshot::Sender<Vec<WorkerSnapshot>>,
@@ -226,6 +253,10 @@ pub struct SpawnRequest {
     pub dir: PathBuf,
     pub cwd: Option<PathBuf>,
     pub lane: Option<crate::config::Lane>,
+    /// `--no-queue`: refuse at the cap rather than wait for a slot. Read on the
+    /// `Admit` half of a spawn; ignored on the attach half, which is executing a
+    /// decision that has already been made.
+    pub no_queue: bool,
 }
 
 impl SpawnRequest {
@@ -234,10 +265,18 @@ impl SpawnRequest {
     pub fn adopt(dir: impl Into<PathBuf>) -> SpawnRequest {
         SpawnRequest {
             dir: dir.into(),
-            cwd: None,
-            lane: None,
+            ..SpawnRequest::default()
         }
     }
+}
+
+/// What one admission decision produced (spec §4.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admitted {
+    /// A slot is held for this directory: write genesis and hand it over.
+    Now,
+    /// No slot; waiting at this **1-based** position.
+    Queued { position: u64 },
 }
 
 /// One envelope, as a tail subscriber sees it.
@@ -283,6 +322,9 @@ pub struct IdleReport {
     pub workers: usize,
     /// ... of which have not settled (terminal or escalated).
     pub live: usize,
+    /// Workers waiting for a slot. They have NO actor — the queue is the
+    /// registry's other half — so they are counted separately.
+    pub queued: usize,
     pub generation: u64,
     pub child_pid: Option<u32>,
     pub degraded: bool,
@@ -319,9 +361,37 @@ impl CoreHandle {
         self.ask(move |reply| CoreMsg::Spawn { req, reply }).await?
     }
 
+    /// The admission half of a spawn: may this worker run yet?
+    pub async fn admit_request(&self, req: SpawnRequest) -> Result<Admitted, AppError> {
+        self.ask(move |reply| CoreMsg::Admit { req, reply }).await?
+    }
+
+    /// Adoption at broker start: re-attach without asking the cap.
     pub async fn resume_worker(&self, dir: impl Into<PathBuf>) -> Result<WorkerSnapshot, AppError> {
         let dir = dir.into();
-        self.ask(move |reply| CoreMsg::Resume { dir, reply }).await?
+        self.ask(move |reply| CoreMsg::Resume {
+            dir,
+            capped: false,
+            reply,
+        })
+        .await?
+    }
+
+    /// A resume off the socket: new work, and held to the cap.
+    pub async fn resume_checked(&self, dir: impl Into<PathBuf>) -> Result<WorkerSnapshot, AppError> {
+        let dir = dir.into();
+        self.ask(move |reply| CoreMsg::Resume {
+            dir,
+            capped: true,
+            reply,
+        })
+        .await?
+    }
+
+    /// Re-enqueue a worker the previous instance left `queued`.
+    pub async fn enqueue_worker(&self, dir: impl Into<PathBuf>) -> Result<(), AppError> {
+        let dir = dir.into();
+        self.ask(move |reply| CoreMsg::Enqueue { dir, reply }).await?
     }
 
     pub async fn send(&self, id: &str, text: impl Into<String>) -> Result<SendPath, AppError> {
@@ -502,6 +572,151 @@ pub fn error_message(params: &Value) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// admission control (spec §4.9)
+// ---------------------------------------------------------------------------
+//
+// Three caps, one queue, and one trigger. A spawn asks [`CoreMsg::Admit`]
+// before it writes genesis; the answer is `Now` (a slot is held for it) or
+// `Queued` (it writes `"queued": true` and waits). The queue drains on
+// [`CoreMsg::WorkerSettled`] — the only moment a slot is released — by writing
+// `Admit` into the waiting worker's own WAL and giving it an actor, which is the
+// same start flow a worker that never waited takes.
+//
+// **Exec spawns do not count against the cap**, deliberately, and it is
+// deferred rather than forgotten (Phase 3). Two reasons, and the second is the
+// decisive one: the broker never learns that an exec worker finished (its
+// process belongs to its own shim and its files to the CLI's reconcile path),
+// so a slot spent on one could never be released; and a spawn taken while no
+// broker is running is uncapped by construction, which makes partial counting
+// incoherent rather than merely approximate.
+
+/// How long a granted slot (or queue place) is held for a spawn that has not
+/// come back with its genesis.
+///
+/// The window between `admit` and `spawn` is one CLI process writing a handful
+/// of small files, so a minute is three orders of magnitude of headroom — and
+/// the reason there is a deadline at all is that the CLI can die inside it. An
+/// abandoned reservation that were never released would retire one slot from
+/// the fleet permanently, which is the one failure mode a cap must not have.
+pub const RESERVATION_TTL: Duration = Duration::from_secs(60);
+
+/// What a caller who met a full queue is told to wait, in `error.data`.
+///
+/// A hint, not a promise: nothing here knows how long a model turn takes. It is
+/// a number an orchestrator can back off on without having to invent one.
+pub const QUEUE_RETRY_AFTER_SECS: u64 = 30;
+
+/// One directory holding — or waiting for — an admission slot.
+struct Ticket {
+    id: String,
+    dir: PathBuf,
+    lane: crate::config::Lane,
+    at: Instant,
+    /// The CLI came back with its genesis. An unclaimed ticket is a promise made
+    /// to a process that may never return, and expires ([`RESERVATION_TTL`]).
+    claimed: bool,
+    /// The 1-based position last written into this worker's `state.json`, so a
+    /// drain re-stamps only what actually moved.
+    stamped: u64,
+}
+
+impl Ticket {
+    fn new(dir: PathBuf, lane: crate::config::Lane) -> Ticket {
+        Ticket {
+            id: dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            dir,
+            lane,
+            at: Instant::now(),
+            claimed: false,
+            stamped: 0,
+        }
+    }
+}
+
+/// The reservations and the FIFO queue. Owned by the core task like everything
+/// else in the registry — the caps themselves live in [`Config`].
+#[derive(Default)]
+struct Admission {
+    /// Admitted, not yet attached: the `admit` → `spawn` window.
+    reserved: Vec<Ticket>,
+    /// Waiting, oldest first.
+    queue: VecDeque<Ticket>,
+}
+
+impl Admission {
+    /// Drop promises nobody came back for. Claimed tickets never expire: their
+    /// worker exists on disk, and forgetting it would strand it.
+    fn expire(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let stale = |t: &Ticket| !t.claimed && now.duration_since(t.at) > RESERVATION_TTL;
+        let mut dropped = Vec::new();
+        for t in self.reserved.iter().filter(|t| stale(t)) {
+            dropped.push(t.id.clone());
+        }
+        self.reserved.retain(|t| !stale(t));
+        for t in self.queue.iter().filter(|t| stale(t)) {
+            dropped.push(t.id.clone());
+        }
+        self.queue.retain(|t| !stale(t));
+        dropped
+    }
+
+    fn position_of(&self, dir: &Path) -> Option<u64> {
+        self.queue
+            .iter()
+            .position(|t| t.dir == dir)
+            .map(|i| i as u64 + 1)
+    }
+
+    /// Take the reservation for `dir`, if there is one.
+    fn take_reservation(&mut self, dir: &Path) -> Option<Ticket> {
+        let idx = self.reserved.iter().position(|t| t.dir == dir)?;
+        Some(self.reserved.remove(idx))
+    }
+
+    fn queued_index(&self, dir: &Path) -> Option<usize> {
+        self.queue.iter().position(|t| t.dir == dir)
+    }
+
+    fn drop_queued(&mut self, id: &str) -> Option<Ticket> {
+        let idx = self.queue.iter().position(|t| t.id == id)?;
+        self.queue.remove(idx)
+    }
+}
+
+/// The refusal a caller gets at the cap: `--no-queue`, or a resume, which has no
+/// queued form to take (the FSM has no `terminal → queued` row).
+fn at_capacity(lane: crate::config::Lane, global_cap: u64, lane_cap: u64) -> AppError {
+    AppError::new(
+        "AT_CAPACITY",
+        ExitCode::Precondition,
+        format!(
+            "the broker is at its admission cap (global {global_cap}, {lane} lane {lane_cap})"
+        ),
+    )
+    .remedy("wait for a worker to finish, raise `admission.global_cap`, or drop `--no-queue`")
+    .data(json!({"global_cap": global_cap, "lane_cap": lane_cap, "lane": lane.as_str()}))
+}
+
+/// The refusal a caller gets when even the WAITING room is full — the one error
+/// here that carries a retry hint, because it is the one that will clear on its
+/// own.
+fn queue_full(queue_cap: u64) -> AppError {
+    AppError::new(
+        "QUEUE_FULL",
+        ExitCode::Precondition,
+        format!("the broker's admission queue is full ({queue_cap} waiting)"),
+    )
+    .remedy(format!(
+        "retry in {QUEUE_RETRY_AFTER_SECS}s, or raise `admission.queue_cap`"
+    ))
+    .data(json!({"retry_after_secs": QUEUE_RETRY_AFTER_SECS, "queue_cap": queue_cap}))
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +1010,8 @@ pub async fn fail_worker(
 struct Worker {
     handle: WorkerHandle,
     dir: PathBuf,
+    /// Which lane's share of the admission cap this worker is spending.
+    lane: crate::config::Lane,
     /// The app-server thread this worker's frames are keyed by. Learned from
     /// the worker's own snapshot: the ACTOR performs `thread/start`, so the
     /// core reads the id back rather than inventing it.
@@ -819,6 +1036,8 @@ pub struct BrokerCore {
     tx: mpsc::Sender<CoreMsg>,
     rx: mpsc::Receiver<CoreMsg>,
     workers: HashMap<String, Worker>,
+    /// The slots and the waiting room (spec §4.9).
+    admission: Admission,
     /// thread id → worker id.
     threads: HashMap<String, String>,
     /// tokio task id → worker id, so a panicking actor can be named.
@@ -903,6 +1122,7 @@ pub async fn start(
         tx: tx.clone(),
         rx,
         workers: HashMap::new(),
+        admission: Admission::default(),
         threads: HashMap::new(),
         task_ids: HashMap::new(),
         actors: tokio::task::JoinSet::new(),
@@ -959,15 +1179,23 @@ impl BrokerCore {
 
     async fn handle(&mut self, msg: CoreMsg) {
         match msg {
+            CoreMsg::Admit { req, reply } => {
+                let outcome = self.decide_admission(&req).await;
+                let _ = reply.send(outcome);
+            }
             CoreMsg::Spawn { req, reply } => {
-                let outcome = match self.admit(&req).await {
-                    Ok(()) => self.register(req.dir, false).await,
+                let outcome = match self.gates(&req).await {
+                    Ok(()) => self.attach(req.dir).await,
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(outcome);
             }
-            CoreMsg::Resume { dir, reply } => {
-                let outcome = self.register(dir, true).await;
+            CoreMsg::Resume { dir, capped, reply } => {
+                let outcome = self.register(dir, true, capped).await;
+                let _ = reply.send(outcome);
+            }
+            CoreMsg::Enqueue { dir, reply } => {
+                let outcome = self.enqueue(dir).await.map(|_| ());
                 let _ = reply.send(outcome);
             }
             CoreMsg::Send { id, text, reply } => match self.worker(&id) {
@@ -993,8 +1221,15 @@ impl BrokerCore {
                 }
             },
             CoreMsg::Kill { id, reply } => match self.worker(&id) {
+                // No actor — but possibly a place in the queue. A queued worker
+                // has no process to interrupt and no actor to ask, so the core
+                // cancels it here, where the queue is, and it is never admitted.
                 Err(e) => {
-                    let _ = reply.send(Err(e));
+                    let outcome = match self.cancel_queued(&id).await {
+                        Some(result) => result,
+                        None => Err(e),
+                    };
+                    let _ = reply.send(outcome);
                 }
                 Ok(handle) => {
                     self.tracker.spawn(async move {
@@ -1049,6 +1284,10 @@ impl BrokerCore {
                 if let Some(worker) = self.workers.get_mut(&settled.id) {
                     worker.settled = true;
                 }
+                // A settled worker has released its slot: that IS the drain
+                // trigger (spec §4.9). Terminal or escalated, both — an
+                // escalated worker is waiting on a human, not on the transport.
+                self.drain_queue().await;
                 self.publish_health().await;
             }
             CoreMsg::Notification {
@@ -1084,7 +1323,7 @@ impl BrokerCore {
     /// running as this uid, so it must not be a way to spawn into a root the
     /// broker was never started with (spec §5), and a worker must not be
     /// attached to a codex build the broker is not the one serving (spec §4.2).
-    async fn admit(&self, req: &SpawnRequest) -> Result<(), AppError> {
+    async fn gates(&self, req: &SpawnRequest) -> Result<(), AppError> {
         self.check_cwd(req)?;
         self.check_codex().await
     }
@@ -1162,6 +1401,333 @@ impl BrokerCore {
         }
     }
 
+    // -- admission ----------------------------------------------------------
+
+    /// Slots in use for a lane (or, with `None`, for the whole broker).
+    ///
+    /// Live actors AND outstanding reservations, because a reservation is a
+    /// promise already made: counting only actors would let every caller in the
+    /// `admit` → `spawn` window win the same last slot.
+    fn slots_used(&self, lane: Option<crate::config::Lane>) -> u64 {
+        let workers = self
+            .workers
+            .values()
+            .filter(|w| !w.settled && lane.is_none_or(|l| w.lane == l))
+            .count() as u64;
+        let reserved = self
+            .admission
+            .reserved
+            .iter()
+            .filter(|t| lane.is_none_or(|l| t.lane == l))
+            .count() as u64;
+        workers + reserved
+    }
+
+    /// Is there room for one more worker in `lane`? Both caps must say yes:
+    /// the global one bounds the fleet, the lane one stops any single lane from
+    /// starving the others.
+    fn has_room(&self, lane: crate::config::Lane) -> bool {
+        let caps = &self.cfg.admission;
+        self.slots_used(None) < caps.global_cap && self.slots_used(Some(lane)) < caps.lane_cap(lane)
+    }
+
+    /// The admission decision, taken before a byte of genesis exists.
+    ///
+    /// The gates run FIRST and in the same order a spawn's do: a refusal for a
+    /// cwd outside the allowlist, or a codex that drifted, must not depend on
+    /// whether the broker happened to be busy. Then the queue is drained — a
+    /// spawn never jumps a worker that is already waiting in its lane — and only
+    /// then is this request placed.
+    async fn decide_admission(&mut self, req: &SpawnRequest) -> Result<Admitted, AppError> {
+        self.gates(req).await?;
+        let lane = req.lane.unwrap_or(crate::config::Lane::General);
+        self.drain_queue().await;
+
+        let waiting_in_lane = self.admission.queue.iter().any(|t| t.lane == lane);
+        if !waiting_in_lane && self.has_room(lane) {
+            self.admission
+                .reserved
+                .push(Ticket::new(req.dir.clone(), lane));
+            return Ok(Admitted::Now);
+        }
+        let caps = self.cfg.admission.clone();
+        if req.no_queue {
+            return Err(at_capacity(lane, caps.global_cap, caps.lane_cap(lane)));
+        }
+        if self.admission.queue.len() as u64 >= caps.queue_cap {
+            return Err(queue_full(caps.queue_cap));
+        }
+        self.admission
+            .queue
+            .push_back(Ticket::new(req.dir.clone(), lane));
+        let position = self
+            .admission
+            .position_of(&req.dir)
+            .expect("just pushed");
+        Ok(Admitted::Queued { position })
+    }
+
+    /// The second half of a spawn: the CLI has written genesis, so claim
+    /// whatever this directory was granted.
+    ///
+    /// A directory with no ticket is not an error — it is one of the callers
+    /// that never asked (`spawn_worker` in-process, an adoption, a raw socket
+    /// client). Those keep exactly the Phase-1 behaviour: register, uncapped.
+    async fn attach(&mut self, dir: PathBuf) -> Result<WorkerSnapshot, AppError> {
+        if self.admission.take_reservation(&dir).is_some() {
+            // The slot was held by the reservation; it is held by the actor now.
+            return self.register(dir, false, false).await;
+        }
+        if let Some(idx) = self.admission.queued_index(&dir) {
+            self.admission.queue[idx].claimed = true;
+            return self.stamped_snapshot(&dir).await;
+        }
+        let queued = state::load_snapshot(&dir)
+            .map(|s| s.state == WorkerState::Queued)
+            .unwrap_or(false);
+        if queued {
+            return self.enqueue(dir).await;
+        }
+        self.register(dir, false, false).await
+    }
+
+    /// Put a directory whose genesis says `queued` into the queue, claimed:
+    /// the worker exists on disk, so there is nothing left to promise.
+    ///
+    /// Not bounded by `queue_cap`: this is the re-enqueue path (a previous
+    /// broker's leftovers), and a cap that dropped existing workers on the floor
+    /// would lose work rather than shed load.
+    async fn enqueue(&mut self, dir: PathBuf) -> Result<WorkerSnapshot, AppError> {
+        let snap = state::load_snapshot(&dir).map_err(|e| {
+            AppError::new(
+                "SNAPSHOT_UNREADABLE",
+                ExitCode::Precondition,
+                format!("{}: {e}", dir.display()),
+            )
+        })?;
+        match self.admission.queued_index(&dir) {
+            Some(idx) => self.admission.queue[idx].claimed = true,
+            None => {
+                let mut ticket = Ticket::new(dir.clone(), snap.lane);
+                ticket.claimed = true;
+                self.admission.queue.push_back(ticket);
+            }
+        }
+        self.stamped_snapshot(&dir).await
+    }
+
+    /// Write every queued worker's position into its `state.json` and return
+    /// this one's snapshot.
+    async fn stamped_snapshot(&mut self, dir: &Path) -> Result<WorkerSnapshot, AppError> {
+        self.restamp_queue().await;
+        let mut snap = state::load_snapshot(dir).map_err(|e| {
+            AppError::new(
+                "SNAPSHOT_UNREADABLE",
+                ExitCode::Precondition,
+                format!("{}: {e}", dir.display()),
+            )
+        })?;
+        snap.queue_position = self.admission.position_of(dir);
+        self.publish_health().await;
+        Ok(snap)
+    }
+
+    /// Re-stamp `queue_position` wherever it moved.
+    ///
+    /// The position is a *derived* fact, so it lives in the snapshot and not in
+    /// the WAL: it changes every time the queue moves, and a log of "you are now
+    /// third" rows would be a log of nothing anybody can act on. Only the
+    /// workers whose position actually changed are written.
+    async fn restamp_queue(&mut self) {
+        let mut writes: Vec<(PathBuf, u64)> = Vec::new();
+        for (idx, ticket) in self.admission.queue.iter_mut().enumerate() {
+            let position = idx as u64 + 1;
+            if ticket.claimed && ticket.stamped != position {
+                ticket.stamped = position;
+                writes.push((ticket.dir.clone(), position));
+            }
+        }
+        for (dir, position) in writes {
+            let joined = tokio::task::spawn_blocking(move || {
+                let _lock = reconcile::lock_state(&dir)?;
+                let mut snap = state::load_snapshot(&dir).map_err(|e| {
+                    AppError::new(
+                        "SNAPSHOT_UNREADABLE",
+                        ExitCode::Precondition,
+                        format!("{}: {e}", dir.display()),
+                    )
+                })?;
+                // Only while it IS queued: a worker admitted or cancelled under
+                // us must not be handed a position it is no longer waiting in.
+                if snap.state != WorkerState::Queued {
+                    return Ok::<_, AppError>(());
+                }
+                snap.queue_position = Some(position);
+                save_snapshot(&dir, &snap).map_err(|e| {
+                    AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}"))
+                })
+            })
+            .await;
+            if let Ok(Err(e)) = joined {
+                eprintln!("a2a broker: recording a queue position: {}: {}", e.code, e.message);
+            }
+        }
+    }
+
+    /// Admit as many waiting workers as there is now room for.
+    ///
+    /// FIFO, with one refinement: an entry whose LANE is full is stepped over
+    /// rather than allowed to block the queue behind it — head-of-line blocking
+    /// across lanes would turn a per-lane cap into a global stall.
+    async fn drain_queue(&mut self) {
+        for dropped in self.admission.expire() {
+            self.log
+                .line(json!({"ts": Utc::now(), "kind": "admission_expired", "worker": dropped}))
+                .await;
+        }
+        loop {
+            let next = self
+                .admission
+                .queue
+                .iter()
+                .position(|t| t.claimed && self.has_room(t.lane));
+            let Some(idx) = next else { break };
+            let Some(ticket) = self.admission.queue.remove(idx) else {
+                break;
+            };
+            match self.admit_queued(&ticket.dir).await {
+                Ok(true) => {}
+                // No longer queued (killed, or resumed by something else): the
+                // ticket is simply gone.
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!(
+                        "a2a broker: admitting {}: {}: {}",
+                        ticket.id, e.code, e.message
+                    );
+                    self.log
+                        .line(json!({"ts": Utc::now(), "kind": "admission_failed",
+                                     "worker": ticket.id, "code": e.code,
+                                     "detail": redact::redact_egress(&e.message)}))
+                        .await;
+                }
+            }
+        }
+        self.restamp_queue().await;
+    }
+
+    /// `Admit` (queued → spawned), then the ordinary start flow.
+    ///
+    /// `Ok(false)` means the worker was not queued any more by the time the lock
+    /// was taken — the `kill`-on-a-queued-worker race, decided under the same
+    /// `state.lock` every other writer takes.
+    async fn admit_queued(&mut self, dir: &Path) -> Result<bool, AppError> {
+        let owned = dir.to_path_buf();
+        let cfg = self.cfg.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let _lock = reconcile::lock_state(&owned)?;
+            let snap = state::load_snapshot(&owned).map_err(|e| {
+                AppError::new(
+                    "SNAPSHOT_UNREADABLE",
+                    ExitCode::Precondition,
+                    format!("{}: {e}", owned.display()),
+                )
+            })?;
+            if snap.state != WorkerState::Queued {
+                return Ok::<bool, AppError>(false);
+            }
+            let mut log = EventLog::open(&owned).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}"))
+            })?;
+            let mut snap = fold::append_and_fold(
+                &mut log,
+                &owned,
+                snap,
+                EventKind::StateChange,
+                json!({"fsm": "Admit"}),
+                Utc::now(),
+            )?;
+            // Nothing is waiting any more, and `spawned` is guarded by the START
+            // deadline — derive it rather than inherit the queue's absence of one.
+            snap.queue_position = None;
+            reconcile::arm_deadline(&mut snap, &cfg);
+            save_snapshot(&owned, &snap).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}"))
+            })?;
+            Ok(true)
+        })
+        .await;
+        let admitted = match joined {
+            Ok(result) => result?,
+            Err(e) => {
+                return Err(AppError::new(
+                    "INTERNAL",
+                    ExitCode::Internal,
+                    format!("admitting a queued worker: {e}"),
+                ))
+            }
+        };
+        if !admitted {
+            return Ok(false);
+        }
+        // The actor opens the thread and starts the first turn from `prompt.md`
+        // — the same flow a spawn that was never queued takes.
+        self.register(dir.to_path_buf(), false, false).await?;
+        Ok(true)
+    }
+
+    /// `a2a kill` on a worker that is still waiting: cancel it where it stands.
+    ///
+    /// `None` = this id is not in the queue either, so the caller's original
+    /// `NO_SUCH_WORKER` stands.
+    async fn cancel_queued(&mut self, id: &str) -> Option<Result<(), AppError>> {
+        let ticket = self.admission.drop_queued(id)?;
+        let dir = ticket.dir.clone();
+        let cfg = self.cfg.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let _lock = reconcile::lock_state(&dir)?;
+            let snap = state::load_snapshot(&dir).map_err(|e| {
+                AppError::new(
+                    "SNAPSHOT_UNREADABLE",
+                    ExitCode::Precondition,
+                    format!("{}: {e}", dir.display()),
+                )
+            })?;
+            if snap.state != WorkerState::Queued {
+                return Ok::<(), AppError>(()); // already decided by someone else
+            }
+            let mut log = EventLog::open(&dir).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}"))
+            })?;
+            let from = snap.state;
+            let mut snap = fold::append_and_fold(
+                &mut log,
+                &dir,
+                snap,
+                EventKind::Killed,
+                json!({"fsm": "Kill", "from": from.as_str(), "pid": null}),
+                Utc::now(),
+            )?;
+            snap.queue_position = None;
+            reconcile::arm_deadline(&mut snap, &cfg);
+            save_snapshot(&dir, &snap).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}"))
+            })
+        })
+        .await;
+        let outcome = match joined {
+            Ok(result) => result,
+            Err(e) => Err(AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("cancelling a queued worker: {e}"),
+            )),
+        };
+        self.restamp_queue().await;
+        self.publish_health().await;
+        Some(outcome)
+    }
+
     // -- registry -----------------------------------------------------------
 
     fn worker(&self, id: &str) -> Result<WorkerHandle, AppError> {
@@ -1184,7 +1750,12 @@ impl BrokerCore {
     /// `resume` additionally re-opens the thread on the live child first — the
     /// same call supervision makes after a restart, and with the same
     /// consequence when the server refuses: `orphaned`.
-    async fn register(&mut self, dir: PathBuf, resume: bool) -> Result<WorkerSnapshot, AppError> {
+    async fn register(
+        &mut self,
+        dir: PathBuf,
+        resume: bool,
+        capped: bool,
+    ) -> Result<WorkerSnapshot, AppError> {
         let snap = state::load_snapshot(&dir).map_err(|e| {
             AppError::new(
                 "SNAPSHOT_UNREADABLE",
@@ -1195,6 +1766,17 @@ impl BrokerCore {
         if let Some(existing) = self.workers.get(&snap.id) {
             let handle = existing.handle.clone();
             return handle.snapshot().await;
+        }
+        // Refused, never queued: the machine has no `terminal → queued` row, so
+        // a resume that cannot have a slot now is one the caller re-issues later
+        // (spec §4.9).
+        if capped && !self.has_room(snap.lane) {
+            let caps = &self.cfg.admission;
+            return Err(at_capacity(
+                snap.lane,
+                caps.global_cap,
+                caps.lane_cap(snap.lane),
+            ));
         }
 
         if resume {
@@ -1250,6 +1832,7 @@ impl BrokerCore {
             Worker {
                 handle: handle.clone(),
                 dir,
+                lane: snap.lane,
                 thread_id: snap.session_id.clone(),
                 epoch: snap.epoch,
                 settled: snap.state.is_terminal() || snap.state == WorkerState::Escalated,
@@ -1418,6 +2001,7 @@ impl BrokerCore {
         IdleReport {
             workers: self.workers.len(),
             live: self.workers.values().filter(|w| !w.settled).count(),
+            queued: self.admission.queue.iter().filter(|t| t.claimed).count(),
             generation: self.generation,
             child_pid: self.health.child_pid,
             degraded: self.degraded,
@@ -2092,12 +2676,18 @@ mod tests {
     use crate::config::Lane;
     use crate::home::A2aHome;
 
-    /// The registry's surface is these twelve messages, and every one of them
+    /// The registry's surface is these fourteen messages, and every one of them
     /// is a message — not a lock, not a shared map, not a second door.
+    ///
+    /// Twelve of them were Task 7's; admission control (spec §4.9) added the two
+    /// that bracket a spawn — `Admit` (may this worker run yet?) and `Enqueue`
+    /// (a previous instance's queue, replayed).
     #[test]
-    fn the_registry_is_reached_by_exactly_these_twelve_messages() {
+    fn the_registry_is_reached_by_exactly_these_fourteen_messages() {
         fn name(msg: &CoreMsg) -> &'static str {
             match msg {
+                CoreMsg::Admit { .. } => "Admit",
+                CoreMsg::Enqueue { .. } => "Enqueue",
                 CoreMsg::Spawn { .. } => "Spawn",
                 CoreMsg::Send { .. } => "Send",
                 CoreMsg::Interrupt { .. } => "Interrupt",
@@ -2117,11 +2707,13 @@ mod tests {
         }
         let dir = PathBuf::from("/tmp/w");
         let surface = vec![
+            CoreMsg::Admit { req: SpawnRequest::adopt(dir.clone()), reply: oneshot::channel().0 },
             CoreMsg::Spawn { req: SpawnRequest::adopt(dir.clone()), reply: oneshot::channel().0 },
+            CoreMsg::Enqueue { dir: dir.clone(), reply: oneshot::channel().0 },
             CoreMsg::Send { id: "w".into(), text: "hi".into(), reply: oneshot::channel().0 },
             CoreMsg::Interrupt { id: "w".into(), reply: oneshot::channel().0 },
             CoreMsg::Kill { id: "w".into(), reply: oneshot::channel().0 },
-            CoreMsg::Resume { dir, reply: oneshot::channel().0 },
+            CoreMsg::Resume { dir, capped: true, reply: oneshot::channel().0 },
             CoreMsg::List { reply: oneshot::channel().0 },
             CoreMsg::Status { id: "w".into(), reply: oneshot::channel().0 },
             CoreMsg::Subscribe { reply: oneshot::channel().0 },
@@ -2134,14 +2726,91 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "Spawn", "Send", "Interrupt", "Kill", "Resume", "List", "Status", "Subscribe",
-                "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled"
+                "Admit", "Spawn", "Enqueue", "Send", "Interrupt", "Kill", "Resume", "List",
+                "Status", "Subscribe", "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled"
             ]
         );
         // The mailbox is bounded — an unbounded queue in front of one owner is
         // just a slower way to run out of memory.
         let (tx, _rx) = mpsc::channel::<CoreMsg>(CORE_MAILBOX_CAPACITY);
         assert_eq!(tx.max_capacity(), CORE_MAILBOX_CAPACITY);
+    }
+
+    // -- admission bookkeeping ----------------------------------------------
+
+    fn ticket(id: &str, lane: Lane, claimed: bool) -> Ticket {
+        let mut t = Ticket::new(PathBuf::from("/tmp/workers").join(id), lane);
+        t.claimed = claimed;
+        t
+    }
+
+    /// The queue is FIFO and 1-based, and a ticket knows the worker it is for
+    /// from its directory alone — which is what lets `kill <id>` find a worker
+    /// that has no actor to ask.
+    #[test]
+    fn the_queue_is_first_in_first_out_and_positions_are_one_based() {
+        let mut a = Admission::default();
+        for id in ["general-a", "general-b", "general-c"] {
+            a.queue.push_back(ticket(id, Lane::General, true));
+        }
+        assert_eq!(a.position_of(Path::new("/tmp/workers/general-a")), Some(1));
+        assert_eq!(a.position_of(Path::new("/tmp/workers/general-c")), Some(3));
+        assert_eq!(a.position_of(Path::new("/tmp/workers/nobody")), None);
+
+        let dropped = a.drop_queued("general-a").expect("the head is in the queue");
+        assert_eq!(dropped.id, "general-a");
+        assert_eq!(
+            a.position_of(Path::new("/tmp/workers/general-c")),
+            Some(2),
+            "everyone behind a departure moves up"
+        );
+        assert!(a.drop_queued("general-a").is_none(), "and only once");
+    }
+
+    /// A promise nobody came back for is released; a worker that exists on disk
+    /// is not. The difference is `claimed`, and it is the difference between
+    /// shedding a dead CLI's reservation and losing somebody's work.
+    #[test]
+    fn unclaimed_tickets_expire_and_claimed_ones_never_do() {
+        let mut a = Admission::default();
+        let stale = |id: &str, claimed: bool| {
+            let mut t = ticket(id, Lane::Impl, claimed);
+            t.at = Instant::now() - RESERVATION_TTL - Duration::from_secs(1);
+            t
+        };
+        a.reserved.push(stale("impl-abandoned", false));
+        a.reserved.push(ticket("impl-fresh", Lane::Impl, false));
+        a.queue.push_back(stale("impl-waiting", true));
+        a.queue.push_back(stale("impl-unclaimed", false));
+
+        let dropped = a.expire();
+        assert_eq!(dropped, vec!["impl-abandoned", "impl-unclaimed"]);
+        assert_eq!(a.reserved.len(), 1, "a fresh reservation is untouched");
+        assert_eq!(a.queue.len(), 1, "a claimed worker waits as long as it takes");
+        assert_eq!(a.queue[0].id, "impl-waiting");
+    }
+
+    /// Both refusals are exit 9, and the one that will clear on its own is the
+    /// one that carries a retry hint an orchestrator can branch on.
+    #[test]
+    fn the_two_refusals_are_typed_and_carry_their_numbers() {
+        let full = queue_full(32);
+        assert_eq!(full.code, "QUEUE_FULL");
+        assert_eq!(full.exit, ExitCode::Precondition);
+        assert_eq!(
+            full.data.as_ref().and_then(|d| d.get("retry_after_secs")),
+            Some(&json!(QUEUE_RETRY_AFTER_SECS))
+        );
+
+        let at = at_capacity(Lane::Impl, 8, 4);
+        assert_eq!(at.code, "AT_CAPACITY");
+        assert_eq!(at.exit, ExitCode::Precondition);
+        assert_eq!(at.data.as_ref().and_then(|d| d.get("lane")), Some(&json!("impl")));
+        assert!(
+            at.message.contains("global 8") && at.message.contains("impl lane 4"),
+            "the refusal names both caps: {}",
+            at.message
+        );
     }
 
     // -- the routing table ---------------------------------------------------

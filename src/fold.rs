@@ -192,7 +192,19 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or(env.ts);
-    snap.state = WorkerState::Spawned;
+    // Admission control (spec §4.9): a worker born at the cap starts `queued`
+    // and waits for `Admit`. The MARKER is in genesis rather than in a second
+    // event because genesis is the only writer of identity — a snapshot rebuilt
+    // from zero must land in the same state, and a queued worker that replayed
+    // as `spawned` would look like one whose process merely never came up.
+    //
+    // This is a fold change, not an FSM change: `queued --admit--> spawned` is
+    // already a row (and `docs/machines/worker.md` already draws the arrow).
+    snap.state = if raw.get("queued").and_then(|v| v.as_bool()) == Some(true) {
+        WorkerState::Queued
+    } else {
+        WorkerState::Spawned
+    };
     snap.state_reason = None;
     snap.failure_class = None;
     snap.entered_state_at = snap.created_at;
@@ -606,6 +618,60 @@ mod tests {
         assert_eq!(after.transport, Transport::AppServer);
         assert_eq!(after.requested_transport, Transport::AppServer);
         assert_eq!(after.owner, None);
+    }
+
+    /// A worker born at the admission cap starts `queued`, from the genesis
+    /// marker alone — and gets to `spawned` the one way the machine allows.
+    #[test]
+    fn a_queued_genesis_seeds_queued_and_admit_is_what_leaves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let genesis = |queued: Option<bool>| {
+            let mut payload = json!({"fsm":"Spawn","id":"general-0817t1200-aaaa",
+                                     "lane":"general","cwd":"/repo","transport":"app-server"});
+            if let Some(q) = queued {
+                payload["queued"] = json!(q);
+            }
+            payload
+        };
+        let folded = |payload, events: &[serde_json::Value]| {
+            let mut all = vec![ev(payload, 1, 1)];
+            all.extend(
+                events
+                    .iter()
+                    .enumerate()
+                    .map(|(n, e)| ev(e.clone(), 1, n as u64 + 2)),
+            );
+            fold(
+                WorkerSnapshot::new_for_test("general-0817t1200-aaaa", tmp.path()),
+                &all,
+                Utc::now(),
+            )
+        };
+
+        assert_eq!(folded(genesis(Some(true)), &[]).state, WorkerState::Queued);
+        // Absent and explicitly-false are the same worker: the Phase-1 shape.
+        assert_eq!(folded(genesis(None), &[]).state, WorkerState::Spawned);
+        assert_eq!(folded(genesis(Some(false)), &[]).state, WorkerState::Spawned);
+
+        // Admission, then the ordinary start flow — no rejections anywhere.
+        let admitted = folded(
+            genesis(Some(true)),
+            &[
+                json!({"fsm":"Admit"}),
+                json!({"fsm":"ProcessStarted","pid":0,"start_witness":"w"}),
+            ],
+        );
+        assert_eq!(admitted.state, WorkerState::Running);
+        assert!(
+            admitted.extra.get("fold_rejections").is_none(),
+            "queued → spawned → running is a legal path: {:?}",
+            admitted.extra
+        );
+
+        // ... and `kill` is the other door out of the queue.
+        let cancelled = folded(genesis(Some(true)), &[json!({"fsm":"Kill"})]);
+        assert_eq!(cancelled.state, WorkerState::Cancelled);
+        assert_eq!(cancelled.failure_class, None, "a human stop never fails");
     }
 
     /// The thread of record and the resolved sandbox arrive on later rows (the

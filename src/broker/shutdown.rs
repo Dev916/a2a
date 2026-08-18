@@ -280,7 +280,10 @@ impl IdleWatch {
             // set on purpose. A worker waiting for a human is the LEAST
             // disposable thing the broker holds.
             Ok(report) => {
-                if report.live > 0 {
+                // Queued workers count too, and they have no actor to be
+                // counted BY: a daemon that retired itself while workers were
+                // waiting for its own cap would leave them waiting forever.
+                if report.live > 0 || report.queued > 0 {
                     return true;
                 }
             }

@@ -307,6 +307,37 @@ pub fn start_witness(pid: u32) -> Option<String> {
 /// How often [`codex_version`] checks whether the probe has finished.
 const VERSION_POLL: Duration = Duration::from_millis(20);
 
+/// How many times [`codex_version`] will re-ask after a *transient* failure.
+///
+/// The probe forks, and a fork is exactly the operation that fails for reasons
+/// that have nothing to do with the binary being probed: a machine running
+/// dozens of test processes hits `EAGAIN`, a child is reaped before it writes,
+/// a `spawn` loses a race with a full process table. Answering "unknown
+/// version" to any of those is worse than waiting 100ms, because the caller —
+/// the broker's drift gate (spec §4.2) — reads an unknown version as *drift*
+/// and refuses a spawn that has nothing wrong with it.
+///
+/// A **timeout** is deliberately NOT retried: a binary that ignored a whole
+/// budget is wedged, not unlucky, and re-asking three times would multiply the
+/// one bound this function promises its caller.
+pub const VERSION_ATTEMPTS: usize = 3;
+
+/// The pause between those attempts — long enough for a transient fork failure
+/// to clear, short enough to stay inside a spawn's latency budget.
+pub const VERSION_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// What one `--version` probe produced.
+enum Probe {
+    /// A clean, timely answer.
+    Answered(String),
+    /// Nothing usable, for a reason that may not repeat (fork failure, a
+    /// non-zero exit, an empty file): worth re-asking.
+    Transient,
+    /// The budget expired and the child was killed: re-asking would only
+    /// multiply the bound.
+    Wedged,
+}
+
 /// `<bin> --version`, bounded: the first non-empty line, or `None` for anything
 /// that is not a clean, timely answer.
 ///
@@ -329,7 +360,30 @@ const VERSION_POLL: Duration = Duration::from_millis(20);
 ///   deadline, on a descriptor this function does not control.
 /// * **The wait is bounded and the child is killed on expiry.** An unknown
 ///   version is a fine answer; a stuck broker is not.
+///
+/// And one property that is about the *caller*: a transient failure is retried
+/// ([`VERSION_ATTEMPTS`] × [`VERSION_RETRY_BACKOFF`]) rather than reported as an
+/// unknown version. The drift gate cannot tell "this binary has no version"
+/// from "this fork failed", so it treats both as drift — which turns a busy
+/// machine into a refused spawn. A wedged binary is still answered `None` on
+/// the first attempt: the bound is the promise this function makes.
 pub fn codex_version(bin: &Path, env: &[(String, String)], budget: Duration) -> Option<String> {
+    for attempt in 0..VERSION_ATTEMPTS {
+        match probe_version(bin, env, budget) {
+            Probe::Answered(version) => return Some(version),
+            Probe::Wedged => return None,
+            Probe::Transient => {
+                if attempt + 1 < VERSION_ATTEMPTS {
+                    std::thread::sleep(VERSION_RETRY_BACKOFF);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One attempt. See [`codex_version`] for why each detail is what it is.
+fn probe_version(bin: &Path, env: &[(String, String)], budget: Duration) -> Probe {
     let sink = std::env::temp_dir().join(format!(
         "a2a-codex-version-{}-{}",
         std::process::id(),
@@ -338,8 +392,10 @@ pub fn codex_version(bin: &Path, env: &[(String, String)], budget: Duration) -> 
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let file = std::fs::File::create(&sink).ok()?;
-    let version = match Command::new(bin)
+    let Ok(file) = std::fs::File::create(&sink) else {
+        return Probe::Transient; // a full or unwritable TMPDIR may not stay so
+    };
+    let probe = match Command::new(bin)
         .arg("--version")
         .env_clear()
         .envs(env.iter().cloned())
@@ -348,9 +404,12 @@ pub fn codex_version(bin: &Path, env: &[(String, String)], budget: Duration) -> 
         .stderr(Stdio::null())
         .spawn()
     {
-        Err(_) => None,
+        // `EAGAIN` from a busy process table looks exactly like this, and it is
+        // the single most likely way this probe fails on a loaded machine.
+        Err(_) => Probe::Transient,
         Ok(mut child) => {
             let deadline = std::time::Instant::now() + budget;
+            let mut wedged = false;
             let status = loop {
                 match child.try_wait() {
                     Ok(Some(status)) => break Some(status),
@@ -360,11 +419,12 @@ pub fn codex_version(bin: &Path, env: &[(String, String)], budget: Duration) -> 
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    wedged = true;
                     break None;
                 }
                 std::thread::sleep(VERSION_POLL);
             };
-            status
+            let answer = status
                 .filter(|s| s.success())
                 .and_then(|_| std::fs::read_to_string(&sink).ok())
                 .and_then(|text| {
@@ -372,11 +432,16 @@ pub fn codex_version(bin: &Path, env: &[(String, String)], budget: Duration) -> 
                         .map(str::trim)
                         .find(|l| !l.is_empty())
                         .map(str::to_string)
-                })
+                });
+            match (answer, wedged) {
+                (Some(version), _) => Probe::Answered(version),
+                (None, true) => Probe::Wedged,
+                (None, false) => Probe::Transient,
+            }
         }
     };
     let _ = std::fs::remove_file(&sink);
-    version
+    probe
 }
 
 /// Signal the worker's process GROUP, but only after the start-time witness

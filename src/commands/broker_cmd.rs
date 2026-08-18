@@ -342,6 +342,11 @@ pub fn status(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
         "generation": info["generation"],
         "workers": info["workers"],
         "live": info["live"],
+        // Workers with no actor because they are still waiting for a slot
+        // (spec §4.9). Reported next to `live` because "8 live, 3 waiting" is
+        // one fact about a fleet, and an operator asking why a spawn has not
+        // started is asking exactly this.
+        "queued": info["queued"],
         "clients": info["clients"],
         "socket": info["socket"],
         "protocol_version": info["protocol_version"],
@@ -352,10 +357,11 @@ pub fn status(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
     });
     if !quiet {
         eprintln!(
-            "a2a: broker up (pid {}, {}, {} worker(s), {} client(s), up {}s)",
+            "a2a: broker up (pid {}, {}, {} worker(s), {} queued, {} client(s), up {}s)",
             info["pid"],
             info["transport"].as_str().unwrap_or("unknown"),
             info["workers"],
+            info["queued"],
             info["clients"],
             info["uptime_secs"]
         );

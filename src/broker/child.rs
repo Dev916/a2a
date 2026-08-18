@@ -337,7 +337,13 @@ pub fn forwarded_test_env() -> Vec<(String, String)> {
 
 /// How long `<codex> --version` is given before the answer is treated as
 /// unknown. A version check is not worth hanging a spawn on.
-pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Generous rather than tight, and deliberately so: an unknown version is read
+/// by [`CodexIdentity::drift_from`] as **drift**, so a probe that merely ran out
+/// of budget on a loaded machine refuses a spawn that had nothing wrong with
+/// it. The bound exists to stop a *wedged* binary hanging the daemon, and ten
+/// seconds is still that — a real `codex --version` answers in milliseconds.
+pub const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which codex binary the broker is serving, and which build of it.
 ///
@@ -685,6 +691,38 @@ mod tests {
         assert_eq!(
             CodexIdentity::resolve(Path::new("/definitely/not/a/binary"), &[]).version,
             None
+        );
+    }
+
+    /// A fork that fails is not a version that is missing.
+    ///
+    /// The drift gate reads `None` as drift, so a probe that lost a race with a
+    /// busy process table would refuse a spawn that had nothing wrong with it.
+    /// Two transient failures in a row are re-asked; the third attempt answers.
+    #[test]
+    fn a_transient_probe_failure_is_retried_rather_than_read_as_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("attempts");
+        let bin = dir.path().join("flaky-codex");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nn=$(cat {c} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {c}\n\
+                 [ \"$n\" -lt 3 ] && exit 1\necho 'codex-cli 0.140.0'\n",
+                c = counter.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let id = CodexIdentity::resolve(&bin, &[]);
+        assert_eq!(id.version.as_deref(), Some("codex-cli 0.140.0"));
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            crate::exec::VERSION_ATTEMPTS.to_string(),
+            "exactly {} attempts — bounded, not a loop",
+            crate::exec::VERSION_ATTEMPTS
         );
     }
 

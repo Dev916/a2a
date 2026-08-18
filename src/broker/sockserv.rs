@@ -657,29 +657,38 @@ async fn dispatch(
                 .map_err(|e| WireError::from_app(&e))?;
             Ok(serde_json::to_value(snap).unwrap_or(Value::Null))
         }
+        // The admission half of a spawn (spec §4.9), asked before the caller
+        // has written a byte of genesis: the answer is what genesis records.
+        "admit" => {
+            let admitted = ctx
+                .core
+                .admit_request(spawn_request(body)?)
+                .await
+                .map_err(|e| WireError::from_app(&e))?;
+            Ok(match admitted {
+                crate::broker::core::Admitted::Now => json!({"decision": "admit"}),
+                crate::broker::core::Admitted::Queued { position } => {
+                    json!({"decision": "queue", "queue_position": position})
+                }
+            })
+        }
         // The one op that carries CLAIMS rather than just a target: the cwd and
         // the lane the caller says it resolved. The core re-checks both against
         // what THIS daemon was started with (spec §5).
         "spawn" => {
-            let req = crate::broker::core::SpawnRequest {
-                dir: PathBuf::from(string_arg(body, "dir")?),
-                cwd: body.get("cwd").and_then(Value::as_str).map(PathBuf::from),
-                lane: body
-                    .get("lane")
-                    .and_then(Value::as_str)
-                    .and_then(|l| l.parse::<crate::config::Lane>().ok()),
-            };
             let snap = ctx
                 .core
-                .spawn_checked(req)
+                .spawn_checked(spawn_request(body)?)
                 .await
                 .map_err(|e| WireError::from_app(&e))?;
             Ok(serde_json::to_value(snap).unwrap_or(Value::Null))
         }
+        // New work off the socket, so it is held to the admission cap — unlike
+        // the adoption path, which re-attaches workers that were already running.
         "resume" => {
             let snap = ctx
                 .core
-                .resume_worker(string_arg(body, "dir")?)
+                .resume_checked(string_arg(body, "dir")?)
                 .await
                 .map_err(|e| WireError::from_app(&e))?;
             Ok(serde_json::to_value(snap).unwrap_or(Value::Null))
@@ -729,6 +738,7 @@ async fn info(ctx: &ServeCtx) -> Value {
         "clients": ctx.clients(),
         "workers": idle.as_ref().map(|i| i.workers),
         "live": idle.as_ref().map(|i| i.live),
+        "queued": idle.as_ref().map(|i| i.queued),
         "generation": idle.as_ref().map(|i| i.generation),
         "child_pid": idle.as_ref().and_then(|i| i.child_pid),
         "restarts": idle.as_ref().map(|i| i.restarts),
@@ -739,6 +749,23 @@ async fn info(ctx: &ServeCtx) -> Value {
         "codex_bin": ctx.codex_bin,
         "allowed_roots": ctx.allowed_roots,
         "reconciled": ctx.reconciled,
+    })
+}
+
+/// The body `admit` and `spawn` share: the directory, plus the two claims the
+/// core re-validates for itself.
+fn spawn_request(body: &Value) -> Result<crate::broker::core::SpawnRequest, WireError> {
+    Ok(crate::broker::core::SpawnRequest {
+        dir: PathBuf::from(string_arg(body, "dir")?),
+        cwd: body.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+        lane: body
+            .get("lane")
+            .and_then(Value::as_str)
+            .and_then(|l| l.parse::<crate::config::Lane>().ok()),
+        no_queue: body
+            .get("no_queue")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 

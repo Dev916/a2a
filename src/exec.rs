@@ -75,7 +75,8 @@ pub struct SpawnSpec<'a> {
     pub schema_path: Option<&'a Path>,
     /// 0600; wired to the child's stdin — argv gets `-`, never the text.
     pub prompt_file: &'a Path,
-    /// `Some(id)` → `exec resume <id> … -`.
+    /// `Some(id)` → `exec … resume <id> -` (the subcommand goes LAST, after
+    /// every `exec` option — see [`build_argv`]).
     pub resume_session: Option<&'a str>,
     /// Extra env (also the test seam — no process-global `set_var` anywhere).
     /// Applied BEFORE [`SCRUBBED_ENV`], which always wins.
@@ -137,10 +138,6 @@ pub fn build_argv(spec: &SpawnSpec) -> Vec<String> {
     };
     let mut argv: Vec<String> = Vec::with_capacity(24);
     argv.push("exec".to_string());
-    if let Some(session) = spec.resume_session {
-        argv.push("resume".to_string());
-        argv.push(session.to_string());
-    }
     argv.push("--json".to_string());
     argv.push("-C".to_string());
     argv.push(path_arg(&workspace));
@@ -167,6 +164,25 @@ pub fn build_argv(spec: &SpawnSpec) -> Vec<String> {
     if let Some(schema) = spec.schema_path {
         argv.push("--output-schema".to_string());
         argv.push(path_arg(schema));
+    }
+    // **After the options, not before them.** `resume` is a SUBCOMMAND of
+    // `codex exec`, and its own option set is much smaller than `exec`'s: real
+    // codex 0.140.0 answers `codex exec resume <id> -C …` with
+    // `error: unexpected argument '-C' found` and exits 2 before the model is
+    // ever reached (verified live in Task 18 — the app-server worker resumed on
+    // the exec fallback came back `orphaned after 0s`). Everything `exec`
+    // accepts is parsed ahead of the subcommand, so the working shape is
+    //
+    // ```text
+    // codex exec --json -C <dir> … --skip-git-repo-check resume <session> -
+    // ```
+    //
+    // which the same probe drove end to end against a thread the BROKER had
+    // opened, proving the cross-transport claim (`thread.id` is the id
+    // `exec resume` accepts).
+    if let Some(session) = spec.resume_session {
+        argv.push("resume".to_string());
+        argv.push(session.to_string());
     }
     argv.push("-".to_string()); // prompt arrives on stdin — NEVER in argv
     argv

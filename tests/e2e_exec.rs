@@ -174,10 +174,19 @@ fn real_codex_smoke() {
     // binary, not `a2a`, so the detached shim would be resolved from the wrong
     // directory. `A2A_CODEX_BIN` is *removed*, not overridden — PATH's codex is
     // the subject of this test.
+    //
+    // `A2A_BROKER_DISABLE=1` is the OTHER pin, and it is not optional: from
+    // Phase 2 on, a bare spawn is `--transport auto`, so this test would
+    // autostart a broker and run the whole smoke over the app-server transport
+    // — validating `map_appserver_notification` (which has its own real proof
+    // in `tests/e2e_appserver.rs`) while claiming to validate `map_exec_line`,
+    // and leaking a daemon holding a deleted tempdir on the way out, since
+    // nothing here owns a `BrokerGuard`. Observed exactly that way in Task 18.
     let envs = |c: &mut assert_cmd::Command| {
         c.env("A2A_HOME", &home)
             .env("A2A_ALLOWED_ROOTS", tmp.path())
             .env("A2A_SHIM_BIN", assert_cmd::cargo::cargo_bin("a2a"))
+            .env("A2A_BROKER_DISABLE", "1")
             .env_remove("A2A_CODEX_BIN");
     };
 

@@ -5,9 +5,13 @@
 out=""; outbox=""; resume=0
 argv="$*"   # captured before the parse loop consumes it — resume-argv.txt is the ps-safety witness
 [ "$1" = "exec" ] && shift
-if [ "$1" = "resume" ]; then resume=1; shift; shift; fi   # consume "resume <session-id>"
 while [ $# -gt 0 ]; do
   case "$1" in
+    # `resume` is a SUBCOMMAND of `codex exec` and real codex parses every
+    # exec-level option BEFORE it, so it can appear anywhere after `exec`
+    # (a2a emits it last, just before the `-`). The trailing shift below eats
+    # the session id that follows it.
+    resume)                resume=1;;
     --output-last-message) shift; out="$1";;
     --add-dir)             shift; outbox="$1";;
   esac; shift

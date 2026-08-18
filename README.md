@@ -8,12 +8,19 @@ call, so an orchestrator never burns its context window polling.
 
 All worker state lives on disk under `$A2A_HOME` (default `~/.a2a`) as a
 write-ahead log (`events.jsonl`, the source of truth) plus an atomic snapshot
-(`state.json`). Workers are detached `codex exec --json` process groups whose
-liveness is a kernel-held `flock` — **no daemon**, and nothing is lost if the
-CLI, your shell, or the machine goes away mid-turn.
+(`state.json`). Nothing is lost if the CLI, your shell, or the machine goes away
+mid-turn — the log is the truth and the snapshot is a rebuildable projection of
+it.
 
-This is **Phase 1** (file layer + worker state machine + exec transport). The
-broker, the app-server transport, and mid-turn interrupts arrive in Phase 2.
+There are **two transports**, and the CLI is the same on both
+([Transports](#transports)): the **app-server** transport runs workers as threads
+inside a small broker daemon (mid-turn `interrupt`, live `tail --follow`,
+admission control), and the **exec** transport runs each worker as a detached
+`codex exec` process group with no daemon at all. `--transport auto` — the
+default — takes the first and falls back to the second.
+
+This is **Phase 2** (broker + app-server transport). Worktrees, guardian-denial
+parking and `a2a approve` arrive later.
 
 ---
 
@@ -41,13 +48,19 @@ a2a doctor
 ✓ layout_version  home layout v1
 ✓ home_perms  /Users/you/.a2a is 0700
 ✓ workers_health  0 worker(s): 0 orphaned, 0 parked (non-terminal, no live process), 0 unreadable
-⚠ env_inheritance  Phase 1 exec workers inherit the CLI environment minus the scrub list …
-6 check(s): 5 ok, 1 warn, 0 fail
+⚠ env_inheritance  exec-transport workers inherit the CLI environment minus the scrub list …
+✓ app_server_handshake  `…/codex app-server` completed initialize as a2a/0.140.0 (…)
+✓ codex_home_match  app-server and CLI agree on /Users/you/.codex
+✓ broker_status  not running — start-on-demand from /Users/you/.local/bin/a2a
+⚠ auth_mode  OPENAI_API_KEY is exported — a2a scrubs it from every child …
+10 check(s): 8 ok, 2 warn, 0 fail
 ```
 
 One line per check; **exit 9 if any check fails** (warnings do not fail). Run it
-first — it creates the home tree (0700) and catches the version-coupled
-transport mismatch before a worker does.
+first — it creates the home tree (0700), performs a real `codex app-server`
+handshake, and catches the version-coupled transport mismatch before a worker
+does. `app_server_handshake` failing is a warning, not an error: it means every
+spawn will quietly take the exec fallback.
 
 ### 3. Spawn a worker
 
@@ -144,10 +157,15 @@ a2a send "$ID" "use option B — keep the existing public API"
 a2a wait "$ID" --timeout 10m ; echo "exit=$?"
 ```
 
-`send` queues the message and delivers it at the next turn boundary, resuming the
-worker's codex session in a new epoch. The text travels through a 0600 prompt
-file on the child's stdin — **never through argv**. `--queue-only` batches several
-messages into one delivery; `--kind steer` marks guidance rather than an answer.
+`send` delivers at the next turn boundary. On the **exec** transport that means
+resuming the worker's codex session in a new epoch; on the **app-server**
+transport the broker delivers it over the live connection and `--json` adds a
+`send_path` saying how — `steered` (the open turn took it mid-flight),
+`started` (there was no open turn), or `retried_as_start` (the steer lost the
+turn-boundary race and became a new turn). Either way the text travels through a
+0600 prompt file on the child's stdin — **never through argv**. `--queue-only`
+batches several messages into one delivery; `--kind steer` marks guidance rather
+than an answer.
 
 ### 7. Clean up
 
@@ -160,6 +178,140 @@ a2a gc --age 7d              # reclaim terminal workers, leaving a tombstone per
 
 `gc` removes **terminal workers only** — there is no flag that overrides that —
 and every removal leaves a tombstone in `index.jsonl` so an id is never reused.
+
+---
+
+## Transports
+
+Every command above works the same on both transports. What differs is who runs
+the worker.
+
+| | `app-server` | `exec` |
+|---|---|---|
+| worker is | a thread in a `codex app-server` the broker owns | a detached `codex exec --json` process group |
+| needs a daemon | yes (autostarted) | no |
+| mid-turn `send` | steers the open turn | queued, delivered at the next turn boundary |
+| `a2a interrupt` | yes | no (exit 9) |
+| `a2a tail --follow` | live frames from the broker | 500ms poll of the log |
+| admission control | yes (caps + queue) | no |
+| survives the daemon dying | adopted by the next one | never had one |
+
+```bash
+a2a spawn --lane impl --cwd ~/dev/p --brief b.md                        # auto (default)
+a2a spawn --transport app-server --lane impl --cwd ~/dev/p --brief b.md # demand the broker
+a2a spawn --transport exec       --lane impl --cwd ~/dev/p --brief b.md # demand no daemon
+A2A_BROKER_DISABLE=1 a2a spawn --lane impl --cwd ~/dev/p --brief b.md   # no socket, at all
+```
+
+* **`auto`** takes the app-server transport when a broker is reachable (starting
+  one if needed) and falls back to exec otherwise, recording a
+  `transport_degraded` event so a downgrade is never silent.
+* **`app-server`** is an ask, not a preference: if the broker cannot be reached
+  it **exits 7** rather than quietly running somewhere else.
+* **`A2A_BROKER_DISABLE=1`** is the hard switch back to Phase 1 — with it set no
+  `a2a` command opens the socket at all, not even to probe. It is the answer to
+  "the broker is misbehaving, get work moving now".
+
+There is exactly one place a worker changes transport, and it only goes one way:
+`a2a resume` always forks a `codex exec resume <session>` child, so an
+app-server worker can be continued **after its broker is gone** — same
+conversation, new epoch, no daemon. That works because the app-server thread id
+*is* the codex session id, which is proved against the real binary by the gated
+smoke ([Development](#development)).
+
+## The broker
+
+The broker is a daemon-lite: one process per `$A2A_HOME`, owning one private
+`codex app-server` child that every worker on that home multiplexes over.
+
+```bash
+a2a broker status            # uptime, pids, worker/queued/client counts (exit 7 if none)
+a2a broker run               # take broker.lock, detach, serve (--foreground to stay attached)
+a2a broker shutdown          # graceful and bounded; exit 0 when there is none
+a2a broker restart           # stop, then start a fresh one
+```
+
+You rarely run any of them: the first `spawn` that wants the live transport
+**autostarts** one, and a second `broker run` on the same home says
+`broker already running` and exits 0. In `$A2A_HOME` it keeps `broker.sock`
+(0600, peer-uid checked), `broker.lock` (flock held for the daemon's lifetime),
+`broker.pid`, `broker.log`, `broker.jsonl` and `broker-health.json`.
+
+Nothing is lost when it dies. A `kill -9`d broker leaves its workers behind;
+the next `a2a status`/`ls` commits them `orphaned` (exit 10), and the next
+daemon **adopts** them — reaping the previous instance's child, re-opening each
+thread (`thread/resume`) and continuing on a fresh epoch. `a2a broker status
+--json` reports what the last reconcile adopted and reaped.
+
+### Interrupt: ending a turn that is already running
+
+```bash
+a2a interrupt "$ID"          # → awaiting-input{interrupted}
+```
+
+The one command with no exec spelling. The broker knows the open turn id and
+sends `turn/interrupt`; the worker parks in `awaiting-input{interrupted}`, which
+`a2a wait --until blocked` reports as exit 5, and a `send` (or `resume`) starts
+it again from there. Two behaviours worth knowing:
+
+* an exec worker is refused **statically** (exit 9) — `a2a kill` stops it, `a2a
+  send` reaches it at the next boundary;
+* interrupting a turn that has already ended is **exit 0 with `data.noop:true`**,
+  not an error: racing a turn's last millisecond is not a mistake.
+
+A missing broker is exit 7, never a quiet success.
+
+### Following a worker live
+
+```bash
+a2a tail "$ID" --follow                 # ends by itself when the worker is terminal (exit 0)
+a2a tail "$ID" --follow --timeout 5m    # …or when the window expires (exit 6)
+a2a tail "$ID" --since 42 --raw         # resume from a cursor; full envelopes as JSONL
+```
+
+On the app-server transport `--follow` subscribes to live frames from the broker;
+on exec it polls the log every 500ms. It is always bounded — a terminal state, an
+expired `--timeout`, or the broker shutting down all end it.
+
+## Admission control
+
+The broker caps how many workers run at once; the rest **queue** rather than
+fail, and drain in FIFO order as slots free.
+
+```toml
+# $A2A_HOME/config.toml
+[admission]
+global_cap = 8       # live workers across all lanes
+queue_cap  = 32      # waiting workers before a spawn is refused
+
+[admission.lanes.impl]
+cap = 4              # per-lane, so one lane cannot starve the others
+```
+
+A queued worker is a real worker with an id, an event log and a
+`queue_position`; `a2a ls` shows it in state `queued`, and `a2a broker status`
+counts the fleet's `live` and `queued` next to each other, because "8 live, 3
+queued" is one fact about a fleet and is exactly what an operator asking "why
+has my spawn not started" wants. `spawn --no-queue` refuses instead of queueing
+(exit 9), and every cap is a `u64` where **`0` means "admit nothing"** — the safe
+reading of a mis-set value. Uncapping is spelled with a large number, which is
+something you can only do on purpose.
+
+## Owner scoping
+
+Every worker records an **owner** at genesis: `$A2A_OWNER`, or `anon-<uid>`.
+
+```bash
+a2a ls                       # your workers, plus every unowned one
+a2a ls --all                 # the whole machine, with an OWNER column
+a2a kill "$ID" --force       # act on somebody else's worker, deliberately
+```
+
+Mutating commands (`send`, `kill`, `interrupt`, `resume`) refuse a worker owned
+by somebody else unless `--force` is given; `gc` skips them unless `--all` is
+given; read-only commands never refuse. Legacy workers with no recorded owner
+stay open to everyone, so upgrading does not strand them. The owner is recorded
+at **genesis**, so it survives losing `state.json`.
 
 ---
 
@@ -215,12 +367,19 @@ codex_version_range = ">=0.140, <0.150"
 model = "gpt-5.5"
 effort = "high"
 task_timeout_secs = 7200
+
+[admission]              # app-server transport only
+global_cap = 8
+queue_cap = 32
 ```
 
 Every key has an `A2A_`-prefixed environment override
 (`A2A_ALLOWED_ROOTS`, `A2A_CODEX_VERSION_RANGE`,
-`A2A_LANES_IMPL_TASK_TIMEOUT_SECS`, …). `A2A_HOME` (or `--home`) relocates the
-entire tree — that is how the test suite stays hermetic.
+`A2A_LANES_IMPL_TASK_TIMEOUT_SECS`, `A2A_ADMISSION_GLOBAL_CAP`,
+`A2A_ADMISSION_LANES_IMPL_CAP`, …). `A2A_HOME` (or `--home`) relocates the
+entire tree — that is how the test suite stays hermetic. Two variables are
+switches rather than settings: `A2A_BROKER_DISABLE=1`
+([Transports](#transports)) and `A2A_OWNER` ([Owner scoping](#owner-scoping)).
 
 ## Safety properties
 
@@ -228,7 +387,12 @@ entire tree — that is how the test suite stays hermetic.
   on ingress (spawn fails on a hit); every printed stream is redacted on egress;
   events are redacted at append time, so the WAL itself is clean.
   `OPENAI_API_KEY`, `AWS_*` and `DEPOT_TOKEN` are scrubbed from every worker's
-  environment.
+  environment. The broker's app-server child gets an **allowlist**, not the
+  ambient environment: `PATH` (pinned at broker start), `HOME`, `USER`, `TERM`,
+  `LANG`, `TMPDIR`, `CODEX_HOME` — nothing else crosses.
+- **The socket cannot out-privilege the CLI.** `broker.sock` is 0600, accepts
+  only a peer whose uid is the daemon's own, and the broker **re-validates**
+  every wire-supplied `cwd` against the allowed roots it was started with.
 - **No shell, ever.** Every codex invocation is an argv array, and no brief or
   message text appears in argv — a `ps` on this machine reveals nothing.
 - **Crash-safe by construction.** `events.jsonl` is append-only with `sync_data`
@@ -236,20 +400,32 @@ entire tree — that is how the test suite stays hermetic.
   projection written temp→fsync→rename→fsync-dir.
 - **Terminal states are absorbing.** Only `a2a resume` leaves one, in a new epoch.
 - **`--ephemeral` is never passed to codex** (it would kill resumability), and
-  Phase 1 rejects `danger-full-access` outright.
+  `danger-full-access` is rejected outright.
 
 ## Development
 
 ```bash
-cargo test                                    # hermetic: no real codex, no network
-A2A_E2E=1 cargo test --test e2e_exec -- --ignored --nocapture   # real codex, spends tokens
+cargo test                                     # hermetic: no real codex, no network
+
+# The gated proofs. Real codex, real ~/.codex auth (read, never written), tokens.
+A2A_E2E=1 cargo test --test e2e_exec      -- --ignored --nocapture
+A2A_E2E=1 cargo test --test e2e_appserver -- --ignored --nocapture
 ```
 
 The suite never touches `~/.a2a` or `~/.codex`; every test gets a temp
-`A2A_HOME` and the scripted stub at `tests/fixtures/stub-codex`. The single
-exception is the `A2A_E2E`-gated smoke, which reads (and never writes) the real
-`~/.codex` auth — it is what validates the `codex exec --json` mapping table in
-`src/events.rs` against the vocabulary codex actually emits.
+`A2A_HOME`, the scripted stub at `tests/fixtures/stub-codex` (exec) and the
+scripted `tests/fixtures/fake-app-server` (live transport), so `cargo test` is
+green from a clean checkout with no codex on `PATH` and no network.
+
+The two `A2A_E2E`-gated smokes are the exception, and they are the only thing
+that can catch **vocabulary drift** — a fake can only ever confirm the
+vocabulary we wrote into it. `e2e_exec` validates `events::map_exec_line`
+against what `codex exec --json` really emits; `e2e_appserver` validates
+`events::map_appserver_notification` and
+`adapter::is_steer_precondition_failure` against a real `codex app-server`,
+proves `a2a interrupt` really ends a turn, and proves the **cross-transport
+resume**: an app-server worker, finished, its broker shut down, continued by
+`codex exec resume <session>` on the same conversation.
 
 - Design: `docs/superpowers/specs/2026-08-14-a2a-claude-codex-design.md`
 - Worker state machine: `docs/machines/worker.md`

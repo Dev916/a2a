@@ -435,10 +435,14 @@ fn workers_health(ctx: &Ctx) -> Check {
 fn env_inheritance(_ctx: &Ctx) -> Check {
     Check::warn(
         "env_inheritance",
-        "Phase 1 exec workers inherit the CLI environment minus the scrub list \
-         (OPENAI_API_KEY, AWS_*, DEPOT_TOKEN); the Phase 2 broker adds the full allowlist.",
+        "exec-transport workers inherit the CLI environment minus the scrub list \
+         (OPENAI_API_KEY, AWS_*, DEPOT_TOKEN); app-server workers see only the \
+         broker's allowlist (PATH, HOME, USER, TERM, LANG, TMPDIR, CODEX_HOME).",
     )
-    .remedy("keep secrets out of the environment a2a itself runs in until the broker lands")
+    .remedy(
+        "keep secrets out of the environment a2a itself runs in, or spawn on the \
+         app-server transport, whose children inherit nothing else",
+    )
 }
 
 // ------------------------------------------------------- the phase-2 checks

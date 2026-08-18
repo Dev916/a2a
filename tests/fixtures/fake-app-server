@@ -48,9 +48,9 @@ SCENARIOS
                    persists in $FAKE_STATE); every later turn on that thread
                    behaves like `happy`, which is what makes park -> answer ->
                    converge expressible against a child whose scenario is fixed.
-  steer-race       the FIRST turn/steer is rejected with
-                   {"code":-32002,"message":"expectedTurnId does not match the
-                   active turn"}; a subsequent turn/start succeeds
+  steer-race       the FIRST turn/steer is rejected with the real 0.140.0
+                   lost-race error {"code":-32600,"message":"no active turn to
+                   steer"}; a subsequent turn/start succeeds
   hang-turn        turn/started, then the turn is held OPEN forever — it
                    completes only when steered (completed) or interrupted
                    (interrupted)
@@ -429,7 +429,13 @@ def handle_request(req_id, method, params):
     if method == "turn/steer":
         if SCENARIO == "steer-race" and not FLAGS.get("steer_rejected"):
             set_flag("steer_rejected", True)
-            reply_error(req_id, -32002, "expectedTurnId does not match the active turn")
+            # The REAL 0.140.0 rejection for a lost race, transcribed in Task
+            # 18: the turn named by expectedTurnId is over, so there is nothing
+            # to steer. The code is the server's catch-all invalid-request code
+            # (it says the same -32600 for `thread not found`), so the MESSAGE
+            # is what `adapter::is_steer_precondition_failure` routes on. A fake
+            # that invented its own wording here would let the predicate drift.
+            reply_error(req_id, -32600, "no active turn to steer")
             return
         reply(req_id, {})
         complete_turn("completed")

@@ -21,9 +21,15 @@
 //      this test created. A suite that greps `ps` for "any app-server" is a
 //      suite that fails when a colleague runs the tests on the same machine.
 //
-// Everything runs against `tests/fixtures/fake-app-server` and
-// `tests/fixtures/stub-codex`: green from a clean checkout, no real codex, no
-// network, no tokens. The real-codex smoke lives in Task 18.
+// Everything in the first three sections runs against
+// `tests/fixtures/fake-app-server` and `tests/fixtures/stub-codex`: green from a
+// clean checkout, no real codex, no network, no tokens.
+//
+// The last section is different in kind. It is the **tier-5 proof** (spec §8):
+// `#[ignore]`d *and* `A2A_E2E=1`-gated, it runs the real `codex` on `PATH`
+// against the real `~/.codex` auth (which it READS and never writes under), and
+// it is the only thing in the repo that can catch app-server *vocabulary drift*
+// — a fake can only ever confirm the vocabulary we wrote into it.
 
 mod common;
 
@@ -175,14 +181,20 @@ fn run(mut cmd: Command, scratch: &Path, tag: &str) -> Ran {
     }
 }
 
-fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + CONVERGE;
+fn until<T>(what: &str, f: impl FnMut() -> Option<T>) -> T {
+    until_within(CONVERGE, what, f)
+}
+
+/// [`until`] with an explicit window — the real-codex proofs wait on a model
+/// rather than on a daemon, and [`CONVERGE`] is sized for the latter.
+fn until_within<T>(window: Duration, what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + window;
     loop {
         if let Some(v) = f() {
             return v;
         }
         if Instant::now() >= deadline {
-            panic!("timed out waiting for {what}");
+            panic!("timed out after {window:?} waiting for {what}");
         }
         std::thread::sleep(POLL);
     }
@@ -693,4 +705,627 @@ fn a_kill_dash_nine_broker_is_recovered_by_the_next_one() {
     drop(guard);
     common::assert_no_broker_left(&env.home);
     assert!(!alive(new_pid), "the second daemon is gone too");
+}
+
+// ---------------------------------------------------------------------------
+// tier 5: the real-codex proofs (gated)
+// ---------------------------------------------------------------------------
+//
+// Three separate claims, each of which only the real binary can settle:
+//
+//   1. **The live transport works end to end against real codex**, and the
+//      notification methods `events::map_appserver_notification` branches on are
+//      the ones a real server actually sends (the drift gate).
+//   2. **A worker is not stranded by its transport.** A thread opened by the
+//      broker is resumable by `codex exec resume` after the broker is gone —
+//      `thread.id == thread.sessionId` is not a curiosity, it is what makes the
+//      exec fallback a fallback rather than a different product.
+//   3. **`turn/interrupt` really ends a turn**, landing the pinned parked state.
+//
+// Plus one zero-token probe of the real error vocabulary behind
+// `adapter::is_steer_precondition_failure`.
+//
+// Every one of them is `#[ignore]`d AND re-checks `A2A_E2E=1` at runtime:
+// `--ignored` alone would spend tokens the moment somebody ran the suite with
+// `--include-ignored`.
+
+/// The runtime half of the gate.
+fn gated(what: &str) -> bool {
+    if std::env::var("A2A_E2E").as_deref() != Ok("1") {
+        eprintln!("A2A_E2E != 1 — skipping {what}");
+        return false;
+    }
+    true
+}
+
+/// `a2a --home <home> …` against the **real** codex on `PATH` and a **real**
+/// broker.
+///
+/// `A2A_CODEX_BIN` is *removed* rather than overridden — PATH's codex is the
+/// subject. `A2A_BROKER_BIN`/`A2A_SHIM_BIN` are pinned to the built binary for
+/// the same reason `tests/common` pins them: under the harness `current_exe()`
+/// is the test binary, and a test binary told to `broker run` is a hang with a
+/// confusing name.
+fn real_cli(env: &Env, args: &[&str]) -> Command {
+    let mut c = Command::new(a2a_bin());
+    c.arg("--home")
+        .arg(&env.home)
+        .args(args)
+        .env_remove("A2A_HOME")
+        .env_remove("A2A_CODEX_BIN")
+        .env_remove("A2A_BROKER_DISABLE")
+        .env("A2A_ALLOWED_ROOTS", &env.allowed)
+        .env("A2A_OWNER", common::TEST_OWNER)
+        .env("A2A_BROKER_BIN", a2a_bin())
+        .env("A2A_SHIM_BIN", a2a_bin());
+    c
+}
+
+/// The same real codex, on the **exec** transport: the broker switched off
+/// entirely, so the only way this can reach the conversation is
+/// `codex exec resume <session_id>`.
+fn real_exec_cli(env: &Env, args: &[&str]) -> Command {
+    let mut c = real_cli(env, args);
+    c.env("A2A_BROKER_DISABLE", "1");
+    c
+}
+
+/// `codex` as `PATH` resolves it — the same binary the broker will spawn.
+fn real_codex_bin() -> PathBuf {
+    let out = Command::new("sh")
+        .args(["-c", "command -v codex"])
+        .output()
+        .expect("sh runs");
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!path.is_empty(), "no `codex` on PATH — the gated smoke needs one");
+    PathBuf::from(path)
+}
+
+/// A git repo under the allowed root: a real worker gets a real workspace.
+fn git_repo(at: &Path) -> PathBuf {
+    std::fs::create_dir_all(at).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(at)
+        .status()
+        .expect("git runs")
+        .success());
+    at.to_path_buf()
+}
+
+/// An item type as [`crate::events`] normalizes it: lowercased, `_` stripped, so
+/// `mcpToolCall` and `mcp_tool_call` are the same word.
+fn norm(v: &Value) -> String {
+    v.as_str()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The census printed under `--nocapture`, so a mapping regression is
+/// diagnosable from the test output alone: every envelope, its kind, and the
+/// top-level keys of the notification params it was mapped from.
+fn print_census(home: &Path, id: &str) {
+    eprintln!("observed app-server vocabulary for {id}:");
+    for e in events_of(home, id) {
+        let mut keys: Vec<&str> = e["raw"]
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        eprintln!(
+            "  seq {:>3}  epoch {}  {:<20} {:<10} raw{:?}",
+            e["seq"],
+            e["epoch"],
+            e["kind"].as_str().unwrap_or("?"),
+            e["transport"].as_str().unwrap_or("?"),
+            keys
+        );
+    }
+}
+
+/// Everything a failing real run needs and a tempdir is about to destroy: the
+/// child's stderr and each epoch's raw transport stream.
+fn dump_worker(home: &Path, id: &str) {
+    let dir = home.join("workers").join(id);
+    eprintln!("---- worker dir {} ----", dir.display());
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    eprintln!("  files: {names:?}");
+    for name in names
+        .iter()
+        .filter(|n| n.starts_with("exec.") || *n == "stderr.log" || *n == "state.json")
+    {
+        let body = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let tail: Vec<&str> = body.lines().rev().take(25).collect();
+        eprintln!("---- {name} (last {} lines) ----", tail.len());
+        for line in tail.into_iter().rev() {
+            eprintln!("  {line}");
+        }
+    }
+}
+
+/// **The real smoke, and the cross-transport resume proof it makes possible.**
+///
+/// One worker, two transports, in the order an operator would hit them:
+///
+/// * `--transport app-server` explicitly (not `auto`): this test is about the
+///   live transport, so a silent degradation to exec must fail it rather than
+///   quietly produce a green run that proves nothing.
+/// * The **drift gate** asserts the load-bearing mappings *fired from real
+///   notifications* — the params shapes `events::map_appserver_notification`
+///   branches on (`thread/started` → `{thread:{id}}`, `turn/started` →
+///   `{threadId,turn}`, `item/completed` → `{item:{type:"agentMessage"}}`,
+///   `turn/completed` → `{turn:{status}}`), not merely that a kind exists. A
+///   kind can be synthesized by a2a itself; a params shape cannot.
+/// * Then `broker shutdown`, and `a2a resume` with the broker DISABLED. The
+///   thread the broker opened is handed to `codex exec resume <session_id>` and
+///   must continue the same conversation. That is the whole cross-transport
+///   claim, and it is why `thread_id == session_id` is asserted above rather
+///   than assumed.
+///
+/// The gate is deliberately NOT "no `unknown` events": unknown is the designed
+/// landing spot for a notification a newer codex invented, so failing on it
+/// would break this test on additions that are explicitly fine.
+#[test]
+#[ignore = "real codex + tokens; run with A2A_E2E=1 cargo test --test e2e_appserver -- --ignored"]
+fn real_codex_smoke_then_cross_transport_resume() {
+    if !gated("the real app-server smoke") {
+        return;
+    }
+    let env = Env::new();
+    let guard = common::BrokerGuard::new(&env.home);
+    let repo = git_repo(&env.work);
+    let brief = env.brief("Reply with exactly the text: A2A-P2-OK\n");
+
+    // ---- the live transport, on the real binary -------------------------
+    let mut cmd = real_cli(
+        &env,
+        &[
+            "--json",
+            "spawn",
+            "--transport",
+            "app-server",
+            "--lane",
+            "general",
+            "--cwd",
+        ],
+    );
+    cmd.arg(&repo).arg("--brief").arg(&brief);
+    let spawned = run(cmd, &env.scratch, "real-spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let d = spawned.data();
+    assert_eq!(
+        d["transport"],
+        json!("app-server"),
+        "`--transport app-server` is an ask, not a preference: {d}"
+    );
+    let id = d["id"].as_str().expect("an id").to_string();
+    eprintln!("real app-server worker: {id}");
+
+    let waited = run(
+        real_cli(&env, &["wait", &id, "--timeout", "300s"]),
+        &env.scratch,
+        "real-wait",
+    );
+    assert_eq!(
+        waited.code, 0,
+        "wait: {} (worker {id})",
+        waited.stderr
+    );
+
+    let status = run(
+        real_cli(&env, &["--json", "status", &id]),
+        &env.scratch,
+        "real-status",
+    );
+    assert_eq!(status.code, 0, "status: {}", status.stderr);
+    let s = status.data();
+    assert_eq!(s["state"], json!("done"), "{s}");
+    let thread_id = s["thread_id"]
+        .as_str()
+        .expect("a real thread of record")
+        .to_string();
+    let session_id = s["session_id"]
+        .as_str()
+        .expect("a real session of record")
+        .to_string();
+    assert!(!thread_id.is_empty(), "{s}");
+    assert_eq!(
+        thread_id, session_id,
+        "the ground-truth identity `thread.id == thread.sessionId` no longer holds \
+         on the real binary — the exec fallback resumes by session id, so this is \
+         the load-bearing fact behind the cross-transport proof below: {s}"
+    );
+    assert!(
+        s.get("fold_rejections").is_none(),
+        "a real happy run folds cleanly: {s}"
+    );
+
+    let result = run(
+        real_cli(&env, &["--json", "result", &id]),
+        &env.scratch,
+        "real-result",
+    );
+    assert_eq!(result.code, 0, "result: {}", result.stderr);
+    let text = result.data()["result"].as_str().unwrap_or_default().to_string();
+    eprintln!("app-server result: {text:?}");
+    assert!(
+        text.contains("A2A-P2-OK"),
+        "the worker's own words are the result on this transport; got {text:?}"
+    );
+
+    // ---- the broker is healthy while it is holding this fleet -----------
+    let broker = run(
+        real_cli(&env, &["--json", "broker", "status"]),
+        &env.scratch,
+        "real-brokerstatus",
+    );
+    assert_eq!(broker.code, 0, "broker status: {}", broker.stderr);
+    let b = broker.data();
+    assert_eq!(b["running"], json!(true), "{b}");
+    assert_eq!(b["transport"], json!("app-server"), "{b}");
+    assert!(b["pid"].is_u64(), "a daemon reports its own pid: {b}");
+    assert!(
+        b["child_pid"].is_u64(),
+        "a healthy broker owns a live app-server child: {b}"
+    );
+
+    // ---- the drift gate --------------------------------------------------
+    print_census(&env.home, &id);
+    let evs = events_of(&env.home, &id);
+    // `thread/started` params are `{thread:{id,…}}` — NO top-level threadId.
+    // Observed on codex-cli 0.140.0: raw keys ["fsm","rollout_path",
+    // "session_id","thread"].
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"] == "session_identified" && e["raw"]["thread"]["id"].is_string()),
+        "no `thread/started` notification reached the fold — \
+         map_appserver_notification has drifted"
+    );
+    // `turn/started` = `{threadId, turn}`.
+    assert!(
+        evs.iter().any(|e| e["kind"] == "turn_started"
+            && e["raw"]["threadId"].is_string()
+            && e["raw"]["turn"]["id"].is_string()),
+        "no `turn/started` notification reached the fold — \
+         map_appserver_notification has drifted"
+    );
+    // `item/completed` carrying an `agentMessage` item is what becomes the
+    // result. None of the three TOOL discriminants contains the lowercase
+    // substring "tool", which is why the mapping normalizes instead of
+    // `contains("tool")`-ing; the same normalization is applied here.
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"] == "agent_message" && norm(&e["raw"]["item"]["type"]) == "agentmessage"),
+        "no `item/completed{{item.type:agentMessage}}` reached the fold — \
+         map_appserver_notification has drifted"
+    );
+    // `turn/completed` = `{threadId, turn}` with `TurnStatus`.
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"] == "turn_completed" && e["raw"]["turn"]["status"] == json!("completed")),
+        "no `turn/completed{{turn.status:completed}}` reached the fold — \
+         map_appserver_notification has drifted"
+    );
+
+    // ---- cross-transport resume -----------------------------------------
+    // The daemon goes away FIRST and by the front door: a clean shutdown is the
+    // case an operator actually hits, and it is the one that makes the next line
+    // a genuine exec-transport run rather than a broker round trip in disguise.
+    let stopped = run(
+        real_cli(&env, &["--json", "broker", "shutdown"]),
+        &env.scratch,
+        "real-shutdown",
+    );
+    assert_eq!(stopped.code, 0, "broker shutdown: {}", stopped.stderr);
+    common::assert_no_broker_left(&env.home);
+
+    let resumed = run(
+        real_exec_cli(
+            &env,
+            &["--json", "resume", &id, "now reply with exactly: A2A-XT-OK"],
+        ),
+        &env.scratch,
+        "real-resume",
+    );
+    assert_eq!(
+        resumed.code, 0,
+        "`codex exec resume <session_id>` refused the thread the broker opened. \
+         If this is an identity divergence rather than a transient failure, the \
+         Phase-3 fix is the recorded `rollout_path` fallback (snapshot field \
+         `rollout_path`, resume by rollout file rather than by session id) — \
+         document it, do NOT paper over it. stderr: {}",
+        resumed.stderr
+    );
+    let r = resumed.data();
+    assert_eq!(
+        r["session_id"],
+        json!(session_id.as_str()),
+        "a resume is a new epoch on the SAME conversation: {r}"
+    );
+    assert_eq!(r["epoch"], json!(2), "{r}");
+
+    let waited = run(
+        real_exec_cli(&env, &["wait", &id, "--timeout", "300s"]),
+        &env.scratch,
+        "real-xt-wait",
+    );
+    if waited.code != 0 {
+        // The evidence lives in the worker dir, and the worker dir lives in a
+        // tempdir that this panic is about to delete. Print it first: a
+        // resumed child that dies instantly says why on its own stderr.
+        dump_worker(&env.home, &id);
+    }
+    assert_eq!(waited.code, 0, "wait after resume: {}", waited.stderr);
+
+    let result = run(
+        real_exec_cli(&env, &["--json", "result", &id]),
+        &env.scratch,
+        "real-xt-result",
+    );
+    assert_eq!(result.code, 0, "result after resume: {}", result.stderr);
+    let text = result.data()["result"].as_str().unwrap_or_default().to_string();
+    eprintln!("cross-transport result: {text:?}");
+    assert!(
+        text.contains("A2A-XT-OK"),
+        "the resumed turn ran, but not on this conversation; got {text:?}"
+    );
+
+    // …and it really was the exec transport: epoch 2 has its own `codex exec`
+    // stream file, and every envelope folded from it is stamped `exec`.
+    print_census(&env.home, &id);
+    assert!(
+        env.home
+            .join("workers")
+            .join(&id)
+            .join("exec.2.jsonl")
+            .exists(),
+        "the resumed epoch is a `codex exec` run with its own stream"
+    );
+    assert!(
+        events_of(&env.home, &id).iter().any(|e| e["epoch"] == json!(2)
+            && e["transport"] == json!("exec")
+            && e["kind"] == json!("agent_message")),
+        "the resumed worker's own words must arrive on the EXEC transport"
+    );
+
+    drop(guard);
+    common::assert_no_broker_left(&env.home);
+}
+
+/// **A real turn, really interrupted.**
+///
+/// The fake can be told to hang; a real model cannot, so the brief buys time
+/// instead — a long answer is a long turn, and a long turn is a window to
+/// interrupt in. The loop is bounded at three attempts and tolerant of losing
+/// the race on any one of them (`noop:true` is exit 0 by design, spec deviation
+/// recorded in the plan); what is NOT tolerated is the worker reaching a
+/// terminal state, because then there was never a turn to interrupt and the test
+/// proved nothing.
+#[test]
+#[ignore = "real codex + tokens; run with A2A_E2E=1 cargo test --test e2e_appserver -- --ignored"]
+fn real_codex_interrupt_parks_the_worker_as_interrupted() {
+    if !gated("the real interrupt proof") {
+        return;
+    }
+    let env = Env::new();
+    let guard = common::BrokerGuard::new(&env.home);
+    let repo = git_repo(&env.work);
+    let brief = env.brief(
+        "Write a long, detailed essay of at least 3000 words on the history of the \
+         shipping container. Take your time and be thorough.\n",
+    );
+
+    let mut cmd = real_cli(
+        &env,
+        &[
+            "--json",
+            "spawn",
+            "--transport",
+            "app-server",
+            "--lane",
+            "general",
+            "--cwd",
+        ],
+    );
+    cmd.arg(&repo).arg("--brief").arg(&brief);
+    let spawned = run(cmd, &env.scratch, "int-spawn");
+    assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
+    let id = spawned.data()["id"].as_str().expect("an id").to_string();
+    eprintln!("real interrupt worker: {id}");
+
+    // A turn must be OPEN before there is anything to interrupt: `turn/started`
+    // in the WAL is that fact, and waiting for it is what makes the three
+    // attempts below about the model's timing rather than about the daemon's
+    // startup.
+    until_within(
+        Duration::from_secs(180),
+        "a real turn to be open",
+        || {
+            events_of(&env.home, &id)
+                .iter()
+                .any(|e| e["kind"] == json!("turn_started"))
+                .then_some(())
+        },
+    );
+
+    let mut parked = None;
+    for attempt in 1..=3 {
+        let interrupted = run(
+            real_cli(&env, &["--json", "interrupt", &id]),
+            &env.scratch,
+            &format!("int-{attempt}"),
+        );
+        assert_eq!(
+            interrupted.code, 0,
+            "interrupt (attempt {attempt}): {}",
+            interrupted.stderr
+        );
+        let data = interrupted.data();
+        eprintln!("interrupt attempt {attempt}: {data}");
+
+        // The commit is the broker's, so the converged snapshot is the answer —
+        // a short bounded poll, not an instant read of a value that is still in
+        // flight.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snap = snap_of(&env.home, &id);
+            if let Some(s) = &snap {
+                if s["state"] == json!("awaiting-input")
+                    && s["state_reason"] == json!("interrupted")
+                {
+                    parked = snap;
+                    break;
+                }
+                assert_ne!(
+                    s["state"],
+                    json!("done"),
+                    "the turn finished before any interrupt landed — the brief is \
+                     not buying enough time to prove anything: {s}"
+                );
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        if parked.is_some() {
+            break;
+        }
+    }
+
+    let parked = parked.expect("three attempts and the turn was never interrupted");
+    assert_eq!(parked["state"], json!("awaiting-input"), "{parked}");
+    assert_eq!(parked["state_reason"], json!("interrupted"), "{parked}");
+    assert!(
+        parked.get("fold_rejections").is_none(),
+        "an interrupt is a legal transition: {parked}"
+    );
+    // `a2a wait --until blocked` is how an orchestrator learns about it.
+    let blocked = run(
+        real_cli(&env, &["wait", &id, "--until", "blocked", "--timeout", "30s"]),
+        &env.scratch,
+        "int-wait",
+    );
+    assert_eq!(
+        blocked.code, 5,
+        "an interrupted worker is reported as blocked: {}",
+        blocked.stderr
+    );
+
+    drop(guard);
+    common::assert_no_broker_left(&env.home);
+}
+
+/// **The steer-precondition matcher, against the real error.**
+///
+/// `adapter::is_steer_precondition_failure` is the ONE predicate that decides
+/// whether a failed `turn/steer` is the expected turn-boundary race (retry as
+/// `turn/start`) or a real error (surface it). Getting it wrong is not a loud
+/// failure: it is a worker that silently double-drives, or a `send` that dies at
+/// a boundary it was designed to survive.
+///
+/// Zero tokens: a `turn/steer` naming a turn that does not exist must fail its
+/// precondition before any model is called, so this drives the real binary
+/// through `initialize` + `thread/start` and never opens a turn at all.
+#[tokio::test]
+#[ignore = "real codex; run with A2A_E2E=1 cargo test --test e2e_appserver -- --ignored"]
+async fn real_steer_precondition_error_is_the_one_the_matcher_knows() {
+    if !gated("the real steer-precondition probe") {
+        return;
+    }
+    use a2a::adapter;
+    use a2a::config::{LaneConfig, SandboxMode};
+    use a2a::rpc::{Client, RpcError};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let budget = Duration::from_secs(30);
+
+    let (client, _incoming, mut child) = Client::spawn(
+        &real_codex_bin(),
+        &adapter::APP_SERVER_ARGS,
+        &[],
+        &tmp.path().join("stderr.log"),
+    )
+    .await
+    .expect("the real codex app-server starts");
+
+    adapter::initialize(&client, budget)
+        .await
+        .expect("the real handshake");
+    let lane = LaneConfig {
+        sandbox: SandboxMode::WorkspaceWrite,
+        network: false,
+        worktree_default: false,
+        model: a2a::config::DEFAULT_MODEL.to_string(),
+        effort: "medium".to_string(),
+        start_timeout_secs: 120,
+        task_timeout_secs: 3600,
+        blocked_timeout_secs: 1800,
+    };
+    let thread = adapter::thread_start(&client, &lane, &work, &work, budget)
+        .await
+        .expect("thread/start on the real server");
+
+    // No turn was ever started, so this `expectedTurnId` is exactly the
+    // condition a lost steer race produces.
+    let err = adapter::turn_steer(
+        &client,
+        &thread.thread_id,
+        "turn_that_never_existed",
+        "steer me",
+        budget,
+    )
+    .await
+    .expect_err("steering a turn that does not exist must fail");
+    eprintln!("observed steer-precondition error: {err:?}");
+
+    assert!(
+        adapter::is_steer_precondition_failure(&err),
+        "the real steer-precondition error is not the one \
+         `adapter::is_steer_precondition_failure` recognizes ({err:?}) — fix the \
+         predicate (`adapter::STEER_PRECONDITION_MARKERS`) and transcribe the \
+         observed message there. Do NOT widen it to the error code: 0.140.0 \
+         answers -32600 to `thread not found` too, and an unknown failure \
+         retried as a fresh turn double-drives the worker"
+    );
+    // …and it is a *remote* error, not a transport failure that happened to
+    // contain the right words.
+    assert!(
+        matches!(err, RpcError::Remote { .. }),
+        "expected a JSON-RPC error from the server, got {err:?}"
+    );
+
+    // The other half, and the reason this predicate is message-shaped: the live
+    // server answers the SAME error code for a wrong thread id. If that were
+    // routed as a lost race, `send` would answer a typo by opening a second
+    // turn on a running worker.
+    let not_a_race = adapter::turn_steer(
+        &client,
+        "00000000-0000-7000-8000-000000000000",
+        "turn_that_never_existed",
+        "steer me",
+        budget,
+    )
+    .await
+    .expect_err("steering an unknown thread must fail");
+    eprintln!("observed non-race error under the same code: {not_a_race:?}");
+    assert!(
+        !adapter::is_steer_precondition_failure(&not_a_race),
+        "an unknown thread id must SURFACE, never be retried as a fresh turn: \
+         {not_a_race:?}"
+    );
+
+    let _ = child.kill().await;
 }

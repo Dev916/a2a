@@ -664,12 +664,21 @@ async fn steer_race_rejects_the_first_steer_then_a_new_turn_succeeds() {
         )
         .await
         .expect_err("the first steer loses the race");
+    // The fake speaks the REAL 0.140.0 rejection (transcribed in Task 18), so
+    // this assertion is a fidelity pin as much as a behaviour one: the message
+    // is what `adapter::is_steer_precondition_failure` routes on, and the code
+    // is the server's catch-all invalid-request code rather than a dedicated
+    // one.
     assert_eq!(
         err,
         RpcError::Remote {
-            code: -32002,
-            message: "expectedTurnId does not match the active turn".to_string(),
+            code: adapter::STEER_PRECONDITION_CODE,
+            message: "no active turn to steer".to_string(),
         }
+    );
+    assert!(
+        adapter::is_steer_precondition_failure(&err),
+        "the fake's rejection must be the one the predicate knows: {err:?}"
     );
 
     // A fresh turn still works.

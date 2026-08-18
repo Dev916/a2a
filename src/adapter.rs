@@ -18,10 +18,12 @@
 //! * **The steer/start race.** `turn/steer` carries `expectedTurnId`; between
 //!   reading the last turn id and sending the steer, the turn can complete. That
 //!   TOCTOU is *expected*, so a precondition failure is transparently retried as
-//!   `turn/start` ([`is_steer_precondition_failure`] — one predicate, so Task 18
-//!   has exactly one place to adjust once the real trigger is observed). Every
-//!   other remote error surfaces unchanged: retrying an unknown failure as a
-//!   fresh turn would double-drive the worker.
+//!   `turn/start` ([`is_steer_precondition_failure`] — one predicate, which is
+//!   why Task 18 had exactly one place to correct once the real trigger was
+//!   measured: the live server says `no active turn to steer`, under the same
+//!   error code it uses for `thread not found`). Every other remote error
+//!   surfaces unchanged: retrying an unknown failure as a fresh turn would
+//!   double-drive the worker.
 //!
 //! [`handshake_probe`] is the one sanctioned exception to "the CLI is
 //! synchronous": `doctor` and transport selection need a real handshake before
@@ -74,15 +76,43 @@ pub const SUPPRESSED_REALTIME_METHODS: [&str; 8] = [
     "thread/realtime/transcript/done",
 ];
 
-/// The JSON-RPC error code the live server used for a lost steer race
-/// (`expectedTurnId does not match the active turn`). Task 18 confirms it
-/// against the real binary; [`is_steer_precondition_failure`] also matches on
-/// the message, so a re-coded error still routes correctly.
-pub const STEER_PRECONDITION_CODE: i64 = -32002;
+/// The JSON-RPC error code the live server returns for a lost steer race —
+/// **and for everything else it dislikes about a request.** Observed against
+/// codex-cli 0.140.0 (Task 18, `tests/e2e_appserver.rs`):
+///
+/// ```text
+/// turn/steer, turn already over       -32600  no active turn to steer
+/// turn/steer, a different turn open   -32600  expected active turn id `A` but found `B`
+/// turn/steer, unknown threadId        -32600  thread not found: <uuid>
+/// turn/steer, missing field           -32600  Invalid request: missing field `expectedTurnId`
+/// turn/start, unknown threadId        -32600  thread not found: <uuid>
+/// ```
+///
+/// So the code is **necessary but never sufficient**: it is the server's
+/// catch-all "invalid request", and routing a failed steer on it alone would
+/// retry a `thread not found` as a fresh `turn/start` — double-driving a worker
+/// on the strength of a typo. The MESSAGE is the discriminator, which is why
+/// [`is_steer_precondition_failure`] matches
+/// [`STEER_PRECONDITION_MARKERS`] and this constant exists to document the
+/// observation (and to keep `tests/fixtures/fake-app-server` speaking the real
+/// vocabulary).
+pub const STEER_PRECONDITION_CODE: i64 = -32600;
 
-/// The substring that identifies a steer precondition failure regardless of
-/// code. Matched case-insensitively.
-pub const STEER_PRECONDITION_MARKER: &str = "expectedTurnId";
+/// The only two messages that route a failed `turn/steer` into a retry, both
+/// transcribed verbatim from codex-cli 0.140.0 and matched case-insensitively
+/// as substrings (the mismatch message embeds two turn ids).
+///
+/// Deliberately NOT widened to `expectedturnid`: `Invalid request: missing
+/// field \`expectedTurnId\`` contains that substring and is an *a2a* bug, which
+/// a silent retry would hide. Adding a marker here is a decision to treat a new
+/// server message as the turn-boundary race; nothing else belongs.
+pub const STEER_PRECONDITION_MARKERS: [&str; 2] = [
+    // The turn ended between reading its id and sending the steer — the TOCTOU
+    // this whole path exists for.
+    "no active turn",
+    // A *different* turn is open: "expected active turn id `A` but found `B`".
+    "expected active turn id",
+];
 
 // ---------------------------------------------------------------------------
 // initialize
@@ -416,18 +446,24 @@ pub struct SendOutcome {
 /// The ONE predicate that decides whether a failed steer is the expected
 /// turn-boundary race or a real error.
 ///
-/// Two ways in on purpose: the live 0.140.0 code
-/// ([`STEER_PRECONDITION_CODE`]) **or** the message naming `expectedTurnId`, so
-/// a re-coded error still routes correctly. Everything else — including
-/// [`RpcError::Timeout`] and [`RpcError::ChildDied`] — is false: retrying an
-/// unknown failure as a fresh turn would double-drive the worker.
+/// **Message-only, by evidence.** The first cut of this predicate also accepted
+/// [`STEER_PRECONDITION_CODE`] on its own, on the theory that a re-coded error
+/// should still route; Task 18 measured the real server and found that code is
+/// its catch-all for *every* malformed request — including `thread not found` —
+/// so accepting it would turn a wrong thread id into a second turn against a
+/// live worker. The server's own wording is the only thing that distinguishes
+/// the race, so that is what is matched.
+///
+/// Everything else — including [`RpcError::Timeout`] and
+/// [`RpcError::ChildDied`] — is false: retrying an unknown failure as a fresh
+/// turn would double-drive the worker.
 pub fn is_steer_precondition_failure(err: &RpcError) -> bool {
     match err {
-        RpcError::Remote { code, message } => {
-            *code == STEER_PRECONDITION_CODE
-                || message
-                    .to_ascii_lowercase()
-                    .contains(&STEER_PRECONDITION_MARKER.to_ascii_lowercase())
+        RpcError::Remote { message, .. } => {
+            let message = message.to_ascii_lowercase();
+            STEER_PRECONDITION_MARKERS
+                .iter()
+                .any(|marker| message.contains(marker))
         }
         _ => false,
     }
@@ -876,29 +912,47 @@ mod tests {
     // --- the steer predicate ------------------------------------------------
 
     #[test]
-    fn a_lost_steer_race_is_recognized_by_code_or_by_message() {
-        // The live 0.140.0 pair, verified in the fake's `steer-race` scenario.
+    fn a_lost_steer_race_is_recognized_by_the_message_the_live_server_sends() {
+        // Both messages transcribed verbatim from codex-cli 0.140.0 (Task 18).
+        // The first is the TOCTOU this path exists for; the second is a
+        // *different* turn having opened in the gap.
         assert!(is_steer_precondition_failure(&RpcError::Remote {
             code: STEER_PRECONDITION_CODE,
-            message: "expectedTurnId does not match the active turn".into(),
-        }));
-        // Either half alone is enough: a re-coded error still routes.
-        assert!(is_steer_precondition_failure(&RpcError::Remote {
-            code: -32602,
-            message: "invalid params: expectedTurnId is stale".into(),
+            message: "no active turn to steer".into(),
         }));
         assert!(is_steer_precondition_failure(&RpcError::Remote {
             code: STEER_PRECONDITION_CODE,
-            message: "some future wording".into(),
+            message: "expected active turn id `turn_a` but found `turn_b`".into(),
+        }));
+        // Re-coded, same wording: still the race. The message is the
+        // discriminator, so the code may move.
+        assert!(is_steer_precondition_failure(&RpcError::Remote {
+            code: -32002,
+            message: "No active turn to steer".into(),
         }));
     }
 
+    /// The half of the predicate that protects the worker: everything the live
+    /// server says under the SAME error code that is *not* the race must
+    /// surface, because a retry would open a second turn on a running worker.
     #[test]
     fn nothing_else_is_treated_as_a_lost_race() {
         for err in [
             RpcError::Timeout,
             RpcError::ChildDied,
             RpcError::Decode("bad json".into()),
+            // Observed on 0.140.0 under the steer code itself — the exact
+            // reason the code alone can never route.
+            RpcError::Remote {
+                code: STEER_PRECONDITION_CODE,
+                message: "thread not found: 019898f0-0000-7000-8000-000000000001".into(),
+            },
+            // Also observed, and an a2a bug rather than a race: retrying it
+            // would hide a malformed request behind a second turn.
+            RpcError::Remote {
+                code: STEER_PRECONDITION_CODE,
+                message: "Invalid request: missing field `expectedTurnId`".into(),
+            },
             RpcError::Remote {
                 code: -32001,
                 message: "thread could not be resumed".into(),

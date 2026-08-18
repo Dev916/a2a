@@ -32,7 +32,13 @@
 //! 4. **Identity after.** The new pid + start witness land in their own
 //!    bookkeeping event, exactly like an inbox delivery — a later `a2a kill`
 //!    must signal the process this resume started, not the corpse of the last
-//!    one.
+//!    one. That row also names the **transport** the new epoch runs on, because
+//!    a resume is the one place a worker can change transports: this command
+//!    always forks a `codex exec resume <session>` child, so an app-server
+//!    worker becomes an exec worker here. It is the same conversation on a
+//!    different pipe — which is exactly what makes the broker optional
+//!    (spec §4.4) — and until the snapshot says so, `reconcile` keeps asking a
+//!    broker about a worker it no longer owns and orphans it.
 //!
 //! The message travels through the 0600 `prompt.md` on the child's stdin, never
 //! argv (spec §5). Queued `inbox/` messages are deliberately NOT consumed here:
@@ -42,7 +48,7 @@
 
 use crate::commands::owner;
 use crate::config;
-use crate::events::EventKind;
+use crate::events::{EventKind, Transport};
 use crate::exec::{self, SpawnSpec};
 use crate::fold::append_and_fold;
 use crate::fsm::{self, FsmEvent};
@@ -183,6 +189,15 @@ pub fn run(
         "start_witness": spawned.start_witness,
         "epoch": snap.epoch,
         "resume_session": session,
+        // **The transport this epoch actually runs on.** `resume` always forks
+        // a `codex exec resume <session>` child, so a worker that ran on the
+        // app-server transport CHANGES TRANSPORT here — the broker does not own
+        // the new epoch and must not be consulted about it. Recording it on the
+        // row (rather than patching the snapshot) is what makes a rebuilt
+        // snapshot agree: without it `reconcile` still routes the worker to a
+        // broker, finds none, and commits `orphaned` on a healthy child. That
+        // is the exact failure Task 18's cross-transport proof caught.
+        "transport": Transport::Exec,
     });
     snap = append_and_fold(
         &mut log,

@@ -82,6 +82,48 @@ fn argv_pins_security_flags_and_no_prompt_text() {
     );
 }
 
+/// **The resume grammar, pinned against the real CLI.**
+///
+/// `resume` is a subcommand of `codex exec`, and it accepts far fewer options
+/// than `exec` does: real codex 0.140.0 rejects `codex exec resume <id> -C <dir>`
+/// outright (`error: unexpected argument '-C' found`, exit 2, no model call), so
+/// an argv that put the subcommand first produced a worker that was `orphaned`
+/// milliseconds after `a2a resume` returned success. Every `exec` option
+/// therefore comes FIRST and `resume <session>` goes last, immediately before
+/// the `-` that makes the prompt stdin.
+///
+/// Verified end to end against the real binary in `tests/e2e_appserver.rs`
+/// (Task 18), on a thread the BROKER opened — which is also what proves the
+/// app-server `thread.id` is the id `codex exec resume` accepts.
+#[test]
+fn resume_argv_puts_the_subcommand_after_the_exec_options() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = mk_worker(tmp.path());
+    let b = stub();
+    let mut s = spec(tmp.path(), &w, &b, &[]);
+    s.resume_session = Some("019898f0-0000-7000-8000-000000000001");
+    let argv = exec::build_argv(&s);
+
+    assert_eq!(argv[0], "exec");
+    let at = argv
+        .iter()
+        .position(|a| a == "resume")
+        .expect("a resume spawns the resume subcommand");
+    assert_eq!(argv[at + 1], "019898f0-0000-7000-8000-000000000001");
+    assert_eq!(argv[at + 2], "-", "the prompt positional follows the session");
+    assert_eq!(at + 3, argv.len(), "nothing follows the prompt positional");
+    for option in ["-C", "-s", "--add-dir", "--output-last-message", "-m"] {
+        let pos = argv
+            .iter()
+            .position(|a| a == option)
+            .unwrap_or_else(|| panic!("missing {option} in {argv:?}"));
+        assert!(
+            pos < at,
+            "`{option}` is an `exec` option and `codex exec resume` refuses it: {argv:?}"
+        );
+    }
+}
+
 #[test]
 fn detached_worker_lifecycle_env_scrub_and_streams() {
     let tmp = tempfile::tempdir().unwrap();

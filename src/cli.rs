@@ -237,13 +237,14 @@ pub struct SpawnArgs {
     /// Override the lane's reasoning effort
     #[arg(long)]
     pub effort: Option<String>,
-    /// auto|exec (Phase 1); app-server arrives with the broker
+    /// auto|app-server|exec (default: auto — the broker when one is reachable,
+    /// exec otherwise; `app-server` demands the broker and exits 7 without one)
     #[arg(long)]
     pub transport: Option<String>,
     /// Run in a git worktree (Phase 4; warns and is ignored today)
     #[arg(long)]
     pub worktree: bool,
-    /// Fail rather than queue at the admission cap (Phase 2; no-op today)
+    /// Fail rather than queue at the admission cap (app-server transport only)
     #[arg(long)]
     pub no_queue: bool,
     /// Who this worker belongs to (default: `$A2A_OWNER`, else `anon-<uid>`).

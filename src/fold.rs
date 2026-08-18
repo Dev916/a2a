@@ -228,6 +228,18 @@ fn apply_transport_identity(snap: &mut WorkerSnapshot, env: &Envelope) {
     if let Some(w) = env.raw.get("watermark").and_then(|v| v.as_u64()) {
         snap.last_delivered_seq = snap.last_delivered_seq.max(w);
     }
+    // A restart may move the worker to a DIFFERENT transport, and that is not a
+    // detail: `reconcile` routes on `snap.transport`, so an app-server worker
+    // resumed by `a2a resume` (which always forks a `codex exec` child) would
+    // otherwise still be looked up in a broker that no longer owns it — and be
+    // committed `orphaned` seconds after a perfectly healthy resume. Only a row
+    // that says so moves it, so the broker's own restart rows (which carry no
+    // `transport` key) leave it alone.
+    if let Some(t) = env.raw.get("transport") {
+        if let Ok(t) = serde_json::from_value::<crate::events::Transport>(t.clone()) {
+            snap.transport = t;
+        }
+    }
     if let Some(pid) = env.raw.get("pid").and_then(|v| v.as_u64()) {
         snap.pid = Some(pid as u32);
         snap.pid_start_witness = env
@@ -720,6 +732,55 @@ mod tests {
         );
         assert_eq!(after.pid, Some(4242));
         assert_eq!(after.pid_start_witness.as_deref(), Some("boot-1"));
+    }
+
+    /// A resume can move a worker between transports, and only a row that says
+    /// so moves it. Without the first half, `reconcile` asks a broker about a
+    /// worker that is now a plain `codex exec` child and orphans it seconds
+    /// after a healthy `a2a resume` (caught by Task 18's cross-transport
+    /// proof); without the second half, the broker's own supervision restarts
+    /// would silently demote a live app-server worker to exec.
+    #[test]
+    fn a_transport_restart_moves_the_transport_only_when_the_row_names_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snap = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        snap.transport = Transport::AppServer;
+
+        let restarted = |payload: serde_json::Value, seq: u64| {
+            let mut e = Envelope::new(
+                1,
+                Transport::Exec,
+                EventClass::Lifecycle,
+                EventKind::TransportRestarted,
+                payload,
+                Utc::now(),
+            );
+            e.seq = seq;
+            e
+        };
+
+        // The broker's own restart row: pid + thread, no transport key.
+        let after = fold(
+            snap.clone(),
+            &[restarted(
+                json!({"pid": 11, "start_witness": "w", "thread_id": "t"}),
+                1,
+            )],
+            Utc::now(),
+        );
+        assert_eq!(after.transport, Transport::AppServer);
+        assert_eq!(after.pid, Some(11));
+
+        // `a2a resume`'s row: the new epoch runs on `codex exec`.
+        let after = fold(
+            snap,
+            &[restarted(
+                json!({"pid": 12, "start_witness": "w", "transport": "exec"}),
+                1,
+            )],
+            Utc::now(),
+        );
+        assert_eq!(after.transport, Transport::Exec);
     }
 
     #[test]

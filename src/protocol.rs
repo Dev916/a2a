@@ -697,11 +697,12 @@ mod tests {
 
     #[test]
     fn remote_errors_deserialize() {
-        let raw = r#"{"id":3,"error":{"code":-32002,"message":"expectedTurnId does not match the active turn"}}"#;
+        // A real 0.140.0 error frame, verbatim (Task 18).
+        let raw = r#"{"id":3,"error":{"code":-32600,"message":"no active turn to steer"}}"#;
         let r: RpcResponse = serde_json::from_str(raw).unwrap();
         let e = r.error.expect("error frame");
-        assert_eq!(e.code, -32002);
-        assert!(e.message.contains("expectedTurnId"));
+        assert_eq!(e.code, -32600);
+        assert_eq!(e.message, "no active turn to steer");
         assert!(r.result.is_none());
     }
 

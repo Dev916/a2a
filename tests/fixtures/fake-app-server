@@ -41,10 +41,13 @@ SCENARIOS
                    <cwd>/outbox/1.question.json BEFORE turn/completed (the
                    broker passes the WORKER DIR as thread/start `cwd`; that dir
                    is the per-thread channel — env cannot be per-worker on a
-                   child shared by every worker). The turn completes with NO
+                   child shared by every worker). That turn completes with NO
                    agent message: a worker that asks a question has produced no
                    result, and on this transport the final agent message is the
-                   result.
+                   result. The question is asked ONCE per thread (the flag
+                   persists in $FAKE_STATE); every later turn on that thread
+                   behaves like `happy`, which is what makes park -> answer ->
+                   converge expressible against a child whose scenario is fixed.
   steer-race       the FIRST turn/steer is rejected with
                    {"code":-32002,"message":"expectedTurnId does not match the
                    active turn"}; a subsequent turn/start succeeds
@@ -403,8 +406,22 @@ def handle_request(req_id, method, params):
             )
             return
         if SCENARIO == "blocked":
-            write_outbox_question(THREADS.get(thread_id, {}).get("cwd") or os.getcwd())
-            complete_turn("completed", answer=False)
+            # Asked ONCE per thread, then answered like `happy`.
+            #
+            # The scenario is fixed for the life of the child, and one child
+            # serves every worker — so a `blocked` that asked on every turn
+            # could never express the round trip the transport exists for
+            # (park -> answer -> converge): the answer turn would re-park
+            # forever. First-turn-only is the same idiom `steer-race` and
+            # `crash-mid-turn` already use, and the flag rides in $FAKE_STATE so
+            # it survives a relaunch the way the thread map does.
+            asked = "asked:%s" % thread_id
+            if not FLAGS.get(asked):
+                set_flag(asked, True)
+                write_outbox_question(THREADS.get(thread_id, {}).get("cwd") or os.getcwd())
+                complete_turn("completed", answer=False)
+                return
+            complete_turn("completed")
             return
         complete_turn("completed")
         return

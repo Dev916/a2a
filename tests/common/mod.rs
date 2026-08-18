@@ -110,21 +110,39 @@ impl BrokerGuard {
 impl Drop for BrokerGuard {
     fn drop(&mut self) {
         let sock = self.home.join("broker.sock");
-        // Unconditional: `broker shutdown` on an empty home is a ~10ms no-op,
-        // and skipping it on "no socket right now" is how a daemon that is
-        // still binding survives its own test.
-        let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("a2a"))
-            .arg("--home")
-            .arg(&self.home)
-            .args(["broker", "shutdown"])
-            .env_remove("A2A_HOME")
-            .output();
         let deadline = std::time::Instant::now() + Self::DRAIN_WAIT;
-        while sock.exists() && std::time::Instant::now() < deadline {
+        loop {
+            // Unconditional, and RETRIED until nothing is left on this home.
+            // `broker shutdown` on an empty home is a ~10ms no-op, but it is
+            // also a no-op against a daemon that has not bound its socket yet —
+            // and "not bound yet" is a real window, widest exactly where the
+            // crash tests live: a SIGKILLed daemon leaves its socket file
+            // behind, so a successor coming up finds the address occupied,
+            // unlinks it and rebinds. One shot into that window would fail to
+            // connect, report success, and leave a daemon holding a temp home
+            // that is about to be deleted. Firing until `ps` says the home has
+            // no `broker run` on it is what closes it.
+            let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("a2a"))
+                .arg("--home")
+                .arg(&self.home)
+                .args(["broker", "shutdown"])
+                .env_remove("A2A_HOME")
+                .output();
+            let left = broker_processes(&self.home);
+            if left.is_empty() && !sock.exists() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                if !std::thread::panicking() {
+                    panic!(
+                        "broker outlived its guard on {}: socket {}, processes {left:?}",
+                        self.home.display(),
+                        if sock.exists() { "still there" } else { "gone" }
+                    );
+                }
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if sock.exists() && !std::thread::panicking() {
-            panic!("broker socket {} outlived its guard", sock.display());
         }
     }
 }

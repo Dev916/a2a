@@ -299,6 +299,9 @@ pub struct WorkerActor {
 
 impl WorkerActor {
     async fn run(mut self) {
+        if let Err(e) = self.record_readoption().await {
+            self.warn("recording a re-adoption", &e);
+        }
         if let Err(e) = self.start_thread().await {
             self.record_start_failure(e).await;
         }
@@ -364,6 +367,52 @@ impl WorkerActor {
     }
 
     // -- startup ------------------------------------------------------------
+
+    /// An orphan the broker just re-attached is `running` again.
+    ///
+    /// `orphaned` is what a CLI commits when it finds a worker recorded as live
+    /// with no broker to be live in — the one thing a dead daemon cannot say
+    /// about itself. It is deliberately non-terminal, and app-server orphans are
+    /// deliberately in the startup adoption set, because a new broker is exactly
+    /// the event that undoes it: by the time this actor exists, `register` has
+    /// already re-opened the conversation with `thread/resume`, and a resume
+    /// that failed refused the adoption outright and left the worker orphaned.
+    /// So the machine's `orphaned + Resume → running` row is the honest record
+    /// of what happened, and writing it is what makes the worker usable again:
+    /// without it a re-adopted worker sits in a state whose own remedy
+    /// (`a2a resume`) would start a SECOND, exec transport against the very
+    /// thread this broker now holds — two writers on one conversation.
+    ///
+    /// Only `orphaned` is rewritten. A `running` or `awaiting-input` worker was
+    /// adopted from a state that is still true, and re-stating it would bump an
+    /// epoch for nothing.
+    async fn record_readoption(&mut self) -> Result<(), AppError> {
+        if self.snap.state != WorkerState::Orphaned {
+            return Ok(());
+        }
+        // The same fact `commands/resume.rs` records: a backlog that was waiting
+        // when the resume happened goes out at the next turn boundary, and the
+        // WAL says it was waiting.
+        let answer_queued = inbox::undelivered(&self.dir, self.snap.last_delivered_seq)
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(false);
+        let session = self.snap.session_id.clone();
+        self.persist("readoption", move |log, dir, snap| {
+            let from = snap.state.as_str();
+            let snap = fold::append_and_fold(
+                log,
+                dir,
+                snap,
+                EventKind::Resumed,
+                json!({"fsm": "Resume", "from": from, "answer_queued": answer_queued,
+                       "session_id": session, "has_message": false,
+                       "detail": "re-adopted by a new broker"}),
+                Utc::now(),
+            )?;
+            Ok((snap, ()))
+        })
+        .await
+    }
 
     /// Open this worker's thread and record that its transport is attached.
     ///

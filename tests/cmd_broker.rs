@@ -682,12 +682,20 @@ fn startup_reconciliation_reaps_the_previous_child_before_it_adopts() {
     assert_eq!(
         a2a::state::load_snapshot(&running).unwrap().state,
         WorkerState::Running,
-        "adoption does not change a worker's state"
+        "adoption re-states nothing that is still true"
     );
-    assert_eq!(
-        a2a::state::load_snapshot(&orphaned).unwrap().state,
-        WorkerState::Orphaned
-    );
+    // The orphan is the exception, and it is the reason orphans are in the
+    // adoption set at all: `orphaned` means "recorded live, with no broker to be
+    // live in", and this daemon has just re-opened the conversation. Committing
+    // the machine's `orphaned + Resume → running` row is what makes the worker
+    // usable again — left orphaned, its own remedy (`a2a resume`) would start a
+    // second, exec transport against the thread this broker now holds. Polled,
+    // because the actor writes it: the report above only says it was adopted.
+    let revived = until("the adopted orphan to be running again", || {
+        let snap = a2a::state::load_snapshot(&orphaned).unwrap();
+        (snap.state == WorkerState::Running).then_some(snap)
+    });
+    assert_eq!(revived.epoch, 2, "a resume is a new epoch on an old conversation");
     assert_eq!(
         std::fs::read(exec_dir.join("state.json")).unwrap(),
         exec_before,

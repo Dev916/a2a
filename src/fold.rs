@@ -188,6 +188,38 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
         snap.extra
             .insert("transport_selection".to_string(), selection.clone());
     }
+    // The result schema. Genesis has recorded this key since Phase 1 and the
+    // fold never read it — harmless while nothing depended on it, and a silent
+    // data loss the moment the impl-lane acceptance gate does. Fixed here,
+    // where lossless rebuild lives.
+    if let Some(schema) = s("schema_path") {
+        snap.schema_path = Some(schema.into());
+    }
+    // The worker's own tree (spec §4.8). ALL FOUR keys or nothing: a half-built
+    // `WorktreeRef` is a worktree no `gc` git call can address (each needs
+    // `-C <repo>`), so a partial genesis row must read as "no worktree" rather
+    // than as one a2a will later try and fail to operate on.
+    if let (Some(path), Some(branch), Some(base_ref), Some(repo)) = (
+        s("worktree_path"),
+        s("worktree_branch"),
+        s("worktree_base_ref"),
+        s("worktree_repo"),
+    ) {
+        snap.worktree = Some(crate::state::WorktreeRef {
+            path: path.into(),
+            branch: branch.to_string(),
+            base_ref: base_ref.to_string(),
+            repo: repo.into(),
+        });
+    }
+    // The diff anchor, recorded whether or not there is a worktree. When only
+    // the worktree keys are present it is derived from them, so the "a worktree
+    // implies its base ref" invariant holds after a fold from zero too.
+    if let Some(base) = s("base_ref") {
+        snap.base_ref = Some(base.to_string());
+    } else if let Some(derived) = snap.worktree.as_ref().map(|w| w.base_ref.clone()) {
+        snap.base_ref = Some(derived);
+    }
     snap.created_at = s("created_at")
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc))
@@ -630,6 +662,101 @@ mod tests {
         assert_eq!(after.transport, Transport::AppServer);
         assert_eq!(after.requested_transport, Transport::AppServer);
         assert_eq!(after.owner, None);
+    }
+
+    /// The worktree, its diff anchor and the result schema all come out of
+    /// genesis, because genesis is the only writer of identity — a snapshot
+    /// rebuilt from zero must be able to name the branch it produced.
+    #[test]
+    fn genesis_seeds_the_worktree_the_base_ref_and_the_schema_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let after = fold(
+            WorkerSnapshot::new_for_test("impl-0817t1200-aaaa", tmp.path()),
+            &[ev(
+                json!({"fsm":"Spawn","id":"impl-0817t1200-aaaa","lane":"impl",
+                       "cwd":"/home/worktrees/impl-0817t1200-aaaa",
+                       "schema_path":"/tpl/impl-result.schema.json",
+                       "worktree_path":"/home/worktrees/impl-0817t1200-aaaa",
+                       "worktree_branch":"a2a/impl/impl-0817t1200-aaaa",
+                       "worktree_base_ref":base,
+                       "worktree_repo":"/repo",
+                       "base_ref":base}),
+                1,
+                1,
+            )],
+            Utc::now(),
+        );
+        let wt = after.worktree.clone().expect("all four keys present");
+        assert_eq!(wt.path, std::path::Path::new("/home/worktrees/impl-0817t1200-aaaa"));
+        assert_eq!(wt.branch, "a2a/impl/impl-0817t1200-aaaa");
+        assert_eq!(wt.base_ref, base);
+        assert_eq!(wt.repo, std::path::Path::new("/repo"));
+        assert_eq!(after.base_ref.as_deref(), Some(base));
+        assert_eq!(
+            after.schema_path.as_deref(),
+            Some(std::path::Path::new("/tpl/impl-result.schema.json"))
+        );
+    }
+
+    /// Two halves of the same rule. A worktree-less worker still records the
+    /// anchor `a2a verify` needs; a genesis missing ANY of the four worktree
+    /// keys yields no worktree at all rather than a partial one.
+    #[test]
+    fn the_base_ref_stands_alone_and_a_partial_worktree_is_no_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let seeded = |extra: serde_json::Value| {
+            let mut payload = json!({"fsm":"Spawn","id":"impl-0817t1200-aaaa",
+                                     "lane":"impl","cwd":"/repo"});
+            for (k, v) in extra.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            fold(
+                WorkerSnapshot::new_for_test("impl-0817t1200-aaaa", tmp.path()),
+                &[ev(payload, 1, 1)],
+                Utc::now(),
+            )
+        };
+
+        // No worktree, but the diff anchor is still recorded.
+        let plain = seeded(json!({"base_ref": base, "worktree_skipped": "not-a-git-repo"}));
+        assert_eq!(plain.worktree, None);
+        assert_eq!(plain.base_ref.as_deref(), Some(base));
+
+        // Every one-key-short row: no partial object, ever.
+        for missing in [
+            "worktree_path",
+            "worktree_branch",
+            "worktree_base_ref",
+            "worktree_repo",
+        ] {
+            let mut keys = serde_json::Map::new();
+            for k in [
+                "worktree_path",
+                "worktree_branch",
+                "worktree_base_ref",
+                "worktree_repo",
+            ] {
+                if k != missing {
+                    keys.insert(k.to_string(), json!(if k == "worktree_base_ref" { base } else { "x" }));
+                }
+            }
+            let partial = seeded(serde_json::Value::Object(keys));
+            assert_eq!(partial.worktree, None, "missing {missing} must not build a worktree");
+        }
+
+        // ...and when the worktree keys are complete but `base_ref` is absent,
+        // the anchor is DERIVED, so the invariant survives a fold from zero.
+        let derived = seeded(json!({"worktree_path":"/home/worktrees/w",
+                                    "worktree_branch":"a2a/impl/w",
+                                    "worktree_base_ref":base,
+                                    "worktree_repo":"/repo"}));
+        assert_eq!(
+            derived.base_ref,
+            derived.worktree.map(|w| w.base_ref),
+            "a worktree always implies its base ref"
+        );
     }
 
     /// A worker born at the admission cap starts `queued`, from the genesis

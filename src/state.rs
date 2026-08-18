@@ -27,6 +27,26 @@ pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 pub const STATE_FILE: &str = "state.json";
 
+/// The git worktree a worker was dispatched into (spec §4.5, §4.8).
+///
+/// Spec §4.5 names `path`, `branch` and `base_ref`; **`repo` is a deliberate
+/// addition**, and a required one rather than a convenience. Every git call
+/// `gc` makes about a finished worker — `worktree remove`, `worktree prune`,
+/// `rev-list --count <base>..<branch>` — has to run with `-C <parent repo>`,
+/// and once the worktree directory is gone there is nothing left to derive the
+/// parent from: `<wt>/.git` is the gitdir *pointer* and it disappears with the
+/// directory, and `rev-parse --show-toplevel` inside a linked worktree answers
+/// with that worktree's own toplevel, never the parent's.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeRef {
+    pub path: PathBuf,
+    pub branch: String,
+    pub base_ref: String,
+    /// Canonical parent-repo toplevel. Every `gc` git call needs `-C <repo>`,
+    /// and it is underivable once the worktree directory is gone.
+    pub repo: PathBuf,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorkerSnapshot {
     pub schema_version: u32,
@@ -41,6 +61,19 @@ pub struct WorkerSnapshot {
     pub network: bool,
     pub writable_roots: Vec<PathBuf>,
     pub elevation_reason: Option<String>,
+    /// The worker's own git worktree, when it has one.
+    ///
+    /// `#[serde(default)]` like every field added after schema_version 1
+    /// shipped: a Phase-1/2 snapshot has no such key and must still load rather
+    /// than read as `Corrupt`.
+    #[serde(default)]
+    pub worktree: Option<WorktreeRef>,
+    /// The target repo's `HEAD` at spawn — recorded **whether or not** there is
+    /// a worktree, because it is the anchor `a2a verify` diffs against in both
+    /// cases. Invariant: when [`Self::worktree`] is `Some`, this is
+    /// `Some(worktree.base_ref)`.
+    #[serde(default)]
+    pub base_ref: Option<String>,
     pub session_id: Option<String>,
     /// The app-server thread of record. The same UUID as `session_id` on
     /// 0.140.0 — both are kept because they are two different *claims*: the
@@ -105,6 +138,8 @@ impl WorkerSnapshot {
             network: false,
             writable_roots: Vec::new(),
             elevation_reason: None,
+            worktree: None,
+            base_ref: None,
             session_id: None,
             thread_id: None,
             queue_position: None,
@@ -245,6 +280,8 @@ mod tests {
         assert_eq!(s.requested_transport, Transport::Exec);
         assert_eq!(s.thread_id, None);
         assert_eq!(s.queue_position, None);
+        assert_eq!(s.worktree, None);
+        assert_eq!(s.base_ref, None);
         assert_eq!(s.sandbox, SandboxMode::WorkspaceWrite);
         assert!(!s.network);
         assert_eq!(s.model, "gpt-5.5");
@@ -299,6 +336,53 @@ mod tests {
         assert!(
             back.extra.get("thread_id").is_none(),
             "the new fields are typed, not swept into the forward-compat bag"
+        );
+    }
+
+    /// Same discipline one phase later: a Phase-1/2 snapshot has neither
+    /// `worktree` nor `base_ref`, and must load as a worker with neither rather
+    /// than as one this binary refuses to read.
+    #[test]
+    fn a_snapshot_without_the_phase_four_fields_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        let mut value = serde_json::to_value(&s).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("worktree");
+        obj.remove("base_ref");
+        std::fs::write(tmp.path().join(STATE_FILE), value.to_string()).unwrap();
+
+        let back = load_snapshot(tmp.path()).expect("an older snapshot is not corrupt");
+        assert_eq!(back.worktree, None);
+        assert_eq!(back.base_ref, None);
+        assert!(
+            back.extra.get("worktree").is_none() && back.extra.get("base_ref").is_none(),
+            "the new fields are typed, not swept into the forward-compat bag"
+        );
+    }
+
+    /// The worktree round trips as a typed object, and the diff anchor agrees
+    /// with it — the invariant every writer of `worktree` has to maintain.
+    #[test]
+    fn a_worktree_round_trips_and_agrees_with_the_base_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        let wt = WorktreeRef {
+            path: PathBuf::from("/home/worktrees/impl-0814t1300-aaaa"),
+            branch: "a2a/impl/impl-0814t1300-aaaa".into(),
+            base_ref: "0123456789abcdef0123456789abcdef01234567".into(),
+            repo: PathBuf::from("/repo"),
+        };
+        s.base_ref = Some(wt.base_ref.clone());
+        s.worktree = Some(wt.clone());
+        save_snapshot(tmp.path(), &s).unwrap();
+
+        let back = load_snapshot(tmp.path()).unwrap();
+        assert_eq!(back.worktree.as_ref(), Some(&wt));
+        assert_eq!(
+            back.base_ref,
+            back.worktree.map(|w| w.base_ref),
+            "a worktree's base ref IS the snapshot's diff anchor"
         );
     }
 

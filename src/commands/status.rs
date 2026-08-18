@@ -101,6 +101,10 @@ fn payload(id: &str, snap: &WorkerSnapshot) -> Value {
         "model": snap.model,
         "effort": snap.effort,
         "cwd": snap.cwd,
+        // The branch this worker is producing, and the commit `a2a verify`
+        // diffs it against — null for a worker spawned straight into --cwd.
+        "worktree": snap.worktree,
+        "base_ref": snap.base_ref,
         "session_id": snap.session_id,
         "pid": snap.pid,
         "created_at": snap.created_at,

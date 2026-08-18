@@ -105,8 +105,9 @@ pub fn run(home: &A2aHome, all: bool, json_mode: bool, quiet: bool) -> Result<Ou
         // Header is decoration, so it goes to stderr: stdout stays a clean
         // machine payload that `awk`/`cut` can read without a skip rule.
         eprintln!(
-            "ID  LANE  STATE  {}DWELL  LAST-EVENT",
-            if all { "OWNER  " } else { "" }
+            "ID  LANE  STATE  {}{}DWELL  LAST-EVENT",
+            if all { "OWNER  " } else { "" },
+            if any_worktree(&rows) { "WT  " } else { "" }
         );
     }
     Ok(Outcome::from(Value::String(render_table(&rows, all))))
@@ -129,6 +130,11 @@ struct Row {
     /// (spec §4.9). `None` for every worker that is not `queued` — which is the
     /// difference between "waiting third" and "waiting, position unknown".
     queue_position: Option<u64>,
+    /// The FULL branch this worker is producing (`a2a/<lane>/<id>`), or `None`
+    /// when it was spawned straight into `--cwd`. The human table gets a
+    /// marker; this string is the one a caller pipes into `git`, so it lives in
+    /// `--json`.
+    worktree_branch: Option<String>,
     created_at: Option<DateTime<Utc>>,
     dwell_secs: Option<i64>,
     last_event_age_secs: Option<i64>,
@@ -144,6 +150,7 @@ impl Row {
             owner: snap.owner.clone(),
             transport: transport_of(Some(snap)),
             queue_position: snap.queue_position,
+            worktree_branch: snap.worktree.as_ref().map(|w| w.branch.clone()),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -169,6 +176,9 @@ impl Row {
             owner: stale.as_ref().and_then(|s| s.owner.clone()),
             transport: transport_of(stale.as_ref()),
             queue_position: stale.as_ref().and_then(|s| s.queue_position),
+            worktree_branch: stale
+                .as_ref()
+                .and_then(|s| s.worktree.as_ref().map(|w| w.branch.clone())),
             created_at: stale.as_ref().map(|s| s.created_at),
             dwell_secs: None,
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -186,6 +196,7 @@ impl Row {
             "owner": self.owner,
             "transport": self.transport,
             "queue_position": self.queue_position,
+            "worktree_branch": self.worktree_branch,
         })
     }
 
@@ -195,6 +206,25 @@ impl Row {
     fn owner_cell(&self) -> &str {
         self.owner.as_deref().unwrap_or("-")
     }
+
+    /// The WT column: a MARKER, not the branch.
+    ///
+    /// `a2a/<lane>/<id>`'s last segment is exactly the worker id, which is
+    /// already column 1 of the same row — printing it would widen the human
+    /// table to carry zero information. The full branch is in `--json`.
+    fn wt_cell(&self) -> &str {
+        if self.worktree_branch.is_some() {
+            "wt"
+        } else {
+            "-"
+        }
+    }
+}
+
+/// Does this listing need a WT column at all? An all-plain fleet keeps the
+/// Phase-1 projection byte for byte.
+fn any_worktree(rows: &[Row]) -> bool {
+    rows.iter().any(|r| r.worktree_branch.is_some())
 }
 
 /// The transport as a wire string, `unknown` when the snapshot could not be
@@ -248,12 +278,15 @@ fn humanize(secs: Option<i64>) -> String {
 }
 
 /// The five-column projection, plus OWNER when `--all` widened the question
-/// from "my fleet" to "this machine's fleet".
+/// from "my fleet" to "this machine's fleet", plus WT when anybody in the
+/// listing has a worktree.
 fn render_table(rows: &[Row], all: bool) -> String {
     let idw = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
     let lanew = rows.iter().map(|r| r.lane.len()).max().unwrap_or(0);
     let statew = rows.iter().map(|r| r.state.len()).max().unwrap_or(0);
     let ownerw = rows.iter().map(|r| r.owner_cell().len()).max().unwrap_or(0);
+    let wt = any_worktree(rows);
+    let wtw = rows.iter().map(|r| r.wt_cell().len()).max().unwrap_or(0);
     rows.iter()
         .map(|r| {
             let owner = if all {
@@ -261,8 +294,13 @@ fn render_table(rows: &[Row], all: bool) -> String {
             } else {
                 String::new()
             };
+            let worktree = if wt {
+                format!("{:<wtw$}  ", r.wt_cell())
+            } else {
+                String::new()
+            };
             format!(
-                "{:<idw$}  {:<lanew$}  {:<statew$}  {owner}{}  {}",
+                "{:<idw$}  {:<lanew$}  {:<statew$}  {owner}{worktree}{}  {}",
                 r.id,
                 r.lane,
                 r.state,
@@ -289,6 +327,7 @@ mod tests {
             owner: None,
             transport: "exec".into(),
             queue_position: None,
+            worktree_branch: None,
             created_at: None,
             dwell_secs: dwell,
             last_event_age_secs: None,
@@ -391,6 +430,50 @@ mod tests {
             false,
         );
         assert!(plain.ends_with("done  4m  -"), "{plain}");
+    }
+
+    /// The WT column costs a column, so it is only rendered when it answers
+    /// something: an all-plain fleet is byte-identical to the Phase-1 table.
+    #[test]
+    fn the_wt_column_appears_only_for_a_fleet_that_has_one() {
+        let plain = || row("general-0814t1300-aaaa", "done", Some(240));
+        assert!(!any_worktree(&[plain()]));
+        assert!(render_table(&[plain()], false).ends_with("done  4m  -"));
+
+        let treed = || {
+            let mut r = row("impl-0814t1301-bb", "running", Some(5));
+            r.worktree_branch = Some("a2a/impl/impl-0814t1301-bb".into());
+            r
+        };
+        assert!(any_worktree(&[plain(), treed()]));
+        let text = render_table(&[plain(), treed()], false);
+        let lines: Vec<_> = text.lines().collect();
+        assert!(lines[0].ends_with("-   4m  -"), "{}", lines[0]);
+        assert!(lines[1].ends_with("wt  5s  -"), "{}", lines[1]);
+        assert!(
+            !text.contains("a2a/impl/"),
+            "the table carries a marker, not the branch:\n{text}"
+        );
+        assert_eq!(
+            lines[0].find("4m"),
+            lines[1].find("5s"),
+            "columns must align:\n{}\n{}",
+            lines[0],
+            lines[1]
+        );
+    }
+
+    /// The branch is the string a caller pipes into git, so `--json` carries it
+    /// in full — and `null`, not `"-"`, when there is none.
+    #[test]
+    fn the_json_row_carries_the_full_branch_or_null() {
+        let mut r = row("impl-0814t1301-bb", "running", Some(5));
+        assert_eq!(r.to_json()["worktree_branch"], Value::Null);
+        r.worktree_branch = Some("a2a/impl/impl-0814t1301-bb".into());
+        assert_eq!(
+            r.to_json()["worktree_branch"],
+            json!("a2a/impl/impl-0814t1301-bb")
+        );
     }
 
     #[test]

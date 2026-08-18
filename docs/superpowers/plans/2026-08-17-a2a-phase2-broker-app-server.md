@@ -94,7 +94,7 @@ tests/
 
 **Files:** Create `src/protocol.rs`, `schema/v2-snapshot/**`; Modify `src/lib.rs`; Test `tests/protocol_canary.rs` + unit tests.
 
-- [ ] Steps: capture snapshot → failing canary+unit tests → RED → implement → GREEN → full suite → commit `feat: typed app-server protocol subset with schema snapshot and drift canary`.
+- [x] Steps: capture snapshot → failing canary+unit tests → RED → implement → GREEN → full suite → commit `feat: typed app-server protocol subset with schema snapshot and drift canary`.
 
 ---
 
@@ -128,7 +128,7 @@ impl Client {
 }
 ```
 
-- [ ] Steps: fixture → failing tests → RED → implement → GREEN → full suite → commit `feat: JSON-RPC client + scripted fake app-server with fidelity validation`.
+- [x] Steps: fixture → failing tests → RED → implement → GREEN → full suite → commit `feat: JSON-RPC client + scripted fake app-server with fidelity validation`.
 
 ---
 
@@ -143,7 +143,7 @@ impl Client {
 
 **Files:** Create `src/responder.rs`; Modify `src/lib.rs`, `src/events.rs`; Test unit + `tests/rpc_fake.rs` (extend).
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: server-request responder with schema-exact deny payloads`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: server-request responder with schema-exact deny payloads`.
 
 ---
 
@@ -161,7 +161,7 @@ impl Client {
 
 **Files:** Create `src/adapter.rs`; Modify `src/lib.rs`; Test `tests/rpc_fake.rs` (extend).
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: app-server adapter (typed lifecycle, steer table, AdapterRef, handshake probe)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: app-server adapter (typed lifecycle, steer table, AdapterRef, handshake probe)`.
 
 ---
 
@@ -177,7 +177,7 @@ impl Client {
 
 **Files:** Modify `src/events.rs`, `src/lib.rs`; Test unit (embedded real payloads incl. a willRetry pair).
 
-- [ ] Steps: failing tests → implement → GREEN → full suite (Phase-1 exec-mapping tests untouched) → commit `feat: app-server notification mapping (willRetry, tool camelCase, delta guards) + result synthesis`.
+- [x] Steps: failing tests → implement → GREEN → full suite (Phase-1 exec-mapping tests untouched) → commit `feat: app-server notification mapping (willRetry, tool camelCase, delta guards) + result synthesis`.
 
 ---
 
@@ -214,7 +214,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
     settle_tx: mpsc::Sender<Settled>, cancel: CancellationToken, tracker: &TaskTracker) -> WorkerHandle;
 ```
 
-- [ ] Steps: failing tests → implement (incl. the reconcile extraction, keeping ALL Phase-1 tests green) → GREEN → full suite → commit `feat: WorkerActor (locked sole-writer persistence, conclude_turn parity, watch-rebind)`.
+- [x] Steps: failing tests → implement (incl. the reconcile extraction, keeping ALL Phase-1 tests green) → GREEN → full suite → commit `feat: WorkerActor (locked sole-writer persistence, conclude_turn parity, watch-rebind)`.
 
 ---
 
@@ -233,7 +233,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Create `src/broker/core.rs`, `src/broker/child.rs`; Modify `src/broker/mod.rs`, `src/lib.rs`; Test `tests/broker_lifecycle.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: BrokerCore + supervised child (per-method demux, re-attach with override re-supply, auth single-flight)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: BrokerCore + supervised child (per-method demux, re-attach with override re-supply, auth single-flight)`.
 
 ---
 
@@ -250,7 +250,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Create `src/broker/sockserv.rs`, `src/broker/wire.rs`, `src/brokerclient.rs`; Modify `src/broker/mod.rs`, `src/lib.rs`, `Cargo.toml` (nix `socket` feature), `tests/common/mod.rs`; Test `tests/broker_lifecycle.rs` (extend).
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: broker socket (one-frame wire, two-branch skew policy) + sync client with safe autostart`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: broker socket (one-frame wire, two-branch skew policy) + sync client with safe autostart`.
 
 ---
 
@@ -267,7 +267,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Create `src/commands/broker_cmd.rs`; Modify `src/broker/mod.rs`, `src/cli.rs`, `src/main.rs`, `src/commands/mod.rs`, `src/commands/status.rs` (--broker alias); Test `tests/cmd_broker.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: daemon-lite broker (flock-first singleton, pidfile, reap-then-adopt startup)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: daemon-lite broker (flock-first singleton, pidfile, reap-then-adopt startup)`.
 
 ---
 
@@ -283,7 +283,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Create `src/broker/shutdown.rs`; Modify `src/broker/mod.rs`, `src/broker/core.rs`, `src/config.rs` (idle key); Test `tests/broker_lifecycle.rs` + scans in `tests/cmd_broker.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: three-phase shutdown, idle exit (default 300s), cancellation source gates`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: three-phase shutdown, idle exit (default 300s), cancellation source gates`.
 
 ---
 
@@ -301,7 +301,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Modify `src/commands/spawn.rs`, `src/commands/status.rs`, `src/commands/ls.rs`, `src/commands/kill.rs`, `src/reconcile.rs`, `src/state.rs`, `src/fold.rs`, `src/events.rs` (TransportDegraded already from T5 — wire only), `src/broker/core.rs`, `tests/common/mod.rs` (A2A_BROKER_DISABLE default); Test `tests/cmd_broker.rs` (extend) + FULL Phase-1 regression.
 
-- [ ] Steps: failing tests → implement → GREEN (incl. every Phase-1 test) → commit `feat: spawn via broker (auto-selection, lossless genesis, guarded kill paths, drift gate)`.
+- [x] Steps: failing tests → implement → GREEN (incl. every Phase-1 test) → commit `feat: spawn via broker (auto-selection, lossless genesis, guarded kill paths, drift gate)`.
 
 ---
 
@@ -317,7 +317,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Create `src/commands/interrupt.rs`; Modify `src/commands/send.rs`, `src/cli.rs`, `src/main.rs`, `src/commands/mod.rs`, `src/broker/{core,worker_actor}.rs`, `docs/machines/worker.md`; Test `tests/cmd_interrupt.rs` + send cases in `tests/cmd_broker.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: mid-turn send and a2a interrupt (converged gates, doc amendment)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: mid-turn send and a2a interrupt (converged gates, doc amendment)`.
 
 ---
 
@@ -331,7 +331,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Modify `src/commands/tail.rs`, `src/cli.rs`, `src/main.rs`, `src/brokerclient.rs`, `src/broker/sockserv.rs`; Test `tests/cmd_follow.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: a2a tail --follow (bounded, lag-recovering, transport-spanning)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: a2a tail --follow (bounded, lag-recovering, transport-spanning)`.
 
 ---
 
@@ -347,7 +347,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Modify `src/config.rs`, `src/broker/core.rs`, `src/commands/spawn.rs`, `src/commands/ls.rs`, `src/fold.rs`, `src/output.rs`, `src/cli.rs`, `src/main.rs` (--no-queue exists from Phase 1 — verify wiring); Test `tests/admission.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: admission control (queued genesis, FIFO drain on settle, pinned config surface)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: admission control (queued genesis, FIFO drain on settle, pinned config surface)`.
 
 ---
 
@@ -362,7 +362,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Modify `src/commands/{spawn,ls,send,kill,interrupt,resume,gc}.rs`, `src/fold.rs`, `src/cli.rs`, `src/main.rs`, `tests/common/mod.rs`; Test `tests/owner_scope.rs`.
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: owner scoping (lossless genesis owner, legacy-unowned open, force guards)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: owner scoping (lossless genesis owner, legacy-unowned open, force guards)`.
 
 ---
 
@@ -376,7 +376,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Modify `src/commands/doctor.rs`; Test `tests/cmd_doctor.rs` (extend, update counts).
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: doctor handshake/codex-home/broker/auth-mode checks (ten total)`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: doctor handshake/codex-home/broker/auth-mode checks (ten total)`.
 
 ---
 
@@ -391,7 +391,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Create `tests/e2e_appserver.rs`; Test itself + full suite.
 
-- [ ] Steps: failing tests → fixes only where pipelines expose them → GREEN → commit `feat: broker e2e pipelines with pinned crash recovery`.
+- [x] Steps: failing tests → fixes only where pipelines expose them → GREEN → commit `feat: broker e2e pipelines with pinned crash recovery`.
 
 ---
 
@@ -407,7 +407,7 @@ pub fn spawn_worker_actor(dir: PathBuf, snap: WorkerSnapshot,
 
 **Files:** Extend `tests/e2e_appserver.rs`; Modify `src/events.rs`/`src/adapter.rs` (real-vocabulary fixes), `README.md`.
 
-- [ ] Steps: gated cases → real run → fix drift → GREEN → README → install + doctor → commit `feat: real app-server smoke, cross-transport resume proof, Phase 2 docs`.
+- [x] Steps: gated cases → real run → fix drift → GREEN → README → install + doctor → commit `feat: real app-server smoke, cross-transport resume proof, Phase 2 docs`.
 
 ---
 

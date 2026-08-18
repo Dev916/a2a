@@ -19,6 +19,7 @@
 //! instead of `set_var` in a shared test binary.
 
 pub mod manifest;
+pub mod skills;
 
 use crate::output::{AppError, ExitCode};
 use serde_json::json;

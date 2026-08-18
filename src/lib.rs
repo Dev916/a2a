@@ -20,3 +20,4 @@ pub mod responder;
 pub mod rpc;
 pub mod state;
 pub mod store;
+pub mod worktree;

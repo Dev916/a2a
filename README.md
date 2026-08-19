@@ -389,6 +389,197 @@ entire tree — that is how the test suite stays hermetic. Two variables are
 switches rather than settings: `A2A_BROKER_DISABLE=1`
 ([Transports](#transports)) and `A2A_OWNER` ([Owner scoping](#owner-scoping)).
 
+## Sync: giving Codex workers the same capability layer
+
+Two one-way mirrors from the Claude side into the Codex home, both governed by a
+single ownership ledger:
+
+```bash
+a2a sync skills --dry-run    # decide everything, write nothing
+a2a sync skills              # ~/.claude/skills      → $CODEX_HOME/skills/<name>/
+a2a sync mcp --dry-run
+a2a sync mcp                 # ~/.claude.json        → $CODEX_HOME/config.toml
+```
+
+`sync skills` copies curated skill directories **flat** into
+`$CODEX_HOME/skills/<name>/`, and first writes — then re-reads from disk — a
+managed `# BEGIN a2a-sync` … `# END a2a-sync` block in that directory's
+`.gitignore`, refusing to copy anything the block does not cover. That
+destination is usually a git submodule, and a skill tree landing in it uncovered
+turns somebody's clean checkout into hundreds of untracked files.
+
+`sync mcp` translates each `mcpServers` entry into an `[mcp_servers.*]` table
+with `toml_edit`, so the comments, ordering and blank lines of a hand-maintained
+`config.toml` survive the write. The candidate is rendered, handed to
+`CODEX_HOME=<temp copy> codex mcp list --json` for a real load check, and only
+then replaces the file — a config codex refuses never reaches your home.
+
+**The ownership rule, in one sentence:** `$A2A_HOME/sync-manifest.json` records
+every destination a2a created, and a2a only ever updates or removes a
+destination that ledger says it created — everything else is reported and left
+byte-for-byte alone.
+
+Two consequences worth knowing. Losing the manifest costs you the ability to
+**update**, never your content: every destination becomes somebody else's and is
+skipped. And `--dry-run` is side-effect-free *structurally* rather than by
+discipline — it runs the planner, and the planner only reads.
+
+Every completed run exits **0**, including runs full of skips and refusals: the
+verdict travels in `data.counts`, because a fleet-wide sync that exited nonzero
+whenever one destination had drifted would be re-run with a bypass by every
+caller. Exit **9** is reserved for static preconditions (no codex home, an
+unreadable ledger, a missing source) that touched nothing.
+
+### What a run reports
+
+| disposition | meaning |
+|---|---|
+| `synced` / `unchanged` / `removed` | a2a owns it: written, already current, or dropped because its source is gone |
+| `skipped-not-a-skill` | a plain file, or a directory with no `SKILL.md` |
+| `skipped-side-effecting` | the skill acts on the world — see below |
+| `skipped-collision` | the destination already exists and the ledger does not own it |
+| `skipped-unowned` | an `[mcp_servers]` table a2a did not write **for this account** |
+| `skipped-secret` | a credential that would land in a git-tracked file |
+| `skipped-untranslatable` | translatable in principle, skipped by policy — see headers below |
+| `refused-dest-drift` | a2a made it, somebody edited it since; it is neither overwritten nor removed |
+
+`skipped-unowned` has two shapes, because "nobody synced this" and "the other
+account synced this" are different problems: a table no ledger entry mentions
+reports `a foreign [mcp_servers] table wins; a2a only ever updates what it
+created`, while one another account owns names the owner — ``account `claude`
+synced this server first; a2a only ever updates what it created for the account
+it was run for`` — so you are not left guessing which of your Claude configs got
+there first. (`--claude-config-dir ~/.claude-revenium` is how the second account
+syncs; MCP entries are namespaced per account, skills are shared.)
+
+### Which skills get mirrored
+
+A worker that never asks for approval will happily run any dangerous skill it
+can reach, so classification is deny-first:
+
+| rule | effect |
+|---|---|
+| name on the built-in seed list (`slack-send`, `docusign`, `dmv-keys`, … 15 names) | `skipped-side-effecting`, reason `seed list` |
+| one of `credential, send, post, deploy, password, token, aws` in the directory name or the **YAML front matter** | `skipped-side-effecting`, reason names the word |
+| anything else | mirrored |
+
+The heuristic reads the front matter only, never the body: a guide that mentions
+`deploy` in an example is not a deploy tool, and scanning bodies flagged nearly
+the whole corpus on a real machine. Matching is on word boundaries, so `send`
+does not fire inside "sender".
+
+The only way past a refusal is a human writing the name down:
+
+```toml
+# $A2A_HOME/config.toml
+[sync]
+allow_skills = ["docusign"]                 # skill directory names
+allow_http_header_servers = ["ghl"]         # SERVER names, not header names
+claude_config_dir = "/Users/you/.claude-revenium"
+```
+
+### The secret policy
+
+**a2a never writes a literal credential into a file git publishes.** What that
+means per source shape:
+
+- **`Authorization: Bearer …` on an HTTP server** is translated through codex's
+  indirection rather than copied: the table gets
+  `bearer_token_env_var = "A2A_MCP_<NAME>_TOKEN"` and you export the value
+  yourself. The naming is exact and mechanical — `Neon` →
+  `A2A_MCP_NEON_TOKEN`, `linear` → `A2A_MCP_LINEAR_TOKEN`,
+  `google-workspace` → `A2A_MCP_GOOGLE_WORKSPACE_TOKEN`. Export the token
+  **without** the `Bearer ` prefix (codex supplies the scheme); if the server
+  rejects that, export the whole header value instead.
+- **Any other header** (`locationId`, `X-Api-Key`, …) is `skipped-untranslatable`
+  by default, with the exact TOML you could paste yourself printed as a remedy —
+  header values masked. Opt in per server with
+  `[sync] allow_http_header_servers = ["ghl"]`; the key holds **server** names,
+  and a list of header names would allowlist nothing while reading as though it
+  had.
+- **Credential-shaped `env` values on a stdio server** are `skipped-secret` for
+  as long as the destination `config.toml` is tracked by git. Untrack it (below)
+  and the same run writes them.
+
+Every value read from a source config is printed as `[REDACTED:<len>]` in every
+mode, whatever the classifier decided — a misclassification cannot leak, because
+the mask does not consult the classification. Errors, warnings and `doctor`
+details name **keys, header names, env var names, files and line numbers**, and
+never a value.
+
+### Taking `config.toml` out of git (one time)
+
+If `$CODEX_HOME` is a git repository that tracks `config.toml` — a published
+dotfiles repo — stdio servers with credentials stay blocked until you run:
+
+```bash
+a2a sync mcp --migrate-untrack        # git rm --cached config.toml + gitignore it, then sync
+```
+
+It removes the file from the **index only** (your copy stays), appends an ignore
+line marked ``# a2a: untracked by `a2a sync mcp --migrate-untrack` ``, and then
+proceeds with the sync that the migration just unblocked. Commit the staged
+removal yourself.
+
+**It is not a fix for what is already out.** Untracking changes nothing about
+the copies on the remote, in forks, or in CI caches — the reminder it prints
+says so verbatim (*already-published secrets must still be rotated*) and names
+the lines to rotate, never their contents.
+
+### The three checks `doctor` gained
+
+| check | says |
+|---|---|
+| `context_canon` | whether the `CLAUDE.md` in the current directory imports `@AGENTS.md`, so a Codex worker reads the same instructions a Claude session does |
+| `codex_config_secrets` | whether `$CODEX_HOME/config.toml` is git-tracked **and** carries a secret shape — the only security-class `fail` in the list |
+| `sync_state` | whether every destination the ledger records is still as a2a left it (and warns on a ledger that will not parse) |
+
+On a machine whose `~/.codex/config.toml` is tracked by git and carries a
+credential, `codex_config_secrets` **fails and `a2a doctor` exits 9** — it names
+the file and the line numbers, never the values. Clear it by running
+`a2a sync mcp --migrate-untrack`, committing the staged removal, and rotating the
+key that was published; the check flips to `ok` as soon as git stops tracking the
+file.
+
+### Three deviations from the design doc, recorded
+
+1. **`--strict-config` is not the post-write validator.** It is nondeterministic
+   on codex 0.140.0 — the identical argv returns either an unknown-field error
+   or "`--strict-config` is not supported for this subcommand", both exit 1 and
+   indistinguishable to a caller. `codex mcp list --json` replaces it and also
+   yields structured `transport.type`/`auth_status`. The cost: unknown fields are
+   tolerated, so the check proves the config **loads**, not that it is
+   schema-complete.
+2. **Codex *can* express arbitrary HTTP headers.** `http_headers` (literal
+   values) and `env_http_headers` (header → env var name) both round-trip, so
+   skipping `ghl`'s `locationId` is a **policy** choice about copying
+   account-scoping data into a shared config — not a capability limit. Hence the
+   `allow_http_header_servers` opt-in above; the default is still to skip,
+   loudly.
+3. **The generated global `~/.codex/AGENTS.md` is deferred.** This phase ships
+   only the `context_canon` check that reports on it; generating the file belongs
+   with the worker-protocol templates.
+
+### Proving it against a real machine
+
+The suite is hermetic — fixture Claude directories, a temp `CODEX_HOME`, and a
+runtime guard that refuses the real `$HOME` with `SYNC_REFUSES_REAL_HOME` (exit
+9) unless `A2A_SYNC_ALLOW_REAL_HOME=1` is set. One gated file opts in, and only
+to **read**:
+
+```bash
+A2A_SYNC_LIVE=1 cargo test --test sync_live -- --ignored
+```
+
+It runs both syncs with `--dry-run` against your real `~/.claude.json`,
+`~/.claude/skills` and `$CODEX_HOME`, and proves they wrote nothing by diffing
+`git status --porcelain` in `~/.codex` and in `~/.codex/skills`, the content
+hashes of `config.toml` and the skills tree, and `~/.a2a/sync-manifest.json`,
+before against after. It then sweeps both transcripts for every value in your
+real `~/.claude.json` and reports only lengths if it finds one. **There is no
+live apply and no live migration in it** — pointing `sync` at your machine for
+real is a decision you make, not one a test suite makes for you.
+
 ## Safety properties
 
 - **Secrets never reach a worker's context.** Briefs and context files are scanned
@@ -418,6 +609,9 @@ cargo test                                     # hermetic: no real codex, no net
 # The gated proofs. Real codex, real ~/.codex auth (read, never written), tokens.
 A2A_E2E=1 cargo test --test e2e_exec      -- --ignored --nocapture
 A2A_E2E=1 cargo test --test e2e_appserver -- --ignored --nocapture
+
+# Read-only, no tokens: both syncs dry-run against this machine ([Sync](#sync-giving-codex-workers-the-same-capability-layer)).
+A2A_SYNC_LIVE=1 cargo test --test sync_live -- --ignored
 ```
 
 The suite never touches `~/.a2a` or `~/.codex`; every test gets a temp

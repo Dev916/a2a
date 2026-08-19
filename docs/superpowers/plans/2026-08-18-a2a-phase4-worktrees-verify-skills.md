@@ -201,7 +201,7 @@ pub fn diff_stat(dir: &Path, base_ref: &str) -> Result<String, AppError>;
 pub fn branch_name(lane: Lane, id: &str) -> String; // format!("a2a/{lane}/{id}")
 ```
 
-- [ ] Steps: failing `tests/worktree_git.rs` (union-diff regression first — it is the security-load-bearing one) → RED → implement → GREEN → full suite → commit `feat: git worktree lifecycle module (union diff, no-track branches, refuse-rails)`.
+- [x] Steps: failing `tests/worktree_git.rs` (union-diff regression first — it is the security-load-bearing one) → RED → implement → GREEN → full suite → commit `feat: git worktree lifecycle module (union diff, no-track branches, refuse-rails)`.
 
 ---
 
@@ -247,7 +247,7 @@ pub struct WorktreeRef {
 #[serde(default)] pub base_ref: Option<String>,
 ```
 
-- [ ] Steps: failing tests → implement → GREEN → full suite → commit `feat: worktree + base_ref on the snapshot, seeded losslessly from genesis`.
+- [x] Steps: failing tests → implement → GREEN → full suite → commit `feat: worktree + base_ref on the snapshot, seeded losslessly from genesis`.
 
 ---
 
@@ -294,7 +294,7 @@ pub no_worktree: bool,
 pub base_ref: Option<String>,
 ```
 
-- [ ] Steps: failing tests (non-git split, lossless genesis, `-C <worktree>` in argv, implicit-root both ways) → implement → GREEN (incl. every Phase-1/2 test **unmodified** except Ground-truth pins #1, #2 and #3, which this task updates on purpose) → commit `feat: spawn creates the impl worktree (default on, --no-worktree, implicit worktrees root)`.
+- [x] Steps: failing tests (non-git split, lossless genesis, `-C <worktree>` in argv, implicit-root both ways) → implement → GREEN (incl. every Phase-1/2 test **unmodified** except Ground-truth pins #1, #2 and #3, which this task updates on purpose) → commit `feat: spawn creates the impl worktree (default on, --no-worktree, implicit worktrees root)`.
 
 ---
 
@@ -349,7 +349,7 @@ pub fn append_audit(home: &A2aHome, entry: &serde_json::Value) -> Result<(), App
 pub const AUDIT_FILE: &str = "audit.jsonl";
 ```
 
-- [ ] Steps: failing `tests/elevation.rs` (the whole seven-row table + audit mode/shape + secret-in-reason) → implement → GREEN → full suite → commit `feat: §5 elevation gate (lane permission + --reason + audit.jsonl, exec-only)`.
+- [x] Steps: failing `tests/elevation.rs` (the whole seven-row table + audit mode/shape + secret-in-reason) → implement → GREEN → full suite → commit `feat: §5 elevation gate (lane permission + --reason + audit.jsonl, exec-only)`.
 
 ---
 
@@ -411,7 +411,7 @@ pub fn scope(dir: &std::path::Path, base_ref: &str, files_in_scope: &[String])
     -> Result<Scope, crate::output::AppError>;
 ```
 
-- [ ] Steps: failing unit tests (both directions for every rule) → implement → GREEN → full suite → commit `feat: execution-bearing-diff gate and scope snapshot for a2a verify`.
+- [x] Steps: failing unit tests (both directions for every rule) → implement → GREEN → full suite → commit `feat: execution-bearing-diff gate and scope snapshot for a2a verify`.
 
 ---
 
@@ -504,7 +504,7 @@ pub fn run(
 ) -> Result<Outcome, AppError>;
 ```
 
-- [ ] Steps: failing `tests/cmd_verify.rs` (green run, failing run exit 4, gate refusal, `--force-verify` records, `--force-verify` + no base ref shape, tampered brief, timeout, **>1 MiB stdout without a false timeout**, cross-transport parity field-wise) → implement → GREEN → full suite → commit `feat: a2a verify — brief-only commands, verification.json, scope snapshot`.
+- [x] Steps: failing `tests/cmd_verify.rs` (green run, failing run exit 4, gate refusal, `--force-verify` records, `--force-verify` + no base ref shape, tampered brief, timeout, **>1 MiB stdout without a false timeout**, cross-transport parity field-wise) → implement → GREEN → full suite → commit `feat: a2a verify — brief-only commands, verification.json, scope snapshot`.
 
 ---
 
@@ -544,7 +544,7 @@ pub fn run(
 ) -> Result<Outcome, AppError>;
 ```
 
-- [ ] Steps: failing `tests/cmd_gc.rs` cases (dirty refusal, unmerged refusal, forced cleanup, branch survives, bytes include the worktree, missing-repo recovery) → implement → GREEN → full suite → commit `feat: gc worktree rails (dirty/unmerged refusal, remove+prune, branches survive)`.
+- [x] Steps: failing `tests/cmd_gc.rs` cases (dirty refusal, unmerged refusal, forced cleanup, branch survives, bytes include the worktree, missing-repo recovery) → implement → GREEN → full suite → commit `feat: gc worktree rails (dirty/unmerged refusal, remove+prune, branches survive)`.
 
 ---
 
@@ -604,7 +604,7 @@ GenSkills {
 },
 ```
 
-- [ ] Steps: write the source → failing `tests/skills_gen.rs` (drift gate + content substrings + no-$HOME-touch) → implement the renderer → check in the generated artifacts → GREEN → full suite → commit `feat: one worker-protocol source rendering the codex skill and AGENTS section, with a drift gate`.
+- [x] Steps: write the source → failing `tests/skills_gen.rs` (drift gate + content substrings + no-$HOME-touch) → implement the renderer → check in the generated artifacts → GREEN → full suite → commit `feat: one worker-protocol source rendering the codex skill and AGENTS section, with a drift gate`.
 
 ---
 
@@ -658,7 +658,7 @@ fn resolve_schema(
 ) -> Result<(Option<PathBuf>, &'static str), AppError>;
 ```
 
-- [ ] Steps: write `templates/impl-result.schema.json` + `skills/orchestrate-protocol.md` → failing tests (required-list pin, precedence table, substring pins, drift gate) → implement → regenerate artifacts → GREEN → full suite → commit `feat: a2a-orchestrate skill, devloop dispatch protocol, impl-lane default result schema`.
+- [x] Steps: write `templates/impl-result.schema.json` + `skills/orchestrate-protocol.md` → failing tests (required-list pin, precedence table, substring pins, drift gate) → implement → regenerate artifacts → GREEN → full suite → commit `feat: a2a-orchestrate skill, devloop dispatch protocol, impl-lane default result schema`.
 
 ---
 
@@ -698,7 +698,7 @@ fn resolve_schema(
 
 **Files:** Create `tests/e2e_worktree.rs`; Modify `tests/fixtures/stub-codex` (two append-only knobs).
 
-- [ ] Steps: write the fixture helpers → failing e2e (exec leg first, then app-server, then the gate) → fix whatever the integration exposes → GREEN → full suite → commit `feat: end-to-end worktree pipeline on both transports with the verify gate`.
+- [x] Steps: write the fixture helpers → failing e2e (exec leg first, then app-server, then the gate) → fix whatever the integration exposes → GREEN → full suite → commit `feat: end-to-end worktree pipeline on both transports with the verify gate`.
 
 ---
 

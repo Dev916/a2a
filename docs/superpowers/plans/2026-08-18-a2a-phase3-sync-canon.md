@@ -259,7 +259,7 @@ pub const SYNC_FIELDS: [&str; 3] = ["allow_skills", "allow_http_header_servers",
 pub fn sync_env_key(field: &str) -> String;
 ```
 
-- [ ] Steps: failing unit + layering tests → implement manifest, hashing, `[sync]` section and the 7 `Config` literal updates → GREEN → full suite, zero warnings → commit `feat: sync manifest ledger and the [sync] config section`.
+- [x] Steps: failing unit + layering tests → implement manifest, hashing, `[sync]` section and the 7 `Config` literal updates → GREEN → full suite, zero warnings → commit `feat: sync manifest ledger and the [sync] config section`.
 
 ---
 
@@ -320,7 +320,7 @@ pub fn block_covers(gitignore: &str, dirs: &[String]) -> bool;
 pub fn rewrite_block(gitignore: &str, dirs: &[String]) -> String;
 ```
 
-- [ ] Steps: failing classification/planner/block tests → implement → GREEN → full suite, zero warnings → commit `feat: skill classification and the read-only sync planner`.
+- [x] Steps: failing classification/planner/block tests → implement → GREEN → full suite, zero warnings → commit `feat: skill classification and the read-only sync planner`.
 
 ---
 
@@ -385,7 +385,7 @@ pub fn skills(home: &crate::home::A2aHome, dry_run: bool,
     -> Result<crate::output::Outcome, crate::output::AppError>;
 ```
 
-- [ ] Steps: failing integration tests over the fixture repo → implement command + apply → GREEN → full suite, zero warnings → commit `feat: a2a sync skills with managed-gitignore containment`.
+- [x] Steps: failing integration tests over the fixture repo → implement command + apply → GREEN → full suite, zero warnings → commit `feat: a2a sync skills with managed-gitignore containment`.
 
 ---
 
@@ -455,7 +455,7 @@ pub fn report_value(v: &str) -> String; // always "[REDACTED:<len>]"
 pub fn is_secret_key(name: &str) -> bool;
 ```
 
-- [ ] Steps: failing classification + redaction tests → implement reader/classifier/fixtures → GREEN → full suite, zero warnings → commit `feat: MCP source reader with deny-by-default secret classification`.
+- [x] Steps: failing classification + redaction tests → implement reader/classifier/fixtures → GREEN → full suite, zero warnings → commit `feat: MCP source reader with deny-by-default secret classification`.
 
 ---
 
@@ -531,7 +531,7 @@ pub fn mcp(home: &crate::home::A2aHome, dry_run: bool, migrate_untrack: bool,
     -> Result<crate::output::Outcome, crate::output::AppError>;
 ```
 
-- [ ] Steps: failing writer/validation/no-clobber tests → implement toml_edit render + apply + codex validation → GREEN → full suite, zero warnings → commit `feat: a2a sync mcp with comment-preserving writes and codex-validated output`.
+- [x] Steps: failing writer/validation/no-clobber tests → implement toml_edit render + apply + codex validation → GREEN → full suite, zero warnings → commit `feat: a2a sync mcp with comment-preserving writes and codex-validated output`.
 
 ---
 
@@ -567,7 +567,7 @@ pub fn migrate_untrack(codex_home: &std::path::Path, dry_run: bool)
     -> Result<Migration, crate::output::AppError>;
 ```
 
-- [ ] Steps: failing migration tests over temp repos → implement → GREEN → full suite, zero warnings → commit `feat: a2a sync mcp --migrate-untrack with a value-free rotation reminder`.
+- [x] Steps: failing migration tests over temp repos → implement → GREEN → full suite, zero warnings → commit `feat: a2a sync mcp --migrate-untrack with a value-free rotation reminder`.
 
 ---
 
@@ -627,7 +627,7 @@ pub struct DriftSummary {
 pub fn drift_summary(manifest: &Manifest, codex_home: &std::path::Path) -> DriftSummary;
 ```
 
-- [ ] Steps: failing verdict + integration tests → implement three checks, update both count assertions and the id-order pin, amend the module doc → GREEN → full suite, zero warnings → commit `feat: doctor context-canon, tracked-secret and sync-state checks (thirteen total)`.
+- [x] Steps: failing verdict + integration tests → implement three checks, update both count assertions and the id-order pin, amend the module doc → GREEN → full suite, zero warnings → commit `feat: doctor context-canon, tracked-secret and sync-state checks (thirteen total)`.
 
 ---
 
@@ -652,7 +652,7 @@ pub fn drift_summary(manifest: &Manifest, codex_home: &std::path::Path) -> Drift
 
 **Files:** Create `tests/sync_e2e.rs`; Test itself + full suite. Fixes only where the pipeline exposes them.
 
-- [ ] Steps: write the pipeline → fix what it exposes (in the owning module, never by weakening an assertion) → GREEN → full suite, zero warnings → commit `feat: hermetic end-to-end sync pipelines with manifest-loss recovery`.
+- [x] Steps: write the pipeline → fix what it exposes (in the owning module, never by weakening an assertion) → GREEN → full suite, zero warnings → commit `feat: hermetic end-to-end sync pipelines with manifest-loss recovery`.
 
 ---
 
@@ -672,7 +672,7 @@ pub fn drift_summary(manifest: &Manifest, codex_home: &std::path::Path) -> Drift
 
 **Files:** Create `tests/sync_live.rs`; Modify `README.md`.
 
-- [ ] Steps: gated cases → real read-only run → transcribe any observed divergence into the ACs as comments (never paper over) → GREEN → README → full suite, zero warnings → commit `feat: gated read-only live sync proof and Phase 3 docs`.
+- [x] Steps: gated cases → real read-only run → transcribe any observed divergence into the ACs as comments (never paper over) → GREEN → README → full suite, zero warnings → commit `feat: gated read-only live sync proof and Phase 3 docs`.
 
 ---
 

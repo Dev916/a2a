@@ -144,6 +144,16 @@ struct Row {
     /// on a terminal, and the number a human wants here is on `a2a status`.
     turns_this_epoch: Option<u64>,
     max_turns: Option<u64>,
+    /// Retry lineage (spec §4.9): the worker this one was respawned from, and
+    /// which attempt at that brief it is. Both `null` for a worker somebody
+    /// spawned directly — and `attempt: null` reads as attempt 1, which is why
+    /// it is not defaulted to a number here: "nobody retried this" and "this is
+    /// the first of a chain" are the same fact and neither invents a parent.
+    ///
+    /// `--json` only, like the turn counters: the fleet TABLE stays the width
+    /// it is, and a chain is something a caller follows programmatically.
+    parent_id: Option<String>,
+    attempt: Option<u32>,
     /// Why this worker was allowed `danger-full-access` (spec §5). An elevated
     /// worker must never be visually identical to an ordinary one, so this
     /// drives the `/ELEV` marker on the STATE cell as well as the `--json` key.
@@ -166,6 +176,8 @@ impl Row {
             worktree_branch: snap.worktree.as_ref().map(|w| w.branch.clone()),
             turns_this_epoch: snap.turns_this_epoch,
             max_turns: snap.max_turns,
+            parent_id: snap.parent_id.clone(),
+            attempt: snap.attempt,
             elevation_reason: snap.elevation_reason.clone(),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
@@ -197,6 +209,8 @@ impl Row {
                 .and_then(|s| s.worktree.as_ref().map(|w| w.branch.clone())),
             turns_this_epoch: stale.as_ref().and_then(|s| s.turns_this_epoch),
             max_turns: stale.as_ref().and_then(|s| s.max_turns),
+            parent_id: stale.as_ref().and_then(|s| s.parent_id.clone()),
+            attempt: stale.as_ref().and_then(|s| s.attempt),
             // Kept from the stale snapshot on purpose: a worker we can no
             // longer reconcile is exactly the one whose elevation matters most.
             elevation_reason: stale.as_ref().and_then(|s| s.elevation_reason.clone()),
@@ -220,6 +234,8 @@ impl Row {
             "worktree_branch": self.worktree_branch,
             "turns_this_epoch": self.turns_this_epoch,
             "max_turns": self.max_turns,
+            "parent_id": self.parent_id,
+            "attempt": self.attempt,
             "elevation_reason": self.elevation_reason,
         })
     }
@@ -368,6 +384,8 @@ mod tests {
             worktree_branch: None,
             turns_this_epoch: None,
             max_turns: None,
+            parent_id: None,
+            attempt: None,
             elevation_reason: None,
             created_at: None,
             dwell_secs: dwell,

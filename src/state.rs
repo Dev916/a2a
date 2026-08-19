@@ -104,6 +104,19 @@ pub struct WorkerSnapshot {
     /// bump resets it, so a snapshot rebuilt from the WAL counts the same.
     #[serde(default)]
     pub turns_this_epoch: Option<u64>,
+    /// The worker this one was respawned from (spec §4.9), when it is a retry.
+    ///
+    /// Genesis-borne like every other identity field, so `a2a respawn`'s chain
+    /// survives losing `state.json`. `None` is the ordinary case: a worker
+    /// somebody spawned directly has no parent, and inventing one would make
+    /// every fleet look like a retry storm.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Which attempt at this brief this worker is. **Absent ≡ 1**: every worker
+    /// that existed before lineage did is the first attempt at its own brief,
+    /// and nothing about it changes on disk when this binary reads it.
+    #[serde(default)]
+    pub attempt: Option<u32>,
     pub rollout_path: Option<PathBuf>,
     pub pid: Option<u32>,
     pub pid_start_witness: Option<String>,
@@ -160,6 +173,8 @@ impl WorkerSnapshot {
             queue_position: None,
             max_turns: None,
             turns_this_epoch: None,
+            parent_id: None,
+            attempt: None,
             rollout_path: None,
             pid: None,
             pid_start_witness: None,
@@ -390,13 +405,23 @@ mod tests {
         let obj = value.as_object_mut().unwrap();
         obj.remove("max_turns");
         obj.remove("turns_this_epoch");
+        // ...and neither `parent_id` nor `attempt`, which arrived with
+        // `a2a respawn` in the same phase. An ABSENT `attempt` is attempt 1 —
+        // it must not read as `0`, and it must not make the record corrupt.
+        obj.remove("parent_id");
+        obj.remove("attempt");
         std::fs::write(tmp.path().join(STATE_FILE), value.to_string()).unwrap();
 
         let back = load_snapshot(tmp.path()).expect("an older snapshot is not corrupt");
         assert_eq!(back.max_turns, None);
         assert_eq!(back.turns_this_epoch, None);
+        assert_eq!(back.parent_id, None);
+        assert_eq!(back.attempt, None);
         assert!(
-            back.extra.get("max_turns").is_none() && back.extra.get("turns_this_epoch").is_none(),
+            back.extra.get("max_turns").is_none()
+                && back.extra.get("turns_this_epoch").is_none()
+                && back.extra.get("parent_id").is_none()
+                && back.extra.get("attempt").is_none(),
             "the new fields are typed, not swept into the forward-compat bag"
         );
     }

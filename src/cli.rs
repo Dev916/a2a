@@ -216,6 +216,22 @@ pub enum Cmd {
         #[arg(long, value_name = "DUR", value_parser = crate::commands::wait::parse_duration)]
         timeout: Option<std::time::Duration>,
     },
+    /// Retry a worker: spawn a fresh one that inherits its lane, cwd, owner,
+    /// model, effort, result schema and brief. Refused while the parent is
+    /// still working, and after `admission.max_attempts` tries at one brief.
+    Respawn {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+        /// Retry with this brief instead of the parent's (it goes through the
+        /// same front-matter and secret gates any spawn's brief does)
+        #[arg(long, value_name = "FILE")]
+        brief: Option<std::path::PathBuf>,
+        /// Respawn a worker owned by somebody else (spec §4.8). The child still
+        /// belongs to the PARENT's owner — a forced retry is a repair, not a
+        /// transfer.
+        #[arg(long)]
+        force: bool,
+    },
     /// (hidden) render the generated skill artifacts from their in-repo sources
     #[command(hide = true, name = "__gen-skills")]
     GenSkills {

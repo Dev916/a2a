@@ -137,3 +137,4 @@ pub mod wait;
 pub mod sync_cmd;
 pub mod verify;
 pub mod gen_skills;
+pub mod respawn;

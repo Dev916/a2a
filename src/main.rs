@@ -61,6 +61,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
             SyncCmd::Mcp { .. } => "sync mcp",
         },
         Cmd::Verify { .. } => "verify",
+        Cmd::Respawn { .. } => "respawn",
         Cmd::GenSkills { .. } => "__gen-skills",
     }
 }
@@ -267,6 +268,17 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 id,
                 *force_verify,
                 timeout.unwrap_or(a2a::commands::verify::DEFAULT_TIMEOUT),
+                cli.global.json,
+                cli.global.quiet,
+            )
+        }
+        Cmd::Respawn { id, brief, force } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::respawn::run(
+                &home,
+                id,
+                brief.as_deref(),
+                *force,
                 cli.global.json,
                 cli.global.quiet,
             )

@@ -264,6 +264,19 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     // A new worker has taken no turns. Seeded unconditionally so a rebuild from
     // zero starts counting from the same place the original did.
     snap.turns_this_epoch = Some(0);
+    // Retry lineage (spec §4.9), present ONLY on a worker `a2a respawn` made.
+    // Genesis is the only writer of identity, and "this is the third attempt at
+    // that brief" is identity: it is what the attempt guard reads, and a
+    // snapshot rebuilt from zero has to reach the same verdict. An ABSENT
+    // `attempt` is attempt 1, so a plain spawn's genesis keeps its exact
+    // Phase-1/2 shape and every worker born before lineage existed stays the
+    // first attempt at its own brief.
+    if let Some(parent) = s("parent_id") {
+        snap.parent_id = Some(parent.to_string());
+    }
+    if let Some(attempt) = raw.get("attempt").and_then(|v| v.as_u64()) {
+        snap.attempt = Some(attempt as u32);
+    }
     snap.created_at = s("created_at")
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc))

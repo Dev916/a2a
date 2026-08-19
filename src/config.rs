@@ -93,19 +93,31 @@ pub const DEFAULT_BREAKER_FAILURES: u64 = 5;
 /// unrelated failures spread across an afternoon are not.
 pub const DEFAULT_BREAKER_WINDOW_SECS: u64 = 300;
 
+/// How many attempts one brief gets before `a2a respawn` quarantines it
+/// (spec §4.9). The original spawn is attempt 1, so the default buys two
+/// retries.
+///
+/// Three is the poison-brief signature: a brief that has failed three times in
+/// a row is not failing for a reason a fourth identical worker will discover,
+/// and a retry loop with no ceiling is how one bad brief spends a day's quota.
+/// The refusal names the chain so the operator fixes the brief rather than the
+/// counter.
+pub const DEFAULT_MAX_ATTEMPTS: u64 = 3;
+
 /// Every `[admission]` key, in the order `config show --origin` reports them.
 /// `lanes` is a nested TABLE, not a value, and is handled separately.
 ///
-/// The two breaker keys are APPENDED, per the phase-append discipline; every
-/// entry here is parsed through [`parse_u64_str`] into a `u64`, which is why
-/// `AdmissionConfig`'s breaker fields are `u64` too — a narrowing `as u32`
-/// would wrap `4294967296` to `0`, and `0` is precisely the value that turns
-/// the breaker off.
-pub const ADMISSION_FIELDS: [&str; 4] = [
+/// The breaker keys and `max_attempts` are APPENDED, per the phase-append
+/// discipline; every entry here is parsed through [`parse_u64_str`] into a
+/// `u64`, which is why `AdmissionConfig`'s numbers are `u64` too — a narrowing
+/// `as u32` would wrap `4294967296` to `0`, and `0` is precisely the value that
+/// turns the breaker off.
+pub const ADMISSION_FIELDS: [&str; 5] = [
     "global_cap",
     "queue_cap",
     "breaker_failures",
     "breaker_window_secs",
+    "max_attempts",
 ];
 
 /// Every `[admission.lanes.<lane>]` key.
@@ -288,6 +300,9 @@ pub struct AdmissionConfig {
     /// breaker. **`0` disables it** — see [`DEFAULT_BREAKER_FAILURES`].
     pub breaker_failures: u64,
     pub breaker_window_secs: u64,
+    /// Attempts one brief gets before `a2a respawn` refuses (spec §4.9). The
+    /// original spawn is attempt 1 — see [`DEFAULT_MAX_ATTEMPTS`].
+    pub max_attempts: u64,
     pub lanes: BTreeMap<Lane, LaneAdmission>,
 }
 
@@ -298,6 +313,7 @@ impl Default for AdmissionConfig {
             queue_cap: DEFAULT_ADMISSION_QUEUE_CAP,
             breaker_failures: DEFAULT_BREAKER_FAILURES,
             breaker_window_secs: DEFAULT_BREAKER_WINDOW_SECS,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
             lanes: Lane::ALL
                 .iter()
                 .map(|l| {
@@ -728,6 +744,7 @@ fn apply_admission_file(
             "queue_cap" => cfg.admission.queue_cap = want_u64(&dotted, v)?,
             "breaker_failures" => cfg.admission.breaker_failures = want_u64(&dotted, v)?,
             "breaker_window_secs" => cfg.admission.breaker_window_secs = want_u64(&dotted, v)?,
+            "max_attempts" => cfg.admission.max_attempts = want_u64(&dotted, v)?,
             _ => unreachable!("field membership fixed by ADMISSION_FIELDS"),
         }
         origins.insert(dotted, Origin::File);
@@ -906,6 +923,7 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
             "queue_cap" => cfg.admission.queue_cap = value,
             "breaker_failures" => cfg.admission.breaker_failures = value,
             "breaker_window_secs" => cfg.admission.breaker_window_secs = value,
+            "max_attempts" => cfg.admission.max_attempts = value,
             _ => unreachable!("field membership fixed by ADMISSION_FIELDS"),
         }
         origins.insert(format!("admission.{field}"), Origin::Env);
@@ -1112,13 +1130,17 @@ mod tests {
         // exception to this file's "0 is the safe reading" rule.
         assert_eq!(a.breaker_failures, 5);
         assert_eq!(a.breaker_window_secs, 300);
+        // ...and the respawn ceiling, appended after THEM (spec §4.9). The
+        // original spawn is attempt 1, so `3` buys two retries.
+        assert_eq!(a.max_attempts, 3);
         assert_eq!(
             ADMISSION_FIELDS,
             [
                 "global_cap",
                 "queue_cap",
                 "breaker_failures",
-                "breaker_window_secs"
+                "breaker_window_secs",
+                "max_attempts"
             ]
         );
         assert_eq!(ADMISSION_LANE_FIELDS, ["cap"]);
@@ -1131,6 +1153,10 @@ mod tests {
         assert_eq!(
             admission_env_key("breaker_window_secs"),
             "A2A_ADMISSION_BREAKER_WINDOW_SECS"
+        );
+        assert_eq!(
+            admission_env_key("max_attempts"),
+            "A2A_ADMISSION_MAX_ATTEMPTS"
         );
         assert_eq!(
             admission_lane_env_key(Lane::Impl, "cap"),

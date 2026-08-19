@@ -127,9 +127,39 @@ enum CwdPlan {
     Fixed(PathBuf),
 }
 
+/// Where a respawned worker came from (spec §4.9).
+///
+/// Carried through the spawn path rather than patched on afterwards, because
+/// the lineage belongs in *genesis*: a worker whose parent only `state.json`
+/// knew about would lose its chain to the first rebuild, and the attempt guard
+/// reads that chain to decide whether a fourth try is a retry or a quarantine.
+#[derive(Clone, Debug)]
+pub struct Lineage {
+    pub parent_id: String,
+    pub attempt: u32,
+}
+
+/// The ordinary spawn: no parent, and therefore a genesis row of exactly the
+/// shape Phase 1 wrote.
 pub fn run(
     home: &A2aHome,
     args: &SpawnArgs,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Value, AppError> {
+    run_with_lineage(home, args, None, json_mode, quiet)
+}
+
+/// [`run`], plus the retry lineage `a2a respawn` supplies.
+///
+/// One path, deliberately: a respawned worker goes through the same gates, the
+/// same elevation check, the same admission door and the same worktree defaults
+/// as any other spawn. A second, parallel spawn path is how a retry quietly
+/// stops obeying the rules the first one enforces.
+pub fn run_with_lineage(
+    home: &A2aHome,
+    args: &SpawnArgs,
+    lineage: Option<Lineage>,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Value, AppError> {
@@ -421,6 +451,13 @@ pub fn run(
     if queued {
         genesis["queued"] = json!(true);
     }
+    // The retry lineage (spec §4.9), and ONLY when there is one: a plain
+    // spawn's genesis keeps its exact Phase-1/2 shape, and the fold reads an
+    // absent `attempt` exactly as it reads `1`.
+    if let Some(lineage) = &lineage {
+        genesis["parent_id"] = json!(lineage.parent_id);
+        genesis["attempt"] = json!(lineage.attempt);
+    }
     let mut snap = append_and_fold(
         &mut log,
         &wdir,
@@ -478,7 +515,7 @@ pub fn run(
             }
         }
         return Ok(if json_mode {
-            json!({
+            let mut payload = json!({
                 "id": id,
                 "lane": lane.as_str(),
                 "state": snap.state.as_str(),
@@ -499,7 +536,9 @@ pub fn run(
                 "queue_position": snap.queue_position,
                 "worktree": worktree_payload,
                 "deadline_at": snap.deadline_at,
-            })
+            });
+            add_lineage(&mut payload, lineage.as_ref());
+            payload
         } else {
             Value::String(id)
         });
@@ -569,7 +608,7 @@ pub fn run(
     // stdout carries the machine payload: the envelope's `data` under --json,
     // the bare id otherwise.
     Ok(if json_mode {
-        json!({
+        let mut payload = json!({
             "id": id,
             "lane": lane.as_str(),
             "state": snap.state.as_str(),
@@ -585,10 +624,22 @@ pub fn run(
             "effort": effort,
             "worktree": worktree_payload,
             "deadline_at": snap.deadline_at,
-        })
+        });
+        add_lineage(&mut payload, lineage.as_ref());
+        payload
     } else {
         Value::String(id)
     })
+}
+
+/// The two lineage keys, added to a spawn payload ONLY when this spawn is a
+/// retry — so `a2a spawn --json`'s shape is untouched for everybody else.
+fn add_lineage(payload: &mut Value, lineage: Option<&Lineage>) {
+    let (Some(lineage), Some(obj)) = (lineage, payload.as_object_mut()) else {
+        return;
+    };
+    obj.insert("parent_id".to_string(), json!(lineage.parent_id));
+    obj.insert("attempt".to_string(), json!(lineage.attempt));
 }
 
 // --------------------------------------------------------------------- gates

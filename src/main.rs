@@ -172,13 +172,19 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.quiet,
             )
         }
-        Cmd::Gc { age, dry_run, all } => {
+        Cmd::Gc {
+            age,
+            dry_run,
+            all,
+            force,
+        } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::gc::run(
                 &home,
                 *age,
                 *dry_run,
                 *all,
+                *force,
                 cli.global.json,
                 cli.global.quiet,
             )

@@ -273,7 +273,7 @@ pub fn remove(repo: &Path, path: &Path, force: bool) -> Result<(), AppError> {
     let run = git(&argv)?;
     // Unconditional: a remove that half-succeeded leaves a stale registration,
     // and a prune with nothing to do is a silent no-op.
-    let _ = git(&argv_in(repo, &["worktree", "prune"]));
+    let _ = prune(repo);
     if !run.ok() {
         let evidence = redact_egress(run.stderr.trim());
         if evidence.contains("contains modified or untracked files") {
@@ -293,6 +293,29 @@ pub fn remove(repo: &Path, path: &Path, force: bool) -> Result<(), AppError> {
             format!("could not remove {}: {evidence}", path.display()),
         )
         .remedy("inspect the tree with `git worktree list` and remove it by hand"));
+    }
+    Ok(())
+}
+
+/// `git -C <repo> worktree prune` — drop registrations whose directory is gone.
+///
+/// Called on its own when a worker's tree has vanished by some other hand:
+/// there is nothing left to [`remove`], only the parent repo's stale
+/// registration, and the recorded parent repo is the only thing that can still
+/// address it. A prune with nothing to do exits 0 silently.
+pub fn prune(repo: &Path) -> Result<(), AppError> {
+    let run = git(&argv_in(repo, &["worktree", "prune"]))?;
+    if !run.ok() {
+        return Err(AppError::new(
+            "WORKTREE_PRUNE_FAILED",
+            ExitCode::Precondition,
+            format!(
+                "could not prune stale worktrees in {}{}",
+                repo.display(),
+                why(&run)
+            ),
+        )
+        .remedy("check the repo is healthy (`git worktree list`)"));
     }
     Ok(())
 }

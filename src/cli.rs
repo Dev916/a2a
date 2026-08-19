@@ -168,6 +168,10 @@ pub enum Cmd {
         /// your own workers plus every unowned one (spec §4.8).
         #[arg(long)]
         all: bool,
+        /// Also reclaim workers whose worktree has uncommitted or unmerged
+        /// work — the worktree directory is deleted, the branch is not
+        #[arg(long)]
+        force: bool,
     },
     /// Check the environment a worker would be spawned into: one line per
     /// check, exit 9 if any of them fails

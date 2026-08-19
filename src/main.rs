@@ -53,6 +53,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
             BrokerCmd::Status => "broker status",
             BrokerCmd::Shutdown => "broker shutdown",
             BrokerCmd::Restart => "broker restart",
+            BrokerCmd::ResetBreaker => "broker reset-breaker",
         },
         Cmd::BrokerCall { .. } => "__broker-call",
         Cmd::Sync { cmd } => match cmd {
@@ -219,6 +220,9 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 BrokerCmd::Status => a2a::commands::broker_cmd::status(&home, cli.global.quiet),
                 BrokerCmd::Shutdown => a2a::commands::broker_cmd::shutdown(&home),
                 BrokerCmd::Restart => a2a::commands::broker_cmd::restart(&home, cli.global.quiet),
+                BrokerCmd::ResetBreaker => {
+                    a2a::commands::broker_cmd::reset_breaker(&home, cli.global.quiet)
+                }
             }
         }
         Cmd::BrokerCall { op, params } => {

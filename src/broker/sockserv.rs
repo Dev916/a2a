@@ -717,6 +717,16 @@ async fn dispatch(
                 .map_err(|e| WireError::from_app(&e))?;
             Ok(json!({}))
         }
+        // The one op that CHANGES an admission decision without spawning
+        // anything: close the circuit breaker again (spec §4.9).
+        "reset-breaker" => {
+            let was_open = ctx
+                .core
+                .reset_breaker()
+                .await
+                .map_err(|e| WireError::from_app(&e))?;
+            Ok(json!({"reset": true, "was_open": was_open}))
+        }
         "shutdown" => Ok(json!({"shutting_down": true})),
         other => Err(WireError::new(
             wire::ERR_UNKNOWN_OP,
@@ -746,6 +756,9 @@ async fn info(ctx: &ServeCtx) -> Value {
             Some(true) => "degraded-exec",
             _ => "app-server",
         },
+        // The circuit breaker (spec §4.9) — the fact that explains why a spawn
+        // this daemon has room for was refused anyway.
+        "breaker": idle.as_ref().map(|i| i.breaker.clone()),
         "codex_bin": ctx.codex_bin,
         "allowed_roots": ctx.allowed_roots,
         "reconciled": ctx.reconciled,

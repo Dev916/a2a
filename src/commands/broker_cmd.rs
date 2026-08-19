@@ -347,6 +347,8 @@ pub fn status(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
         // one fact about a fleet, and an operator asking why a spawn has not
         // started is asking exactly this.
         "queued": info["queued"],
+        // Why a spawn this daemon has room for may still be refused (spec §4.9).
+        "breaker": info["breaker"],
         "clients": info["clients"],
         "socket": info["socket"],
         "protocol_version": info["protocol_version"],
@@ -356,17 +358,51 @@ pub fn status(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
         "reconciled": info["reconciled"],
     });
     if !quiet {
+        // An open breaker is the loudest thing a broker can be (spec §4.9): a
+        // daemon that is up, idle and refusing every spawn looks healthy on
+        // every other number on this line.
+        let breaker = if info["breaker"]["open"] == json!(true) {
+            format!(
+                ", breaker OPEN ({} failures in {}s)",
+                info["breaker"]["failures"], info["breaker"]["window_secs"]
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "a2a: broker up (pid {}, {}, {} worker(s), {} queued, {} client(s), up {}s)",
+            "a2a: broker up (pid {}, {}, {} worker(s), {} queued, {} client(s), up {}s){}",
             info["pid"],
             info["transport"].as_str().unwrap_or("unknown"),
             info["workers"],
             info["queued"],
             info["clients"],
-            info["uptime_secs"]
+            info["uptime_secs"],
+            breaker
         );
     }
     Ok(Outcome::from(data))
+}
+
+/// `a2a broker reset-breaker` — close the circuit breaker again (spec §4.9).
+///
+/// [`brokerclient::connect`], never `connect_or_start`: autostarting a daemon in
+/// order to reset a breaker it never had is a lie about what happened, so a home
+/// with no broker is exit 7 rather than a fresh daemon and a cheerful `true`.
+pub fn reset_breaker(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
+    let mut client = brokerclient::connect(home.root())?;
+    let data = client.request("reset-breaker", json!({}))?;
+    let was_open = data["was_open"].as_bool().unwrap_or(false);
+    if !quiet {
+        eprintln!(
+            "a2a: breaker reset ({})",
+            if was_open {
+                "it was open"
+            } else {
+                "it was already closed"
+            }
+        );
+    }
+    Ok(Outcome::from(json!({"reset": true, "was_open": was_open})))
 }
 
 /// `a2a broker shutdown` — graceful, bounded, and idempotent.

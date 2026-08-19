@@ -73,9 +73,40 @@ pub const DEFAULT_MAX_TURNS_REVIEW: u64 = 15;
 pub const DEFAULT_MAX_TURNS_RESEARCH: u64 = 20;
 pub const DEFAULT_MAX_TURNS_GENERAL: u64 = 30;
 
+/// How many `failed` settlements inside [`DEFAULT_BREAKER_WINDOW_SECS`] open the
+/// broker's circuit breaker and stop it admitting new work (spec §4.9).
+///
+/// Five is "this is not one bad brief". A fleet whose workers fail one after
+/// another is failing for a reason the fleet cannot see — a revoked token, a
+/// repo that will not build, a model outage — and every further spawn spends
+/// quota discovering the same thing. Stopping is the cheap answer; the operator
+/// re-opens the door with `a2a broker reset-breaker` once the cause is fixed.
+///
+/// **`0` DISABLES the breaker** — the one documented exception to the "`0` is
+/// the safe reading" rule this file otherwise keeps. A threshold whose job is to
+/// *stop* work must not read "stop everything" when it is unset: a breaker that
+/// trips at zero is not caution, it is an outage on a fresh daemon.
+pub const DEFAULT_BREAKER_FAILURES: u64 = 5;
+
+/// The window those failures have to fall inside. Five minutes is long enough
+/// that a genuine cascade is still counted as one, and short enough that five
+/// unrelated failures spread across an afternoon are not.
+pub const DEFAULT_BREAKER_WINDOW_SECS: u64 = 300;
+
 /// Every `[admission]` key, in the order `config show --origin` reports them.
 /// `lanes` is a nested TABLE, not a value, and is handled separately.
-pub const ADMISSION_FIELDS: [&str; 2] = ["global_cap", "queue_cap"];
+///
+/// The two breaker keys are APPENDED, per the phase-append discipline; every
+/// entry here is parsed through [`parse_u64_str`] into a `u64`, which is why
+/// `AdmissionConfig`'s breaker fields are `u64` too — a narrowing `as u32`
+/// would wrap `4294967296` to `0`, and `0` is precisely the value that turns
+/// the breaker off.
+pub const ADMISSION_FIELDS: [&str; 4] = [
+    "global_cap",
+    "queue_cap",
+    "breaker_failures",
+    "breaker_window_secs",
+];
 
 /// Every `[admission.lanes.<lane>]` key.
 pub const ADMISSION_LANE_FIELDS: [&str; 1] = ["cap"];
@@ -253,6 +284,10 @@ pub struct LaneAdmission {
 pub struct AdmissionConfig {
     pub global_cap: u64,
     pub queue_cap: u64,
+    /// Failed settlements inside `breaker_window_secs` that open the circuit
+    /// breaker. **`0` disables it** — see [`DEFAULT_BREAKER_FAILURES`].
+    pub breaker_failures: u64,
+    pub breaker_window_secs: u64,
     pub lanes: BTreeMap<Lane, LaneAdmission>,
 }
 
@@ -261,6 +296,8 @@ impl Default for AdmissionConfig {
         AdmissionConfig {
             global_cap: DEFAULT_ADMISSION_GLOBAL_CAP,
             queue_cap: DEFAULT_ADMISSION_QUEUE_CAP,
+            breaker_failures: DEFAULT_BREAKER_FAILURES,
+            breaker_window_secs: DEFAULT_BREAKER_WINDOW_SECS,
             lanes: Lane::ALL
                 .iter()
                 .map(|l| {
@@ -689,6 +726,8 @@ fn apply_admission_file(
         match field.as_str() {
             "global_cap" => cfg.admission.global_cap = want_u64(&dotted, v)?,
             "queue_cap" => cfg.admission.queue_cap = want_u64(&dotted, v)?,
+            "breaker_failures" => cfg.admission.breaker_failures = want_u64(&dotted, v)?,
+            "breaker_window_secs" => cfg.admission.breaker_window_secs = want_u64(&dotted, v)?,
             _ => unreachable!("field membership fixed by ADMISSION_FIELDS"),
         }
         origins.insert(dotted, Origin::File);
@@ -865,6 +904,8 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         match field {
             "global_cap" => cfg.admission.global_cap = value,
             "queue_cap" => cfg.admission.queue_cap = value,
+            "breaker_failures" => cfg.admission.breaker_failures = value,
+            "breaker_window_secs" => cfg.admission.breaker_window_secs = value,
             _ => unreachable!("field membership fixed by ADMISSION_FIELDS"),
         }
         origins.insert(format!("admission.{field}"), Origin::Env);
@@ -1066,10 +1107,31 @@ mod tests {
         for lane in Lane::ALL {
             assert_eq!(a.lane_cap(lane), 4, "{lane} lane");
         }
-        assert_eq!(ADMISSION_FIELDS, ["global_cap", "queue_cap"]);
+        // The circuit breaker's two keys, APPENDED in this order (spec §4.9).
+        // `breaker_failures = 0` DISABLES the breaker — the one recorded
+        // exception to this file's "0 is the safe reading" rule.
+        assert_eq!(a.breaker_failures, 5);
+        assert_eq!(a.breaker_window_secs, 300);
+        assert_eq!(
+            ADMISSION_FIELDS,
+            [
+                "global_cap",
+                "queue_cap",
+                "breaker_failures",
+                "breaker_window_secs"
+            ]
+        );
         assert_eq!(ADMISSION_LANE_FIELDS, ["cap"]);
         assert_eq!(admission_env_key("global_cap"), "A2A_ADMISSION_GLOBAL_CAP");
         assert_eq!(admission_env_key("queue_cap"), "A2A_ADMISSION_QUEUE_CAP");
+        assert_eq!(
+            admission_env_key("breaker_failures"),
+            "A2A_ADMISSION_BREAKER_FAILURES"
+        );
+        assert_eq!(
+            admission_env_key("breaker_window_secs"),
+            "A2A_ADMISSION_BREAKER_WINDOW_SECS"
+        );
         assert_eq!(
             admission_lane_env_key(Lane::Impl, "cap"),
             "A2A_ADMISSION_LANES_IMPL_CAP"

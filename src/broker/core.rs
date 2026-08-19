@@ -208,6 +208,12 @@ pub enum CoreMsg {
     /// A worker reached a state nobody is waiting on. Wraps the `Settled`
     /// channel every `WorkerActor` announces on.
     WorkerSettled(Settled),
+    /// Close the circuit breaker again (`a2a broker reset-breaker`), replying
+    /// with whether it had been open — an operator who resets a breaker that
+    /// was already closed has learned something, and should be told.
+    ResetBreaker {
+        reply: oneshot::Sender<bool>,
+    },
 
     // ---- internal ---------------------------------------------------------
     /// One notification off the child's stdout, tagged with the generation that
@@ -329,6 +335,10 @@ pub struct IdleReport {
     pub child_pid: Option<u32>,
     pub degraded: bool,
     pub restarts: u64,
+    /// The circuit breaker (spec §4.9). It rides this report because `info` is
+    /// the one op that asks the core what it knows about itself, and "is the
+    /// door shut" is exactly that kind of fact.
+    pub breaker: BreakerHealth,
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +440,11 @@ impl CoreHandle {
 
     pub async fn idle(&self) -> Result<IdleReport, AppError> {
         self.ask(|reply| CoreMsg::IdleCheck { reply }).await
+    }
+
+    /// Close the breaker again; `Ok(true)` iff it had been open.
+    pub async fn reset_breaker(&self) -> Result<bool, AppError> {
+        self.ask(|reply| CoreMsg::ResetBreaker { reply }).await
     }
 
     /// Flush every live worker and stop the child — the *tell* phase of
@@ -790,6 +805,116 @@ pub struct Notice {
     pub params: Value,
 }
 
+/// The circuit breaker's state as `broker-health.json` records it (spec §4.9).
+///
+/// **Observational.** A fresh daemon starts with the breaker closed regardless
+/// of what this file says — which is exactly why `a2a broker restart` is the
+/// documented second reset path.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BreakerHealth {
+    pub open: bool,
+    /// Failures still inside the window.
+    pub failures: u64,
+    pub window_secs: u64,
+    pub opened_at: Option<DateTime<Utc>>,
+}
+
+/// K failures in a window and the broker stops admitting new work (spec §4.9).
+///
+/// **A value owned by the core task** — no `Arc`, no lock. The registry is the
+/// only thing that counts settlements and the only thing that decides admission,
+/// so the counter lives where both of those happen and travels by message like
+/// everything else the core owns.
+///
+/// The window is a deque of the instants failures happened at, pruned on the way
+/// in: bounded by the threshold's worth of failures per window rather than by
+/// anything a fleet can grow, and cheap enough that the prune costs nothing next
+/// to the settlement that triggered it.
+#[derive(Default)]
+pub struct Breaker {
+    /// In-window failures, oldest first.
+    failures: VecDeque<Instant>,
+    /// `Some` iff the breaker is open. It records when it FIRST opened and does
+    /// not move afterwards: an operator asking "since when" wants the start of
+    /// the outage, not the timestamp of the most recent casualty.
+    opened_at: Option<DateTime<Utc>>,
+}
+
+impl Breaker {
+    /// Record one failed settlement; returns true iff THIS one opened it.
+    ///
+    /// `threshold == 0` DISABLES the breaker — the one recorded exception to
+    /// this codebase's "`0` is the safe reading" rule (see
+    /// [`crate::config::DEFAULT_BREAKER_FAILURES`]): a threshold whose job is to
+    /// stop work must not read "stop everything" when it is unset.
+    pub fn record_failure(
+        &mut self,
+        now: Instant,
+        at: DateTime<Utc>,
+        threshold: u64,
+        window: Duration,
+    ) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+        while let Some(oldest) = self.failures.front() {
+            if now.duration_since(*oldest) > window {
+                self.failures.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.failures.push_back(now);
+        if self.opened_at.is_some() {
+            return false; // already open; a later failure does not re-open it
+        }
+        if self.failures.len() as u64 >= threshold {
+            self.opened_at = Some(at);
+            return true;
+        }
+        false
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.opened_at.is_some()
+    }
+
+    /// Clear the window and `opened_at`; returns whether it had been open.
+    pub fn reset(&mut self) -> bool {
+        self.failures.clear();
+        self.opened_at.take().is_some()
+    }
+
+    pub fn health(&self, window_secs: u64) -> BreakerHealth {
+        BreakerHealth {
+            open: self.is_open(),
+            failures: self.failures.len() as u64,
+            window_secs,
+            opened_at: self.opened_at,
+        }
+    }
+}
+
+/// The refusal a caller gets while the breaker is open. Exit 9 like every other
+/// admission refusal: it is decided from records and config, and no broker
+/// appearing or disappearing changes the answer.
+fn breaker_open(h: &BreakerHealth) -> AppError {
+    AppError::new(
+        "BREAKER_OPEN",
+        ExitCode::Precondition,
+        format!(
+            "the broker's circuit breaker is open ({} failures in {}s)",
+            h.failures, h.window_secs
+        ),
+    )
+    .remedy("`a2a broker reset-breaker` once the cause is fixed, or `a2a broker restart`")
+    .data(json!({
+        "failures": h.failures,
+        "window_secs": h.window_secs,
+        "opened_at": h.opened_at,
+    }))
+}
+
 /// `broker-health.json` — what the daemon knows about itself.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BrokerHealth {
@@ -815,6 +940,11 @@ pub struct BrokerHealth {
     /// The most recent broker-scoped notifications (rate limits, deprecations,
     /// config warnings) — the ones that belong to no worker.
     pub notices: Vec<Notice>,
+    /// The circuit breaker (spec §4.9). `#[serde(default)]` because a
+    /// `broker-health.json` written by a Phase-2 binary has no `breaker` key and
+    /// must still load rather than reading as a corrupt daemon.
+    #[serde(default)]
+    pub breaker: BreakerHealth,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -835,6 +965,7 @@ impl Default for BrokerHealth {
             next_promotion_probe_at: None,
             workers: 0,
             notices: Vec::new(),
+            breaker: BreakerHealth::default(),
             updated_at: Utc::now(),
         }
     }
@@ -1038,6 +1169,10 @@ pub struct BrokerCore {
     workers: HashMap<String, Worker>,
     /// The slots and the waiting room (spec §4.9).
     admission: Admission,
+    /// The failure counter that shuts the door (spec §4.9). A VALUE, owned by
+    /// this task — the core is the only thing that sees settlements and the only
+    /// thing that decides admission, so nothing else needs a share of it.
+    breaker: Breaker,
     /// thread id → worker id.
     threads: HashMap<String, String>,
     /// tokio task id → worker id, so a panicking actor can be named.
@@ -1123,6 +1258,10 @@ pub async fn start(
         rx,
         workers: HashMap::new(),
         admission: Admission::default(),
+        // A fresh daemon starts CLOSED: the persisted state is observational,
+        // and a breaker that survived a restart would make `a2a broker restart`
+        // — the documented second reset path — a no-op.
+        breaker: Breaker::default(),
         threads: HashMap::new(),
         task_ids: HashMap::new(),
         actors: tokio::task::JoinSet::new(),
@@ -1284,11 +1423,32 @@ impl BrokerCore {
                 if let Some(worker) = self.workers.get_mut(&settled.id) {
                     worker.settled = true;
                 }
+                // The breaker counts EVERY `failed` settlement, whatever the
+                // class: every failure class in the table is a reason to stop
+                // and look, and a breaker with exemptions is one that does not
+                // trip when it matters (spec §4.9).
+                if settled.state == WorkerState::Failed {
+                    self.on_failed_settlement().await;
+                }
                 // A settled worker has released its slot: that IS the drain
                 // trigger (spec §4.9). Terminal or escalated, both — an
                 // escalated worker is waiting on a human, not on the transport.
                 self.drain_queue().await;
                 self.publish_health().await;
+            }
+            CoreMsg::ResetBreaker { reply } => {
+                let was_open = self.breaker.reset();
+                if was_open {
+                    // Logged on the TRANSITION only, like `breaker_open`:
+                    // `broker.jsonl` is a post-mortem, and a `breaker_reset`
+                    // line with no matching `breaker_open` would read as an
+                    // outage that never happened.
+                    self.log
+                        .line(json!({"ts": Utc::now(), "kind": "breaker_reset"}))
+                        .await;
+                    self.publish_health().await;
+                }
+                let _ = reply.send(was_open);
             }
             CoreMsg::Notification {
                 generation,
@@ -1431,6 +1591,32 @@ impl BrokerCore {
         self.slots_used(None) < caps.global_cap && self.slots_used(Some(lane)) < caps.lane_cap(lane)
     }
 
+    /// The breaker's state, stamped with the window it is currently configured
+    /// with — the window is config, not breaker state, so it is supplied rather
+    /// than remembered and an operator who widens it sees the new number at once.
+    fn breaker_health(&self) -> BreakerHealth {
+        self.breaker.health(self.cfg.admission.breaker_window_secs)
+    }
+
+    /// One failed settlement, counted. Writes the `breaker_open` transition line
+    /// exactly once — on the failure that opened it, never on the ones after.
+    async fn on_failed_settlement(&mut self) {
+        let at = Utc::now();
+        let opened = self.breaker.record_failure(
+            Instant::now(),
+            at,
+            self.cfg.admission.breaker_failures,
+            Duration::from_secs(self.cfg.admission.breaker_window_secs),
+        );
+        if opened {
+            let h = self.breaker_health();
+            self.log
+                .line(json!({"ts": at, "kind": "breaker_open",
+                             "failures": h.failures, "window_secs": h.window_secs}))
+                .await;
+        }
+    }
+
     /// The admission decision, taken before a byte of genesis exists.
     ///
     /// The gates run FIRST and in the same order a spawn's do: a refusal for a
@@ -1440,6 +1626,13 @@ impl BrokerCore {
     /// then is this request placed.
     async fn decide_admission(&mut self, req: &SpawnRequest) -> Result<Admitted, AppError> {
         self.gates(req).await?;
+        // AFTER the gates and BEFORE the queue: a cwd outside the allowlist is
+        // still reported as a cwd problem rather than as a breaker one, and an
+        // open breaker refuses rather than parking the request in a queue that
+        // may never be allowed to admit it.
+        if self.breaker.is_open() {
+            return Err(breaker_open(&self.breaker_health()));
+        }
         let lane = req.lane.unwrap_or(crate::config::Lane::General);
         self.drain_queue().await;
 
@@ -1770,13 +1963,23 @@ impl BrokerCore {
         // Refused, never queued: the machine has no `terminal → queued` row, so
         // a resume that cannot have a slot now is one the caller re-issues later
         // (spec §4.9).
-        if capped && !self.has_room(snap.lane) {
-            let caps = &self.cfg.admission;
-            return Err(at_capacity(
-                snap.lane,
-                caps.global_cap,
-                caps.lane_cap(snap.lane),
-            ));
+        //
+        // `capped` is exactly "this is NEW work off the socket", which is what
+        // the breaker refuses. Adoption (`capped == false`) is never refused:
+        // those workers were already running, and refusing to re-attach them
+        // strands the fleet this daemon exists to recover.
+        if capped {
+            if self.breaker.is_open() {
+                return Err(breaker_open(&self.breaker_health()));
+            }
+            if !self.has_room(snap.lane) {
+                let caps = &self.cfg.admission;
+                return Err(at_capacity(
+                    snap.lane,
+                    caps.global_cap,
+                    caps.lane_cap(snap.lane),
+                ));
+            }
         }
 
         if resume {
@@ -2006,6 +2209,7 @@ impl BrokerCore {
             child_pid: self.health.child_pid,
             degraded: self.degraded,
             restarts: self.health.restarts,
+            breaker: self.breaker_health(),
         }
     }
 
@@ -2415,6 +2619,7 @@ impl BrokerCore {
     async fn publish_health(&mut self) {
         self.health.workers = self.workers.len();
         self.health.restarts_in_window = self.budget.in_window();
+        self.health.breaker = self.breaker_health();
         self.health.updated_at = Utc::now();
         self.log.health(self.health.clone()).await;
     }
@@ -2676,14 +2881,17 @@ mod tests {
     use crate::config::Lane;
     use crate::home::A2aHome;
 
-    /// The registry's surface is these fourteen messages, and every one of them
+    /// The registry's surface is these fifteen messages, and every one of them
     /// is a message — not a lock, not a shared map, not a second door.
     ///
     /// Twelve of them were Task 7's; admission control (spec §4.9) added the two
     /// that bracket a spawn — `Admit` (may this worker run yet?) and `Enqueue`
-    /// (a previous instance's queue, replayed).
+    /// (a previous instance's queue, replayed) — and the circuit breaker added
+    /// the fifteenth, `ResetBreaker`. `name()`'s `_ => "internal"` catch-all
+    /// means a new variant neither breaks the build nor fails the assertion, so
+    /// this list only stays true if every task that adds one comes here.
     #[test]
-    fn the_registry_is_reached_by_exactly_these_fourteen_messages() {
+    fn the_registry_is_reached_by_exactly_these_fifteen_messages() {
         fn name(msg: &CoreMsg) -> &'static str {
             match msg {
                 CoreMsg::Admit { .. } => "Admit",
@@ -2700,6 +2908,7 @@ mod tests {
                 CoreMsg::ChildDied { .. } => "ChildDied",
                 CoreMsg::IdleCheck { .. } => "IdleCheck",
                 CoreMsg::WorkerSettled(_) => "WorkerSettled",
+                CoreMsg::ResetBreaker { .. } => "ResetBreaker",
                 // Plumbing: the demux, the supervisor and the thread-learner
                 // reach the registry through the same queue as everyone else.
                 _ => "internal",
@@ -2721,13 +2930,15 @@ mod tests {
             CoreMsg::ChildDied { generation: 1, detail: "eof".into() },
             CoreMsg::IdleCheck { reply: oneshot::channel().0 },
             CoreMsg::WorkerSettled(Settled { id: "w".into(), state: WorkerState::Done }),
+            CoreMsg::ResetBreaker { reply: oneshot::channel().0 },
         ];
         let names: Vec<&str> = surface.iter().map(name).collect();
         assert_eq!(
             names,
             vec![
                 "Admit", "Spawn", "Enqueue", "Send", "Interrupt", "Kill", "Resume", "List",
-                "Status", "Subscribe", "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled"
+                "Status", "Subscribe", "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled",
+                "ResetBreaker"
             ]
         );
         // The mailbox is bounded — an unbounded queue in front of one owner is
@@ -3124,6 +3335,173 @@ mod tests {
         );
         assert_eq!(redacted["n"], json!(7), "non-strings are untouched");
         assert_eq!(redacted["ok"], json!(true));
+    }
+
+    // -- the circuit breaker ------------------------------------------------
+    //
+    // Pure: no IO, no clock, no runtime. Every `Instant` is injected, so what
+    // these assert is the RULE rather than how fast the machine running them is.
+
+    /// `breaker_failures = 0` DISABLES the breaker — the one recorded exception
+    /// to this codebase's "`0` is the safe reading" rule. Fifty failures and the
+    /// door is still open, because a threshold whose job is to stop work must
+    /// not read "stop everything" when it is unset.
+    #[test]
+    fn a_zero_threshold_disables_the_breaker_entirely() {
+        let mut breaker = Breaker::default();
+        let base = Instant::now();
+        for n in 0..50 {
+            assert!(
+                !breaker.record_failure(
+                    base + Duration::from_secs(n),
+                    Utc::now(),
+                    0,
+                    Duration::from_secs(300)
+                ),
+                "failure {n} must not open a disabled breaker"
+            );
+        }
+        assert!(!breaker.is_open(), "fifty failures, threshold zero, still shut");
+        assert_eq!(breaker.health(300).failures, 0);
+    }
+
+    /// The threshold is `>=`, not `>`: `breaker_failures = 2` means the SECOND
+    /// failure is the one that shuts the door.
+    #[test]
+    fn the_breaker_opens_at_the_threshold_not_past_it() {
+        let mut breaker = Breaker::default();
+        let base = Instant::now();
+        let window = Duration::from_secs(300);
+        assert!(!breaker.record_failure(base, Utc::now(), 2, window));
+        assert!(!breaker.is_open(), "one failure is not a pattern");
+        assert!(
+            breaker.record_failure(base + Duration::from_secs(1), Utc::now(), 2, window),
+            "the second failure is the one that opens it"
+        );
+        assert!(breaker.is_open());
+        let h = breaker.health(300);
+        assert_eq!(h.failures, 2);
+        assert_eq!(h.window_secs, 300);
+        assert!(h.open);
+    }
+
+    /// Failures that fell out of the window do not count. Two failures five
+    /// minutes and one second apart are two incidents, not a cascade.
+    #[test]
+    fn failures_outside_the_window_are_pruned() {
+        let mut breaker = Breaker::default();
+        let base = Instant::now();
+        let window = Duration::from_secs(300);
+        assert!(!breaker.record_failure(base, Utc::now(), 2, window));
+        assert!(
+            !breaker.record_failure(base + Duration::from_secs(301), Utc::now(), 2, window),
+            "the first failure aged out before the second arrived"
+        );
+        assert!(!breaker.is_open());
+        assert_eq!(
+            breaker.health(300).failures,
+            1,
+            "only the in-window failure is still counted"
+        );
+        // ... and a second one inside the window from THAT is the pair.
+        assert!(breaker.record_failure(base + Duration::from_secs(302), Utc::now(), 2, window));
+    }
+
+    /// `opened_at` is the start of the outage, not the timestamp of the most
+    /// recent casualty — an operator asking "since when" wants the former.
+    #[test]
+    fn a_later_failure_does_not_move_opened_at() {
+        let mut breaker = Breaker::default();
+        let base = Instant::now();
+        let window = Duration::from_secs(300);
+        let first = Utc::now();
+        assert!(breaker.record_failure(base, first, 1, window));
+        let opened_at = breaker.health(300).opened_at.expect("open");
+        assert_eq!(opened_at, first);
+
+        let later = first + chrono::Duration::seconds(30);
+        assert!(
+            !breaker.record_failure(base + Duration::from_secs(30), later, 1, window),
+            "an already-open breaker is not re-opened"
+        );
+        assert_eq!(
+            breaker.health(300).opened_at,
+            Some(first),
+            "opened_at is immovable while the breaker stays open"
+        );
+    }
+
+    /// A reset says whether it reset anything, which is what
+    /// `a2a broker reset-breaker` reports as `was_open`.
+    #[test]
+    fn a_reset_clears_the_window_and_reports_whether_it_had_been_open() {
+        let mut breaker = Breaker::default();
+        let base = Instant::now();
+        let window = Duration::from_secs(300);
+        assert!(breaker.record_failure(base, Utc::now(), 1, window));
+        assert!(breaker.reset(), "it had been open");
+        assert!(!breaker.is_open());
+        assert_eq!(breaker.health(300), BreakerHealth {
+            open: false,
+            failures: 0,
+            window_secs: 300,
+            opened_at: None,
+        });
+        assert!(!breaker.reset(), "the second reset reset nothing");
+        // The window went with it: the threshold is met from scratch.
+        assert!(breaker.record_failure(base + Duration::from_secs(1), Utc::now(), 1, window));
+    }
+
+    /// The refusal an open breaker hands back, in full. Every value here is
+    /// pinned: an orchestrator branches on the code and reads the data.
+    #[test]
+    fn the_breaker_refusal_is_a_precondition_that_names_the_cause() {
+        let mut breaker = Breaker::default();
+        let at = Utc::now();
+        breaker.record_failure(Instant::now(), at, 1, Duration::from_secs(300));
+        let err = breaker_open(&breaker.health(300));
+        assert_eq!(err.code, "BREAKER_OPEN");
+        assert_eq!(err.exit, ExitCode::Precondition, "exit 9, like every static refusal");
+        assert_eq!(
+            err.remedy.as_deref(),
+            Some("`a2a broker reset-breaker` once the cause is fixed, or `a2a broker restart`")
+        );
+        assert_eq!(
+            err.data,
+            Some(json!({"failures": 1, "window_secs": 300, "opened_at": at})),
+            "three keys, and the moment in rfc3339"
+        );
+        assert!(
+            crate::broker::wire::KNOWN_CODES.contains(&"BREAKER_OPEN"),
+            "it crosses the socket as itself, not through the leak fallback"
+        );
+    }
+
+    /// A `broker-health.json` written by a Phase-2 binary has no `breaker` key
+    /// and must still load: an older file is not a corrupt daemon.
+    #[test]
+    fn a_health_file_without_the_breaker_key_still_loads() {
+        let phase_two = json!({
+            "schema_version": HEALTH_SCHEMA_VERSION,
+            "pid": 4321,
+            "generation": 2,
+            "child_pid": null,
+            "child_user_agent": null,
+            "child_started_at": null,
+            "restarts": 0,
+            "restarts_in_window": 0,
+            "degraded": null,
+            "degraded_since": null,
+            "degraded_reason": null,
+            "next_promotion_probe_at": null,
+            "workers": 0,
+            "notices": [],
+            "updated_at": Utc::now(),
+        });
+        let health: BrokerHealth =
+            serde_json::from_value(phase_two).expect("an older health file still loads");
+        assert_eq!(health.breaker, BreakerHealth::default());
+        assert!(!health.breaker.open);
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 22] = [
+pub const KNOWN_CODES: [&str; 23] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -102,6 +102,11 @@ pub const KNOWN_CODES: [&str; 22] = [
     // caller said `--no-queue` and the broker is at its cap.
     "QUEUE_FULL",
     "AT_CAPACITY",
+    // ... and the third, which is not about room at all: the fleet has failed
+    // K times in a window and the door is shut until somebody re-opens it
+    // (spec §4.9). `ATTEMPTS_EXHAUSTED`/`PARENT_ACTIVE` are deliberately NOT
+    // here — `respawn` decides both CLI-side and neither crosses this socket.
+    "BREAKER_OPEN",
     "BROKER_GONE",
     "APP_SERVER",
     "APP_SERVER_START",

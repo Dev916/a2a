@@ -243,6 +243,10 @@ pub enum BrokerCmd {
     Shutdown,
     /// Stop the running broker, then start a fresh one
     Restart,
+    /// Close the circuit breaker again after the cause is fixed, so the broker
+    /// admits new work (exit 7 when there is no broker — resetting a breaker a
+    /// daemon never had is not a thing that can be autostarted into being)
+    ResetBreaker,
 }
 
 #[derive(clap::Args)]

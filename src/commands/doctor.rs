@@ -9,7 +9,9 @@
 //! `fn(&Ctx) -> Check`; the runner maps over it and knows nothing about any
 //! individual check. Phase 2's four (app-server handshake, codex-home
 //! agreement, broker status, auth mode) were appended to that slice and the
-//! runner was not touched. Ten is the count, and it is pinned by a test.
+//! runner was not touched. Phase 3 appended three more the same way (context
+//! canon, the tracked-secret check, sync state). **Thirteen** is the count —
+//! Phase 1's six, Phase 2's four, Phase 3's three — and it is pinned by a test.
 //!
 //! **Only `fail` is fatal.** `fail` means "a worker spawned right now would
 //! not work" and exits 9 (precondition); `warn` means "this will bite you
@@ -20,6 +22,15 @@
 //! answer is a *warn*, because the exec transport still spawns workers, and an
 //! absent codexHome is a warn rather than a fail — [`codex_home_match`] fails
 //! only when it holds two known values that disagree.
+//!
+//! Phase 3 **widens that rule exactly once**, and only for
+//! [`codex_config_secrets`]: a live credential in a file git publishes fails
+//! whether or not a spawn would succeed. It violates the machine's hard rule on
+//! its own — the key is already out, and every future clone republishes it —
+//! and a preflight that reported it as a warning would be read as optional,
+//! which for a leaked credential it is not. Every other check keeps the
+//! spawn-blocker meaning of `fail`; the two sync checks Phase 3 added beside it
+//! ([`context_canon`], [`sync_state`]) have no `fail` branch at all.
 //!
 //! **Doctor adopts a home that other commands refuse.** Every other command
 //! goes through [`A2aHome::resolve`], which gates on `LAYOUT_VERSION` and errors
@@ -38,6 +49,7 @@ use crate::home::{self, A2aHome, LAYOUT_VERSION};
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
 use crate::rpc::RpcError;
+use crate::sync::{manifest, mcp};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
@@ -135,7 +147,7 @@ pub struct Ctx {
 }
 
 /// The check list, in report order. Append-only across phases: Phase 1's six,
-/// then Phase 2's four.
+/// then Phase 2's four, then Phase 3's three.
 const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_present,
     codex_version,
@@ -147,6 +159,9 @@ const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_home_match,
     broker_status,
     auth_mode,
+    context_canon,
+    codex_config_secrets,
+    sync_state,
 ];
 
 /// The whole handshake — spawn, `initialize`, response — not each call.
@@ -756,6 +771,229 @@ fn auth_mode_verdict(api_key_exported: bool, auth_json: Option<&Path>) -> Check 
     ))
 }
 
+// ------------------------------------------------------- the phase-3 checks
+
+/// The file a Claude session reads, and the one line that makes a Codex worker
+/// read the same thing (spec §6.3).
+const CLAUDE_MD: &str = "CLAUDE.md";
+const AGENTS_IMPORT: &str = "@AGENTS.md";
+
+/// Does this repository's context reach a Codex worker at all?
+///
+/// Codex reads `AGENTS.md`; Claude reads `CLAUDE.md`. A repository whose
+/// machine-shared instructions live only in the second one has workers running
+/// without them and no symptom that says so, which is exactly what a preflight
+/// is for. Evaluated against the process's cwd, because that is the repository
+/// the operator is asking about.
+fn context_canon(_ctx: &Ctx) -> Check {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let text = std::fs::read_to_string(cwd.join(CLAUDE_MD)).ok();
+    context_canon_verdict(text.as_deref(), &cwd)
+}
+
+/// Never a `fail`. This is a migration nudge, and a fail would take the
+/// preflight of every repository that has not migrated yet down with it — a
+/// gate over a *documentation* fact, which is precisely how operators learn to
+/// pass `--force` to a preflight.
+fn context_canon_verdict(claude_md: Option<&str>, cwd: &Path) -> Check {
+    let Some(text) = claude_md else {
+        return Check::ok(
+            "context_canon",
+            format!("no {CLAUDE_MD} in {} — nothing to migrate", cwd.display()),
+        );
+    };
+    // The line has to BE the import. A `CLAUDE.md` that merely mentions
+    // `@AGENTS.md` in a sentence imports nothing, and reporting it as migrated
+    // would be worse than not checking.
+    if text.lines().any(|l| l.trim() == AGENTS_IMPORT) {
+        return Check::ok(
+            "context_canon",
+            format!(
+                "{} in {} imports {AGENTS_IMPORT}",
+                CLAUDE_MD,
+                cwd.display()
+            ),
+        );
+    }
+    Check::warn(
+        "context_canon",
+        format!(
+            "{CLAUDE_MD} does not import {AGENTS_IMPORT} — Codex workers read AGENTS.md and will not see it"
+        ),
+    )
+    .remedy(format!(
+        "move machine-shared content into AGENTS.md and put `{AGENTS_IMPORT}` at the top of {CLAUDE_MD}"
+    ))
+}
+
+/// Is a credential sitting in a file git publishes (spec §5, §6.2)?
+///
+/// The gathering reads the file and asks git one question about it; the verdict
+/// below never sees a byte of what was in it. That split is the whole design:
+/// this check's report travels into agent context and into CI logs, so it may
+/// carry a path and a set of 1-based line numbers, and nothing else.
+fn codex_config_secrets(ctx: &Ctx) -> Check {
+    let Some(codex_home) = ctx.codex_home.as_deref() else {
+        return codex_config_secrets_verdict(None, false, &[]);
+    };
+    let target = codex_home.join(mcp::TARGET_FILE);
+    if !target.is_file() {
+        return codex_config_secrets_verdict(None, false, &[]);
+    }
+    // False for "not a git repository" as well as for "tracked by nothing" —
+    // both are the same answer to the only question that matters here, which is
+    // whether this file is published.
+    let tracked = mcp::target_is_tracked(codex_home);
+    codex_config_secrets_verdict(Some(&target), tracked, &mcp::secret_lines(&target))
+}
+
+/// Doctor's first **security-class** `fail` (see the module docs): tracked AND
+/// carrying a secret shape. Every other combination is `ok`, including the
+/// untracked-with-secrets one, which is the state `--migrate-untrack` exists to
+/// produce.
+fn codex_config_secrets_verdict(
+    path: Option<&Path>,
+    tracked: bool,
+    secret_lines: &[usize],
+) -> Check {
+    let Some(path) = path else {
+        return Check::ok(
+            "codex_config_secrets",
+            format!("no {} under the codex home — nothing to check", mcp::TARGET_FILE),
+        );
+    };
+    let count = secret_lines.len();
+    if !tracked {
+        let detail = if count == 0 {
+            format!("{} carries no secret shape and git does not track it", path.display())
+        } else {
+            format!(
+                "{count} secret-shaped line(s) in {}, which git does not track",
+                path.display()
+            )
+        };
+        return Check::ok("codex_config_secrets", detail);
+    }
+    if count == 0 {
+        return Check::ok(
+            "codex_config_secrets",
+            format!("{} is tracked by git and carries no secret shape", path.display()),
+        );
+    }
+    Check::fail(
+        "codex_config_secrets",
+        format!(
+            "{} is tracked by git and carries a secret shape on {} {} — git has published it",
+            path.display(),
+            if count == 1 { "line" } else { "lines" },
+            secret_lines
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    )
+    .remedy(mcp::MIGRATE_REMEDY)
+}
+
+/// Is what `sync` mirrored still what is on disk?
+///
+/// Three input states, not two — see [`sync_state_verdict`]. The manifest file's
+/// existence is asked separately from loading it because [`manifest::Manifest::load`]
+/// answers "no file" with an empty ledger, which is the right answer for a run
+/// and the wrong one for a report.
+fn sync_state(ctx: &Ctx) -> Check {
+    let path = manifest::Manifest::path(ctx.home.root());
+    if !path.exists() {
+        return sync_state_verdict(None);
+    }
+    match manifest::Manifest::load(ctx.home.root()) {
+        Err(e) => sync_state_verdict(Some(Err(&e.message))),
+        Ok(loaded) => {
+            // A machine with a ledger but no resolvable codex home is a machine
+            // whose destinations are all missing, which is what the summary will
+            // say — an honest answer rather than a skipped check.
+            let codex_home = ctx.codex_home.clone().unwrap_or_default();
+            let summary = manifest::drift_summary(&loaded, &codex_home);
+            sync_state_verdict(Some(Ok(&summary)))
+        }
+    }
+}
+
+/// `None` = no manifest, `Some(Err(detail))` = corrupt or wrong schema version,
+/// `Some(Ok(_))` = loaded.
+///
+/// Folding the middle state into `None` would report a corrupt ledger as `ok`
+/// with "no sync manifest", inverting the truth for the one state that costs
+/// the user the ability to update anything a2a owns.
+///
+/// Never a `fail`: a stale mirror does not stop a spawn.
+fn sync_state_verdict(summary: Option<Result<&manifest::DriftSummary, &str>>) -> Check {
+    let Some(loaded) = summary else {
+        return Check::ok(
+            "sync_state",
+            "no sync manifest — `a2a sync skills`/`a2a sync mcp` have not run",
+        );
+    };
+    let summary = match loaded {
+        Err(detail) => {
+            return Check::warn("sync_state", format!("unreadable ledger: {detail}"))
+                .remedy(manifest::CORRUPT_REMEDY)
+        }
+        Ok(s) => s,
+    };
+
+    let stale = summary.drifted > 0
+        || summary.missing_dest > 0
+        || summary.orphaned_source > 0
+        || summary.ignore_block_uncovered;
+    if !stale {
+        return Check::ok(
+            "sync_state",
+            format!(
+                "{} manifest entry(s), every destination as a2a left it; last synced {}",
+                summary.entries,
+                summary
+                    .last_synced_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "never".into()),
+            ),
+        );
+    }
+    Check::warn(
+        "sync_state",
+        format!(
+            "{} manifest entry(s): {} drifted, {} missing, {} orphaned sources, ignore block {}",
+            summary.entries,
+            summary.drifted,
+            summary.missing_dest,
+            summary.orphaned_source,
+            if summary.ignore_block_uncovered {
+                "uncovered"
+            } else {
+                "covers every managed dir"
+            },
+        ),
+    )
+    .remedy(sync_remedy(&summary.kinds_affected))
+}
+
+/// Only the commands that would fix something. A remedy naming both syncs when
+/// one kind is clean is a remedy an operator learns to skim.
+fn sync_remedy(kinds: &[crate::sync::Kind]) -> String {
+    let commands: Vec<&str> = kinds
+        .iter()
+        .map(|k| match k {
+            crate::sync::Kind::Skill => "a2a sync skills",
+            crate::sync::Kind::Mcp => "a2a sync mcp",
+        })
+        .collect();
+    if commands.is_empty() {
+        return "a2a sync skills / a2a sync mcp".into();
+    }
+    commands.join(" / ")
+}
+
 // -------------------------------------------------------------------- helpers
 
 /// `CODEX_HOME`, else `$HOME/.codex` — codex's own resolution, and the one the
@@ -906,14 +1144,15 @@ impl Constraint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::manifest::DriftSummary;
 
     #[test]
-    fn the_check_list_is_exactly_ten_named_checks() {
+    fn the_check_list_is_exactly_thirteen_named_checks() {
         // The list is the contract `doctor --json` publishes; a phase that adds
         // a check adds it here and to the acceptance test in the same commit.
-        // Six in Phase 1, four in Phase 2 — the ids and their order are pinned
-        // end-to-end by `tests/cmd_doctor.rs`.
-        assert_eq!(CHECKS.len(), 10);
+        // Six in Phase 1, four in Phase 2, three in Phase 3 — the ids and their
+        // order are pinned end-to-end by `tests/cmd_doctor.rs`.
+        assert_eq!(CHECKS.len(), 13);
     }
 
     #[test]
@@ -1167,6 +1406,184 @@ mod tests {
             up.detail,
             format!("broker up (protocol v{}, binary unknown)", wire::PROTOCOL_VERSION)
         );
+    }
+
+    /// A migration nudge, never a blocker: the check has no `fail` branch at
+    /// all, because a `fail` here would take every un-migrated repository's
+    /// preflight down over a file Codex workers merely cannot see.
+    #[test]
+    fn context_canon_is_ok_without_a_claude_md_and_warns_only_on_a_missing_import() {
+        let cwd = Path::new("/work/proj");
+
+        let none = context_canon_verdict(None, cwd);
+        assert_eq!(none.status, Status::Ok);
+        assert_eq!(none.detail, "no CLAUDE.md in /work/proj — nothing to migrate");
+
+        for body in [
+            "@AGENTS.md\n\n# Project\n",
+            "# Project\n\n  @AGENTS.md  \n",
+            "@AGENTS.md",
+        ] {
+            let c = context_canon_verdict(Some(body), cwd);
+            assert_eq!(c.status, Status::Ok, "{body:?}");
+            assert!(c.detail.contains("@AGENTS.md"), "{}", c.detail);
+        }
+
+        // A mention is not an import: the line has to BE the import.
+        for body in [
+            "# Project\n\nsee AGENTS.md\n",
+            "read @AGENTS.md when you can\n",
+            "",
+        ] {
+            let c = context_canon_verdict(Some(body), cwd);
+            assert_eq!(c.status, Status::Warn, "{body:?}");
+            assert_eq!(
+                c.detail,
+                "CLAUDE.md does not import @AGENTS.md — Codex workers read AGENTS.md and will not see it"
+            );
+            assert_eq!(
+                c.remedy.as_deref(),
+                Some(
+                    "move machine-shared content into AGENTS.md and put `@AGENTS.md` at the top of CLAUDE.md"
+                )
+            );
+        }
+    }
+
+    /// Doctor's first security-class `fail` — and the one thing it may never
+    /// print is the reason it fired.
+    #[test]
+    fn codex_config_secrets_fails_only_on_tracked_and_secret_bearing() {
+        let path = Path::new("/home/mike/.codex/config.toml");
+
+        // No file (or no codex home at all) is nothing to check.
+        assert_eq!(codex_config_secrets_verdict(None, false, &[]).status, Status::Ok);
+        assert_eq!(codex_config_secrets_verdict(None, true, &[23]).status, Status::Ok);
+
+        // Not a work tree / not tracked, with secrets: the DESIRED end state.
+        let private = codex_config_secrets_verdict(Some(path), false, &[23, 41]);
+        assert_eq!(private.status, Status::Ok);
+        assert_eq!(
+            private.detail,
+            "2 secret-shaped line(s) in /home/mike/.codex/config.toml, which git does not track"
+        );
+
+        // Tracked but clean, and untracked and clean, are both ok.
+        assert_eq!(
+            codex_config_secrets_verdict(Some(path), true, &[]).status,
+            Status::Ok
+        );
+        assert_eq!(
+            codex_config_secrets_verdict(Some(path), false, &[]).status,
+            Status::Ok
+        );
+
+        let published = codex_config_secrets_verdict(Some(path), true, &[23, 41]);
+        assert_eq!(published.status, Status::Fail);
+        assert!(published.detail.contains("/home/mike/.codex/config.toml"));
+        assert!(published.detail.contains("lines 23, 41"), "{}", published.detail);
+        assert_eq!(
+            published.remedy.as_deref(),
+            Some(crate::sync::mcp::MIGRATE_REMEDY)
+        );
+        // One line is one line, not "lines 23".
+        assert!(codex_config_secrets_verdict(Some(path), true, &[23])
+            .detail
+            .contains("line 23"));
+    }
+
+    /// Three input states, not two. Folding "corrupt" into "absent" would
+    /// report the one state that costs the user every future update as `ok`.
+    #[test]
+    fn sync_state_reports_absent_corrupt_and_loaded_as_three_different_things() {
+        let absent = sync_state_verdict(None);
+        assert_eq!(absent.status, Status::Ok);
+        assert_eq!(
+            absent.detail,
+            "no sync manifest — `a2a sync skills`/`a2a sync mcp` have not run"
+        );
+
+        let corrupt = sync_state_verdict(Some(Err(
+            "/home/mike/.a2a/sync-manifest.json: expected value at line 1 column 1",
+        )));
+        assert_eq!(corrupt.status, Status::Warn, "a broken ledger is not a spawn blocker");
+        assert!(corrupt.detail.contains("/home/mike/.a2a/sync-manifest.json"));
+        assert!(corrupt.detail.contains("expected value"), "{}", corrupt.detail);
+        assert_eq!(
+            corrupt.remedy.as_deref(),
+            Some(crate::sync::manifest::CORRUPT_REMEDY),
+            "one sentence, from the loader and from here"
+        );
+
+        let clean = DriftSummary {
+            entries: 4,
+            last_synced_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-18T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            ..DriftSummary::default()
+        };
+        let ok = sync_state_verdict(Some(Ok(&clean)));
+        assert_eq!(ok.status, Status::Ok);
+        assert!(ok.detail.contains('4'), "{}", ok.detail);
+        assert!(ok.detail.contains("2026-08-18T10:00:00"), "{}", ok.detail);
+        assert!(ok.remedy.is_none());
+
+        // An empty-but-present ledger is still `ok`, and says when it last ran.
+        let never = sync_state_verdict(Some(Ok(&DriftSummary::default())));
+        assert_eq!(never.status, Status::Ok);
+        assert!(never.detail.contains("never"), "{}", never.detail);
+    }
+
+    /// Each of the four drift conditions warns on its own, the counts are named
+    /// in the report, and the remedy names only the kinds that are affected.
+    #[test]
+    fn sync_state_warns_on_each_drift_condition_and_never_fails() {
+        let base = DriftSummary {
+            entries: 3,
+            kinds_affected: vec![crate::sync::Kind::Skill],
+            ..DriftSummary::default()
+        };
+        let cases = [
+            DriftSummary { drifted: 2, missing_dest: 1, ..base.clone() },
+            DriftSummary { missing_dest: 1, ..base.clone() },
+            DriftSummary { orphaned_source: 1, ..base.clone() },
+            DriftSummary { ignore_block_uncovered: true, ..base.clone() },
+        ];
+        for summary in &cases {
+            let c = sync_state_verdict(Some(Ok(summary)));
+            assert_eq!(c.status, Status::Warn, "{:?}", summary);
+            assert_eq!(c.remedy.as_deref(), Some("a2a sync skills"));
+        }
+
+        let named = sync_state_verdict(Some(Ok(&DriftSummary {
+            drifted: 2,
+            missing_dest: 1,
+            ignore_block_uncovered: true,
+            kinds_affected: vec![crate::sync::Kind::Skill, crate::sync::Kind::Mcp],
+            ..base
+        })));
+        assert!(
+            named
+                .detail
+                .contains("2 drifted, 1 missing, 0 orphaned sources, ignore block uncovered"),
+            "{}",
+            named.detail
+        );
+        assert_eq!(
+            named.remedy.as_deref(),
+            Some("a2a sync skills / a2a sync mcp")
+        );
+
+        // A stale mirror never stops a spawn.
+        for c in [
+            sync_state_verdict(None),
+            sync_state_verdict(Some(Err("broken"))),
+            sync_state_verdict(Some(Ok(&cases[0]))),
+        ] {
+            assert_ne!(c.status, Status::Fail, "{}", c.detail);
+        }
     }
 
     #[test]

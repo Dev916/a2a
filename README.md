@@ -53,7 +53,10 @@ a2a doctor
 ✓ codex_home_match  app-server and CLI agree on /Users/you/.codex
 ✓ broker_status  not running — start-on-demand from /Users/you/.local/bin/a2a
 ⚠ auth_mode  OPENAI_API_KEY is exported — a2a scrubs it from every child …
-10 check(s): 8 ok, 2 warn, 0 fail
+✓ context_canon  CLAUDE.md in /Users/you/dev/proj imports @AGENTS.md
+✓ codex_config_secrets  2 secret-shaped line(s) in /Users/you/.codex/config.toml, which git does not track
+✓ sync_state  12 manifest entry(s), every destination as a2a left it; last synced 2026-08-18T10:04:11+00:00
+13 check(s): 11 ok, 2 warn, 0 fail
 ```
 
 One line per check; **exit 9 if any check fails** (warnings do not fail). Run it
@@ -61,6 +64,11 @@ first — it creates the home tree (0700), performs a real `codex app-server`
 handshake, and catches the version-coupled transport mismatch before a worker
 does. `app_server_handshake` failing is a warning, not an error: it means every
 spawn will quietly take the exec fallback.
+
+On a machine whose `~/.codex/config.toml` is **tracked by git** and carries a
+credential, `codex_config_secrets` fails and `a2a doctor` **exits 9** until
+`a2a sync mcp --migrate-untrack` has been run — it names the file and the line
+numbers, never the values.
 
 ### 3. Spawn a worker
 

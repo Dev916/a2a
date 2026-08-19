@@ -159,15 +159,136 @@ impl Manifest {
     }
 }
 
+/// What to do about a ledger a2a cannot read, spelled **once**.
+///
+/// `doctor`'s `sync_state` check reports the same condition from a different
+/// direction (a warning in a preflight rather than a refusal in a run), and two
+/// sentences saying the same thing slightly differently is how an operator ends
+/// up believing they are two problems.
+pub const CORRUPT_REMEDY: &str = "move sync-manifest.json aside and re-run the sync — a2a will only re-adopt what it can prove it wrote";
+
 fn corrupt(path: &Path, detail: impl std::fmt::Display) -> AppError {
     AppError::new(
         "SYNC_MANIFEST_CORRUPT",
         ExitCode::Precondition,
         format!("{}: {detail}", path.display()),
     )
-    .remedy(
-        "move sync-manifest.json aside and re-run the sync — a2a will only re-adopt what it can prove it wrote",
-    )
+    .remedy(CORRUPT_REMEDY)
+}
+
+// ---------------------------------------------------------------------------
+// What `doctor` reports about the ledger
+// ---------------------------------------------------------------------------
+
+/// One look at the ledger and its destinations, as counts and booleans —
+/// **never** as content.
+///
+/// It lives here rather than next to the check that prints it because every
+/// question it answers is a question about ownership, and a summary computed in
+/// `doctor` would be a second implementation of the rules this file exists to
+/// hold. That also makes `doctor`'s `sync_state` a pure function of this value,
+/// testable at every branch with no tree on disk.
+#[derive(Default, PartialEq, Eq, Clone, Debug)]
+pub struct DriftSummary {
+    pub entries: usize,
+    /// Destinations whose content no longer hashes to what the ledger recorded.
+    pub drifted: usize,
+    /// Destinations the ledger owns that are not there at all.
+    pub missing_dest: usize,
+    /// **Skills only — an mcp entry can never contribute to this count.**
+    /// [`drift_summary`] is given a codex home and no Claude source path, so it
+    /// has no way to know whether a *server* left `.claude.json`; the file the
+    /// ledger names is the whole 200 KB config, whose presence says nothing
+    /// about one server. A count that silently meant "skills" would be worse
+    /// than one that says so.
+    pub orphaned_source: usize,
+    /// The skills repository's managed `.gitignore` block does not cover every
+    /// directory the ledger owns — i.e. a managed skill is visible to that
+    /// repository's `git status` and can be committed by accident.
+    pub ignore_block_uncovered: bool,
+    pub last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which kinds any of the above was found in, sorted and deduplicated, so a
+    /// report can name `a2a sync skills` and `a2a sync mcp` only when they are
+    /// the commands that would actually fix something.
+    pub kinds_affected: Vec<Kind>,
+}
+
+/// Compare every entry in the ledger with what is at its destination today.
+///
+/// Reading only, and never into the report: this hashes trees and TOML tables
+/// and reports counts. It is deliberately tolerant of a codex home that is
+/// missing or unparseable — a preflight that failed because a destination was
+/// gone would be reporting the very thing it exists to describe.
+pub fn drift_summary(manifest: &Manifest, codex_home: &Path) -> DriftSummary {
+    let mut summary = DriftSummary {
+        entries: manifest.entries.len(),
+        last_synced_at: manifest.entries.values().map(|e| e.synced_at).max(),
+        ..DriftSummary::default()
+    };
+    let mut affected: std::collections::BTreeSet<Kind> = std::collections::BTreeSet::new();
+
+    for (_, entry) in manifest.entries_for(Kind::Skill) {
+        if !entry.dest_path.exists() {
+            summary.missing_dest += 1;
+            affected.insert(Kind::Skill);
+        } else if hash_path(&entry.dest_path).ok().as_deref() != Some(entry.dest_hash.as_str()) {
+            summary.drifted += 1;
+            affected.insert(Kind::Skill);
+        }
+        if !entry.source_path.exists() {
+            summary.orphaned_source += 1;
+            affected.insert(Kind::Skill);
+        }
+    }
+
+    // An unreadable or absent `config.toml` is an EMPTY document, which reports
+    // every managed table as missing — true, and the sentence an operator whose
+    // codex home was replaced needs to read.
+    let doc = super::mcp::read_target(codex_home).unwrap_or_default();
+    let names = super::mcp::dest_names(&doc);
+    for (key, entry) in manifest.entries_for(Kind::Mcp) {
+        // The destination's own names are matched FORWARD through
+        // [`Manifest::key`] rather than by taking a key apart: the key spelling
+        // exists in exactly one place, and a server name containing a `:` would
+        // turn any parse of it into a silently wrong answer.
+        let found = names
+            .iter()
+            .find(|name| Manifest::key(Kind::Mcp, &entry.account, name) == **key);
+        match found {
+            None => {
+                summary.missing_dest += 1;
+                affected.insert(Kind::Mcp);
+            }
+            Some(name) => {
+                if super::mcp::dest_hash(&doc, name).as_deref() != Some(entry.dest_hash.as_str()) {
+                    summary.drifted += 1;
+                    affected.insert(Kind::Mcp);
+                }
+            }
+        }
+    }
+
+    // The managed directories come from the ledger, and so does the tree they
+    // live in: `<CODEX_HOME>/skills` is spelled by the applier, and re-deriving
+    // it here would be a second spelling that could drift from it. An empty
+    // ledger manages no directory and therefore cannot be uncovered.
+    let dirs = super::skills::managed_dirs(&super::Plan::default(), manifest);
+    if let Some(root) = manifest
+        .entries_for(Kind::Skill)
+        .next()
+        .and_then(|(_, e)| e.dest_path.parent())
+    {
+        if !dirs.is_empty() {
+            let ignore = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
+            if !super::skills::block_covers(&ignore, &dirs) {
+                summary.ignore_block_uncovered = true;
+                affected.insert(Kind::Skill);
+            }
+        }
+    }
+
+    summary.kinds_affected = affected.into_iter().collect();
+    summary
 }
 
 /// Content and relative layout of a file or directory — deliberately NOT
@@ -473,6 +594,151 @@ mod tests {
         );
         // A file hashes on its own too.
         assert_ne!(hash_path(&binary).unwrap(), before);
+    }
+
+    /// An mcp entry whose source vanished is not a thing this function can
+    /// know: it is given a codex home and no Claude source path, so the file it
+    /// would have to look in is not even named here. The count says "skills"
+    /// out loud rather than quietly meaning it.
+    #[test]
+    fn an_mcp_entry_never_contributes_to_an_orphaned_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join("codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let write = |body: &str| std::fs::write(codex.join("config.toml"), body).unwrap();
+        write("[mcp_servers.linear]\nurl = \"https://mcp.linear.app/mcp\"\n");
+
+        let doc = crate::sync::mcp::read_target(&codex).unwrap();
+        let mut entry = an_entry();
+        entry.kind = Kind::Mcp;
+        // A source path that is not there at all — an ordinary state for the
+        // ledger's `.claude.json` on a machine syncing a second account.
+        entry.source_path = tmp.path().join("gone/.claude.json");
+        entry.dest_path = codex.join("config.toml");
+        entry.dest_hash = crate::sync::mcp::dest_hash(&doc, "linear").unwrap();
+        let mut m = Manifest::default();
+        m.entries
+            .insert(Manifest::key(Kind::Mcp, "default", "linear"), entry);
+
+        let clean = drift_summary(&m, &codex);
+        assert_eq!(clean.entries, 1);
+        assert_eq!(clean.orphaned_source, 0, "mcp entries contribute 0, always");
+        assert_eq!((clean.drifted, clean.missing_dest), (0, 0));
+        assert!(!clean.ignore_block_uncovered, "no skill dirs, nothing to cover");
+        assert_eq!(clean.kinds_affected, Vec::<Kind>::new());
+        assert!(clean.last_synced_at.is_some());
+
+        // A table edited underneath the ledger is drift ...
+        write("[mcp_servers.linear]\nurl = \"https://elsewhere/mcp\"\n");
+        let drifted = drift_summary(&m, &codex);
+        assert_eq!((drifted.drifted, drifted.missing_dest), (1, 0));
+        assert_eq!(drifted.kinds_affected, vec![Kind::Mcp]);
+        assert_eq!(drifted.orphaned_source, 0);
+
+        // ... and a table that is gone is missing, which is a different verdict.
+        write("model = \"gpt-5-codex\"\n");
+        let missing = drift_summary(&m, &codex);
+        assert_eq!((missing.drifted, missing.missing_dest), (0, 1));
+    }
+
+    /// The three skill-side conditions, each counted once and each naming its
+    /// kind — a summary that reported four warnings for one broken entry would
+    /// teach an operator to skim it.
+    #[test]
+    fn drift_summary_counts_a_drifted_a_missing_and_an_orphaned_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("codex/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let source = tmp.path().join("src/techniques");
+        copy_tree(&fixture_skill(), &source);
+
+        let skill = |name: &str, dest_exists: bool, source_path: &Path| {
+            let dest = skills.join(name);
+            if dest_exists {
+                copy_tree(&fixture_skill(), &dest);
+            }
+            let mut e = an_entry();
+            e.source_path = source_path.to_path_buf();
+            e.dest_path = dest.clone();
+            e.dest_hash = hash_path(&fixture_skill()).unwrap();
+            e
+        };
+        let mut m = Manifest::default();
+        m.entries.insert(
+            Manifest::key(Kind::Skill, "default", "clean"),
+            skill("clean", true, &source),
+        );
+        m.entries.insert(
+            Manifest::key(Kind::Skill, "default", "drifted"),
+            skill("drifted", true, &source),
+        );
+        m.entries.insert(
+            Manifest::key(Kind::Skill, "default", "gone"),
+            skill("gone", false, &source),
+        );
+        m.entries.insert(
+            Manifest::key(Kind::Skill, "default", "orphan"),
+            skill("orphan", true, &tmp.path().join("src/deleted")),
+        );
+        std::fs::write(skills.join("drifted/SKILL.md"), "somebody edited this").unwrap();
+
+        let s = drift_summary(&m, &tmp.path().join("codex"));
+        assert_eq!(s.entries, 4);
+        assert_eq!(s.drifted, 1, "only the edited destination");
+        assert_eq!(s.missing_dest, 1, "only the destination that is not there");
+        assert_eq!(s.orphaned_source, 1, "only the entry whose source went away");
+        assert_eq!(s.kinds_affected, vec![Kind::Skill]);
+    }
+
+    /// The containment block is checked against the ledger's OWN directories,
+    /// read out of the entries rather than out of a second spelling of
+    /// `<CODEX_HOME>/skills` — and an empty ledger has nothing to cover, which
+    /// is not the same as an uncovered one.
+    #[test]
+    fn the_ignore_block_is_uncovered_only_when_a_managed_dir_is_missing_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join("codex");
+        let skills = codex.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+
+        assert!(
+            !drift_summary(&Manifest::default(), &codex).ignore_block_uncovered,
+            "an empty ledger manages no directory"
+        );
+
+        let mut m = Manifest::default();
+        for name in ["one", "two"] {
+            copy_tree(&fixture_skill(), &skills.join(name));
+            let mut e = an_entry();
+            e.source_path = fixture_skill();
+            e.dest_path = skills.join(name);
+            e.dest_hash = hash_path(&fixture_skill()).unwrap();
+            m.entries
+                .insert(Manifest::key(Kind::Skill, "default", name), e);
+        }
+        assert!(
+            drift_summary(&m, &codex).ignore_block_uncovered,
+            "no .gitignore at all covers nothing"
+        );
+
+        let dirs = ["one".to_string(), "two".to_string()];
+        std::fs::write(
+            skills.join(".gitignore"),
+            crate::sync::skills::managed_block(&dirs),
+        )
+        .unwrap();
+        let covered = drift_summary(&m, &codex);
+        assert!(!covered.ignore_block_uncovered);
+        assert_eq!(covered.kinds_affected, Vec::<Kind>::new());
+
+        std::fs::write(
+            skills.join(".gitignore"),
+            crate::sync::skills::managed_block(&dirs[..1]),
+        )
+        .unwrap();
+        let half = drift_summary(&m, &codex);
+        assert!(half.ignore_block_uncovered, "one dir short is uncovered");
+        assert_eq!(half.kinds_affected, vec![Kind::Skill]);
     }
 
     /// An mcp entry's `source_hash` is about ONE server. Two servers in the

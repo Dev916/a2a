@@ -5,10 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The ten checks, in report order: Phase 1's six (unchanged ids, unchanged
-/// order) then Phase 2's four. This list IS the contract `doctor --json`
-/// publishes — a phase that adds a check adds it here in the same commit.
-const CHECK_IDS: [&str; 10] = [
+/// The thirteen checks, in report order: Phase 1's six (unchanged ids,
+/// unchanged order), then Phase 2's four, then Phase 3's three. This list IS
+/// the contract `doctor --json` publishes — a phase that adds a check adds it
+/// here in the same commit.
+const CHECK_IDS: [&str; 13] = [
     "codex_present",
     "codex_version",
     "layout_version",
@@ -19,6 +20,9 @@ const CHECK_IDS: [&str; 10] = [
     "codex_home_match",
     "broker_status",
     "auth_mode",
+    "context_canon",
+    "codex_config_secrets",
+    "sync_state",
 ];
 
 /// `a2a --json doctor` with the two ambient facts the Phase-2 checks read
@@ -55,7 +59,7 @@ fn detail(v: &serde_json::Value, id: &str) -> String {
 }
 
 #[test]
-fn all_ok_with_stub_exits_zero_and_lists_ten_checks() {
+fn all_ok_with_stub_exits_zero_and_lists_thirteen_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |_| {});
     assert_eq!(code, 0);
@@ -299,4 +303,271 @@ fn wait_for_socket(home: &Path) {
         assert!(Instant::now() < deadline, "the broker never bound its socket");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ------------------------------------------------------- the phase-3 checks
+
+/// Copied verbatim from `tests/sync_migrate.rs`, where the migration this
+/// check's remedy names is tested: a hand-written `config.toml` with two
+/// secret-shaped lines, at 1-based **14** and **18**. Each `tests/*.rs` is its
+/// own crate, so the const is duplicated rather than shared — and both copies
+/// are pinned by the same two line numbers.
+const SECRET_CONFIG: &str = r#"# The codex home's own config.toml, hand written, and tracked by git.
+model = "gpt-5-codex"
+
+[tui]
+notifications = true
+
+[mcp_servers.mx]
+# mx exists on BOTH sides. a2a did not write this table and must never touch it.
+command = "mx"
+args = ["mcp"]
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+http_headers = { Authorization = "Bearer FAKEcontext7keyFAKEcontext7key" }
+
+[mcp_servers.gh]
+command = "gh-mcp"
+env = { GITHUB_TOKEN = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+"#;
+
+/// The two literals on lines 14 and 18. Neither may appear anywhere in a
+/// `doctor --json` payload, in any state of the repository.
+const CONFIG_SECRETS: [&str; 2] = [
+    "Bearer FAKEcontext7keyFAKEcontext7key",
+    "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+];
+
+/// A developer's global `core.excludesFile` changes what `git check-ignore`
+/// answers, and their hooks and templates would otherwise run inside a fixture
+/// repository. Every process that shells out to git — the test's own `git` and
+/// the binary under test — gets this.
+fn nowhere(tmp: &Path) -> std::path::PathBuf {
+    tmp.join("no-such-gitconfig")
+}
+
+fn hermetic_git(c: &mut assert_cmd::Command, tmp: &Path) {
+    c.env("GIT_CONFIG_GLOBAL", nowhere(tmp))
+        .env("GIT_CONFIG_SYSTEM", nowhere(tmp));
+}
+
+fn git(dir: &Path, tmp: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.email=a2a@test",
+            "-c",
+            "user.name=a2a",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", nowhere(tmp))
+        .env("GIT_CONFIG_SYSTEM", nowhere(tmp))
+        .output()
+        .expect("git is on PATH");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A codex home that is a git repository whose `config.toml` is **committed** —
+/// the exact state of this machine's real `~/.codex`, and the one the check
+/// exists for.
+fn tracked_secret_home(tmp: &Path) -> std::path::PathBuf {
+    let codex_home = tmp.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(codex_home.join("config.toml"), SECRET_CONFIG).unwrap();
+    git(&codex_home, tmp, &["init", "-q", "-b", "main"]);
+    git(&codex_home, tmp, &["add", "config.toml"]);
+    git(&codex_home, tmp, &["commit", "-qm", "codex home"]);
+    codex_home
+}
+
+/// The fixture Claude source, copied to the spelling `sync mcp` reads
+/// (`<dir>/.claude.json`).
+fn fixture_claude_dir(tmp: &Path) -> std::path::PathBuf {
+    let dir = tmp.join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sync/claude.json"),
+        dir.join(".claude.json"),
+    )
+    .unwrap();
+    dir
+}
+
+/// Doctor's first security-class `fail`: a credential in a file git publishes
+/// is a hard-rule violation whether or not a spawn would succeed.
+#[test]
+fn a_tracked_config_toml_carrying_a_secret_fails_exit_9() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_home = tracked_secret_home(tmp.path());
+    let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |c| {
+        c.env("CODEX_HOME", &codex_home);
+        hermetic_git(c, tmp.path());
+    });
+    assert_eq!(code, 9, "a published credential is fatal");
+    assert_eq!(check(&v, "codex_config_secrets")["status"], "fail");
+
+    let d = detail(&v, "codex_config_secrets");
+    assert!(
+        d.contains(&*codex_home.join("config.toml").to_string_lossy()),
+        "the path is named: {d}"
+    );
+    assert!(d.contains("lines 14, 18"), "1-based line numbers only: {d}");
+    assert_eq!(
+        check(&v, "codex_config_secrets")["remedy"],
+        "a2a sync mcp --migrate-untrack"
+    );
+
+    // The whole payload, not merely the one detail: a value that leaked into
+    // any other field would be just as published.
+    let payload = v.to_string();
+    for secret in CONFIG_SECRETS {
+        assert!(
+            !payload.contains(secret),
+            "doctor names lines, never values — found {secret} in {payload}"
+        );
+    }
+}
+
+/// ... and the remedy it prints actually clears it.
+#[test]
+fn migrate_untrack_flips_the_secret_check_to_ok_and_the_exit_to_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_home = tracked_secret_home(tmp.path());
+    let claude_dir = fixture_claude_dir(tmp.path());
+    let home = tmp.path().join("h");
+
+    // Built by `sync_a2a` with an explicit fixture Claude dir: `checks()` knows
+    // nothing about a Claude source, and a bare `a2a` here would be answered by
+    // the SYNC_REFUSES_REAL_HOME guard instead of testing the behaviour.
+    let mut c = sync_a2a(&home, &codex_home, &claude_dir, tmp.path());
+    hermetic_git(&mut c, tmp.path());
+    let out = c
+        .args(["--json", "sync", "mcp", "--migrate-untrack"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let (v, code) = checks(&home, tmp.path(), |c| {
+        c.env("CODEX_HOME", &codex_home);
+        hermetic_git(c, tmp.path());
+    });
+    assert_eq!(code, 0, "nothing published, nothing fatal");
+    assert_eq!(check(&v, "codex_config_secrets")["status"], "ok");
+    assert!(
+        detail(&v, "codex_config_secrets").contains("which git does not track"),
+        "{}",
+        detail(&v, "codex_config_secrets")
+    );
+    let payload = v.to_string();
+    for secret in CONFIG_SECRETS {
+        assert!(!payload.contains(secret), "{secret}");
+    }
+}
+
+/// The context-canon nudge, from the process's cwd — ok when `CLAUDE.md`
+/// imports `@AGENTS.md`, warn (never fail) when it does not.
+#[test]
+fn context_canon_is_ok_with_an_agents_import_and_warns_without_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let importing = tmp.path().join("importing");
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&importing).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(importing.join("CLAUDE.md"), "@AGENTS.md\n\n# Project\n").unwrap();
+    std::fs::write(plain.join("CLAUDE.md"), "# Project\n\nlocal notes\n").unwrap();
+
+    let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |c| {
+        c.current_dir(&importing);
+    });
+    assert_eq!(code, 0);
+    assert_eq!(check(&v, "context_canon")["status"], "ok");
+
+    let (v, code) = checks(&tmp.path().join("h2"), tmp.path(), |c| {
+        c.current_dir(&plain);
+    });
+    assert_eq!(code, 0, "an un-migrated repo is nudged, never blocked");
+    assert_eq!(check(&v, "context_canon")["status"], "warn");
+    assert!(
+        detail(&v, "context_canon").contains("Codex workers read AGENTS.md"),
+        "{}",
+        detail(&v, "context_canon")
+    );
+}
+
+/// A ledger whose destination moved underneath it warns — and says how many of
+/// each thing, so the operator knows which sync to re-run.
+#[test]
+fn a_drifted_manifest_entry_warns_in_sync_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("h");
+    let source = tmp.path().join("src/techniques");
+    let dest = tmp.path().join("codex/skills/techniques");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(source.join("SKILL.md"), "source").unwrap();
+    std::fs::write(dest.join("SKILL.md"), "somebody edited this").unwrap();
+
+    let (v, _) = checks(&home, tmp.path(), |_| {}); // creates the home tree
+    assert_eq!(check(&v, "sync_state")["status"], "ok");
+    assert!(detail(&v, "sync_state").contains("no sync manifest"));
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "entries": {
+            "skill:default:techniques": {
+                "source_path": source,
+                "dest_path": dest,
+                "source_hash": "0000",
+                "dest_hash": "not-the-hash-on-disk",
+                "synced_at": "2026-08-18T10:00:00Z",
+                "tool_version": "0.1.0",
+                "kind": "skill",
+                "account": "default",
+            }
+        }
+    });
+    std::fs::write(home.join("sync-manifest.json"), manifest.to_string()).unwrap();
+
+    let (v, code) = checks(&home, tmp.path(), |_| {});
+    assert_eq!(code, 0, "a stale mirror does not stop a spawn");
+    assert_eq!(check(&v, "sync_state")["status"], "warn");
+    let d = detail(&v, "sync_state");
+    assert!(d.contains("1 drifted"), "{d}");
+    assert!(d.contains("0 missing"), "the counts are named, not summed: {d}");
+    assert_eq!(check(&v, "sync_state")["remedy"], "a2a sync skills");
+}
+
+/// The third input state: a ledger a2a cannot read is the one condition that
+/// costs the user every future update, so it may never be reported as `ok`.
+#[test]
+fn a_corrupt_manifest_warns_in_sync_state_and_names_the_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("h");
+    checks(&home, tmp.path(), |_| {}); // creates the home tree
+    let path = home.join("sync-manifest.json");
+    std::fs::write(&path, "{ this is not the ledger you left").unwrap();
+
+    let (v, code) = checks(&home, tmp.path(), |_| {});
+    assert_eq!(code, 0);
+    assert_eq!(check(&v, "sync_state")["status"], "warn");
+    let d = detail(&v, "sync_state");
+    assert!(d.contains(&*path.to_string_lossy()), "{d}");
+    assert_eq!(
+        check(&v, "sync_state")["remedy"],
+        "move sync-manifest.json aside and re-run the sync — a2a will only re-adopt what it can prove it wrote"
+    );
 }

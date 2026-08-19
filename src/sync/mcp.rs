@@ -736,7 +736,12 @@ fn already_ignored(codex_home: &Path) -> bool {
 ///
 /// A file that cannot be read reports nothing: this feeds a reminder, and a
 /// reminder is not the place to fail a run.
-fn secret_lines(target: &Path) -> Vec<usize> {
+///
+/// `pub(crate)` for `doctor`'s `codex_config_secrets` check, which asks the same
+/// question about the same file and must get the same answer — two scanners
+/// disagreeing about which lines carry a credential is the failure that would
+/// make the check's line numbers untrustworthy.
+pub(crate) fn secret_lines(target: &Path) -> Vec<usize> {
     let Ok(text) = std::fs::read_to_string(target) else {
         return Vec::new();
     };
@@ -1167,6 +1172,24 @@ fn dest_item<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a Item> {
 /// destination happens to use.
 pub fn dest_hash(doc: &DocumentMut, name: &str) -> Option<String> {
     dest_item(doc, name).map(item_hash)
+}
+
+/// Every server name the destination document defines, in document order.
+///
+/// Exists so the ledger's mcp entries can be matched back to their destinations
+/// **forwards**, through [`Manifest::key`](super::manifest::Manifest::key): a
+/// caller reads a name here, rebuilds the key it would have, and asks the map.
+/// Nothing in the crate takes a manifest key apart, which is what keeps a
+/// server name containing a `:` from resolving to a silently wrong entry.
+pub fn dest_names(doc: &DocumentMut) -> Vec<String> {
+    let Some(table) = doc.get(SERVERS_TABLE).and_then(|item| item.as_table_like()) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .filter(|(_, item)| !item.is_none())
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 fn item_hash(item: &Item) -> String {

@@ -39,9 +39,11 @@
 //! Everything here is pure: no IO, no clock, no config lookups.
 
 use crate::config::Lane;
+use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 /// A parsed brief: front-matter fields plus the Markdown body after the fence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -144,6 +146,44 @@ pub fn validate(brief: &Brief, lane: Lane) -> Result<(), Vec<&'static str>> {
     }
 }
 
+/// The spec §4.7 `BLOCKED:` marker, as a regex over ONE line.
+///
+/// It is applied to the last non-empty line of a final agent message and to
+/// nothing else — see [`blocked_marker`] for why.
+pub const BLOCKED_MARKER_RE: &str = r"^BLOCKED:[ \t]*(.*)$";
+
+static BLOCKED_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(BLOCKED_MARKER_RE).expect("the §4.7 marker must compile"));
+
+/// The §4.7 marker on the LAST non-empty line of a final agent message.
+///
+/// **Observational only.** `outbox/<seq>.question.json` is what drives the
+/// `awaiting-input{blocked}` transition (spec §4.7, and a recorded Phase-5
+/// deferral): a turn that ends with the marker and no file has not asked
+/// anybody anything, and a matcher that could move the FSM would make prose
+/// into control flow. Nothing in the FSM or the reconcile path calls this — it
+/// exists so the prompt-contract eval tier can *score* a run, and so an
+/// operator reading a result knows the marker was seen.
+///
+/// **Last non-empty line, and only that.** A mid-message `BLOCKED:` is ignored
+/// on purpose: models narrate ("if I am BLOCKED: I will write a question"), and
+/// a matcher that fired anywhere in the text would classify a worker that
+/// finished cleanly as blocked. Trailing blank lines are tolerated because a
+/// final message almost always has one, and `\r\n` because `str::lines` is what
+/// splits here and it strips the carriage return.
+///
+/// `Some("")` for a bare `BLOCKED:` is deliberate — the marker was present, the
+/// reason was not. That is a different fact from no marker at all.
+pub fn blocked_marker(final_message: &str) -> Option<String> {
+    let last = final_message
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?;
+    BLOCKED_MARKER
+        .captures(last)
+        .map(|caps| caps[1].to_string())
+}
+
 /// Hex-encoded SHA-256 of `text` — the `brief_sha` recorded at spawn, which
 /// pins a brief as immutable for the life of the worker.
 pub fn sha256_hex(text: &str) -> String {
@@ -238,6 +278,43 @@ mod tests {
         assert!(validate(&ac_only, Lane::Review).is_ok()); // review needs AC only
         assert!(validate(&empty, Lane::Research).is_ok());
         assert!(validate(&empty, Lane::General).is_ok());
+    }
+
+    /// The four §4.7 pins, stated literally. The third one — a bare `BLOCKED:`
+    /// answering `Some("")` — is the one that would quietly become `None` under
+    /// a "reason must be non-empty" refactor, and it is exactly the case an
+    /// operator most needs to see.
+    #[test]
+    fn blocked_marker_reads_the_last_non_empty_line_only() {
+        assert_eq!(
+            blocked_marker("done some work\nBLOCKED: needs a decision\n"),
+            Some("needs a decision".to_string())
+        );
+        assert_eq!(
+            blocked_marker("BLOCKED: mid\nand then more text"),
+            None,
+            "mid-message occurrences are ignored"
+        );
+        assert_eq!(blocked_marker("BLOCKED:"), Some(String::new()));
+        assert_eq!(
+            blocked_marker("work\r\nBLOCKED: crlf reason\r\n\r\n  \n"),
+            Some("crlf reason".to_string()),
+            "trailing blank lines and \\r\\n are tolerated"
+        );
+    }
+
+    /// The tab half of `[ \t]*`, the empty haystack, and a line that merely
+    /// mentions the word — the three ways a looser matcher would be wrong.
+    #[test]
+    fn blocked_marker_edges() {
+        assert_eq!(
+            blocked_marker("BLOCKED:\twith a tab"),
+            Some("with a tab".to_string())
+        );
+        assert_eq!(blocked_marker(""), None);
+        assert_eq!(blocked_marker("\n\n   \n"), None);
+        assert_eq!(blocked_marker("I am not BLOCKED: really"), None);
+        assert_eq!(blocked_marker("blocked: lowercase"), None);
     }
 
     #[test]

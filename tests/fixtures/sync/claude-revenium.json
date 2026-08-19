@@ -1,0 +1,58 @@
+{
+  "numStartups": 7,
+  "installMethod": "fixture",
+  "projects": {
+    "/Users/fixture/dev/revenium": {
+      "allowedTools": [],
+      "hasTrustDialogAccepted": true
+    }
+  },
+  "mcpServers": {
+    "Neon": {
+      "type": "http",
+      "url": "https://mcp.neon.tech/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-fakeneonrevenium0000000000000000000"
+      }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-fakelinearrevenium00000000000000000"
+      }
+    },
+    "context-lake": {
+      "type": "http",
+      "url": "https://context-lake.fixture.internal/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-fakelake00000000000000000000000000"
+      }
+    },
+    "ghl": {
+      "type": "http",
+      "url": "https://services.leadconnectorhq.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer sk-fakeghlrevenium000000000000000000",
+        "locationId": "FAKErev000000000fake"
+      }
+    },
+    "atlassian": {
+      "command": "uvx",
+      "args": ["mcp-atlassian"],
+      "env": {
+        "CONFLUENCE_URL": "https://revenium.atlassian.net/wiki",
+        "CONFLUENCE_USERNAME": "fixture@revenium.example",
+        "CONFLUENCE_API_TOKEN": "ghp_111111111111111111111111111111111111",
+        "JIRA_API_TOKEN": "FAKEreveniumjiratokenFAKEtoken"
+      }
+    },
+    "mx": {
+      "command": "mx",
+      "args": ["mcp"],
+      "env": {
+        "MECH_CRATE_ROOT": "/fixture/mech-crate"
+      }
+    }
+  }
+}

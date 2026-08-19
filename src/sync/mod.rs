@@ -19,6 +19,7 @@
 //! instead of `set_var` in a shared test binary.
 
 pub mod manifest;
+pub mod mcp;
 pub mod skills;
 
 use crate::output::{AppError, ExitCode};

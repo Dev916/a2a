@@ -242,9 +242,11 @@ fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> 
 /// server, so an unrelated edit anywhere in it would mark every server changed
 /// and the `unchanged` disposition would never fire again.
 ///
-/// Takes anything serializable so the mcp module's `SourceServer` projection
-/// can be hashed directly (`canonical_server_hash(&server)`), with no second
-/// spelling of the normalization living next to the reader.
+/// Takes anything serializable so the mcp module's [`super::mcp::SourceServer`]
+/// projection can be hashed directly (`canonical_server_hash(&server)`), with no
+/// second spelling of the normalization living next to the reader. Hashing the
+/// projection rather than the raw JSON object is deliberate: a key Claude adds
+/// to a server object next release is not drift in a server a2a already syncs.
 pub fn canonical_server_hash(server: &impl Serialize) -> String {
     let value = serde_json::to_value(server).expect("a source server projection always serializes");
     let mut canonical = String::new();

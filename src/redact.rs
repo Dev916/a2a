@@ -138,6 +138,30 @@ pub fn redact_egress(text: &str) -> String {
     out
 }
 
+/// Whether a KEY NAME alone is grounds for treating its value as a credential.
+///
+/// The value shapes above catch a token that announces itself (`sk-…`,
+/// `ghp_…`). This catches the far more common case where the value announces
+/// nothing and only the name knows: Ground truth's `CONFLUENCE_API_TOKEN` holds
+/// 192 opaque characters matching no shape in [`VALUE_RULES`]. `sync mcp` takes
+/// a value to be secret when EITHER fires, which is deny-by-default in the
+/// direction that matters — a false positive costs one env-var indirection, a
+/// false negative writes a live credential into a git-published file.
+///
+/// Deliberately narrow on the whole-name list. `KEY` on its own is an ordinary
+/// variable name (a map key, a sort key, a cache key), and a rule that fired on
+/// it would be one operators learn to override — which is how a rule stops
+/// protecting anything. Suffix rules carry their separator (`_KEY`, not `KEY`)
+/// for exactly the same reason: `MONKEY` is not a credential.
+pub fn is_secret_key(name: &str) -> bool {
+    /// Matched against the whole name.
+    const EXACT: [&str; 5] = ["PASSWORD", "TOKEN", "SECRET", "APIKEY", "API_KEY"];
+    /// Matched against the end of the name, separator included.
+    const SUFFIXES: [&str; 4] = ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"];
+    let upper = name.to_ascii_uppercase();
+    EXACT.contains(&upper.as_str()) || SUFFIXES.iter().any(|s| upper.ends_with(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +273,45 @@ mod tests {
         assert_eq!(once, "k=[REDACTED:20]");
         // the placeholder itself must not look like a secret to a second pass
         assert_eq!(redact_egress(&once), once);
+    }
+
+    /// Both directions, against the real key names Ground truth found in
+    /// `~/.claude.json` — the negatives matter as much as the positives, since
+    /// a rule that flags `CONFLUENCE_URL` is a rule that gets turned off.
+    #[test]
+    fn secret_key_names_are_recognized_and_ordinary_ones_are_not() {
+        for secret in [
+            "CONFLUENCE_API_TOKEN",
+            "JIRA_API_TOKEN",
+            "GOOGLE_OAUTH_CLIENT_SECRET",
+            "GHL_PRIVATE_KEY",
+            "DB_PASSWORD",
+            "PASSWORD",
+            "TOKEN",
+            "SECRET",
+            "APIKEY",
+            "API_KEY",
+            // Case is not part of the rule.
+            "token",
+            "Confluence_Api_Token",
+            "db_password",
+        ] {
+            assert!(is_secret_key(secret), "missed: {secret}");
+        }
+        for ordinary in [
+            "CONFLUENCE_URL",
+            "CONFLUENCE_USERNAME",
+            "OAUTHLIB_INSECURE_TRANSPORT",
+            "MECH_CRATE_ROOT",
+            "XCODEBUILDMCP_ENABLED_WORKFLOWS",
+            "PATH",
+            "KEY_PATH",
+            "TOKENIZER",
+            "MONKEY",
+            "SECRETARY",
+            "locationId",
+        ] {
+            assert!(!is_secret_key(ordinary), "false positive: {ordinary}");
+        }
     }
 }

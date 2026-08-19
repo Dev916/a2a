@@ -1,0 +1,90 @@
+{
+  "numStartups": 42,
+  "installMethod": "fixture",
+  "tipsHistory": { "ide-hotkey": 7 },
+  "projects": {
+    "/Users/fixture/dev/a2a": {
+      "allowedTools": [],
+      "hasTrustDialogAccepted": true
+    }
+  },
+  "mcpServers": {
+    "Neon": {
+      "type": "http",
+      "url": "https://mcp.neon.tech/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-fakeneon00000000000000000000000000"
+      }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-fakelinear000000000000000000000000"
+      }
+    },
+    "akiflow": {
+      "type": "http",
+      "url": "https://mcp.akiflow.com/mcp"
+    },
+    "hq": {
+      "type": "http",
+      "url": "http://127.0.0.1:7717/mcp"
+    },
+    "ghl": {
+      "type": "http",
+      "url": "https://services.leadconnectorhq.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer sk-fakeghl000000000000000000000000000",
+        "locationId": "FAKEloc000000000fake"
+      }
+    },
+    "atlassian": {
+      "command": "uvx",
+      "args": ["mcp-atlassian"],
+      "env": {
+        "CONFLUENCE_URL": "https://fixture.atlassian.net/wiki",
+        "CONFLUENCE_USERNAME": "fixture@example.com",
+        "CONFLUENCE_API_TOKEN": "ghp_000000000000000000000000000000000000",
+        "JIRA_API_TOKEN": "FAKEjiratokenFAKEjiratokenFAKE"
+      }
+    },
+    "google-workspace": {
+      "command": "uv",
+      "args": ["run", "main.py"],
+      "env": {
+        "GOOGLE_OAUTH_CLIENT_SECRET": "FAKE-google-oauth-client-secret",
+        "OAUTHLIB_INSECURE_TRANSPORT": "1"
+      }
+    },
+    "telegram": {
+      "command": "telegram-mcp",
+      "args": [],
+      "env": {
+        "TELEGRAM_SESSION": "xoxb-000000000000-fakefakefake"
+      }
+    },
+    "mx": {
+      "command": "mx",
+      "args": ["mcp"],
+      "env": {
+        "MECH_CRATE_ROOT": "/fixture/mech-crate"
+      }
+    },
+    "XcodeBuildMCP": {
+      "command": "npx",
+      "args": ["-y", "xcodebuildmcp@latest"],
+      "env": {
+        "XCODEBUILDMCP_ENABLED_WORKFLOWS": "simulator-workspace"
+      }
+    },
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp"]
+    },
+    "malformed": {
+      "type": "unknown-transport",
+      "note": "no command and no url: the shape this reader must carry rather than drop"
+    }
+  }
+}

@@ -159,6 +159,12 @@ pub fn skills(
 pub const BROKER_STALE_WARNING: &str = "the running broker's app-server child read the previous \
      MCP config — run `a2a broker restart`";
 
+/// Said on every `--migrate-untrack --dry-run`, because the classification such
+/// a run prints is the one that applies *before* the migration it is describing.
+pub const DRY_RUN_PRE_MIGRATION_NOTE: &str =
+    "dry run: the classification below is the PRE-migration one — the `skipped-secret` servers \
+     become writable once config.toml is out of git";
+
 /// `a2a sync mcp [--dry-run] [--claude-config-dir <DIR>]`.
 ///
 /// The write is **rendered, validated, then committed**, in that order and
@@ -168,6 +174,15 @@ pub const BROKER_STALE_WARNING: &str = "the running broker's app-server child re
 /// list` creates `<CODEX_HOME>/tmp/` — and only then replaces the file. A codex
 /// that refuses the render leaves the real file exactly where it was; a codex
 /// that cannot answer at all is a warning, not a verdict.
+///
+/// `--migrate-untrack` hangs off the same discipline from the other side. It is
+/// the one flag here that mutates git state, so it runs **after every static
+/// precondition and before the planner**: after, because a run that un-tracked
+/// `config.toml` on its way to discovering there is no `~/.claude.json` would
+/// have made a git-visible change to reach an exit-9 refusal; before, because
+/// [`sync::mcp::classify`] asks git whether the destination is published, and
+/// the whole point of the migration is that the answer changes and the servers
+/// it unblocks are written in the same run.
 pub fn mcp(
     home: &A2aHome,
     dry_run: bool,
@@ -196,24 +211,42 @@ pub fn mcp(
     let source_json = sync::mcp::source_path(&claude_dir);
     let source = sync::mcp::read_source(&source_json)?;
     let mut manifest = Manifest::load(home.root())?;
-    if migrate_untrack {
-        // Every precondition above is checked FIRST on purpose: a run that
-        // un-tracked config.toml before discovering there is no source config
-        // would have made a git-visible mutation on the way to a "precondition
-        // failed" verdict.
-        return Err(AppError::new(
-            "SYNC_MIGRATE_UNIMPLEMENTED",
-            ExitCode::Precondition,
-            "--migrate-untrack is not available in this build",
-        )
-        .remedy("`git rm --cached config.toml` in the codex home does the same thing by hand"));
-    }
+    // Every precondition above is checked FIRST on purpose: a run that
+    // un-tracked config.toml before discovering there is no source config would
+    // have made a git-visible mutation on the way to a "precondition failed"
+    // verdict, and exit 9 is reserved for refusals that touched nothing.
+    let migration = if migrate_untrack {
+        let m = sync::mcp::migrate_untrack(&codex_home, dry_run)?;
+        // Printed HERE rather than with the rest of the report: the mutation
+        // has already happened, and a reminder that a later failure could
+        // swallow is not a reminder.
+        if !quiet {
+            if dry_run {
+                for line in sync::mcp::migration_preview(&codex_home) {
+                    eprintln!("a2a: dry run: would {line}");
+                }
+            }
+            if !m.rotation_reminder.is_empty() {
+                eprintln!("a2a: {}", m.rotation_reminder);
+            }
+        }
+        Some(m)
+    } else {
+        None
+    };
     let account = sync::account_label(&claude_dir, &anchor);
     let target = codex_home.join(sync::mcp::TARGET_FILE);
     let plan = sync::mcp::plan(&source, &codex_home, &manifest, &cfg.sync, &account)?;
 
     let mut warnings: Vec<String> = config_warnings;
     warnings.extend(plan.warnings.iter().cloned());
+    if migrate_untrack && dry_run {
+        // The planner asked git about the destination BEFORE the migration it
+        // is only describing, so every stdio server below is classified against
+        // a still-published file. Saying so beats printing a classification the
+        // real run would contradict.
+        warnings.push(DRY_RUN_PRE_MIGRATION_NOTE.to_string());
+    }
 
     // ------------------------------------------------------------- apply
     let writes = plan
@@ -288,6 +321,10 @@ pub fn mcp(
             // says there is nothing there".
             "validated": validated,
             "broker_config_stale": broker_config_stale,
+            // `null` unless --migrate-untrack was asked for: "not requested"
+            // and "requested, nothing to do" are different facts and a caller
+            // branches on them.
+            "migration": migration,
         })
     } else {
         Value::String(summary)

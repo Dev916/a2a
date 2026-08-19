@@ -499,6 +499,311 @@ pub fn target_is_tracked(codex_home: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// `--migrate-untrack`: taking config.toml out of git, on purpose
+// ---------------------------------------------------------------------------
+
+/// The comment the ignore entry lands under, verbatim.
+///
+/// A marker rather than a bare line because the next person to read that
+/// `.gitignore` is entitled to know which tool put the entry there and which
+/// command to blame; the migration is one-way and nothing here ever removes it.
+pub const GITIGNORE_MARKER: &str = "# a2a: untracked by `a2a sync mcp --migrate-untrack`";
+
+/// The sentence every rotation reminder carries verbatim, so it is greppable in
+/// a transcript months later.
+pub const ROTATION_PHRASE: &str = "already-published secrets must still be rotated";
+
+/// The index-only removal, as an argv array.
+///
+/// **Never `-f`.** `git rm --cached` drops the index entry and leaves the
+/// working file exactly where it is; `-f` (or a plain `git rm`) would delete
+/// the config the machine actually runs on. The `--` is not decoration either:
+/// it is what stops a pathname from ever being read as an option.
+pub const RM_CACHED_ARGV: [&str; 4] = ["rm", "--cached", "--", TARGET_FILE];
+
+/// The ignore file the migration appends to, in the codex home's own root.
+const GITIGNORE_FILE: &str = ".gitignore";
+
+/// What `--migrate-untrack` did — or, under `--dry-run`, did not do.
+///
+/// The three booleans are deliberately about *this run* rather than about the
+/// end state, because the caller has to be able to tell "I untracked it" from
+/// "it was already untracked" from "I would have untracked it": only the first
+/// is a git-visible change somebody now has to commit.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Migration {
+    /// A git-visible change was made by this run. Always false under
+    /// `--dry-run`, and false when there was nothing to do.
+    pub performed: bool,
+    /// `config.toml` is out of git's index now — true after a migration and
+    /// true when it already was, false under `--dry-run`, where nothing moved
+    /// and the classification that follows still sees a published file.
+    pub untracked: bool,
+    /// The managed line was appended by this run (false when the repository
+    /// already ignored the file, by that line or by any other rule).
+    pub gitignore_appended: bool,
+    /// 1-based lines that carried a secret shape BEFORE the migration, sorted
+    /// and deduplicated. Never values — this travels into agent context.
+    pub secret_lines: Vec<usize>,
+    /// The value-free sentence a run prints. Empty when there was no migration
+    /// to remind anybody about.
+    pub rotation_reminder: String,
+}
+
+/// Take `<codex_home>/config.toml` out of git's index and teach the repository
+/// to ignore it, so the stdio credentials [`classify`] refuses to write into a
+/// published file may be written into a private one.
+///
+/// The order is the point, and it is fixed: **confirm, remove from the index,
+/// ignore, remind.** Confirmation first because the two ways this can be
+/// inapplicable are not the same fact — a codex home that is not a repository
+/// is a refusal (`SYNC_MIGRATE_NOT_APPLICABLE`), while a `config.toml` that is
+/// already untracked is the desired end state and returns a no-op so the run
+/// continues into the sync. Re-running the migration must be free, or nobody
+/// will put it in a script.
+///
+/// This is the only function in the module that changes anything outside a
+/// rendered document, and every static precondition of the command it serves is
+/// already checked before it is called.
+pub fn migrate_untrack(codex_home: &Path, dry_run: bool) -> Result<Migration, AppError> {
+    if !is_work_tree(codex_home) {
+        return Err(not_applicable(format!(
+            "{} is not a git repository, so config.toml is not tracked and there is nothing \
+             to untrack",
+            codex_home.display()
+        )));
+    }
+    let target = codex_home.join(TARGET_FILE);
+    // Scanned BEFORE anything moves: the reminder is about what git has already
+    // published, which is a fact about the file as it stands right now.
+    let secret_lines = secret_lines(&target);
+    if !target_is_tracked(codex_home) {
+        // Success-shaped, and silent: the file is already private, so there is
+        // no new publication to warn about and the run has a sync to get on
+        // with.
+        return Ok(Migration {
+            performed: false,
+            untracked: true,
+            gitignore_appended: false,
+            secret_lines,
+            rotation_reminder: String::new(),
+        });
+    }
+    let rotation_reminder = rotation_reminder(&target, &secret_lines);
+    if dry_run {
+        return Ok(Migration {
+            performed: false,
+            untracked: false,
+            gitignore_appended: false,
+            secret_lines,
+            rotation_reminder,
+        });
+    }
+    git_rm_cached(codex_home)?;
+    let gitignore_appended = ensure_ignored(codex_home)?;
+    Ok(Migration {
+        performed: true,
+        untracked: true,
+        gitignore_appended,
+        secret_lines,
+        rotation_reminder,
+    })
+}
+
+/// The git-visible changes a `--migrate-untrack` run would make, as the lines a
+/// `--dry-run` prints.
+///
+/// A free function rather than a [`Migration`] field because a dry run has, by
+/// construction, nothing to report about itself: the struct records what
+/// happened, and these are what would.
+pub fn migration_preview(codex_home: &Path) -> Vec<String> {
+    let mut out = vec![format!(
+        "run `git -C {} {}`, which removes the index entry and leaves the working file alone",
+        codex_home.display(),
+        RM_CACHED_ARGV.join(" ")
+    )];
+    if !already_ignored(codex_home) {
+        out.push(format!(
+            "append a `{TARGET_FILE}` line to {} under `{GITIGNORE_MARKER}`",
+            codex_home.join(GITIGNORE_FILE).display()
+        ));
+    }
+    out
+}
+
+/// Is `codex_home` inside a git work tree at all?
+///
+/// Asked separately from [`target_is_tracked`], which answers false for this
+/// case too: "there is no repository here" and "the repository does not track
+/// this file" need different sentences, and one boolean cannot carry both.
+fn is_work_tree(codex_home: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(codex_home)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+fn git_rm_cached(codex_home: &Path) -> Result<(), AppError> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(codex_home)
+        .args(RM_CACHED_ARGV)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(migrate_failed(format!(
+            "git {}: {}",
+            RM_CACHED_ARGV.join(" "),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ))),
+        Err(e) => Err(migrate_failed(format!(
+            "git {}: {e}",
+            RM_CACHED_ARGV.join(" ")
+        ))),
+    }
+}
+
+/// Append the managed block unless the repository already ignores
+/// `config.toml`, returning whether anything was written.
+fn ensure_ignored(codex_home: &Path) -> Result<bool, AppError> {
+    if already_ignored(codex_home) {
+        return Ok(false);
+    }
+    let path = codex_home.join(GITIGNORE_FILE);
+    let current = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(migrate_failed(format!("{}: {e}", path.display()))),
+    };
+    let mut next = current;
+    if !next.is_empty() {
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push('\n');
+    }
+    next.push_str(GITIGNORE_MARKER);
+    next.push('\n');
+    next.push_str(TARGET_FILE);
+    next.push('\n');
+    // Deliberately a plain write, NOT `store::write_atomic`, for the same
+    // reason the skills applier writes its block that way: a rename would
+    // replace the inode of a file this repository's owner maintains and walk
+    // straight past a mode they set on purpose.
+    std::fs::write(&path, next.as_bytes())
+        .map_err(|e| migrate_failed(format!("{}: {e}", path.display())))?;
+    Ok(true)
+}
+
+/// Does the repository ignore `config.toml` already — by the managed line or by
+/// any other rule the human wrote?
+///
+/// `git check-ignore --no-index` is the truthful question (a `*.toml` in the
+/// repository's own ignore file covers this file just as well as a literal
+/// line), with a plain text scan as the fallback for a git that cannot answer.
+/// Getting this wrong in the permissive direction appends a redundant line;
+/// getting it wrong in the other direction appends one on every single run.
+fn already_ignored(codex_home: &Path) -> bool {
+    let asked = std::process::Command::new("git")
+        .arg("-C")
+        .arg(codex_home)
+        .args(["check-ignore", "-q", "--no-index", "--", TARGET_FILE])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match asked {
+        // 0 = ignored, 1 = not ignored, anything else = git could not answer.
+        Ok(s) if s.code() == Some(0) => true,
+        Ok(s) if s.code() == Some(1) => false,
+        _ => std::fs::read_to_string(codex_home.join(GITIGNORE_FILE))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| matches!(l.trim(), TARGET_FILE | "/config.toml")),
+    }
+}
+
+/// The 1-based lines of `target` that carry a secret shape, sorted and
+/// deduplicated — [`redact::scan_text`] reports one hit per match, and two
+/// rules firing on one line is one line to rotate, not two.
+///
+/// A file that cannot be read reports nothing: this feeds a reminder, and a
+/// reminder is not the place to fail a run.
+fn secret_lines(target: &Path) -> Vec<usize> {
+    let Ok(text) = std::fs::read_to_string(target) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<usize> = redact::scan_text(&text)
+        .into_iter()
+        .map(|h| h.line)
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// The reminder, which names the file and the lines and NEVER what is on them.
+///
+/// It exists because the migration is easy to mistake for a fix: taking a file
+/// out of the index changes nothing about the copies of it already on a remote,
+/// in a fork, or in somebody's CI cache. The line numbers are what make it
+/// actionable without printing a single byte of the credential.
+fn rotation_reminder(target: &Path, lines: &[usize]) -> String {
+    let found = if lines.is_empty() {
+        "no secret-shaped line is in it today, but git keeps every version that ever was"
+            .to_string()
+    } else {
+        format!(
+            "{} secret-shaped line{} ({}) {} tracked",
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" },
+            lines
+                .iter()
+                .map(|l| format!("line {l}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if lines.len() == 1 { "was" } else { "were" }
+        )
+    };
+    format!(
+        "{}: {found}. Untracking removes the file from git's index — it does not un-publish \
+         anything already pushed, so {ROTATION_PHRASE}.",
+        target.display()
+    )
+}
+
+/// The migration cannot apply here. A static fact about the destination,
+/// decided before anything is touched, so it is exit 9 like every other
+/// precondition.
+fn not_applicable(detail: String) -> AppError {
+    AppError::new(
+        "SYNC_MIGRATE_NOT_APPLICABLE",
+        ExitCode::Precondition,
+        detail,
+    )
+    .remedy(
+        "run `a2a sync mcp` without --migrate-untrack; the migration only applies to a \
+         config.toml that a git repository tracks",
+    )
+}
+
+/// git said no, or the filesystem did, part-way through. **Not** exit 9: the
+/// run got past every static precondition and the mutation itself failed, which
+/// is a different thing to tell an operator.
+fn migrate_failed(detail: String) -> AppError {
+    AppError::new("SYNC_MIGRATE_FAILED", ExitCode::Internal, detail).remedy(
+        "run `git -C <codex home> rm --cached -- config.toml` by hand and add config.toml to \
+         the repository's .gitignore; nothing else in the sync depends on this step",
+    )
+}
+
 /// `[REDACTED:<len>]`, for every value read from a source config, in every
 /// mode, whatever [`classify`] decided about it.
 ///

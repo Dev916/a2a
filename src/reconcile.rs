@@ -133,7 +133,12 @@ fn reconcile_locked(
         return reconcile_app_server(home, dir, snap, now);
     }
 
-    let mut log = EventLog::open(dir).map_err(|e| io_err("opening events.jsonl", e))?;
+    // One of exactly TWO capped writers (spec §4.5): the exec ingest path turns
+    // a whole transport stream into envelopes, so it is one of the two that can
+    // actually fill a log. Every other `EventLog::open` in the tree writes one
+    // envelope per command and keeps the default cap.
+    let mut log = EventLog::open_capped(dir, cfg.broker.events_max_bytes)
+        .map_err(|e| io_err("opening events.jsonl", e))?;
 
     // 2. Ingest this epoch's exec stream from the byte watermark.
     let (mut snap, ingested) = ingest(&mut log, dir, snap, now)?;

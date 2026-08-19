@@ -967,8 +967,11 @@ impl WorkerActor {
         let snap = self.snap.clone();
         let joined = tokio::task::spawn_blocking(move || {
             let _lock = reconcile::lock_state(&dir)?;
-            let mut log =
-                EventLog::open(&dir).map_err(|e| io_err("opening events.jsonl", e))?;
+            // The other capped writer (spec §4.5): every app-server envelope a
+            // worker produces lands here, so this is the path a flooding
+            // transport would grow without bound.
+            let mut log = EventLog::open_capped(&dir, cfg.broker.events_max_bytes)
+                .map_err(|e| io_err("opening events.jsonl", e))?;
             let (mut snap, out) = f(&mut log, &dir, snap)?;
             reconcile::arm_deadline(&mut snap, &cfg);
             save_snapshot(&dir, &snap).map_err(|e| io_err("writing state.json", e))?;

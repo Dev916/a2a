@@ -33,8 +33,24 @@ pub const DEFAULT_BLOCKED_TIMEOUT_SECS: u64 = 1800;
 /// mysterious. `0` disables the timer entirely.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// How large `events.jsonl` may grow before [`crate::store::EventLog`] rotates
+/// it to `events.jsonl.1` (spec §4.5).
+///
+/// Ten mebibytes is a *read* budget, not a disk budget: every append reopens
+/// the log and scans it to resume `seq`, so the cap is really "how much a
+/// worker's own bookkeeping may cost per event". A flooding transport reaches
+/// it in minutes; a normal worker never does.
+///
+/// **`0` means no rotation** — the file grows. That is the deliberate escape
+/// hatch for anyone debugging a fold, where a log split across two files (and,
+/// after a second rotation, a *discarded* generation) is exactly the thing that
+/// makes the bug harder to see. It is safe as an unset-to-zero reading for the
+/// same reason a cap of zero is unsafe elsewhere: this number's job is to
+/// DISCARD, and "discard nothing" is the conservative direction.
+pub const DEFAULT_EVENTS_MAX_BYTES: u64 = 10_485_760;
+
 /// Every `[broker]` key, in the order `config show --origin` reports them.
-pub const BROKER_FIELDS: [&str; 1] = ["idle_timeout_secs"];
+pub const BROKER_FIELDS: [&str; 2] = ["idle_timeout_secs", "events_max_bytes"];
 
 /// How many workers one broker will run at once (spec §4.9 admission control).
 ///
@@ -288,12 +304,16 @@ pub struct BrokerConfig {
     /// Seconds with nothing live before the daemon self-exits; `0` disables it.
     /// See [`DEFAULT_IDLE_TIMEOUT_SECS`] for why this exists at all.
     pub idle_timeout_secs: u64,
+    /// Bytes of `events.jsonl` before it rotates; `0` disables rotation.
+    /// See [`DEFAULT_EVENTS_MAX_BYTES`].
+    pub events_max_bytes: u64,
 }
 
 impl Default for BrokerConfig {
     fn default() -> Self {
         BrokerConfig {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            events_max_bytes: DEFAULT_EVENTS_MAX_BYTES,
         }
     }
 }
@@ -830,6 +850,7 @@ fn apply_broker_toml(
 ) -> Result<(), AppError> {
     match field {
         "idle_timeout_secs" => bc.idle_timeout_secs = want_u64(dotted, v)?,
+        "events_max_bytes" => bc.events_max_bytes = want_u64(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -928,6 +949,9 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         match field {
             "idle_timeout_secs" => {
                 cfg.broker.idle_timeout_secs = parse_u64_str(&key, raw.trim())?
+            }
+            "events_max_bytes" => {
+                cfg.broker.events_max_bytes = parse_u64_str(&key, raw.trim())?
             }
             _ => unreachable!("field membership fixed by BROKER_FIELDS"),
         }
@@ -1113,9 +1137,26 @@ mod tests {
         assert_eq!(broker_env_key("idle_timeout_secs"), "A2A_BROKER_IDLE_TIMEOUT_SECS");
     }
 
+    /// The `events.jsonl` cap (spec §4.5): ten mebibytes, one env spelling, and
+    /// `0` meaning **no rotation** rather than "rotate everything away" — the
+    /// one direction that is safe when a number whose job is to discard is
+    /// unset to zero.
+    #[test]
+    fn the_events_log_cap_defaults_to_ten_mebibytes() {
+        assert_eq!(DEFAULT_EVENTS_MAX_BYTES, 10_485_760);
+        assert_eq!(BrokerConfig::default().events_max_bytes, 10_485_760);
+        assert_eq!(
+            broker_env_key("events_max_bytes"),
+            "A2A_BROKER_EVENTS_MAX_BYTES"
+        );
+        // Appended, not inserted: `config show --origin` reports `[broker]` in
+        // this order and an operator's eye is the only index into it.
+        assert_eq!(BROKER_FIELDS, ["idle_timeout_secs", "events_max_bytes"]);
+    }
+
     #[test]
     fn the_broker_section_walks_its_keys_and_warns_on_unknown() {
-        let table: toml::Table = "[broker]\nidle_timeout_secs = 45\nbogus = 1\n"
+        let table: toml::Table = "[broker]\nidle_timeout_secs = 45\nevents_max_bytes = 4096\nbogus = 1\n"
             .parse()
             .unwrap();
         let mut cfg = Config {
@@ -1131,7 +1172,9 @@ mod tests {
         let mut warnings = vec![];
         apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
         assert_eq!(cfg.broker.idle_timeout_secs, 45);
+        assert_eq!(cfg.broker.events_max_bytes, 4096);
         assert_eq!(origins.get("broker.idle_timeout_secs"), Some(&Origin::File));
+        assert_eq!(origins.get("broker.events_max_bytes"), Some(&Origin::File));
         assert!(
             warnings.iter().any(|w| w.contains("broker.bogus")),
             "{warnings:?}"

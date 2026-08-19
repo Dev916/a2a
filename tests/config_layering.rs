@@ -197,6 +197,30 @@ fn broker_idle_timeout_defaults_to_300_and_names_its_layer() {
     assert_eq!(v["data"]["origins"]["broker.idle_timeout_secs"], "env");
 }
 
+/// The `[broker]` section's second key (spec §4.5): the `events.jsonl` cap,
+/// 10 MiB by default, layered like every other key — and `0` is a value an
+/// operator sets on purpose (no rotation), not an unset one.
+#[test]
+fn broker_events_max_bytes_defaults_to_ten_mebibytes_and_names_its_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["broker"]["events_max_bytes"], 10_485_760);
+    assert_eq!(v["data"]["origins"]["broker.events_max_bytes"], "default");
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[broker]\nevents_max_bytes = 65536\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["broker"]["events_max_bytes"], 65536);
+    assert_eq!(v["data"]["origins"]["broker.events_max_bytes"], "file");
+
+    let v = show(tmp.path(), &[("A2A_BROKER_EVENTS_MAX_BYTES", "0")], true);
+    assert_eq!(v["data"]["broker"]["events_max_bytes"], 0);
+    assert_eq!(v["data"]["origins"]["broker.events_max_bytes"], "env");
+}
+
 /// The admission section (spec §4.9): three numbers with the same
 /// defaults < file < env precedence every other key obeys, named in `--origin`
 /// as `admission.global_cap`, `admission.queue_cap` and

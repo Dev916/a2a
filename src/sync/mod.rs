@@ -102,7 +102,10 @@ pub struct PlanEntry {
     pub name: String,
     pub kind: Kind,
     pub account: String,
-    /// `None` for an entry whose source is gone (a [`Disposition::Removed`]).
+    /// `None` for an entry whose source is gone (a [`Disposition::Removed`]) —
+    /// and on EVERY mcp entry, whose source is one object inside a file shared
+    /// with 200 KB of somebody else's schema rather than a path of its own.
+    /// (The ledger still records that file; see [`mcp::plan`].)
     pub source_path: Option<PathBuf>,
     pub dest_path: PathBuf,
     pub disposition: Disposition,

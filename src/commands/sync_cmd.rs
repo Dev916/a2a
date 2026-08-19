@@ -149,18 +149,230 @@ pub fn skills(
     Ok(Outcome::from(data))
 }
 
-/// `a2a sync mcp` — the MCP half of the surface.
+/// Verbatim on stderr, and `data.broker_config_stale` beside it, whenever a run
+/// wrote while a broker was up (spec §6.2).
 ///
-/// Declared and dispatched from the same release as [`skills`] so that
-/// `a2a sync --help` has always listed both halves; the translation itself
-/// needs comment-preserving TOML mutation and lands with it.
-pub fn mcp() -> Result<Outcome, AppError> {
-    Err(AppError::new(
-        "SYNC_MCP_UNAVAILABLE",
-        ExitCode::Precondition,
-        "`a2a sync mcp` is not available in this build",
+/// The daemon's app-server child read the MCP config at launch and nothing in
+/// it re-reads: the servers a2a just translated are invisible to every worker
+/// until somebody restarts it, and a sync that stayed quiet about that would be
+/// reported as broken tooling by the next person who used it.
+pub const BROKER_STALE_WARNING: &str = "the running broker's app-server child read the previous \
+     MCP config — run `a2a broker restart`";
+
+/// `a2a sync mcp [--dry-run] [--claude-config-dir <DIR>]`.
+///
+/// The write is **rendered, validated, then committed**, in that order and
+/// never another: the destination is a config a human maintains, so a2a mutates
+/// a `toml_edit` document (comments and grouping intact), asks the real codex
+/// binary whether the result loads — against a temp COPY, because `codex mcp
+/// list` creates `<CODEX_HOME>/tmp/` — and only then replaces the file. A codex
+/// that refuses the render leaves the real file exactly where it was; a codex
+/// that cannot answer at all is a warning, not a verdict.
+pub fn mcp(
+    home: &A2aHome,
+    dry_run: bool,
+    migrate_untrack: bool,
+    claude_config_dir: Option<&Path>,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Outcome, AppError> {
+    let (cfg, _origins, config_warnings) = config::load(home)?;
+
+    // ---------------------------------------------- static preconditions
+    let codex_home = doctor::effective_codex_home().ok_or_else(codex_home_unknown)?;
+    let real_home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let anchor = real_home.clone().unwrap_or_default();
+    let claude_dir = sync::claude_config_dir(
+        &cfg.sync,
+        claude_config_dir,
+        env_path("CLAUDE_CONFIG_DIR").as_deref(),
+        &anchor,
+    );
+    if let Some(h) = &real_home {
+        sync::refuse_real_home(&codex_home, &claude_dir, h, allow_real_home())?;
+    }
+    let source_json = sync::mcp::source_path(&claude_dir);
+    let source = sync::mcp::read_source(&source_json)?;
+    let mut manifest = Manifest::load(home.root())?;
+    if migrate_untrack {
+        // Every precondition above is checked FIRST on purpose: a run that
+        // un-tracked config.toml before discovering there is no source config
+        // would have made a git-visible mutation on the way to a "precondition
+        // failed" verdict.
+        return Err(AppError::new(
+            "SYNC_MIGRATE_UNIMPLEMENTED",
+            ExitCode::Precondition,
+            "--migrate-untrack is not available in this build",
+        )
+        .remedy("`git rm --cached config.toml` in the codex home does the same thing by hand"));
+    }
+    let account = sync::account_label(&claude_dir, &anchor);
+    let target = codex_home.join(sync::mcp::TARGET_FILE);
+    let plan = sync::mcp::plan(&source, &codex_home, &manifest, &cfg.sync, &account)?;
+
+    let mut warnings: Vec<String> = config_warnings;
+    warnings.extend(plan.warnings.iter().cloned());
+
+    // ------------------------------------------------------------- apply
+    let writes = plan
+        .entries
+        .iter()
+        .any(|e| matches!(e.disposition, Disposition::Synced | Disposition::Removed));
+    let mut validated = None;
+    let mut wrote = false;
+    if !dry_run && writes {
+        let mut doc = sync::mcp::read_target(&codex_home)?;
+        sync::mcp::render(&mut doc, &plan, &source)?;
+        let rendered = doc.to_string();
+        let codex_bin = doctor::resolve_codex(&cfg);
+        // Ordered so that a rejection is returned BEFORE the write: the whole
+        // point of validating a candidate is that the real file survives one
+        // that does not load.
+        validated = sync::mcp::validate_with_codex(&rendered, codex_bin.as_deref())?;
+        if validated.is_none() {
+            warnings.push(validation_unavailable(&cfg, codex_bin.as_deref()));
+        }
+        home::create_dir_0700(&codex_home).map_err(|e| write_failed(&target, e))?;
+        // Atomic and 0600: this file may now carry an env literal that would
+        // have been refused into a published one, and a crash mid-write would
+        // leave codex a config it cannot load.
+        crate::store::write_atomic(&target, rendered.as_bytes())
+            .map_err(|e| write_failed(&target, e))?;
+        wrote = true;
+        record(&plan, &doc, &source, &source_json, &mut manifest, &account);
+        manifest.save(home.root())?;
+    }
+
+    let broker_config_stale = wrote && crate::broker::sockserv::socket_path(home.root()).exists();
+    if broker_config_stale {
+        warnings.push(BROKER_STALE_WARNING.to_string());
+    }
+
+    // ------------------------------------------------------------ report
+    if !quiet {
+        for w in &warnings {
+            eprintln!("a2a: warning: {w}");
+        }
+        for e in &plan.entries {
+            eprintln!("{} {} — {}", e.disposition, e.name, e.detail);
+        }
+    }
+    let counts = plan.counts();
+    let summary = format!(
+        "{}{} synced, {} unchanged, {} removed, {} skipped, {} refused{}",
+        if dry_run { "dry run: " } else { "" },
+        counts["synced"],
+        counts["unchanged"],
+        counts["removed"],
+        counts["skipped"],
+        counts["refused"],
+        if dry_run {
+            " — nothing was written".to_string()
+        } else {
+            format!(" → {}", target.display())
+        }
+    );
+    let data = if json_mode {
+        json!({
+            "kind": "mcp",
+            "account": account,
+            "dry_run": dry_run,
+            "dest": target.to_string_lossy(),
+            "counts": counts,
+            "entries": plan.entries,
+            "warnings": warnings,
+            // codex's own view of what it just loaded, or null when it could
+            // not be asked — never an empty array, which would read as "codex
+            // says there is nothing there".
+            "validated": validated,
+            "broker_config_stale": broker_config_stale,
+        })
+    } else {
+        Value::String(summary)
+    };
+    Ok(Outcome::from(data))
+}
+
+/// The ledger half of an mcp apply, walked over the plan the run already
+/// printed so that what is recorded is exactly what was reported.
+///
+/// `dest_hash` comes from the rendered document rather than from a re-read of
+/// the file, which is the same "one hash for both ends" discipline the skills
+/// applier keeps: the bytes on disk are that document, and hashing a re-read
+/// would let an edit landing between the two record an ownership claim over
+/// something a2a never wrote.
+fn record(
+    plan: &Plan,
+    doc: &toml_edit::DocumentMut,
+    source: &[sync::mcp::SourceServer],
+    source_json: &Path,
+    manifest: &mut Manifest,
+    account: &str,
+) {
+    let now = chrono::Utc::now();
+    for e in &plan.entries {
+        let key = Manifest::key(Kind::Mcp, account, &e.name);
+        match e.disposition {
+            Disposition::Synced => {
+                let (Some(server), Some(dest_hash)) = (
+                    source.iter().find(|s| s.name == e.name),
+                    sync::mcp::dest_hash(doc, &e.name),
+                ) else {
+                    continue; // a Synced entry always has both; be total anyway
+                };
+                manifest.entries.insert(
+                    key,
+                    Entry {
+                        source_path: source_json.to_path_buf(),
+                        dest_path: e.dest_path.clone(),
+                        source_hash: crate::sync::manifest::canonical_server_hash(server),
+                        dest_hash,
+                        synced_at: now,
+                        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+                        kind: Kind::Mcp,
+                        account: account.to_string(),
+                    },
+                );
+            }
+            Disposition::Removed => {
+                manifest.entries.remove(&key);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Why the post-write validation did not happen, naming the binary a2a looked
+/// for either way — a warning that said only "unavailable" would send an
+/// operator to the wrong machine.
+fn validation_unavailable(cfg: &config::Config, bin: Option<&Path>) -> String {
+    let budget = sync::mcp::VALIDATE_BUDGET.as_secs();
+    match bin {
+        Some(bin) => format!(
+            "post-write validation unavailable: `{} mcp list --json` did not answer with the \
+             expected JSON array within {budget}s; the rendered config was written unvalidated",
+            bin.display()
+        ),
+        None => format!(
+            "post-write validation unavailable: no executable codex resolved (looked for {}); \
+             the rendered config was written unvalidated",
+            cfg.codex_bin
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("codex"))
+                .display()
+        ),
+    }
+}
+
+fn write_failed(path: &Path, e: std::io::Error) -> AppError {
+    AppError::new(
+        "SYNC_MCP_WRITE_FAILED",
+        ExitCode::Internal,
+        format!("{}: {e}", path.display()),
     )
-    .remedy("`a2a sync skills` mirrors the skills half today"))
+    .remedy("re-run once the codex home is writable; the previous config.toml is untouched")
 }
 
 /// Containment, before content and independent of it: rewrite the managed block

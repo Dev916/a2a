@@ -21,6 +21,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "net", "io-ut
 # `rt` is what TaskTracker needs; tokio-util's default feature set is empty.
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1.1.4"
+# Comment-preserving TOML mutation for `a2a sync mcp`: the destination is
+# somebody's hand-written `~/.codex/config.toml`, and a writer that re-serialized
+# it would silently delete their comments and grouping. `toml` 1.1.4 does NOT
+# re-export this — it is its own crate.
+toml_edit = "0.25"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

@@ -32,12 +32,16 @@
 //! arguments: no clock, no environment, no filesystem beyond the one file
 //! [`read_source`] is handed.
 
-use super::Disposition;
+use super::manifest::{canonical_server_hash, Manifest};
+use super::{Disposition, Kind, Plan, PlanEntry};
+use crate::config::SyncConfig;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table};
 
 /// The file `sync mcp` reads out of a Claude config directory. The same
 /// basename in both branches of [`super::claude_config_dir`] — unlike skills,
@@ -334,16 +338,7 @@ pub fn classify(
                         headers: extras,
                     };
                 }
-                let (mut literal, mut via_env) = (Vec::new(), Vec::new());
-                for name in extras {
-                    let value = headers.get(&name).map(String::as_str).unwrap_or_default();
-                    if header_is_secret(&name, value) {
-                        let var = header_env_var(&server.name, &name);
-                        via_env.push((name, var));
-                    } else {
-                        literal.push(name);
-                    }
-                }
+                let (literal, via_env) = split_extra_headers(&server.name, headers);
                 return McpClass::ExtraHeaders { literal, via_env };
             }
             if bearer_header(headers).is_some() {
@@ -362,6 +357,31 @@ pub fn classify(
             }
         }
     }
+}
+
+/// The allowlisted split: header names whose values may be written literally
+/// (`http_headers`), and header names that must travel as the NAME of an env
+/// var (`env_http_headers`).
+///
+/// Shared by [`classify`], which reports it, and by [`render`], which writes
+/// it. Two spellings of this split would let a server be *reported* as carrying
+/// one literal header and *written* carrying another — the one failure mode a
+/// report exists to rule out.
+fn split_extra_headers(
+    server: &str,
+    headers: &BTreeMap<String, String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let (mut literal, mut via_env) = (Vec::new(), Vec::new());
+    for name in extra_headers(headers) {
+        let value = headers.get(&name).map(String::as_str).unwrap_or_default();
+        if header_is_secret(&name, value) {
+            let var = header_env_var(server, &name);
+            via_env.push((name, var));
+        } else {
+            literal.push(name);
+        }
+    }
+    (literal, via_env)
 }
 
 /// Header names that are not a bearer `Authorization`, in the map's order.
@@ -529,6 +549,524 @@ pub fn untranslatable_remedy(server: &SourceServer) -> Option<String> {
         out.push_str(&format!("http_headers = {{ {} }}\n", pairs.join(", ")));
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// The planner, the writer, and the validation that stands between them
+// ---------------------------------------------------------------------------
+
+/// The one place the destination table's name is spelled.
+const SERVERS_TABLE: &str = "mcp_servers";
+
+/// Pinned report details for the three verdicts that are facts about the
+/// DESTINATION rather than about the source — so they read identically to the
+/// skills planner's, which decides the same three things about a tree.
+const DRIFT_DETAIL: &str = "destination was edited after the last sync; a2a will not overwrite it";
+const REMOVAL_DRIFT_DETAIL: &str =
+    "destination was edited after the last sync; a2a will not remove it";
+const UNCHANGED_DETAIL: &str = "source and destination both match the ledger";
+
+/// Parse `<codex_home>/config.toml`, preserving every comment and every blank
+/// line. A file that is not there yet is an EMPTY document, not an error: a
+/// fresh codex home is a normal codex home.
+///
+/// A file that does not parse is a precondition failure rather than something
+/// to overwrite — codex cannot load it either, and replacing somebody's broken
+/// config with a2a's idea of a good one would delete the very lines they are
+/// half-way through fixing.
+pub fn read_target(codex_home: &Path) -> Result<DocumentMut, AppError> {
+    let path = codex_home.join(TARGET_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(target_unreadable(&path, e)),
+    };
+    text.parse::<DocumentMut>()
+        .map_err(|e| target_unreadable(&path, e))
+}
+
+fn target_unreadable(path: &Path, detail: impl std::fmt::Display) -> AppError {
+    AppError::new(
+        "SYNC_CODEX_CONFIG_UNREADABLE",
+        ExitCode::Precondition,
+        format!("{}: {detail}", path.display()),
+    )
+    .remedy("fix the TOML at that location — codex cannot load this file either")
+}
+
+/// What a run would do about every server in `source`, plus every managed table
+/// whose server has left the source.
+///
+/// Reading only: it opens `config.toml`, asks git one question about it and
+/// hashes what it finds. Nothing here writes, which is what makes `--dry-run`
+/// side-effect-free as a fact about the call graph.
+///
+/// The [`Disposition::Synced`] that [`McpClass::disposition`] returns is
+/// refined HERE, because this is the only thing that has seen a destination: a
+/// managed table whose hash still matches the ledger is `Unchanged`, and one
+/// that does not is [`Disposition::RefusedDestDrift`] — refused, never
+/// clobbered.
+///
+/// Every entry's `source_path` is `None`: an mcp source is one object inside a
+/// file shared with 200 KB of somebody else's schema, not a path of its own.
+/// The ledger records `<claude dir>/.claude.json`, which the applier knows and
+/// this function deliberately does not.
+pub fn plan(
+    source: &[SourceServer],
+    codex_home: &Path,
+    manifest: &Manifest,
+    cfg: &SyncConfig,
+    account: &str,
+) -> Result<Plan, AppError> {
+    let target = codex_home.join(TARGET_FILE);
+    let doc = read_target(codex_home)?;
+    let tracked = target_is_tracked(codex_home);
+    let mut plan = Plan::default();
+
+    for server in source {
+        let owned = manifest.owns(Kind::Mcp, account, &server.name);
+        let dest = dest_item(&doc, &server.name);
+        let class = classify(
+            server,
+            owned.is_some(),
+            dest.is_some(),
+            tracked,
+            &cfg.allow_http_header_servers,
+        );
+        let (mut disposition, mut detail) = (class.disposition(), class.detail());
+        if disposition == Disposition::Synced {
+            if let (Some(entry), Some(item)) = (owned, dest) {
+                if item_hash(item) != entry.dest_hash {
+                    disposition = Disposition::RefusedDestDrift;
+                    detail = DRIFT_DETAIL.to_string();
+                } else if entry.source_hash == canonical_server_hash(server) {
+                    disposition = Disposition::Unchanged;
+                    detail = UNCHANGED_DETAIL.to_string();
+                }
+            }
+        }
+        if disposition == Disposition::SkippedUntranslatable {
+            if let Some(remedy) = untranslatable_remedy(server) {
+                plan.warnings.push(format!(
+                    "{} was not translated — paste this into {} to do it yourself:\n{remedy}",
+                    server.name,
+                    target.display()
+                ));
+            }
+        }
+        plan.entries.push(PlanEntry {
+            name: server.name.clone(),
+            kind: Kind::Mcp,
+            account: account.to_string(),
+            source_path: None,
+            dest_path: target.clone(),
+            disposition,
+            detail,
+        });
+    }
+
+    plan_removals(source, &doc, &target, manifest, account, &mut plan);
+    Ok(plan)
+}
+
+/// Managed tables whose server is no longer in the source. A destination that
+/// has been edited since is refused rather than removed: a user's edits are
+/// never deleted on the strength of a deletion somewhere else.
+fn plan_removals(
+    source: &[SourceServer],
+    doc: &DocumentMut,
+    target: &Path,
+    manifest: &Manifest,
+    account: &str,
+    plan: &mut Plan,
+) {
+    // The ledger key is built, never parsed — except here, where the PREFIX is
+    // built from the same function and only the remainder is read off. A server
+    // name containing a `:` therefore still round-trips.
+    let prefix = Manifest::key(Kind::Mcp, account, "");
+    for (key, entry) in manifest.entries_for(Kind::Mcp) {
+        if entry.account != account {
+            continue;
+        }
+        let Some(name) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if source.iter().any(|s| s.name == name) {
+            continue; // already decided against the live source above
+        }
+        let (disposition, detail) = match dest_item(doc, name) {
+            None => (
+                Disposition::Removed,
+                "source is gone; the managed table is already gone",
+            ),
+            Some(item) if item_hash(item) != entry.dest_hash => {
+                (Disposition::RefusedDestDrift, REMOVAL_DRIFT_DETAIL)
+            }
+            Some(_) => (
+                Disposition::Removed,
+                "source is gone; the managed table is removed",
+            ),
+        };
+        plan.entries.push(PlanEntry {
+            name: name.to_string(),
+            kind: Kind::Mcp,
+            account: account.to_string(),
+            source_path: None,
+            dest_path: target.to_path_buf(),
+            disposition,
+            detail: detail.to_string(),
+        });
+    }
+}
+
+/// Apply `plan` to `doc`: insert or replace the tables it marked
+/// [`Disposition::Synced`], remove the ones it marked [`Disposition::Removed`],
+/// and touch **nothing** else — every skip, every refusal and every unchanged
+/// table keeps the bytes it already had, comments and all.
+///
+/// The plan is the authority on *whether* a server is written and the source is
+/// the authority on *what* is written. That split is why this needs no
+/// classifier: a [`Disposition::Synced`] HTTP server carrying extra headers can
+/// only have got that verdict by being allowlisted.
+pub fn render(doc: &mut DocumentMut, plan: &Plan, source: &[SourceServer]) -> Result<(), AppError> {
+    let managed: Vec<&PlanEntry> = plan
+        .entries
+        .iter()
+        .filter(|e| matches!(e.disposition, Disposition::Synced | Disposition::Removed))
+        .collect();
+    if managed.is_empty() {
+        return Ok(());
+    }
+    let root = doc.as_table_mut();
+    if root.get(SERVERS_TABLE).is_none() {
+        let mut table = Table::new();
+        // Implicit: `[mcp_servers]` itself carries no keys, so it is a heading
+        // nobody wrote and nobody should have to read.
+        table.set_implicit(true);
+        root.insert(SERVERS_TABLE, Item::Table(table));
+    }
+    let servers = root
+        .get_mut(SERVERS_TABLE)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            AppError::new(
+                "SYNC_CODEX_CONFIG_UNWRITABLE",
+                ExitCode::Precondition,
+                format!("{SERVERS_TABLE} is not a table of tables in the codex config"),
+            )
+            .remedy("rewrite [mcp_servers] as ordinary tables, then re-run")
+        })?;
+
+    for entry in managed {
+        match entry.disposition {
+            Disposition::Synced => {
+                let Some(server) = source.iter().find(|s| s.name == entry.name) else {
+                    continue; // a Synced entry always has a source; be total anyway
+                };
+                servers.insert(&entry.name, Item::Table(server_table(server)));
+            }
+            Disposition::Removed => {
+                servers.remove(&entry.name);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// One `[mcp_servers.<name>]` table, in the four pinned shapes: stdio
+/// (`command`, `args`, `env` — the last two omitted when empty), HTTP
+/// (`url`), HTTP with a bearer (`+ bearer_token_env_var`) and HTTP with
+/// allowlisted extra headers (`+ http_headers` for values that may be written
+/// and `+ env_http_headers` mapping a header name to the NAME of an env var).
+fn server_table(server: &SourceServer) -> Table {
+    let mut table = Table::new();
+    // One blank line before the header, so a file a human maintains stays one a
+    // human can read.
+    table.decor_mut().set_prefix("\n");
+    match &server.transport {
+        SourceTransport::Stdio { command, args, env } => {
+            table.insert("command", toml_edit::value(command.as_str()));
+            if !args.is_empty() {
+                let mut array = Array::new();
+                for arg in args {
+                    array.push(arg.as_str());
+                }
+                table.insert("args", toml_edit::value(array));
+            }
+            if !env.is_empty() {
+                table.insert("env", toml_edit::value(inline(env.iter())));
+            }
+        }
+        SourceTransport::Http { url, headers } => {
+            table.insert("url", toml_edit::value(url.as_str()));
+            if bearer_header(headers).is_some() {
+                table.insert(
+                    "bearer_token_env_var",
+                    toml_edit::value(bearer_env_var(&server.name).as_str()),
+                );
+            }
+            let (literal, via_env) = split_extra_headers(&server.name, headers);
+            if !literal.is_empty() {
+                let pairs = literal.iter().filter_map(|name| {
+                    headers.get(name).map(|value| (name.clone(), value.clone()))
+                });
+                table.insert("http_headers", toml_edit::value(inline(pairs)));
+            }
+            if !via_env.is_empty() {
+                table.insert(
+                    "env_http_headers",
+                    toml_edit::value(inline(via_env.iter().cloned())),
+                );
+            }
+        }
+        // Unreachable through a plan (an unknown shape is never Synced), and
+        // total anyway: an empty table is refused by nothing and writes nothing
+        // of anybody's.
+        SourceTransport::Unknown => {}
+    }
+    table
+}
+
+fn inline<K: AsRef<str>, V: AsRef<str>>(pairs: impl Iterator<Item = (K, V)>) -> InlineTable {
+    let mut table = InlineTable::new();
+    for (key, value) in pairs {
+        table.insert(key.as_ref(), value.as_ref().into());
+    }
+    table
+}
+
+/// `sha256` of a canonical JSON projection of one `[mcp_servers.<name>]` table
+/// — keys sorted, every scalar rendered as a string.
+///
+/// Content, deliberately not formatting: reformatting a managed table or adding
+/// a comment to it must not read as "a human edited this", or the drift refusal
+/// would fire on every run that followed somebody tidying their config, and an
+/// operator who sees a spurious refusal learns to bypass a real one.
+pub fn canonical_table_hash(table: &Table) -> String {
+    canonical_server_hash(&table_json(table))
+}
+
+/// The destination entry for `name`, whatever shape it is in — a `[table]`, a
+/// dotted key or an inline table all count as "the destination already has
+/// this", which is the question ownership turns on.
+fn dest_item<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a Item> {
+    doc.get(SERVERS_TABLE)?
+        .as_table_like()?
+        .get(name)
+        .filter(|item| !item.is_none())
+}
+
+/// The `dest_hash` a run records for `name`, or `None` when there is no such
+/// table. Same projection as [`canonical_table_hash`], for whichever shape the
+/// destination happens to use.
+pub fn dest_hash(doc: &DocumentMut, name: &str) -> Option<String> {
+    dest_item(doc, name).map(item_hash)
+}
+
+fn item_hash(item: &Item) -> String {
+    canonical_server_hash(&item_json(item))
+}
+
+fn table_json(table: &Table) -> Value {
+    Value::Object(
+        table
+            .iter()
+            .map(|(key, item)| (key.to_string(), item_json(item)))
+            .collect(),
+    )
+}
+
+fn item_json(item: &Item) -> Value {
+    match item {
+        Item::None => Value::Null,
+        Item::Value(v) => value_json(v),
+        Item::Table(t) => table_json(t),
+        Item::ArrayOfTables(a) => Value::Array(a.iter().map(table_json).collect()),
+    }
+}
+
+/// Scalars become strings, which is what [`canonical_server_hash`] does to them
+/// anyway: a `port = 8080` and a `port = "8080"` are the same destination.
+fn value_json(value: &toml_edit::Value) -> Value {
+    match value {
+        toml_edit::Value::String(s) => Value::String(s.value().clone()),
+        toml_edit::Value::Integer(i) => Value::String(i.value().to_string()),
+        toml_edit::Value::Float(f) => Value::String(f.value().to_string()),
+        toml_edit::Value::Boolean(b) => Value::String(b.value().to_string()),
+        toml_edit::Value::Datetime(d) => Value::String(d.value().to_string()),
+        toml_edit::Value::Array(a) => Value::Array(a.iter().map(value_json).collect()),
+        toml_edit::Value::InlineTable(t) => Value::Object(
+            t.iter()
+                .map(|(key, v)| (key.to_string(), value_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// How long the post-write validation waits for codex, pinned.
+///
+/// `sync` is meant to be safe to run from a hook, so a `codex` that blocks on
+/// stdin or takes a slow cold start must not wedge it. Mirrors Phase 2's
+/// `doctor::HANDSHAKE_BUDGET`, the only other child this binary spawns to ask a
+/// question.
+pub const VALIDATE_BUDGET: Duration = Duration::from_secs(5);
+
+/// How often the validation asks whether the child is done.
+const VALIDATE_POLL: Duration = Duration::from_millis(20);
+
+/// One server as `codex mcp list --json` reported it back.
+#[derive(serde::Serialize, PartialEq, Eq, Clone, Debug)]
+pub struct ValidatedServer {
+    pub name: String,
+    /// `"stdio"` or `"streamable_http"`.
+    pub transport_type: String,
+    /// `"bearer_token"` for an HTTP entry with a `bearer_token_env_var`,
+    /// `"unsupported"` for stdio and for plain HTTP.
+    pub auth_status: String,
+}
+
+/// `CODEX_HOME=<temp> <codex_bin> mcp list --json` against a COPY of the
+/// rendered document, with stdin on `/dev/null` and the child killed at
+/// [`VALIDATE_BUDGET`].
+///
+/// The copy is not caution, it is necessity: `codex mcp list` creates
+/// `<CODEX_HOME>/tmp/` as a side effect, and a validator that dirties the real
+/// codex home is not a validator.
+///
+/// This proves the config **loads**, not that every field is recognised: codex
+/// 0.140.0 tolerates unknown fields, and `--strict-config` is nondeterministic
+/// on that release (Ground truth), so a spelling mistake in a key codex ignores
+/// will pass here and show up as a server that never starts.
+///
+/// `Ok(None)` is **validation unavailable** — no codex resolved, one that could
+/// not be spawned, one that exited 0 with something that is not the expected
+/// array, or one that ran out of budget. The caller warns and proceeds; it
+/// never silently passes. A nonzero exit is a different fact entirely: codex
+/// read the document and refused it, which is
+/// `Err(SYNC_CODEX_REJECTED_CONFIG)`.
+pub fn validate_with_codex(
+    rendered: &str,
+    codex_bin: Option<&Path>,
+) -> Result<Option<Vec<ValidatedServer>>, AppError> {
+    let Some(bin) = codex_bin else {
+        return Ok(None);
+    };
+    let Some(scratch) = Scratch::new() else {
+        return Ok(None);
+    };
+    let home = scratch.0.join("codex-home");
+    let (out_path, err_path) = (scratch.0.join("stdout"), scratch.0.join("stderr"));
+    if crate::home::create_dir_0700(&home).is_err()
+        || std::fs::write(home.join(TARGET_FILE), rendered).is_err()
+    {
+        return Ok(None);
+    }
+    let (Ok(out_file), Ok(err_file)) = (
+        std::fs::File::create(&out_path),
+        std::fs::File::create(&err_path),
+    ) else {
+        return Ok(None);
+    };
+    // Files rather than pipes: this is a poll loop, and a child that filled a
+    // pipe nobody was draining would deadlock against its own budget.
+    let Ok(mut child) = std::process::Command::new(bin)
+        .args(["mcp", "list", "--json"])
+        .env("CODEX_HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out_file))
+        .stderr(std::process::Stdio::from(err_file))
+        .spawn()
+    else {
+        return Ok(None);
+    };
+
+    let deadline = std::time::Instant::now() + VALIDATE_BUDGET;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(VALIDATE_POLL);
+    };
+    let Some(status) = status else {
+        return Ok(None); // wedged or unwaitable: unavailable, never a pass
+    };
+    if !status.success() {
+        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+        return Err(rejected(bin, &stderr));
+    }
+    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+    Ok(parse_listing(&stdout))
+}
+
+/// codex read the rendered document and refused it. Its own message carries
+/// `<path>:<line>:<col>`, which is the only thing that says WHERE, so it is
+/// quoted rather than summarized.
+fn rejected(bin: &Path, stderr: &str) -> AppError {
+    let said = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no message)");
+    AppError::new(
+        "SYNC_CODEX_REJECTED_CONFIG",
+        ExitCode::Precondition,
+        format!("{} rejected the rendered config: {said}", bin.display()),
+    )
+    .remedy(
+        "the real config.toml was NOT touched — re-run with --dry-run and report the message \
+         above, which names the line codex could not read",
+    )
+}
+
+/// `None` for anything that is not the expected array — including valid JSON of
+/// another shape, which is what a foreign or future `codex` on `PATH` would
+/// print.
+fn parse_listing(stdout: &str) -> Option<Vec<ValidatedServer>> {
+    let items = serde_json::from_str::<Value>(stdout).ok()?;
+    let items = items.as_array()?.clone();
+    items
+        .iter()
+        .map(|item| {
+            Some(ValidatedServer {
+                name: item.get("name")?.as_str()?.to_string(),
+                transport_type: item.get("transport")?.get("type")?.as_str()?.to_string(),
+                auth_status: item.get("auth_status")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A private directory under the system temp dir, removed on every path out —
+/// including the wedged one. `tempfile` is a dev-dependency, and a validator
+/// that leaked a directory per run would be a slow disk leak on a machine that
+/// syncs from a hook.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Option<Scratch> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("a2a-sync-validate-{}-{unique}", std::process::id()));
+        crate::home::create_dir_0700(&dir).ok()?;
+        Some(Scratch(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(test)]
@@ -849,6 +1387,69 @@ mod tests {
             !target_is_tracked(&repo),
             "untracked again, which is what --migrate-untrack will do"
         );
+    }
+
+    /// Drift is about content. Reformatting a table, commenting it or
+    /// reordering its keys is not an edit; changing a value is.
+    #[test]
+    fn the_destination_hash_is_content_not_formatting() {
+        let doc = |text: &str| text.parse::<DocumentMut>().expect("the fixture parses");
+        let plain = doc("[mcp_servers.neon]\nurl = \"https://x/mcp\"\nbearer_token_env_var = \"V\"\n");
+        let fussed = doc(
+            "# a human's note\n[mcp_servers.neon]\nbearer_token_env_var   =   \"V\"   # why\n\n\
+             url = 'https://x/mcp'\n",
+        );
+        let changed = doc("[mcp_servers.neon]\nurl = \"https://y/mcp\"\nbearer_token_env_var = \"V\"\n");
+
+        let hash = |d: &DocumentMut| dest_hash(d, "neon").expect("the table is there");
+        assert_eq!(
+            hash(&plain),
+            hash(&fussed),
+            "comments, spacing, quoting and key order are not content"
+        );
+        assert_ne!(hash(&plain), hash(&changed), "a value IS content");
+        assert_eq!(dest_hash(&doc("model = \"x\"\n"), "neon"), None);
+
+        // The same projection whichever shape the destination uses, so a table
+        // a human wrote inline is not reported as drift the moment a2a adopts
+        // it.
+        let inline_form = doc("[mcp_servers]\nneon = { url = \"https://x/mcp\", bearer_token_env_var = \"V\" }\n");
+        assert_eq!(hash(&inline_form), hash(&plain));
+        assert_eq!(
+            canonical_table_hash(
+                plain["mcp_servers"]["neon"]
+                    .as_table()
+                    .expect("a real table")
+            ),
+            hash(&plain),
+            "the pinned public spelling agrees with the internal one"
+        );
+    }
+
+    /// A validator that answered something else has not rejected anything — and
+    /// must not be read as though it had.
+    #[test]
+    fn only_the_expected_array_parses_as_a_listing() {
+        let good = r#"[{"name":"neon","transport":{"type":"streamable_http"},
+                       "auth_status":"bearer_token"}]"#;
+        assert_eq!(
+            parse_listing(good),
+            Some(vec![ValidatedServer {
+                name: "neon".to_string(),
+                transport_type: "streamable_http".to_string(),
+                auth_status: "bearer_token".to_string(),
+            }])
+        );
+        assert_eq!(parse_listing("[]"), Some(vec![]), "no servers is an answer");
+        for other in [
+            "",
+            "codex-cli 0.140.0",
+            "{\"servers\":[]}",
+            r#"[{"type":"session.created"}]"#,
+            r#"[{"name":"neon","transport":{},"auth_status":"x"}]"#,
+        ] {
+            assert_eq!(parse_listing(other), None, "not a listing: {other}");
+        }
     }
 
     /// The reader carries what it cannot read, and normalizes the scalars it

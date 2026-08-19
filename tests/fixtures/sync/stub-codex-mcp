@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""stub-codex-mcp — the Phase-3-owned `codex mcp list --json` answerer.
+
+Emphatically NOT `tests/fixtures/stub-codex`: that fixture falls through its
+argument loop and answers `mcp list --json` with exec NDJSON and **exit 0**, so
+a sync test pointed at it would see its post-write validation "pass" for
+reasons that have nothing to do with the config. It also belongs to Phase 4.
+
+What this answers, transcribed from the plan's Ground truth (codex-cli 0.140.0):
+
+  * `mcp list --json` → exit 0 and a JSON **array**, one object per
+    `[mcp_servers.<name>]` table found in `$CODEX_HOME/config.toml`, with
+    `transport.type` `"stdio"` (the table has a `command`) or
+    `"streamable_http"` (it has a `url`), and `auth_status` `"bearer_token"`
+    when an HTTP table carries `bearer_token_env_var`, `"unsupported"`
+    otherwise.
+  * `--version` → the version line, so a doctor test may point at this fixture
+    too (Task 7).
+
+Env knobs, all `STUB_CODEX_MCP_*`:
+
+  REJECT=<path>:<line>:<col>  print `Error: failed to load configuration`
+                              naming that location on stderr and exit 1 — the
+                              `SYNC_CODEX_REJECTED_CONFIG` case.
+  GARBAGE=1                   exit 0 with stdout that is not that array — the
+                              "a validator that cannot answer has not rejected
+                              anything" case.
+  SLEEP=<secs>                sleep first, to be killed at `VALIDATE_BUDGET`.
+  WITNESS=<path>              write two facts the caller cannot otherwise see:
+                              whether this process's stdin really is /dev/null,
+                              and which CODEX_HOME it was handed. Both are
+                              pinned ACs (`codex mcp list` creates
+                              `<CODEX_HOME>/tmp/`, so validation must run
+                              against a COPY, never the real codex home).
+
+The TOML reading below is deliberately a line scanner rather than a parser: it
+must answer for a file this repository's own writer produced, and a fixture
+that dragged in a TOML library would be asserting that library's behaviour
+instead of a2a's.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+HEADER = re.compile(r'^\s*\[mcp_servers\.(?P<name>"[^"]+"|[^\]]+)\]\s*$')
+OTHER_HEADER = re.compile(r"^\s*\[")
+KEY = re.compile(r'^\s*(?P<key>[A-Za-z0-9_-]+)\s*=')
+
+
+def witness():
+    path = os.environ.get("STUB_CODEX_MCP_WITNESS")
+    if not path:
+        return
+    try:
+        # st_rdev identifies the character device behind fd 0 — the only way,
+        # from inside the child, to tell an inherited stdin from /dev/null.
+        is_null = os.fstat(0).st_rdev == os.stat("/dev/null").st_rdev
+    except OSError:
+        is_null = False
+    with open(path, "a") as f:
+        f.write("stdin=%s\n" % ("/dev/null" if is_null else "other"))
+        f.write("codex_home=%s\n" % os.environ.get("CODEX_HOME", ""))
+
+
+def servers(codex_home):
+    path = os.path.join(codex_home, "config.toml")
+    try:
+        with open(path, "r") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out, current = [], None
+    for line in lines:
+        header = HEADER.match(line)
+        if header:
+            name = header.group("name").strip().strip('"')
+            current = {"name": name, "keys": set()}
+            out.append(current)
+            continue
+        if OTHER_HEADER.match(line):
+            current = None
+            continue
+        key = KEY.match(line)
+        if current is not None and key:
+            current["keys"].add(key.group("key"))
+    listed = []
+    for server in out:
+        keys = server["keys"]
+        if "command" in keys:
+            transport, auth = "stdio", "unsupported"
+        elif "url" in keys:
+            transport = "streamable_http"
+            auth = "bearer_token" if "bearer_token_env_var" in keys else "unsupported"
+        else:
+            transport, auth = "unknown", "unsupported"
+        listed.append(
+            {
+                "name": server["name"],
+                "enabled": True,
+                "transport": {"type": transport},
+                "auth_status": auth,
+            }
+        )
+    return listed
+
+
+def main(argv):
+    witness()
+    sleep = os.environ.get("STUB_CODEX_MCP_SLEEP")
+    if sleep:
+        time.sleep(float(sleep))
+    reject = os.environ.get("STUB_CODEX_MCP_REJECT")
+    if reject:
+        sys.stderr.write(
+            "Error: failed to load configuration: TOML parse error at %s\n" % reject
+        )
+        return 1
+    if "--version" in argv:
+        sys.stdout.write("codex-cli 0.140.0\n")
+        return 0
+    positional = [a for a in argv if not a.startswith("-")]
+    if positional[:2] != ["mcp", "list"] or "--json" not in argv:
+        sys.stderr.write("stub-codex-mcp: unsupported argv %r\n" % (argv,))
+        return 2
+    if os.environ.get("STUB_CODEX_MCP_GARBAGE"):
+        sys.stdout.write("codex-cli 0.140.0: no MCP servers configured\n")
+        return 0
+    codex_home = os.environ.get("CODEX_HOME")
+    if not codex_home:
+        sys.stderr.write("Error: failed to load configuration: no CODEX_HOME\n")
+        return 1
+    # The real binary's side effect, reproduced because it is the whole reason
+    # validation runs against a temp copy.
+    try:
+        os.makedirs(os.path.join(codex_home, "tmp"), exist_ok=True)
+    except OSError:
+        pass
+    sys.stdout.write(json.dumps(servers(codex_home)) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

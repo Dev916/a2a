@@ -230,7 +230,18 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                     cli.global.json,
                     cli.global.quiet,
                 ),
-                SyncCmd::Mcp { .. } => a2a::commands::sync_cmd::mcp(),
+                SyncCmd::Mcp {
+                    dry_run,
+                    claude_config_dir,
+                    migrate_untrack,
+                } => a2a::commands::sync_cmd::mcp(
+                    &home,
+                    *dry_run,
+                    *migrate_untrack,
+                    claude_config_dir.as_deref(),
+                    cli.global.json,
+                    cli.global.quiet,
+                ),
             }
         }
     }

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "a2a review findings",
+  "type": "object",
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "severity", "rationale"],
+        "properties": {
+          "file": {"type": "string"},
+          "line": {"type": "integer", "minimum": 0},
+          "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+          "rationale": {"type": "string"}
+        }
+      }
+    }
+  }
+}

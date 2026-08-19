@@ -167,11 +167,17 @@ fn inherited_args(
     brief: Option<&Path>,
 ) -> SpawnArgs {
     SpawnArgs {
-        lane: parent.lane,
+        lane: Some(parent.lane),
         cwd: inherited_cwd(parent),
-        brief: brief
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| parent_dir.join("brief.md")),
+        brief: Some(
+            brief
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| parent_dir.join("brief.md")),
+        ),
+        // A retry re-runs a brief; it never asks for a scaffold. `--template`
+        // short-circuits the spawn path before any of this is read, so the
+        // neutral value here is the only one that is not a contradiction.
+        template: None,
         // Context files were staged into the parent's own directory and are its
         // copies, not the caller's originals; a retry re-stages nothing rather
         // than inventing paths that may no longer exist.
@@ -318,9 +324,11 @@ mod tests {
         parent.schema_path = Some(PathBuf::from("/w/parent/schema.json"));
 
         let args = inherited_args(&parent, Path::new("/w/parent"), None);
-        assert_eq!(args.lane, Lane::Impl);
+        assert_eq!(args.lane, Some(Lane::Impl));
         assert_eq!(args.cwd, Some(PathBuf::from("/dev/proj")));
-        assert_eq!(args.brief, PathBuf::from("/w/parent/brief.md"));
+        assert_eq!(args.brief, Some(PathBuf::from("/w/parent/brief.md")));
+        // A retry runs the brief; it never asks for a scaffold.
+        assert_eq!(args.template, None);
         assert_eq!(args.owner.as_deref(), Some("alice"));
         assert_eq!(args.model.as_deref(), Some("gpt-5.5-codex"));
         assert_eq!(args.effort.as_deref(), Some("high"));
@@ -331,6 +339,6 @@ mod tests {
         assert!(!args.worktree && !args.no_worktree);
 
         let replaced = inherited_args(&parent, Path::new("/w/parent"), Some(Path::new("/x/new.md")));
-        assert_eq!(replaced.brief, PathBuf::from("/x/new.md"));
+        assert_eq!(replaced.brief, Some(PathBuf::from("/x/new.md")));
     }
 }

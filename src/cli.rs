@@ -267,16 +267,23 @@ pub enum BrokerCmd {
 
 #[derive(clap::Args)]
 pub struct SpawnArgs {
-    /// Lane: impl|review|research|general (sets sandbox, model, effort)
-    #[arg(long)]
-    pub lane: Lane,
+    /// Lane: impl|review|research|general (sets sandbox, model, effort).
+    /// Required unless `--template` is asking for a scaffold instead.
+    #[arg(long, required_unless_present = "template")]
+    pub lane: Option<Lane>,
     /// Working directory; must be under an allowed root. Forbidden for
     /// `--lane research`, which always runs in the worker's own scratch dir.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
-    /// Brief file (Markdown + optional YAML front matter)
-    #[arg(long)]
-    pub brief: PathBuf,
+    /// Brief file (Markdown + optional YAML front matter).
+    /// Required unless `--template` is asking for a scaffold instead.
+    #[arg(long, required_unless_present = "template")]
+    pub brief: Option<PathBuf>,
+    /// Print this lane's brief scaffold to stdout and exit, creating nothing.
+    /// The scaffolds are compiled into the binary: there is no install step and
+    /// no runtime data dir, so `--template` answers the same on every machine.
+    #[arg(long, value_name = "LANE", conflicts_with_all = ["lane", "brief"])]
+    pub template: Option<Lane>,
     /// Extra file staged read-only into <worker>/context/ (repeatable)
     #[arg(long)]
     pub context: Vec<PathBuf>,
@@ -320,6 +327,28 @@ pub struct SpawnArgs {
     /// §5 gate, so a missing reason is a typed envelope, not clap's exit 2.
     #[arg(long, value_name = "TEXT")]
     pub reason: Option<String>,
+}
+
+impl SpawnArgs {
+    /// The lane this spawn is for.
+    ///
+    /// `Option` only because `--template` may stand alone; clap's
+    /// `required_unless_present` guarantees one of the two, and the spawn path
+    /// short-circuits on `--template` before it asks. A construction that
+    /// reaches here with neither is a programming error inside this crate, not
+    /// a user input, so it panics rather than growing a runtime refusal for a
+    /// state the argument parser cannot produce.
+    pub fn require_lane(&self) -> Lane {
+        self.lane
+            .expect("clap requires --lane unless --template short-circuited first")
+    }
+    /// The brief file this spawn reads. See [`SpawnArgs::require_lane`] for why
+    /// the `Option` is not a runtime possibility here.
+    pub fn require_brief(&self) -> &std::path::Path {
+        self.brief
+            .as_deref()
+            .expect("clap requires --brief unless --template short-circuited first")
+    }
 }
 
 /// clap-facing mirror of [`crate::inbox::MsgKind`]; the domain enum stays free

@@ -106,7 +106,11 @@ const MAX_CONTEXT_BYTES: u64 = 10 * 1024 * 1024;
 /// parsed by devloop step 4.3.4 without an adapter. Compiled in, because a
 /// worker's schema must not depend on the a2a checkout still being where it was
 /// at spawn.
-pub const IMPL_RESULT_SCHEMA: &str = include_str!("../../templates/impl-result.schema.json");
+///
+/// The bytes now live in [`crate::templates`] with every other compiled-in
+/// artifact; this alias stays because it is the name the schema's own tests and
+/// the rest of this module have always used.
+pub const IMPL_RESULT_SCHEMA: &str = crate::templates::IMPL_RESULT_SCHEMA;
 
 /// Where the chosen schema is materialized inside the worker directory.
 pub const WORKER_SCHEMA_FILE: &str = "result-schema.json";
@@ -163,6 +167,16 @@ pub fn run_with_lineage(
     json_mode: bool,
     quiet: bool,
 ) -> Result<Value, AppError> {
+    // `--template <lane>`: print the scaffold, create nothing.
+    //
+    // FIRST, deliberately — before the config load, before every gate, and
+    // long before [`select_transport`]. Printing a compiled-in document is not
+    // a spawn: it must not read a config it will not use, must not leave a
+    // worker directory behind, and above all must not autostart a broker to
+    // answer a question that has never left this process.
+    if let Some(lane) = args.template {
+        return Ok(json!(crate::templates::brief_scaffold(lane)));
+    }
     let (cfg, _origins, warnings) = config::load(home)?;
     let warn = |msg: &str| {
         if !quiet {
@@ -176,7 +190,7 @@ pub fn run_with_lineage(
     // ---- gates: nothing below this block has touched the filesystem --------
     let requested = transport_gate(args.transport.as_deref())?;
 
-    let lane = args.lane;
+    let lane = args.require_lane();
     let lane_cfg = cfg
         .lanes
         .get(&lane)
@@ -186,15 +200,16 @@ pub fn run_with_lineage(
     let cwd_plan = resolve_cwd(lane, args.cwd.as_deref(), &cfg.allowed_roots)?;
     let wt_gate = worktree_gate(args, &lane_cfg, &cwd_plan, &warn)?;
 
-    let brief_text = std::fs::read_to_string(&args.brief).map_err(|e| {
+    let brief_path = args.require_brief();
+    let brief_text = std::fs::read_to_string(brief_path).map_err(|e| {
         AppError::new(
             "BRIEF_UNREADABLE",
             ExitCode::Precondition,
-            format!("--brief {}: {e}", args.brief.display()),
+            format!("--brief {}: {e}", brief_path.display()),
         )
     })?;
-    let parsed = parse_and_validate_brief(&brief_text, &args.brief, lane, &warn)?;
-    scan_brief(&brief_text, &args.brief)?;
+    let parsed = parse_and_validate_brief(&brief_text, brief_path, lane, &warn)?;
+    scan_brief(&brief_text, brief_path)?;
     // The reason is INGRESS, exactly like the brief: it is operator text that
     // this process is about to write to two files, so it is scanned on the same
     // pass and refused on the same terms.
@@ -217,7 +232,7 @@ pub fn run_with_lineage(
     // lands at layout time: a `--schema` — or a brief `result_schema` — naming a
     // file that is not there is a static precondition (exit 9), and a static
     // refusal must not first autostart a broker it is never going to use.
-    let _ = plan_schema(lane, args.schema.as_deref(), &args.brief, &parsed)?;
+    let _ = plan_schema(lane, args.schema.as_deref(), brief_path, &parsed)?;
 
     // The last gate: which transport will own this worker. A refusal here still
     // leaves nothing behind, and the answer is what the genesis event records.
@@ -1072,7 +1087,7 @@ fn worktree_gate(
             warn(&format!(
                 "the {} lane defaults to a worktree, but {} is not inside a git work tree — \
                  spawning directly in it",
-                args.lane,
+                args.require_lane(),
                 target.map(|p| p.display().to_string()).unwrap_or_default()
             ));
             return Ok(WorktreeGate {
@@ -1108,7 +1123,8 @@ enum SchemaChoice {
     Flag(PathBuf),
     /// The brief's `result_schema`, already resolved against the brief's dir.
     Brief(PathBuf),
-    /// The impl lane's compiled-in template ([`IMPL_RESULT_SCHEMA`]).
+    /// The lane's own compiled-in template
+    /// ([`crate::templates::default_result_schema`]).
     LaneDefault,
 }
 
@@ -1124,16 +1140,18 @@ impl SchemaChoice {
 }
 
 /// The precedence table (spec §4.9), decided without touching the worker dir:
-/// **`--schema` > the brief's `result_schema` > the impl lane's template**.
+/// **`--schema` > the brief's `result_schema` > the lane's own template**.
 ///
 /// The middle rung is resolved **relative to the brief's own directory** — a
 /// brief is a document that travels with its schema, and `./task.schema.json`
 /// in it means "beside me", not "beside whatever the operator's shell happened
 /// to be in". An absolute value is used as written.
 ///
-/// The lane default is **impl-only**: it is devloop's result shape, and giving
-/// a research or general worker a schema it was never briefed for would fail it
-/// at the gate for something nobody asked of it.
+/// Which lanes HAVE a default is [`crate::templates::default_result_schema`]'s
+/// question, not this function's — `impl` (devloop's result shape) and `review`
+/// (the findings schema) are the lanes whose output another machine consumes.
+/// Giving a research or general worker a schema it was never briefed for would
+/// fail it at the gate for something nobody asked of it.
 fn plan_schema(
     lane: Lane,
     flag: Option<&Path>,
@@ -1174,10 +1192,7 @@ fn plan_schema(
         }
         return Ok(Some(SchemaChoice::Brief(resolved)));
     }
-    Ok(match lane {
-        Lane::Impl => Some(SchemaChoice::LaneDefault),
-        _ => None,
-    })
+    Ok(crate::templates::default_result_schema(lane).map(|_| SchemaChoice::LaneDefault))
 }
 
 fn schema_not_found(message: String) -> AppError {
@@ -1185,7 +1200,7 @@ fn schema_not_found(message: String) -> AppError {
 }
 
 /// `--schema` > brief `result_schema` (relative to the brief's dir) > the
-/// impl-lane default template — resolved **and materialized** as
+/// lane's own default template — resolved **and materialized** as
 /// `<worker>/result-schema.json` (0600).
 ///
 /// Returns the path recorded on the snapshot, in genesis and in
@@ -1204,7 +1219,10 @@ fn resolve_schema(
         return Ok((None, "none"));
     };
     let bytes = match &choice {
-        SchemaChoice::LaneDefault => IMPL_RESULT_SCHEMA.as_bytes().to_vec(),
+        SchemaChoice::LaneDefault => crate::templates::default_result_schema(lane)
+            .expect("plan_schema only chooses LaneDefault for a lane that has one")
+            .as_bytes()
+            .to_vec(),
         SchemaChoice::Flag(p) | SchemaChoice::Brief(p) => std::fs::read(p).map_err(|e| {
             schema_not_found(format!("reading the result schema {}: {e}", p.display()))
         })?,
@@ -1420,7 +1438,13 @@ fn lay_out_worker(
         &parsed.body
     };
     write_0600(&wdir.join("prompt.md"), prompt.as_bytes())?;
-    resolve_schema(wdir, args.lane, args.schema.as_deref(), &args.brief, parsed)
+    resolve_schema(
+        wdir,
+        args.require_lane(),
+        args.schema.as_deref(),
+        args.require_brief(),
+        parsed,
+    )
 }
 
 /// Stage `--context` files into `<worker>/context/`, applying both halves of
@@ -1731,8 +1755,14 @@ mod tests {
         assert_eq!(source, "lane-default");
         assert_eq!(body.unwrap(), IMPL_RESULT_SCHEMA);
 
-        // The default is impl-only; every other lane keeps `schema_path: null`.
-        for lane in [Lane::General, Lane::Review, Lane::Research] {
+        // The review lane has a default too — the findings schema — and it
+        // rides this same rung.
+        let (source, body) = case(Lane::Review, None, &without);
+        assert_eq!(source, "lane-default");
+        assert_eq!(body.unwrap(), crate::templates::REVIEW_FINDINGS_SCHEMA);
+
+        // The prose lanes have none; they keep `schema_path: null`.
+        for lane in [Lane::General, Lane::Research] {
             let (source, body) = case(lane, None, &without);
             assert_eq!(source, "none", "{lane}");
             assert!(body.is_none(), "{lane}");

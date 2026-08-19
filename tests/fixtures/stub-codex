@@ -2,6 +2,8 @@
 # stub-codex: scripted `codex exec --json` stand-in.
 # Env knobs: STUB_SLEEP, STUB_EXIT, STUB_LAST_MSG, STUB_NO_RESULT, STUB_LEAK,
 #            STUB_EMIT_QUESTION, STUB_RECORD (dir for resume recordings), STUB_RESUME_FAIL
+#            STUB_ARGV_FILE (file; the whole argv, every run),
+#            STUB_PWD_FILE (file; this child's own working directory)
 out=""; outbox=""; resume=0
 argv="$*"   # captured before the parse loop consumes it — resume-argv.txt is the ps-safety witness
 [ "$1" = "exec" ] && shift
@@ -19,6 +21,10 @@ done
 # STUB_ARGV_FILE: the whole argv, every run — the witness for `-C <workspace>`
 # (a2a derives it from the worker's cwd, so a worktree spawn must land here).
 [ -n "$STUB_ARGV_FILE" ] && printf '%s\n' "$argv" > "$STUB_ARGV_FILE"
+# STUB_PWD_FILE: this child's own working directory — the witness that the shim
+# sets the WORKER DIR as cwd and the workspace travels ONLY in `-C` (a2a never
+# calls current_dir on the codex child, which is deliberate, not an oversight).
+[ -n "$STUB_PWD_FILE" ] && pwd > "$STUB_PWD_FILE"
 if [ "$resume" = 1 ] && [ -n "$STUB_RECORD" ]; then
   printf '%s\n' "$0 $argv" > "$STUB_RECORD/resume-argv.txt"
   cat > "$STUB_RECORD/resume-stdin.txt"

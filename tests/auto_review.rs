@@ -609,12 +609,15 @@ fn the_reviewer_is_admitted_queued_or_declined_like_any_other_spawn() {
 
     let reviewer = w.until_reviewer(&id);
     let rid = reviewer["id"].as_str().unwrap().to_string();
-    let queued = w.until_state(&rid, "queued");
-    assert_eq!(
-        queued["queue_position"],
-        json!(1),
-        "the reviewer waits its turn like anything else: {queued}"
-    );
+    w.until_state(&rid, "queued");
+    // Converged, not instant: `queue_position` is stamped by a LATER broker
+    // write (`restamp_queue`) than the one that put the worker in `queued`, so
+    // reading it off the snapshot that first said `queued` is a race.
+    let queued = until("the reviewer's queue position to be stamped", || {
+        w.snap(&rid)
+            .filter(|s| s["state"] == json!("queued") && s["queue_position"] == json!(1))
+    });
+    assert_eq!(queued["queue_position"], json!(1), "{queued}");
     drop(guard);
     common::assert_no_broker_left(&w.home);
 

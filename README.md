@@ -305,6 +305,158 @@ has my spawn not started" wants. `spawn --no-queue` refuses instead of queueing
 reading of a mis-set value. Uncapping is spelled with a large number, which is
 something you can only do on purpose.
 
+## Fleet survival
+
+Caps stop a fleet running too *wide*. These stop it running too *long*, too
+often, or unreviewed — the four things that let a fleet burn quota on its own
+mistakes, plus the two file-layer leftovers.
+
+### Turn budgets — `failed{budget_exhausted}`
+
+Every lane has a **turn budget**: how many turns one worker may take in one
+epoch before the broker stops it.
+
+```toml
+[lanes.impl]
+max_turns = 40       # impl 40, general 30, research 20, review 15
+```
+
+A brief may **only lower** it (`max_turns:` in the front matter); asking for
+more than the lane allows is clamped, loudly, at spawn. Spending it lands the
+worker in `failed` with `failure_class = "budget_exhausted"` — a real failure
+with a real diagnosis, not a silent stop. It is **resumable**: `a2a resume`
+opens a new epoch, and a new epoch is a fresh budget.
+
+Counted on both transports (the fold counts `turn_started` envelopes), but
+**enforced broker-side only** — an exec worker's `turns_this_epoch` shows up in
+`a2a ls --json` and nothing acts on it, because the exec transport has no
+mid-turn interrupt to enforce with.
+
+### The circuit breaker — `BREAKER_OPEN`
+
+A fleet that is failing is usually failing for one reason, and the cheapest
+thing to do about it is stop.
+
+```toml
+[admission]
+breaker_failures   = 5     # failed settlements inside the window that open it
+breaker_window_secs = 300  # the window
+```
+
+At the threshold the broker stops admitting **new** work: `a2a spawn` exits 9
+with `BREAKER_OPEN`, and `error.data` carries `{failures, window_secs,
+opened_at}`. Adoption is never refused — workers that were already running are
+re-attached, because refusing them strands the fleet the daemon exists to
+recover. `a2a broker status` says `breaker OPEN (…)` on a daemon that otherwise
+looks perfectly healthy, which is the point.
+
+```bash
+a2a broker reset-breaker     # close it again (exit 7 if no broker is running)
+a2a broker restart           # the other reset path: a fresh daemon starts closed
+```
+
+`breaker_failures = 0` **disables** the breaker. That is the one cap in this
+tree where `0` does not mean "admit nothing" — a threshold whose job is to stop
+work must not read "stop everything" when it is left unset.
+
+### `a2a respawn` — retry with lineage, quarantine without
+
+```bash
+a2a respawn "$ID"                      # same brief, new worker
+a2a respawn "$ID" --brief /tmp/fix.md  # a different brief, same lineage
+```
+
+The child records `parent_id` and `attempt`; `max_attempts` (default 3) is what
+stops a poison brief being retried forever — the fourth try exits 9 with
+`ATTEMPTS_EXHAUSTED` and `error.data` naming `{parent_id, attempt,
+max_attempts}`. Respawning a parent that is still `spawned`/`queued`/`running`
+is `PARENT_ACTIVE` (exit 9): kill it first, deliberately.
+
+```toml
+[admission]
+max_attempts = 3
+```
+
+### `auto_review` — a reviewer per finished impl worker
+
+```toml
+[lanes.impl]
+auto_review = true       # OFF by default
+```
+
+When an **impl** worker with a worktree reaches `done`, the broker diffs its
+branch (`git diff <base_ref>..<branch>`), builds a review brief from that diff
+plus the impl brief's acceptance criteria, and spawns a **review-lane worker**
+for it. The reviewer's findings land in the impl worker's directory as
+`review.json`.
+
+**What it costs:** one extra worker per completed impl worker, and it goes
+through the same admission door as anything else — it is counted against the
+caps, it can queue behind them, and it can be refused by them. Turning this on
+roughly doubles the workers a busy impl lane creates. An impl worker without a
+worktree is skipped with a recorded `auto_review_skipped{reason:"no_worktree"}`
+line in `broker.jsonl`; reviewing a diff that does not exist is worse than not
+reviewing. Reviewers are never themselves reviewed, and a worker that already
+has a `review.json` is not reviewed twice.
+
+### `a2a spawn --template <lane>` — the brief scaffold
+
+```bash
+a2a spawn --template impl > /tmp/brief.md   # then fill it in and spawn it
+```
+
+Prints that lane's brief scaffold — front matter, acceptance criteria, verify
+commands — and creates nothing. The scaffolds are compiled into the binary, so
+there is no install step and no runtime data dir, and every machine answers the
+same.
+
+### `broker.jsonl` — the transition log
+
+Every state transition in the fleet is one line, so a post-mortem is a `grep`:
+
+```jsonc
+{"ts":"…","kind":"state_change","worker":"impl-…","from":"queued","to":"spawned","event":"admit","epoch":1}
+{"ts":"…","kind":"state_change","worker":"impl-…","from":"spawned","to":"running","event":"process_started","epoch":1}
+{"ts":"…","kind":"state_change","worker":"impl-…","from":"running","to":"done","event":"turn_ended","epoch":1}
+```
+
+`from`/`to` are the same kebab-case spellings `a2a ls` prints; `event` names the
+write that carried the transition. One line per transition, and none for a
+self-loop.
+
+### `events.jsonl` rotation
+
+```toml
+[broker]
+events_max_bytes = 10485760   # 10 MiB
+```
+
+A worker whose transport floods it cannot grow its WAL without bound: at the
+threshold `events.jsonl` is rotated to `events.jsonl.1` and a fresh one is
+started, with an `events_rotated` marker recording the cut. Reads span both
+generations, so `a2a tail`, `status` and the fold do not notice.
+
+**One generation is kept.** A *second* rotation discards the oldest, and its
+marker says `discarded_prior_generation: true` — so a rebuild-from-zero that
+starts mid-log is visible rather than inferred. Multi-generation retention is
+deliberately deferred.
+
+### The two eval tiers
+
+The worker protocol is testable rather than merely written down:
+
+```bash
+# Deterministic, always on: fixtures + the BLOCKED matcher, no tokens, no codex.
+cargo test --test prompt_contract
+
+# Statistical: k=3 real-codex runs against adversarial briefs. Gated, #[ignore]d,
+# and it copies ~/.codex/auth.json into a temp CODEX_HOME (your real one is read,
+# never written).
+A2A_E2E=1 A2A_EVAL=1 cargo test --test prompt_contract -- --ignored --nocapture
+```
+
+Both gates must be `1`; either one missing skips the tier with a line saying so.
+
 ## Owner scoping
 
 Every worker records an **owner** at genesis: `$A2A_OWNER`, or `anon-<uid>`.
@@ -375,16 +527,28 @@ codex_version_range = ">=0.140, <0.150"
 model = "gpt-5.5"
 effort = "high"
 task_timeout_secs = 7200
+max_turns = 40           # per-lane turn budget: impl 40, general 30,
+                         # research 20, review 15. A brief may only lower it.
+auto_review = false      # impl only: review every finished impl worktree
 
 [admission]              # app-server transport only
 global_cap = 8
 queue_cap = 32
+breaker_failures = 5     # failed settlements in the window that open the
+                         # circuit breaker; 0 DISABLES it
+breaker_window_secs = 300
+max_attempts = 3         # `a2a respawn` attempts before ATTEMPTS_EXHAUSTED
+
+[broker]
+events_max_bytes = 10485760   # 10 MiB, then events.jsonl rotates to .1
 ```
 
 Every key has an `A2A_`-prefixed environment override
 (`A2A_ALLOWED_ROOTS`, `A2A_CODEX_VERSION_RANGE`,
-`A2A_LANES_IMPL_TASK_TIMEOUT_SECS`, `A2A_ADMISSION_GLOBAL_CAP`,
-`A2A_ADMISSION_LANES_IMPL_CAP`, …). `A2A_HOME` (or `--home`) relocates the
+`A2A_LANES_IMPL_TASK_TIMEOUT_SECS`, `A2A_LANES_IMPL_MAX_TURNS`,
+`A2A_LANES_IMPL_AUTO_REVIEW`, `A2A_ADMISSION_GLOBAL_CAP`,
+`A2A_ADMISSION_LANES_IMPL_CAP`, `A2A_ADMISSION_BREAKER_FAILURES`,
+`A2A_ADMISSION_MAX_ATTEMPTS`, `A2A_BROKER_EVENTS_MAX_BYTES`, …). `A2A_HOME` (or `--home`) relocates the
 entire tree — that is how the test suite stays hermetic. Two variables are
 switches rather than settings: `A2A_BROKER_DISABLE=1`
 ([Transports](#transports)) and `A2A_OWNER` ([Owner scoping](#owner-scoping)).

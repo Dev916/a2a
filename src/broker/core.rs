@@ -1046,6 +1046,34 @@ impl BrokerLog {
     }
 }
 
+/// The ONE shape of a `broker.jsonl` transition line (spec §4.5).
+///
+/// Built here rather than at either call site because there are two writers and
+/// they must not drift: the [`WorkerActor`](super::worker_actor::WorkerActor)
+/// for every transition it commits, and [`BrokerCore`] for the two it commits
+/// itself (`queued → spawned` in `admit_queued`, `queued → cancelled` in
+/// `cancel_queued`) — neither of which passes through the actor at all.
+///
+/// `event` is the persist label, an OPEN set: it is written through as whatever
+/// string the caller carried, so a new persist site needs no change here.
+pub fn state_change_line(
+    worker: &str,
+    from: WorkerState,
+    to: WorkerState,
+    event: &str,
+    epoch: u32,
+) -> Value {
+    json!({
+        "ts": Utc::now(),
+        "kind": "state_change",
+        "worker": worker,
+        "from": from.as_str(),
+        "to": to.as_str(),
+        "event": event,
+        "epoch": epoch,
+    })
+}
+
 fn write_log(home: &Path, msg: LogMsg) {
     match msg {
         LogMsg::Line(value) => {
@@ -2135,7 +2163,7 @@ impl BrokerCore {
                 )
             })?;
             if snap.state != WorkerState::Queued {
-                return Ok::<bool, AppError>(false);
+                return Ok::<Option<(String, u32)>, AppError>(None);
             }
             let mut log = EventLog::open(&owned).map_err(|e| {
                 AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}"))
@@ -2155,7 +2183,7 @@ impl BrokerCore {
             save_snapshot(&owned, &snap).map_err(|e| {
                 AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}"))
             })?;
-            Ok(true)
+            Ok(Some((snap.id.clone(), snap.epoch)))
         })
         .await;
         let admitted = match joined {
@@ -2168,9 +2196,22 @@ impl BrokerCore {
                 ))
             }
         };
-        if !admitted {
+        let Some((id, epoch)) = admitted else {
             return Ok(false);
-        }
+        };
+        // The first of the two transitions the actor never sees (spec §4.5):
+        // this worker has no actor yet, and is about to get one already
+        // `spawned`. Without this line its `broker.jsonl` trail would begin
+        // mid-life, with no `from:"queued"` anywhere.
+        self.log
+            .line(state_change_line(
+                &id,
+                WorkerState::Queued,
+                WorkerState::Spawned,
+                "admit",
+                epoch,
+            ))
+            .await;
         // The actor opens the thread and starts the first turn from `prompt.md`
         // — the same flow a spawn that was never queued takes.
         self.register(dir.to_path_buf(), false, false).await?;
@@ -2195,7 +2236,8 @@ impl BrokerCore {
                 )
             })?;
             if snap.state != WorkerState::Queued {
-                return Ok::<(), AppError>(()); // already decided by someone else
+                // already decided by someone else
+                return Ok::<Option<(String, u32)>, AppError>(None);
             }
             let mut log = EventLog::open(&dir).map_err(|e| {
                 AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}"))
@@ -2213,7 +2255,8 @@ impl BrokerCore {
             reconcile::arm_deadline(&mut snap, &cfg);
             save_snapshot(&dir, &snap).map_err(|e| {
                 AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}"))
-            })
+            })?;
+            Ok(Some((snap.id.clone(), snap.epoch)))
         })
         .await;
         let outcome = match joined {
@@ -2224,6 +2267,20 @@ impl BrokerCore {
                 format!("cancelling a queued worker: {e}"),
             )),
         };
+        // The second transition the actor never sees: a worker cancelled where
+        // it stood, which never had an actor to persist it.
+        if let Ok(Some((id, epoch))) = &outcome {
+            self.log
+                .line(state_change_line(
+                    id,
+                    WorkerState::Queued,
+                    WorkerState::Cancelled,
+                    "cancel_queued",
+                    *epoch,
+                ))
+                .await;
+        }
+        let outcome = outcome.map(|_| ());
         self.restamp_queue().await;
         self.publish_health().await;
         Some(outcome)
@@ -2326,6 +2383,7 @@ impl BrokerCore {
             self.adapter_rx.clone(),
             self.settle_tx.clone(),
             self.cancel.child_token(),
+            self.log.clone(),
         );
         let tracked = self.tracker.track_future(actor);
         let task_id = {

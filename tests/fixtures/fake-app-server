@@ -284,7 +284,14 @@ def turn_obj(turn_id, status):
 # turn machinery
 # ---------------------------------------------------------------------------
 
-OPEN = {}  # the single in-flight turn, if any: {"threadId":…, "turnId":…}
+# In-flight turns, keyed by threadId: {threadId: turnId}.
+#
+# PER THREAD, not one global turn: ONE child serves every worker, so a fleet
+# under an admission cap really does hold two turns open at once (two
+# `hang-turn` workers waiting to be steered). A single global slot made the
+# second `turn/start` orphan the first worker's turn, and no steer could ever
+# end it again — the cross-talk `tests/fleet_smoke.rs` exposed.
+OPEN = {}
 PENDING_SERVER_REQ = [None]  # id of the server->client request we are waiting on
 
 
@@ -306,8 +313,12 @@ def emit_agent_message(thread_id, turn_id):
     )
 
 
-def complete_turn(status="completed", answer=True):
-    """End the open turn.
+def complete_turn(status="completed", answer=True, thread_id=None):
+    """End one thread's open turn.
+
+    `thread_id=None` means the most recently opened turn — the reading every
+    single-worker scenario has always had, and the only one available to a
+    server->client response, which names no thread.
 
     `answer=False` completes it WITHOUT a final agent message — what a worker
     that asked a question rather than producing a result looks like on the wire
@@ -315,13 +326,16 @@ def complete_turn(status="completed", answer=True):
     final agent message IS the result on this transport, so a turn that emits
     one lands the worker in `done` no matter what it wrote to its outbox.
     """
-    if not OPEN:
+    if thread_id is None:
+        if not OPEN:
+            return
+        thread_id = next(reversed(list(OPEN)))
+    turn_id = OPEN.pop(thread_id, None)
+    if turn_id is None:
         return
-    thread_id, turn_id = OPEN["threadId"], OPEN["turnId"]
     if status == "completed" and answer:
         emit_agent_message(thread_id, turn_id)
     notify("turn/completed", {"threadId": thread_id, "turn": turn_obj(turn_id, status)})
-    OPEN.clear()
 
 
 def write_outbox_question(cwd):
@@ -379,7 +393,7 @@ def handle_request(req_id, method, params):
         thread_id = params.get("threadId") or ""
         turn_id = str(uuid.uuid4())
         reply(req_id, {"turn": turn_obj(turn_id, "inProgress")})
-        OPEN.update({"threadId": thread_id, "turnId": turn_id})
+        OPEN[thread_id] = turn_id
         notify("turn/started", {"threadId": thread_id, "turn": turn_obj(turn_id, "inProgress")})
         for _ in range(FLOOD):
             emit_agent_message(thread_id, turn_id)
@@ -419,11 +433,11 @@ def handle_request(req_id, method, params):
             if not FLAGS.get(asked):
                 set_flag(asked, True)
                 write_outbox_question(THREADS.get(thread_id, {}).get("cwd") or os.getcwd())
-                complete_turn("completed", answer=False)
+                complete_turn("completed", answer=False, thread_id=thread_id)
                 return
-            complete_turn("completed")
+            complete_turn("completed", thread_id=thread_id)
             return
-        complete_turn("completed")
+        complete_turn("completed", thread_id=thread_id)
         return
 
     if method == "turn/steer":
@@ -438,12 +452,12 @@ def handle_request(req_id, method, params):
             reply_error(req_id, -32600, "no active turn to steer")
             return
         reply(req_id, {})
-        complete_turn("completed")
+        complete_turn("completed", thread_id=params.get("threadId"))
         return
 
     if method == "turn/interrupt":
         reply(req_id, {})
-        complete_turn("interrupted")
+        complete_turn("interrupted", thread_id=params.get("threadId"))
         return
 
     if method == "thread/loaded/list":

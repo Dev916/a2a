@@ -48,6 +48,7 @@
 //! `Deliver`/`Interrupt`, so a post-restart delivery can never be written into a
 //! dead child's stdin.
 
+use super::core::{state_change_line, BrokerLog};
 use crate::adapter::{self, AdapterRef, SendPath, TurnSpec};
 use crate::config::{Config, LaneConfig};
 use crate::events::{self, Envelope, EventClass, EventKind};
@@ -221,6 +222,10 @@ fn gone(id: &str) -> AppError {
 /// `cfg` is owned by the actor because two of its jobs need lane policy on
 /// every step: the per-turn sandbox/effort it re-supplies to `turn/start`, and
 /// the deadlines it arms from `start`/`task`/`blocked_timeout_secs`.
+// Eight: the actor's dependency set, one parameter each, and every one of them
+// is a distinct thing the core owns. Bundling them into a struct would move the
+// same list somewhere else and cost the two call sites their one-line edits.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker_actor(
     dir: PathBuf,
     snap: WorkerSnapshot,
@@ -229,8 +234,9 @@ pub fn spawn_worker_actor(
     settle_tx: mpsc::Sender<Settled>,
     cancel: CancellationToken,
     tracker: &TaskTracker,
+    log: BrokerLog,
 ) -> WorkerHandle {
-    let (handle, actor) = build_worker_actor(dir, snap, cfg, adapter_rx, settle_tx, cancel);
+    let (handle, actor) = build_worker_actor(dir, snap, cfg, adapter_rx, settle_tx, cancel, log);
     tracker.spawn(actor);
     handle
 }
@@ -248,6 +254,7 @@ pub fn build_worker_actor(
     adapter_rx: watch::Receiver<AdapterRef>,
     settle_tx: mpsc::Sender<Settled>,
     cancel: CancellationToken,
+    log: BrokerLog,
 ) -> (WorkerHandle, impl std::future::Future<Output = ()> + Send + 'static) {
     let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
     let id = snap.id.clone();
@@ -259,6 +266,7 @@ pub fn build_worker_actor(
         adapter_rx,
         settle_tx,
         cancel,
+        log,
         rx,
         trace: TraceBuffer::new(TRACE_BUFFER_CAPACITY),
         turn_messages: Vec::new(),
@@ -279,6 +287,10 @@ pub struct WorkerActor {
     adapter_rx: watch::Receiver<AdapterRef>,
     settle_tx: mpsc::Sender<Settled>,
     cancel: CancellationToken,
+    /// The fleet's transition log (spec §4.5). `BrokerLog` is `Clone` over an
+    /// mpsc sender, so holding one here adds no writer and no channel: the
+    /// broker's dedicated log task remains the sole writer of `broker.jsonl`.
+    log: BrokerLog,
     rx: mpsc::Receiver<WorkerMsg>,
     trace: TraceBuffer,
     /// This turn's agent messages, in arrival order — the input to
@@ -990,6 +1002,25 @@ impl WorkerActor {
         };
         let previous = self.snap.state;
         self.snap = snap;
+        // Spec §4.5: one line per TRANSITION, and none for a self-loop. Most
+        // `persist` calls change no state at all (a trace flush, a delivery),
+        // and `broker.jsonl` is a post-mortem of a fleet's movements rather
+        // than a mirror of its writes.
+        //
+        // `event` is whatever `what` label the call carried. The set is OPEN —
+        // every task that adds a persist site adds a label — so it is written
+        // through as a string and never mapped onto an enumeration.
+        if previous != self.snap.state {
+            self.log
+                .line(state_change_line(
+                    &self.snap.id,
+                    previous,
+                    self.snap.state,
+                    what,
+                    self.snap.epoch,
+                ))
+                .await;
+        }
         self.announce_settled(previous).await;
         Ok(out)
     }
@@ -1462,6 +1493,10 @@ mod tests {
         let (settle_tx, settle_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
+        // A real `BrokerLog` writing into the harness's temp dir, MOVED into
+        // the actor: the actor is then its only holder, so the log task ends
+        // when the actor does and `tracker.wait()` still converges.
+        let log = BrokerLog::start(root.clone(), &tracker);
         let handle = spawn_worker_actor(
             dir.clone(),
             snap,
@@ -1470,6 +1505,7 @@ mod tests {
             settle_tx,
             cancel.clone(),
             &tracker,
+            log,
         );
         tracker.close();
 

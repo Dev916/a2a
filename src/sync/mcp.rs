@@ -876,6 +876,24 @@ const REMOVAL_DRIFT_DETAIL: &str =
     "destination was edited after the last sync; a2a will not remove it";
 const UNCHANGED_DETAIL: &str = "source and destination both match the ledger";
 
+/// The [`Disposition::SkippedUnowned`] detail for a table a2a *did* write — for
+/// another account.
+///
+/// [`McpClass::classify`] is told only whether THIS account owns the name, so
+/// its own detail can say no more than "somebody else's". Two accounts
+/// legitimately contending for one destination is the case where that is not
+/// enough: an operator reading `skipped-unowned Neon` needs to know which of
+/// their Claude configs got there first, or the obvious next move is to delete
+/// the table and re-run — which is the ping-pong the ledger exists to prevent.
+/// The owner is resolved through [`Manifest::owner_account`], never by taking a
+/// manifest key apart.
+fn owned_by_detail(account: &str) -> String {
+    format!(
+        "account `{account}` synced this server first; a2a only ever updates what it created for \
+         the account it was run for"
+    )
+}
+
 /// Parse `<codex_home>/config.toml`, preserving every comment and every blank
 /// line. A file that is not there yet is an EMPTY document, not an error: a
 /// fresh codex home is a normal codex home.
@@ -915,7 +933,10 @@ fn target_unreadable(path: &Path, detail: impl std::fmt::Display) -> AppError {
 /// refined HERE, because this is the only thing that has seen a destination: a
 /// managed table whose hash still matches the ledger is `Unchanged`, and one
 /// that does not is [`Disposition::RefusedDestDrift`] — refused, never
-/// clobbered.
+/// clobbered. A [`Disposition::SkippedUnowned`] is refined the same way and for
+/// the same reason: only this function has the ledger, so only it can say
+/// whether the table belongs to nobody or to the machine's other account (see
+/// [`owned_by_detail`]).
 ///
 /// Every entry's `source_path` is `None`: an mcp source is one object inside a
 /// file shared with 200 KB of somebody else's schema, not a path of its own.
@@ -944,6 +965,13 @@ pub fn plan(
             &cfg.allow_http_header_servers,
         );
         let (mut disposition, mut detail) = (class.disposition(), class.detail());
+        // A table this account does not own may still be one a2a wrote, for the
+        // other account — and then the report can say whose it is.
+        if disposition == Disposition::SkippedUnowned {
+            if let Some(owner) = manifest.owner_account(Kind::Mcp, &server.name) {
+                detail = owned_by_detail(owner);
+            }
+        }
         if disposition == Disposition::Synced {
             if let (Some(entry), Some(item)) = (owned, dest) {
                 if item_hash(item) != entry.dest_hash {

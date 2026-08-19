@@ -103,6 +103,14 @@ pub fn fold(mut snap: WorkerSnapshot, events: &[Envelope], now: DateTime<Utc>) -
             seed_from_genesis(&mut snap, env, now);
         } else if env.epoch >= snap.epoch {
             absorb_app_server_identity(&mut snap, env);
+            // The turn budget's counter is FOLD-derived (spec §4.9), and it is
+            // incremented here — inside the epoch-current branch, so a buffer
+            // flushed by a dead prior run cannot spend a resumed worker's
+            // budget, and BEFORE the FSM dispatch, so the count a `turn_started`
+            // trips on is the count that same envelope produced.
+            if env.kind == events::EventKind::TurnStarted {
+                snap.turns_this_epoch = Some(snap.turns_this_epoch.unwrap_or(0) + 1);
+            }
             if let Some(ev) = envelope_to_fsm_event(env) {
                 apply_event(&mut snap, env, &ev, now);
             } else if matches!(
@@ -245,6 +253,17 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     } else if let Some(derived) = snap.worktree.as_ref().map(|w| w.base_ref.clone()) {
         snap.base_ref = Some(derived);
     }
+    // The EFFECTIVE turn budget (spec §4.9), already clamped by anything the
+    // brief asked for. In genesis rather than read from config at enforcement
+    // time, for the reason every other identity field is: an operator editing
+    // the lane table must not silently re-judge a worker already in flight, and
+    // a rebuild from zero has to reach the same verdict.
+    if let Some(max) = raw.get("max_turns").and_then(|v| v.as_u64()) {
+        snap.max_turns = Some(max);
+    }
+    // A new worker has taken no turns. Seeded unconditionally so a rebuild from
+    // zero starts counting from the same place the original did.
+    snap.turns_this_epoch = Some(0);
     snap.created_at = s("created_at")
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc))
@@ -357,6 +376,12 @@ fn apply_event(snap: &mut WorkerSnapshot, env: &Envelope, ev: &FsmEvent, now: Da
             snap.failure_class = t.failure.map(|class| refine_failure_class(env, class));
             if t.epoch_bump {
                 snap.epoch += 1;
+                // A new epoch is a fresh budget (spec §4.9): the whole point of
+                // `a2a resume` on a `failed{budget_exhausted}` worker is that
+                // the operator has looked and decided to grant more turns. The
+                // reset rides the epoch bump rather than the resume command so
+                // every future edge that bumps gets it for free.
+                snap.turns_this_epoch = Some(0);
             }
         }
         Err(rejected) => record_rejection(snap, env, &rejected),
@@ -687,6 +712,98 @@ mod tests {
         assert_eq!(after.transport, Transport::AppServer);
         assert_eq!(after.requested_transport, Transport::AppServer);
         assert_eq!(after.owner, None);
+    }
+
+    /// One `turn_started` envelope per turn, counted by the fold — plus the
+    /// genesis seed that starts the count at zero and records the budget the
+    /// count is judged against.
+    #[test]
+    fn the_fold_counts_turn_started_and_genesis_seeds_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let genesis = ev(
+            json!({"fsm":"Spawn","id":"general-0818t1200-aaaa","lane":"general",
+                   "cwd":"/repo","transport":"exec","max_turns":3}),
+            1,
+            1,
+        );
+        let mut log = vec![genesis];
+        for seq in 2..=4u64 {
+            let mut turn = ev(json!({}), 1, seq);
+            turn.kind = EventKind::TurnStarted;
+            log.push(turn);
+        }
+        let after = fold(
+            WorkerSnapshot::new_for_test("general-0818t1200-aaaa", tmp.path()),
+            &log,
+            Utc::now(),
+        );
+        assert_eq!(after.max_turns, Some(3), "the budget comes out of genesis");
+        assert_eq!(after.turns_this_epoch, Some(3), "three turns, three counts");
+
+        // (d) Replay is idempotent: seq dedup means folding the same log over
+        // the result changes nothing. Recovery runs on every read path, so a
+        // counter that double-counted would trip a worker for being read twice.
+        let again = fold(after.clone(), &log, Utc::now());
+        assert_eq!(again.turns_this_epoch, Some(3), "seq dedup, not re-counted");
+        assert_eq!(again.epoch, after.epoch);
+
+        // ...and a rebuild from zero reaches the same number, which is what
+        // makes the counter fold-derived rather than writer-derived.
+        let rebuilt = fold(
+            WorkerSnapshot::new_for_test("general-0818t1200-aaaa", tmp.path()),
+            &log,
+            Utc::now(),
+        );
+        assert_eq!(rebuilt.turns_this_epoch, after.turns_this_epoch);
+        assert_eq!(rebuilt.max_turns, after.max_turns);
+    }
+
+    /// (b) The epoch bump is the reset, and (c) a stale-epoch turn is fenced —
+    /// the two halves of "one epoch, one budget".
+    #[test]
+    fn a_resume_resets_the_counter_and_a_stale_turn_never_increments_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut turn1 = ev(json!({}), 1, 2);
+        turn1.kind = EventKind::TurnStarted;
+        let mut turn2 = ev(json!({}), 1, 3);
+        turn2.kind = EventKind::TurnStarted;
+        let after = fold(
+            WorkerSnapshot::new_for_test("general-0818t1200-bbbb", tmp.path()),
+            &[
+                ev(
+                    json!({"fsm":"Spawn","id":"general-0818t1200-bbbb","lane":"general",
+                           "cwd":"/repo","transport":"exec","max_turns":1}),
+                    1,
+                    1,
+                ),
+                turn1,
+                turn2,
+                // The worker has to be terminal for `Resume` to be legal.
+                ev(json!({"fsm":"ProcessStarted","pid":1,"start_witness":"w"}), 1, 4),
+                ev(json!({"fsm":"ProcessExited","code":0}), 1, 5),
+                ev(json!({"fsm":"Resume","answer_queued":false}), 1, 6),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(after.epoch, 2, "resume bumps the epoch");
+        assert_eq!(
+            after.turns_this_epoch,
+            Some(0),
+            "the resumed worker gets a fresh budget"
+        );
+        assert!(
+            after.extra.get("fold_rejections").is_none(),
+            "no rejections on the way there: {:?}",
+            after.extra.get("fold_rejections")
+        );
+
+        // (c) Epoch fencing: a `turn_started` from the dead epoch-1 run is
+        // consumed (its seq advances the watermark) and counts for nothing.
+        let mut stale = ev(json!({}), 1, 7);
+        stale.kind = EventKind::TurnStarted;
+        let fenced = fold(after, &[stale], Utc::now());
+        assert_eq!(fenced.turns_this_epoch, Some(0), "stale epoch, no count");
+        assert_eq!(fenced.last_applied_seq, 7, "the seq is still consumed");
     }
 
     /// The worktree, its diff anchor and the result schema all come out of

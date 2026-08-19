@@ -593,8 +593,81 @@ impl WorkerActor {
             self.warn("appending a lifecycle event", &e);
             return;
         }
+        // The turn budget (spec §4.9), checked HERE — after the envelope is
+        // durably appended, so the count that trips is the count on disk and a
+        // crash in this gap replays to the same verdict.
+        //
+        // `>` and not `>=`: `max_turns = 3` means three turns are allowed, so
+        // the fourth is the one that is too many. `max_turns = 0` therefore
+        // trips on the first, which is the safe reading every cap in
+        // `config.rs` has.
+        //
+        // Gated on `running` because that is the only state a `turn/started`
+        // can legally arrive in, and the only one whose `Timeout{task}` row
+        // lands in `failed`. Committing from anywhere else would buy a
+        // `fold_rejections` entry instead of a trip.
+        if env.kind == EventKind::TurnStarted
+            && self.snap.state == WorkerState::Running
+            && self.snap.turns_this_epoch.unwrap_or(0) > self.budget()
+        {
+            self.trip_budget().await;
+            return;
+        }
         if concludes {
             self.conclude_turn().await;
+        }
+    }
+
+    /// This worker's turn budget: the one genesis recorded, falling back to the
+    /// lane's current value for a worker spawned before budgets existed.
+    ///
+    /// The snapshot leads on purpose — an operator editing the lane table must
+    /// not retroactively re-judge a worker already in flight.
+    fn budget(&self) -> u64 {
+        self.snap
+            .max_turns
+            .or_else(|| self.cfg.lanes.get(&self.snap.lane).map(|l| l.max_turns))
+            .unwrap_or(0)
+    }
+
+    /// The budget is spent: stop the turn, then record it — once.
+    ///
+    /// The interrupt is **best effort and its result is ignored**: a child that
+    /// will not answer must not keep a worker running past its budget, which is
+    /// the whole point of having one. The commit is ONE lifecycle envelope
+    /// carrying an EXISTING FSM payload (`Timeout{task}`) with a refined
+    /// diagnosis — `Running + Timeout{Task} → failed` is already a row, so the
+    /// machine is untouched and only the *reason* is new.
+    async fn trip_budget(&mut self) {
+        let turns_this_epoch = self.snap.turns_this_epoch.unwrap_or(0);
+        let max_turns = self.budget();
+        if let Some(turn_id) = self.open_turn.take() {
+            if let Ok(thread_id) = self.thread_id() {
+                let _ = self
+                    .adapter()
+                    .turn_interrupt(&thread_id, &turn_id, RPC_TIMEOUT)
+                    .await;
+            }
+        }
+        self.flush_trace().await;
+        let outcome = self
+            .persist("trip_budget", move |log, dir, snap| {
+                let snap = fold::append_and_fold(
+                    log,
+                    dir,
+                    snap,
+                    EventKind::BudgetExhausted,
+                    json!({"fsm": "Timeout", "kind": "task",
+                           "failure_class": "budget_exhausted",
+                           "turns_this_epoch": turns_this_epoch,
+                           "max_turns": max_turns}),
+                    Utc::now(),
+                )?;
+                Ok((snap, ()))
+            })
+            .await;
+        if let Err(e) = outcome {
+            self.warn("tripping the turn budget", &e);
         }
     }
 

@@ -664,6 +664,7 @@ mod tests {
             task_timeout_secs: 3600,
             blocked_timeout_secs: 1800,
             allow_elevation: false,
+            max_turns: 30,
         }
     }
 

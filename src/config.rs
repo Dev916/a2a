@@ -56,6 +56,23 @@ pub const DEFAULT_ADMISSION_QUEUE_CAP: u64 = 32;
 /// global cap has no way to prevent.
 pub const DEFAULT_ADMISSION_LANE_CAP: u64 = 4;
 
+/// How many turns one epoch of a worker on this lane may open (spec §4.9).
+///
+/// A turn is one model round trip, so this is the *quota* budget: the thing
+/// that stops a worker which has misread its brief from spending an account's
+/// headroom re-reading it forever. The four numbers are the lanes' shapes — an
+/// impl worker legitimately iterates, a review worker reads a diff and answers,
+/// a research worker follows a few threads, a general worker is somewhere in
+/// between.
+///
+/// `0` means "no turns allowed" and trips on the FIRST one, exactly like every
+/// other cap in this file: the value a mis-set environment variable produces
+/// must be the safe reading. Uncapping is spelled with a large number.
+pub const DEFAULT_MAX_TURNS_IMPL: u64 = 40;
+pub const DEFAULT_MAX_TURNS_REVIEW: u64 = 15;
+pub const DEFAULT_MAX_TURNS_RESEARCH: u64 = 20;
+pub const DEFAULT_MAX_TURNS_GENERAL: u64 = 30;
+
 /// Every `[admission]` key, in the order `config show --origin` reports them.
 /// `lanes` is a nested TABLE, not a value, and is handled separately.
 pub const ADMISSION_FIELDS: [&str; 2] = ["global_cap", "queue_cap"];
@@ -71,7 +88,7 @@ pub const SYNC_FIELDS: [&str; 3] = [
 ];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
-pub const LANE_FIELDS: [&str; 9] = [
+pub const LANE_FIELDS: [&str; 10] = [
     "sandbox",
     "network",
     "worktree_default",
@@ -84,6 +101,9 @@ pub const LANE_FIELDS: [&str; 9] = [
     // reports its keys in, and a new key inserted mid-list would renumber a
     // surface other tools read.
     "allow_elevation",
+    // APPENDED LAST, same discipline: the turn budget joins the end of the
+    // reported order rather than displacing a key another tool reads by index.
+    "max_turns",
 ];
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -186,6 +206,18 @@ pub struct LaneConfig {
     /// alone — which is the whole shape of the §5 gate.
     #[serde(default)]
     pub allow_elevation: bool,
+    /// How many turns ONE EPOCH of a worker on this lane may open (spec §4.9).
+    ///
+    /// Counted by the fold (a `turn_started` envelope increments the snapshot's
+    /// `turns_this_epoch`, an epoch bump resets it) and enforced by the broker's
+    /// `WorkerActor` at the one moment it already knows a turn opened. `0` trips
+    /// on the first turn — see [`DEFAULT_MAX_TURNS_IMPL`] for why the safe
+    /// reading has to be the one an unset value produces.
+    ///
+    /// Deliberately NOT `#[serde(default)]`: a `0` conjured by a missing key
+    /// would be a worker that can never take a turn, and this struct is only
+    /// ever built by [`default_lane`] plus the layered overrides below.
+    pub max_turns: u64,
 }
 
 /// The `[broker]` section: what the daemon does about itself.
@@ -330,6 +362,12 @@ fn default_lane(lane: Lane) -> LaneConfig {
         Lane::Research => (SandboxMode::OutboxOnly, true, "medium"),
         Lane::General => (SandboxMode::WorkspaceWrite, false, "medium"),
     };
+    let max_turns = match lane {
+        Lane::Impl => DEFAULT_MAX_TURNS_IMPL,
+        Lane::Review => DEFAULT_MAX_TURNS_REVIEW,
+        Lane::Research => DEFAULT_MAX_TURNS_RESEARCH,
+        Lane::General => DEFAULT_MAX_TURNS_GENERAL,
+    };
     LaneConfig {
         sandbox,
         network,
@@ -341,6 +379,7 @@ fn default_lane(lane: Lane) -> LaneConfig {
         blocked_timeout_secs: DEFAULT_BLOCKED_TIMEOUT_SECS,
         // No lane may elevate until an operator says so, in writing, per lane.
         allow_elevation: false,
+        max_turns,
     }
 }
 
@@ -738,6 +777,7 @@ fn apply_lane_toml(
         "task_timeout_secs" => lc.task_timeout_secs = want_u64(dotted, v)?,
         "blocked_timeout_secs" => lc.blocked_timeout_secs = want_u64(dotted, v)?,
         "allow_elevation" => lc.allow_elevation = want_bool(dotted, v)?,
+        "max_turns" => lc.max_turns = want_u64(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -921,6 +961,7 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "task_timeout_secs" => lc.task_timeout_secs = parse_u64_str(key, s)?,
         "blocked_timeout_secs" => lc.blocked_timeout_secs = parse_u64_str(key, s)?,
         "allow_elevation" => lc.allow_elevation = parse_bool_str(key, s)?,
+        "max_turns" => lc.max_turns = parse_u64_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
     }
     Ok(())
@@ -1034,12 +1075,79 @@ mod tests {
             "A2A_ADMISSION_LANES_IMPL_CAP"
         );
         // The layering test's key set is stable: admission is its own section.
-        assert_eq!(LANE_FIELDS.len(), 9);
+        assert_eq!(LANE_FIELDS.len(), 10);
         assert!(!LANE_FIELDS.contains(&"cap"));
-        // The §5 permission is a LANE key, appended last so the reported order
-        // of every key before it is untouched.
+        // The §5 permission is a LANE key, appended after the Phase-1 block so
+        // the reported order of every key before it is untouched.
         assert!(LANE_FIELDS.contains(&"allow_elevation"));
-        assert_eq!(*LANE_FIELDS.last().unwrap(), "allow_elevation");
+        // ...and the Phase-5 turn budget is appended after THAT, for the same
+        // reason. Whatever is last is the newest key, always.
+        assert_eq!(*LANE_FIELDS.last().unwrap(), "max_turns");
+    }
+
+    /// The turn-budget surface is PINNED (spec §4.9): four per-lane numbers,
+    /// one env spelling, and `0` reading as "no turns allowed" rather than as
+    /// "unbounded" — the same safe direction every other cap in this file has.
+    #[test]
+    fn the_turn_budget_surface_is_the_one_the_spec_pins() {
+        assert_eq!(default_lane(Lane::Impl).max_turns, 40);
+        assert_eq!(default_lane(Lane::Review).max_turns, 15);
+        assert_eq!(default_lane(Lane::Research).max_turns, 20);
+        assert_eq!(default_lane(Lane::General).max_turns, 30);
+        assert_eq!(DEFAULT_MAX_TURNS_IMPL, 40);
+        assert_eq!(DEFAULT_MAX_TURNS_REVIEW, 15);
+        assert_eq!(DEFAULT_MAX_TURNS_RESEARCH, 20);
+        assert_eq!(DEFAULT_MAX_TURNS_GENERAL, 30);
+        assert_eq!(
+            lane_env_key(Lane::Impl, "max_turns"),
+            "A2A_LANES_IMPL_MAX_TURNS"
+        );
+        assert_eq!(
+            lane_env_key(Lane::General, "max_turns"),
+            "A2A_LANES_GENERAL_MAX_TURNS"
+        );
+    }
+
+    /// The file layer walks the new key like every other one: a good value
+    /// lands with a `lanes.<lane>.max_turns` origin, a malformed one fails
+    /// `CONFIG_INVALID` naming the dotted key, and an unknown sibling still
+    /// only warns.
+    #[test]
+    fn the_lane_turn_budget_is_layered_parsed_and_named_when_it_is_wrong() {
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        let table: toml::Table = "[lanes.impl]\nmax_turns = 7\nmax_turnz = 3\n"
+            .parse()
+            .unwrap();
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert_eq!(cfg.lanes[&Lane::Impl].max_turns, 7);
+        assert_eq!(
+            origins.get("lanes.impl.max_turns"),
+            Some(&Origin::File),
+            "the origin key is the dotted path `config show --origin` reports"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("lanes.impl.max_turnz")),
+            "an unknown sibling only warns: {warnings:?}"
+        );
+
+        let bad: toml::Table = "[lanes.review]\nmax_turns = \"lots\"\n".parse().unwrap();
+        let err = apply_file(&mut cfg, &mut origins, &mut warnings, &bad).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        assert!(
+            err.message.contains("lanes.review.max_turns"),
+            "the failure names the dotted key: {}",
+            err.message
+        );
     }
 
     /// A lane the map does not carry (a config from a newer binary) falls back

@@ -135,6 +135,15 @@ struct Row {
     /// marker; this string is the one a caller pipes into `git`, so it lives in
     /// `--json`.
     worktree_branch: Option<String>,
+    /// Turns opened in the CURRENT epoch, and the budget they are judged
+    /// against (spec §4.9). Both nullable: a worker spawned before budgets
+    /// existed has neither, and `null` is the honest answer for it.
+    ///
+    /// `--json` only — the human table is unchanged, because a fleet view that
+    /// grew a column every time a number became observable would stop fitting
+    /// on a terminal, and the number a human wants here is on `a2a status`.
+    turns_this_epoch: Option<u64>,
+    max_turns: Option<u64>,
     /// Why this worker was allowed `danger-full-access` (spec §5). An elevated
     /// worker must never be visually identical to an ordinary one, so this
     /// drives the `/ELEV` marker on the STATE cell as well as the `--json` key.
@@ -155,6 +164,8 @@ impl Row {
             transport: transport_of(Some(snap)),
             queue_position: snap.queue_position,
             worktree_branch: snap.worktree.as_ref().map(|w| w.branch.clone()),
+            turns_this_epoch: snap.turns_this_epoch,
+            max_turns: snap.max_turns,
             elevation_reason: snap.elevation_reason.clone(),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
@@ -184,6 +195,8 @@ impl Row {
             worktree_branch: stale
                 .as_ref()
                 .and_then(|s| s.worktree.as_ref().map(|w| w.branch.clone())),
+            turns_this_epoch: stale.as_ref().and_then(|s| s.turns_this_epoch),
+            max_turns: stale.as_ref().and_then(|s| s.max_turns),
             // Kept from the stale snapshot on purpose: a worker we can no
             // longer reconcile is exactly the one whose elevation matters most.
             elevation_reason: stale.as_ref().and_then(|s| s.elevation_reason.clone()),
@@ -205,6 +218,8 @@ impl Row {
             "transport": self.transport,
             "queue_position": self.queue_position,
             "worktree_branch": self.worktree_branch,
+            "turns_this_epoch": self.turns_this_epoch,
+            "max_turns": self.max_turns,
             "elevation_reason": self.elevation_reason,
         })
     }
@@ -351,6 +366,8 @@ mod tests {
             transport: "exec".into(),
             queue_position: None,
             worktree_branch: None,
+            turns_this_epoch: None,
+            max_turns: None,
             elevation_reason: None,
             created_at: None,
             dwell_secs: dwell,

@@ -89,6 +89,21 @@ pub struct WorkerSnapshot {
     /// it; nothing reads it before then).
     #[serde(default)]
     pub queue_position: Option<u64>,
+    /// The turn budget this worker was born with (spec §4.9) — the lane's
+    /// `max_turns`, already clamped by anything the brief asked for.
+    ///
+    /// Recorded on the worker rather than read from config at enforcement time
+    /// for the same reason `model` and `sandbox` are: an operator editing the
+    /// lane table must not silently re-judge a worker that is already running.
+    /// `None` is a worker spawned before budgets existed, and the enforcement
+    /// path falls back to the lane's current value for it.
+    #[serde(default)]
+    pub max_turns: Option<u64>,
+    /// How many turns THIS epoch has opened. Fold-derived, never
+    /// writer-derived: a `turn_started` envelope increments it and an epoch
+    /// bump resets it, so a snapshot rebuilt from the WAL counts the same.
+    #[serde(default)]
+    pub turns_this_epoch: Option<u64>,
     pub rollout_path: Option<PathBuf>,
     pub pid: Option<u32>,
     pub pid_start_witness: Option<String>,
@@ -143,6 +158,8 @@ impl WorkerSnapshot {
             session_id: None,
             thread_id: None,
             queue_position: None,
+            max_turns: None,
+            turns_this_epoch: None,
             rollout_path: None,
             pid: None,
             pid_start_witness: None,
@@ -357,6 +374,29 @@ mod tests {
         assert_eq!(back.base_ref, None);
         assert!(
             back.extra.get("worktree").is_none() && back.extra.get("base_ref").is_none(),
+            "the new fields are typed, not swept into the forward-compat bag"
+        );
+    }
+
+    /// One phase further on: a snapshot written before turn budgets existed has
+    /// neither `max_turns` nor `turns_this_epoch`, and must load as a worker
+    /// with neither — never as one whose budget reads `0` (which the broker
+    /// would trip on its very next turn).
+    #[test]
+    fn a_snapshot_without_the_phase_five_fields_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        let mut value = serde_json::to_value(&s).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("max_turns");
+        obj.remove("turns_this_epoch");
+        std::fs::write(tmp.path().join(STATE_FILE), value.to_string()).unwrap();
+
+        let back = load_snapshot(tmp.path()).expect("an older snapshot is not corrupt");
+        assert_eq!(back.max_turns, None);
+        assert_eq!(back.turns_this_epoch, None);
+        assert!(
+            back.extra.get("max_turns").is_none() && back.extra.get("turns_this_epoch").is_none(),
             "the new fields are typed, not swept into the forward-compat bag"
         );
     }

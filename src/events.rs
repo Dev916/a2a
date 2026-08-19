@@ -81,6 +81,12 @@ pub enum EventKind {
     Error,
     TurnCompleted,
     ResultWritten,
+    /// The worker opened one turn more than its lane's `max_turns` allowed
+    /// (spec §4.9). A NEW kind carrying an EXISTING FSM payload
+    /// (`Timeout{task}` refined to `failure_class: budget_exhausted`): the
+    /// vocabulary grows so `a2a tail` can name what happened, the machine does
+    /// not.
+    BudgetExhausted,
     #[serde(other)]
     Unknown,
 }
@@ -823,14 +829,20 @@ mod tests {
         );
     }
 
-    /// The three new kinds cross the file layer: a Phase-1 binary reading a
-    /// Phase-2 `events.jsonl` must degrade to `Unknown`, not fail the read.
+    /// Every post-Phase-1 kind crosses the file layer: a Phase-1 binary reading
+    /// a newer `events.jsonl` must degrade to `Unknown`, not fail the read.
+    ///
+    /// `budget_exhausted` is here for exactly that reason and is deliberately
+    /// absent from [`Phase1EventKind`] below — the mirror is the frozen
+    /// vocabulary of a deployed older binary, and adding to it would assert the
+    /// opposite of what this test exists to prove.
     #[test]
     fn new_kinds_are_snake_case_and_read_as_unknown_by_a_phase1_binary() {
         for (kind, wire) in [
             (EventKind::TokenUsage, "token_usage"),
             (EventKind::ModelRerouted, "model_rerouted"),
             (EventKind::TransportDegraded, "transport_degraded"),
+            (EventKind::BudgetExhausted, "budget_exhausted"),
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), json!(wire));
             let back: EventKind = serde_json::from_value(json!(wire)).unwrap();

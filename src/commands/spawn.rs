@@ -218,6 +218,14 @@ pub fn run(
         warn("--no-queue has no effect on the exec transport: there is no admission queue to refuse");
     }
 
+    // The turn budget (spec §4.9). The lane owns the ceiling; the brief may only
+    // lower it, and asking for more is a clamp plus a warning rather than a
+    // refusal — a brief is a request, not a grant.
+    let (max_turns, clamp) = effective_max_turns(lane, lane_cfg.max_turns, parsed.max_turns);
+    if let Some(msg) = &clamp {
+        warn(msg);
+    }
+
     let model = args.model.clone().unwrap_or_else(|| lane_cfg.model.clone());
     let effort = args.effort.clone().unwrap_or_else(|| lane_cfg.effort.clone());
     let brief_sha = brief::sha256_hex(&brief_text);
@@ -362,6 +370,11 @@ pub fn run(
             "transport_selection": requested.selection(),
             "owner": owner,
             "schema_path": schema_path,
+            // The EFFECTIVE turn budget, in genesis for the same reason the
+            // model and the sandbox are: it is what this worker was judged
+            // against, and an operator editing the lane table afterwards must
+            // not retroactively change the verdict on a worker in flight.
+            "max_turns": max_turns,
             "created_at": now.to_rfc3339(),
     });
     // WHICH rung of the precedence table produced that schema. In genesis, not
@@ -930,6 +943,42 @@ struct WorktreeGate {
     skipped: Option<&'static str>,
 }
 
+/// The turn budget this spawn will be judged against (spec §4.9), and the
+/// warning to print when the brief asked for more than the lane allows.
+///
+/// **The brief may only LOWER it.** A budget is the operator's protection
+/// against a worker spending an account's headroom on its own confusion, and a
+/// brief is written by whoever dispatched the worker — often the worker's own
+/// orchestrator. A brief that could raise its own ceiling would be a cap that
+/// only stops the callers who were not going to exceed it anyway. Asking for
+/// less is honoured silently: that is a caller volunteering a tighter bound.
+///
+/// The returned message carries **no** `a2a: warning: ` prefix — `run`'s `warn`
+/// closure adds that, and a string that carried it would print it twice.
+///
+/// Takes the [`Lane`] as well as its ceiling, unlike the two-argument sketch in
+/// the plan: the pinned wording names the lane ("the impl lane's 40"), and a
+/// function that cannot see the lane cannot produce it.
+pub fn effective_max_turns(
+    lane: Lane,
+    lane_max: u64,
+    brief_max: Option<u32>,
+) -> (u64, Option<String>) {
+    let Some(asked) = brief_max.map(u64::from) else {
+        return (lane_max, None);
+    };
+    if asked > lane_max {
+        return (
+            lane_max,
+            Some(format!(
+                "brief max_turns {asked} exceeds the {lane} lane's {lane_max} — clamped to \
+                 {lane_max} (a brief may only lower the turn budget)"
+            )),
+        );
+    }
+    (asked, None)
+}
+
 /// `--worktree` ⇒ yes; `--no-worktree` ⇒ no; neither ⇒ the lane default.
 ///
 /// The two-rule split on a cwd that is not a git work tree is deliberate and
@@ -1410,6 +1459,34 @@ mod tests {
         assert!(!is_under(Path::new("/x/abc"), Path::new("/x/ab")));
         assert!(!is_under(Path::new("/x/a"), Path::new("/x/ab")));
         assert!(!is_under(Path::new("/y/ab"), Path::new("/x/ab")));
+    }
+
+    /// The clamp, in all four shapes it has — and the pinned wording, WITHOUT
+    /// the `a2a: warning: ` prefix `run`'s own closure prepends.
+    #[test]
+    fn a_brief_may_only_lower_the_turn_budget() {
+        // No ask: the lane's number, silently.
+        assert_eq!(effective_max_turns(Lane::Impl, 40, None), (40, None));
+        // A lower ask is honoured, silently — a caller volunteering a bound.
+        assert_eq!(effective_max_turns(Lane::Impl, 40, Some(5)), (5, None));
+        // Equal is not "more".
+        assert_eq!(effective_max_turns(Lane::Impl, 40, Some(40)), (40, None));
+        // More is clamped, and says so.
+        let (effective, warning) = effective_max_turns(Lane::Impl, 40, Some(99));
+        assert_eq!(effective, 40);
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "brief max_turns 99 exceeds the impl lane's 40 — clamped to 40 \
+                 (a brief may only lower the turn budget)"
+            )
+        );
+        assert!(
+            !warning.unwrap().starts_with("a2a: warning: "),
+            "`run`'s warn closure adds the prefix; carrying it here would double it"
+        );
+        // `0` is a lane that allows no turns, and a brief cannot talk its way up.
+        assert_eq!(effective_max_turns(Lane::General, 0, Some(7)).0, 0);
     }
 
     #[test]

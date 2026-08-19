@@ -55,6 +55,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
             BrokerCmd::Restart => "broker restart",
         },
         Cmd::BrokerCall { .. } => "__broker-call",
+        Cmd::Verify { .. } => "verify",
     }
 }
 
@@ -212,6 +213,21 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
         Cmd::BrokerCall { op, params } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::broker_cmd::call(&home, op, params.as_deref())
+        }
+        Cmd::Verify {
+            id,
+            force_verify,
+            timeout,
+        } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::verify::run(
+                &home,
+                id,
+                *force_verify,
+                timeout.unwrap_or(a2a::commands::verify::DEFAULT_TIMEOUT),
+                cli.global.json,
+                cli.global.quiet,
+            )
         }
     }
 }

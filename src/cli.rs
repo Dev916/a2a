@@ -193,6 +193,20 @@ pub enum Cmd {
         params: Option<String>,
     },
     // later tasks append variants here
+    /// Re-run the BRIEF's verify commands in the worker's workspace and write
+    /// verification.json. Never runs commands the worker proposed.
+    Verify {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+        /// Run even when the diff touches execution-bearing paths (recorded
+        /// either way)
+        #[arg(long)]
+        force_verify: bool,
+        /// Kill any single verify command after this long — `30s`, `5m`, `2h`
+        /// (default: 10m)
+        #[arg(long, value_name = "DUR", value_parser = crate::commands::wait::parse_duration)]
+        timeout: Option<std::time::Duration>,
+    },
 }
 
 #[derive(Subcommand)]

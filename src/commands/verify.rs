@@ -44,11 +44,47 @@
 //! for. A worker with `base_ref == None` (a non-git cwd, or a pre-Phase-4
 //! worker) therefore meets [`no_diff_base_error`] rather than an ungated run;
 //! `--force-verify` is the way to say "I trust this tree" out loud.
+//!
+//! # The runner ([`run`])
+//!
+//! `a2a verify <id>` is synchronous and talks to no broker: it reads the
+//! worker's record and its workspace, and nothing else. That is the whole
+//! reason the two transports verify identically.
+//!
+//! Order of operations, pinned: resolve → reconcile → read+hash brief →
+//! base-ref branch → changed paths → gate → run the commands → write
+//! `verification.json` → exit.
+//!
+//! **On the FSM contract, precisely.** In a2a *reading a worker is what
+//! advances it*: [`crate::reconcile::reconcile`] is itself the path that
+//! appends envelopes and commits transitions, and verify calls it because it
+//! needs a *current* `base_ref`/`worktree`/`brief_sha` — a stale snapshot is
+//! exactly how verify would end up diffing against the wrong anchor. So verify
+//! is not "appends nothing"; the pin is that **verify contributes no transition
+//! of its own**. It appends nothing beyond what the shared reconcile would have
+//! appended for any reader at that instant, and it never writes a
+//! verify-specific event.
 
-use crate::output::{AppError, ExitCode};
+use crate::config;
+use crate::home::A2aHome;
+use crate::ids;
+use crate::output::{AppError, ExitCode, Outcome};
+use crate::reconcile::reconcile;
 use crate::worktree;
-use serde_json::json;
-use std::path::Path;
+use crate::{brief, exec, redact, store};
+use chrono::{DateTime, Utc};
+use nix::errno::Errno;
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::{setsid, Pid};
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The execution-bearing pattern list (spec §5), one string per rule.
 ///
@@ -273,6 +309,443 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the runner (Task 6)
+// ---------------------------------------------------------------------------
+
+/// The artifact `a2a verify` leaves in the worker directory.
+///
+/// A rerun **overwrites** it; unlike `result.json` there is no rotation. The
+/// latest verification is the one that counts, and the WAL is not involved.
+pub const VERIFICATION_FILE: &str = "verification.json";
+
+/// Per-command wall clock before the group is killed (`--timeout` overrides).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Who ran these commands. Not "codex", not the worker — the point of the
+/// artifact is that an independent process re-ran the brief's own checks.
+const RAN_BY: &str = "a2a-verify";
+
+/// How much of each command's stderr reaches the human (the artifact itself
+/// carries no output text at all — spec §5, it must not become an egress
+/// channel).
+const STDERR_TAIL: usize = 4096;
+
+/// Wait granularity for the bounded per-command wait.
+const WAIT_POLL: Duration = Duration::from_millis(10);
+
+/// `verification.json`, in declaration order.
+///
+/// A `#[derive(Serialize)]` struct rather than a `json!` literal on purpose:
+/// `serde_json::Map` is a `BTreeMap` (the crate is declared with no features),
+/// so anything routed through a [`Value`] comes back out alphabetized. The file
+/// is written from this struct directly; only the `--json` envelope, which
+/// nobody diffs, goes through [`Value`].
+#[derive(Serialize, Debug)]
+pub struct Verification {
+    pub schema_version: u32,
+    pub id: String,
+    pub ran_at: DateTime<Utc>,
+    pub ran_by: &'static str,
+    pub workspace: PathBuf,
+    /// The commit the workspace was diffed against — `null` only on the
+    /// `--force-verify` + no-base path.
+    pub base_ref: Option<String>,
+    /// Did `--force-verify` run this? Forcing bypasses the refusal, never the
+    /// record.
+    pub forced: bool,
+    /// The execution-bearing paths the gate found. Non-empty here implies
+    /// `forced`, because otherwise the run would have been refused.
+    pub exec_bearing: Vec<String>,
+    pub commands: Vec<CommandRun>,
+    pub scope: Scope,
+    pub ok: bool,
+}
+
+/// One brief command's outcome — exactly seven keys.
+///
+/// The brief pins `{command, exit_code, duration_ms, stdout_sha256, ran_at,
+/// ran_by}`; `timed_out` is the seventh, added because `exit_code: null` alone
+/// is ambiguous (killed by us? killed by something else?).
+#[derive(Serialize, Debug)]
+pub struct CommandRun {
+    pub command: String,
+    /// `null` when the command was killed rather than exited.
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub duration_ms: u64,
+    /// Lowercase hex SHA-256 of the child's **stdout bytes**. The text itself
+    /// is never stored (spec §5).
+    pub stdout_sha256: String,
+    pub ran_at: DateTime<Utc>,
+    pub ran_by: &'static str,
+}
+
+/// Re-run the BRIEF's verify commands in the worker's workspace.
+///
+/// Never runs a command the worker proposed: the list is
+/// `brief::parse(<worker>/brief.md).verify`, and the brief is re-hashed against
+/// the `brief_sha` pinned at spawn first.
+pub fn run(
+    home: &A2aHome,
+    id_arg: &str,
+    force_verify: bool,
+    timeout: Duration,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Outcome, AppError> {
+    let (cfg, _origins, warnings) = config::load(home)?;
+    if !quiet {
+        for w in &warnings {
+            eprintln!("a2a: warning: {w}");
+        }
+    }
+    let id = ids::resolve(home, id_arg)?;
+    // The read path `status` uses, for the reason in the module doc-comment.
+    let snap = reconcile(home, &cfg, &id, Utc::now())?;
+    let wdir = home.worker_dir(&id);
+
+    // --- the brief, and the two guards that make it the ONLY source of commands
+    let brief_path = wdir.join("brief.md");
+    let brief_text = std::fs::read_to_string(&brief_path).map_err(|e| {
+        AppError::new(
+            "BRIEF_UNREADABLE",
+            ExitCode::Precondition,
+            format!("cannot read {}: {e}", brief_path.display()),
+        )
+        .remedy("verify runs the brief's commands, so a worker without its brief cannot be verified")
+    })?;
+    if brief::sha256_hex(&brief_text) != snap.brief_sha {
+        return Err(AppError::new(
+            "BRIEF_TAMPERED",
+            ExitCode::Precondition,
+            format!(
+                "{}'s brief no longer hashes to the value recorded at spawn",
+                id
+            ),
+        )
+        .remedy("the brief is immutable after spawn; a2a will not run commands from an edited brief")
+        .data(json!({"id": id, "expected": snap.brief_sha})));
+    }
+    let parsed = brief::parse(&brief_text).map_err(|e| {
+        AppError::new("BRIEF_INVALID", ExitCode::Precondition, e)
+            .remedy("fix the brief's front matter and respawn")
+    })?;
+    if parsed.verify.is_empty() {
+        return Err(AppError::new(
+            "NO_VERIFY_COMMANDS",
+            ExitCode::Precondition,
+            format!("{id}'s brief declares no `verify:` commands, so there is nothing to run"),
+        )
+        .remedy("add `verify:` commands to the brief's front matter and respawn"));
+    }
+
+    // --- the workspace: the worktree when there is one, else the plain cwd
+    let workspace = snap
+        .worktree
+        .as_ref()
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| snap.cwd.clone());
+    if !workspace.is_dir() {
+        return Err(AppError::new(
+            "WORKSPACE_MISSING",
+            ExitCode::Precondition,
+            format!("{id}'s workspace {} is gone", workspace.display()),
+        )
+        .remedy("nothing can be verified in a tree that no longer exists")
+        .data(json!({"id": id, "workspace": workspace})));
+    }
+
+    // --- the base-ref branch, then the gate
+    let (base_ref, scope_snapshot, exec_bearing) = match snap.base_ref.as_deref() {
+        Some(base) => {
+            let snapshot = scope(&workspace, base, &parsed.files_in_scope)?;
+            let hits = gate(&snapshot.changed);
+            if !hits.is_empty() && !force_verify {
+                return Err(exec_bearing_error(&hits));
+            }
+            (Some(base.to_string()), snapshot, hits)
+        }
+        // No anchor: refuse, unless the operator said "I trust this tree" out
+        // loud. `scope()` is deliberately NOT called on the forced path —
+        // there is no ref to hand it, and the artifact's shape is pinned to the
+        // empty snapshot below.
+        None => {
+            if !force_verify {
+                return Err(no_diff_base_error(&id));
+            }
+            (
+                None,
+                Scope {
+                    files_in_scope_declared: !parsed.files_in_scope.is_empty(),
+                    ..Scope::default()
+                },
+                Vec::new(),
+            )
+        }
+    };
+    if !exec_bearing.is_empty() {
+        // Deliberately NOT gated on `--quiet`: this is the notice that a
+        // refusal was overridden, not decoration.
+        eprintln!(
+            "a2a: WARNING: --force-verify: running the brief's commands against a diff that \
+             touches {} execution-bearing path(s): {}",
+            exec_bearing.len(),
+            exec_bearing.join(", ")
+        );
+    }
+
+    // --- run every command, in brief order, even after one fails
+    let mut commands = Vec::with_capacity(parsed.verify.len());
+    for command in &parsed.verify {
+        commands.push(run_one(command, &workspace, &id, timeout, quiet)?);
+    }
+    let ok = commands
+        .iter()
+        .all(|c| !c.timed_out && c.exit_code == Some(0));
+
+    let artifact = Verification {
+        schema_version: 1,
+        id: id.clone(),
+        ran_at: Utc::now(),
+        ran_by: RAN_BY,
+        workspace,
+        base_ref,
+        forced: force_verify,
+        exec_bearing,
+        commands,
+        scope: scope_snapshot,
+        ok,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&artifact).map_err(|e| {
+        AppError::new(
+            "INTERNAL",
+            ExitCode::Internal,
+            format!("serializing the verification: {e}"),
+        )
+    })?;
+    bytes.push(b'\n');
+    store::write_atomic(&wdir.join(VERIFICATION_FILE), &bytes).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("writing {VERIFICATION_FILE}: {e}"),
+        )
+    })?;
+
+    let data = if json_mode {
+        serde_json::to_value(&artifact).map_err(|e| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("rendering the verification: {e}"),
+            )
+        })?
+    } else {
+        Value::String(plain_lines(&artifact.commands))
+    };
+    Ok(Outcome::with(
+        data,
+        if ok {
+            ExitCode::Success
+        } else {
+            // Commands that failed are a WORKER failure, not a precondition
+            // one: verify itself answered the question correctly.
+            ExitCode::WorkerFailed
+        },
+    ))
+}
+
+/// `<exit_code> <duration_ms>ms <command>`, one line per command. A killed
+/// command has no exit code, so it renders as `-`.
+fn plain_lines(commands: &[CommandRun]) -> String {
+    commands
+        .iter()
+        .map(|c| {
+            let code = c
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!("{code} {}ms {}", c.duration_ms, c.command)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Run ONE brief command and report what it did.
+///
+/// # Why `/bin/sh -c <command>` is safe here, and only here
+///
+/// `<command>` is passed as a **single argv element, verbatim from the brief**.
+/// This is the one shell use in the phase, and three facts guard it: the brief
+/// is human-authored; its `brief_sha` is pinned at spawn and re-checked by
+/// [`run`] before this function is ever reached; and **no worker output, steer,
+/// inbox message or any other machine-generated text ever reaches this argv**.
+/// A verify command therefore says exactly what its author typed.
+///
+/// # Why two reader threads
+///
+/// The obvious implementation — `spawn()` plus a `try_wait()` poll that reads
+/// the pipes after exit — **deadlocks** the moment a command's stdout exceeds
+/// the ~64 KiB pipe buffer: the child blocks writing, the parent blocks
+/// waiting, the timeout expires, and a perfectly healthy `cargo test` is
+/// recorded `timed_out: true, exit_code: null`. So stdout and stderr are
+/// drained by their own threads *concurrently* with the wait, and both are
+/// joined **before** the hash is read, so `stdout_sha256` always covers the
+/// full byte stream.
+fn run_one(
+    command: &str,
+    workspace: &Path,
+    id: &str,
+    timeout: Duration,
+    quiet: bool,
+) -> Result<CommandRun, AppError> {
+    let ran_at = Utc::now();
+    let started = Instant::now();
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(command) // ONE argv element — never a built-up shell string
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The caller's environment minus the credentials a worker may never see
+    // (spec §4.2, §5) — the same list `exec` scrubs.
+    for key in exec::SCRUBBED_ENV {
+        cmd.env_remove(key);
+    }
+    cmd.env("A2A_WORKER_ID", id).env("A2A_WORKSPACE", workspace);
+    unsafe {
+        cmd.pre_exec(|| {
+            // Own session + process group — the same idiom as
+            // `exec::spawn_detached` — so a timeout can reap the whole tree
+            // with one `killpg` instead of orphaning the grandchildren.
+            match setsid() {
+                Ok(_) => Ok(()),
+                Err(Errno::EPERM) => Ok(()), // already a session leader
+                Err(e) => Err(io::Error::from(e)),
+            }
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::new(
+            "VERIFY_SPAWN_FAILED",
+            ExitCode::Internal,
+            format!("could not run `{command}`: {e}"),
+        )
+    })?;
+    let pid = child.id() as i32;
+    let mut out = child.stdout.take().expect("stdout is piped");
+    let mut err = child.stderr.take().expect("stderr is piped");
+    let hasher = std::thread::spawn(move || hash_stream(&mut out));
+    let tailer = std::thread::spawn(move || tail_stream(&mut err));
+
+    let deadline = started + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(AppError::new(
+                    "VERIFY_WAIT_FAILED",
+                    ExitCode::Internal,
+                    format!("waiting for `{command}`: {e}"),
+                ))
+            }
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            // The child setsid'd, so its pid IS its process group: one signal
+            // takes the whole tree.
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+            let _ = child.wait(); // reap, so nothing is left as a zombie
+            break None;
+        }
+        std::thread::sleep(WAIT_POLL);
+    };
+
+    // Joined BEFORE the hash is used: a hash taken while a reader is still
+    // draining would cover a prefix of the stream.
+    let stdout_sha256 = hasher.join().unwrap_or_else(|_| hex(&Sha256::digest([])));
+    let stderr_tail = tailer.join().unwrap_or_default();
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    if !stderr_tail.is_empty() && !quiet {
+        // The human gets the tail, egress-redacted; the artifact gets none of
+        // it (spec §5 — it must not become an egress channel).
+        eprint!(
+            "a2a: verify: `{command}` stderr (last {} bytes):\n{}",
+            stderr_tail.len(),
+            redact::redact_egress(&String::from_utf8_lossy(&stderr_tail))
+        );
+        if !stderr_tail.ends_with(b"\n") {
+            eprintln!();
+        }
+    }
+
+    Ok(CommandRun {
+        command: command.to_string(),
+        exit_code: if timed_out {
+            None
+        } else {
+            status.and_then(|s| s.code())
+        },
+        timed_out,
+        duration_ms,
+        stdout_sha256,
+        ran_at,
+        ran_by: RAN_BY,
+    })
+}
+
+/// Drain a pipe to its end, hashing as it goes: the bytes are never held.
+fn hash_stream(r: &mut impl Read) -> String {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    hex(&hasher.finalize())
+}
+
+/// Drain a pipe to its end, keeping only the last [`STDERR_TAIL`] bytes.
+fn tail_stream(r: &mut impl Read) -> Vec<u8> {
+    let mut keep: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                keep.extend_from_slice(&buf[..n]);
+                if keep.len() > STDERR_TAIL {
+                    let cut = keep.len() - STDERR_TAIL;
+                    keep.drain(..cut);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    keep
+}
+
+/// Lowercase hex, the same rendering as [`crate::brief::sha256_hex`].
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String is infallible.
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +930,33 @@ mod tests {
                  on a workspace you trust"
             )
         );
+    }
+
+    /// The non-JSON rendering, including the one shape no integration test
+    /// reaches: a killed command has no exit code, and `-` is its spelling.
+    #[test]
+    fn the_plain_rendering_names_the_code_the_duration_and_the_command() {
+        let runs = vec![
+            CommandRun {
+                command: "cargo test".to_string(),
+                exit_code: Some(0),
+                timed_out: false,
+                duration_ms: 1234,
+                stdout_sha256: String::new(),
+                ran_at: Utc::now(),
+                ran_by: RAN_BY,
+            },
+            CommandRun {
+                command: "sleep 300".to_string(),
+                exit_code: None,
+                timed_out: true,
+                duration_ms: 1000,
+                stdout_sha256: String::new(),
+                ran_at: Utc::now(),
+                ran_by: RAN_BY,
+            },
+        ];
+        assert_eq!(plain_lines(&runs), "0 1234ms cargo test\n- 1000ms sleep 300");
     }
 
     #[test]

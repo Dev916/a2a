@@ -149,7 +149,7 @@ pub fn effective_max_turns(lane_max: u64, brief_max: Option<u32>) -> (u64, Optio
 //   async fn trip_budget(&mut self)              // interrupt + the one lifecycle commit
 ```
 
-- [ ] Steps: failing tests → RED → implement (config → state → fold → spawn → actor → ls) → GREEN → full suite, zero warnings → commit `feat: per-lane turn budgets (fold-counted, broker-enforced, resumable)`.
+- [x] Steps: failing tests → RED → implement (config → state → fold → spawn → actor → ls) → GREEN → full suite, zero warnings → commit `feat: per-lane turn budgets (fold-counted, broker-enforced, resumable)`.
 
 ---
 
@@ -209,7 +209,7 @@ impl CoreHandle { pub async fn reset_breaker(&self) -> Result<bool, AppError>; }
 pub fn reset_breaker(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError>;
 ```
 
-- [ ] Steps: failing tests → RED → implement (config → Breaker unit → core hook + admission doors → health/log → op + CLI) → GREEN → full suite, zero warnings → commit `feat: broker circuit breaker (BREAKER_OPEN, health persistence, reset-breaker op)`.
+- [x] Steps: failing tests → RED → implement (config → Breaker unit → core hook + admission doors → health/log → op + CLI) → GREEN → full suite, zero warnings → commit `feat: broker circuit breaker (BREAKER_OPEN, health persistence, reset-breaker op)`.
 
 ---
 
@@ -256,7 +256,7 @@ pub fn run(home: &A2aHome, id: &str, brief: Option<&Path>, force: bool,
            json_mode: bool, quiet: bool) -> Result<Outcome, AppError>;
 ```
 
-- [ ] Steps: failing tests → RED → implement (config → snapshot+fold → `run_with_lineage` refactor with the spawn suite green → respawn command → cli/main → ls) → GREEN → full suite, zero warnings → commit `feat: a2a respawn with parent/attempt lineage and max_attempts quarantine`.
+- [x] Steps: failing tests → RED → implement (config → snapshot+fold → `run_with_lineage` refactor with the spawn suite green → respawn command → cli/main → ls) → GREEN → full suite, zero warnings → commit `feat: a2a respawn with parent/attempt lineage and max_attempts quarantine`.
 
 ---
 
@@ -323,7 +323,7 @@ pub fn default_result_schema(lane: crate::config::Lane) -> Option<&'static str>;
 pub const REVIEW_FINDINGS_SCHEMA: &str = include_str!("../templates/review-findings.schema.json");
 ```
 
-- [ ] Steps: failing tests → RED → write the templates → implement (`templates.rs` → clap surface → spawn's `--template` short circuit → review default schema) → GREEN → full suite, zero warnings → commit `feat: lane brief templates, spawn --template, review findings schema default`.
+- [x] Steps: failing tests → RED → write the templates → implement (`templates.rs` → clap surface → spawn's `--template` short circuit → review default schema) → GREEN → full suite, zero warnings → commit `feat: lane brief templates, spawn --template, review findings schema default`.
 
 ---
 
@@ -419,7 +419,7 @@ pub fn seed_worker(home: &A2aHome, cfg: &config::Config, plan: &SeedPlan, now: D
     -> Result<(String, PathBuf, WorkerSnapshot), AppError>;
 ```
 
-- [ ] Steps: failing tests → RED → implement (config key → `seed_worker` extraction with the spawn suite green → brief builder → core hook incl. diff + admission + guards → `review.json` writeback → ls) → GREEN → full suite, zero warnings → commit `feat: auto_review — impl worktree diffs reviewed on completion, findings as review.json`.
+- [x] Steps: failing tests → RED → implement (config key → `seed_worker` extraction with the spawn suite green → brief builder → core hook incl. diff + admission + guards → `review.json` writeback → ls) → GREEN → full suite, zero warnings → commit `feat: auto_review — impl worktree diffs reviewed on completion, findings as review.json`.
 
 ---
 
@@ -476,7 +476,7 @@ impl EventLog {
 pub fn read_events(worker_dir: &Path, since_seq: u64) -> io::Result<Vec<crate::events::Envelope>>;
 ```
 
-- [ ] Steps: failing tests → RED → implement (config key → `open_capped` + rotate-on-append + marker → `.1`-aware `open`/`read_events` → wire the two config-carrying writers) → GREEN → full suite, zero warnings → commit `feat: events.jsonl rotation (single generation, seq-continuous, fold-safe)`.
+- [x] Steps: failing tests → RED → implement (config key → `open_capped` + rotate-on-append + marker → `.1`-aware `open`/`read_events` → wire the two config-carrying writers) → GREEN → full suite, zero warnings → commit `feat: events.jsonl rotation (single generation, seq-continuous, fold-safe)`.
 
 ---
 
@@ -518,7 +518,7 @@ pub const BLOCKED_MARKER_RE: &str = r"^BLOCKED:[ \t]*(.*)$";
 pub fn blocked_marker(final_message: &str) -> Option<String>;
 ```
 
-- [ ] Steps: write the fixtures → failing tests → RED → implement `blocked_marker` → GREEN on the deterministic tier → run the gated tier once locally and transcribe the observed rate into a comment → full suite, zero warnings → commit `feat: prompt-contract fixtures, BLOCKED matcher, deterministic + gated statistical eval tiers`.
+- [x] Steps: write the fixtures → failing tests → RED → implement `blocked_marker` → GREEN on the deterministic tier → run the gated tier once locally and transcribe the observed rate into a comment → full suite, zero warnings → commit `feat: prompt-contract fixtures, BLOCKED matcher, deterministic + gated statistical eval tiers`.
 
 ---
 
@@ -564,7 +564,7 @@ pub fn build_worker_actor(dir: PathBuf, snap: WorkerSnapshot, cfg: Config,
     -> (WorkerHandle, impl std::future::Future<Output = ()> + Send + 'static);
 ```
 
-- [ ] Steps: failing tests → RED → implement the transition log → GREEN → write the fleet smoke → fixes only where the smoke exposes them → full suite, zero warnings → README → commit `feat: broker.jsonl transition log, fleet smoke under cap, Phase 5 docs`.
+- [x] Steps: failing tests → RED → implement the transition log → GREEN → write the fleet smoke → fixes only where the smoke exposes them → full suite, zero warnings → README → commit `feat: broker.jsonl transition log, fleet smoke under cap, Phase 5 docs`.
 
 ---
 

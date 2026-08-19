@@ -441,7 +441,15 @@ fn the_core_writes_the_two_transitions_the_actor_never_sees() {
     w.finish(&first, "send-1");
     w.until_state(&first, "done");
     w.until_state(&second, "running");
-    let lines = w.transitions(&second);
+    // `broker.jsonl` trails `state.json`: `WorkerActor::persist` commits the
+    // snapshot first and appends the transition line afterwards, so the state
+    // read above can win the race against the admission line and the
+    // `spawned → …` line that follows it. Poll for both, as the `until` above
+    // does, rather than indexing a log that is still catching up.
+    let lines = until("the admitted worker's first two transitions", || {
+        let lines = w.transitions(&second);
+        (lines.len() >= 2).then_some(lines)
+    });
     assert_line_shape(&lines[0]);
     assert_eq!(
         lines[0]["from"],

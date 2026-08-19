@@ -56,6 +56,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         },
         Cmd::BrokerCall { .. } => "__broker-call",
         Cmd::Verify { .. } => "verify",
+        Cmd::GenSkills { .. } => "__gen-skills",
     }
 }
 
@@ -234,6 +235,11 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.json,
                 cli.global.quiet,
             )
+        }
+        // No `A2aHome::resolve`: this command renders repo artifacts under
+        // `--out` and has no business touching a home tree at all.
+        Cmd::GenSkills { out, check } => {
+            a2a::commands::gen_skills::run(out, *check, cli.global.json, cli.global.quiet)
         }
     }
 }

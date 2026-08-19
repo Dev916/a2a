@@ -211,6 +211,15 @@ pub enum Cmd {
         #[arg(long, value_name = "DUR", value_parser = crate::commands::wait::parse_duration)]
         timeout: Option<std::time::Duration>,
     },
+    /// (hidden) render the generated skill artifacts from their in-repo sources
+    #[command(hide = true, name = "__gen-skills")]
+    GenSkills {
+        #[arg(long, value_name = "DIR")]
+        out: std::path::PathBuf,
+        /// Compare instead of writing; exit 9 naming any drifted artifact
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]

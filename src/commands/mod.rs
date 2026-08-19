@@ -135,3 +135,4 @@ pub mod status;
 pub mod tail;
 pub mod wait;
 pub mod verify;
+pub mod gen_skills;

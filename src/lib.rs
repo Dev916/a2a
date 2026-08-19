@@ -21,3 +21,4 @@ pub mod rpc;
 pub mod state;
 pub mod store;
 pub mod sync;
+pub mod worktree;

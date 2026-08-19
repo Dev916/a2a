@@ -97,10 +97,17 @@ fn payload(id: &str, snap: &WorkerSnapshot) -> Value {
         "thread_id": snap.thread_id,
         "queue_position": snap.queue_position,
         "sandbox": snap.sandbox.as_str(),
+        // Why this worker was allowed `danger-full-access` — `null` for every
+        // ordinary worker, and the operator's own words for the rest (spec §5).
+        "elevation_reason": snap.elevation_reason,
         "network": snap.network,
         "model": snap.model,
         "effort": snap.effort,
         "cwd": snap.cwd,
+        // The branch this worker is producing, and the commit `a2a verify`
+        // diffs it against — null for a worker spawned straight into --cwd.
+        "worktree": snap.worktree,
+        "base_ref": snap.base_ref,
         "session_id": snap.session_id,
         "pid": snap.pid,
         "created_at": snap.created_at,

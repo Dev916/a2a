@@ -71,7 +71,7 @@ pub const SYNC_FIELDS: [&str; 3] = [
 ];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
-pub const LANE_FIELDS: [&str; 8] = [
+pub const LANE_FIELDS: [&str; 9] = [
     "sandbox",
     "network",
     "worktree_default",
@@ -80,6 +80,10 @@ pub const LANE_FIELDS: [&str; 8] = [
     "start_timeout_secs",
     "task_timeout_secs",
     "blocked_timeout_secs",
+    // APPENDED LAST on purpose: this array is the order `config show --origin`
+    // reports its keys in, and a new key inserted mid-list would renumber a
+    // surface other tools read.
+    "allow_elevation",
 ];
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -173,6 +177,15 @@ pub struct LaneConfig {
     pub start_timeout_secs: u64,
     pub task_timeout_secs: u64,
     pub blocked_timeout_secs: u64,
+    /// May a spawn on this lane ask for `danger-full-access` (spec §5)?
+    ///
+    /// **`false` for every lane by default, and it is a *permission*, not an
+    /// action**: it grants nothing on its own. An actual elevation additionally
+    /// needs the per-spawn intent (`--danger-full-access`) and an audited
+    /// `--reason`, so neither the config nor the flag can elevate a worker
+    /// alone — which is the whole shape of the §5 gate.
+    #[serde(default)]
+    pub allow_elevation: bool,
 }
 
 /// The `[broker]` section: what the daemon does about itself.
@@ -306,8 +319,10 @@ impl Origin {
 
 pub type Origins = BTreeMap<String, Origin>;
 
-/// Spec §4.9 lane table, with the Phase-1 exception that `worktree_default`
-/// is false everywhere (worktrees land in Phase 4).
+/// Spec §4.9 lane table. `worktree_default` is TRUE for the impl lane and false
+/// for every other one: impl is the lane that writes, and now that
+/// `src/worktree.rs` exists the protection the spec asks for is real rather than
+/// a warning (Phase 1 shipped it false because nothing could create the tree).
 fn default_lane(lane: Lane) -> LaneConfig {
     let (sandbox, network, effort) = match lane {
         Lane::Impl => (SandboxMode::WorkspaceWrite, false, "high"),
@@ -318,12 +333,14 @@ fn default_lane(lane: Lane) -> LaneConfig {
     LaneConfig {
         sandbox,
         network,
-        worktree_default: false,
+        worktree_default: lane == Lane::Impl,
         model: DEFAULT_MODEL.to_string(),
         effort: effort.to_string(),
         start_timeout_secs: DEFAULT_START_TIMEOUT_SECS,
         task_timeout_secs: DEFAULT_TASK_TIMEOUT_SECS,
         blocked_timeout_secs: DEFAULT_BLOCKED_TIMEOUT_SECS,
+        // No lane may elevate until an operator says so, in writing, per lane.
+        allow_elevation: false,
     }
 }
 
@@ -398,7 +415,38 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     apply_env(&mut cfg, &mut origins)?;
 
     cfg.allowed_roots = canonicalize_roots(std::mem::take(&mut cfg.allowed_roots), &mut warnings);
+    append_implicit_worktrees_root(home, &mut cfg.allowed_roots);
     Ok((cfg, origins, warnings))
+}
+
+/// `$A2A_HOME/worktrees` is an allowed root by construction — this is the ONE
+/// thing that makes the worktree spawn work on the app-server transport without
+/// touching `src/broker/**`.
+///
+/// A worker spawned into its own worktree runs with that path as its cwd, and
+/// the broker re-validates the wire cwd against the roots *this* function
+/// produced (`config::load` is the single source for both legs). A home outside
+/// every configured root would otherwise make every worktree spawn unspawnable
+/// over the socket.
+///
+/// Three properties are pinned: it is appended only when the directory exists,
+/// only when no configured root already contains it (so a home *inside* an
+/// allowed root leaves the list byte-identical to Phase 1), and always **last**.
+/// `origins` gains no new key — the implicit root rides under `allowed_roots`.
+///
+/// Accepted consequence, recorded rather than papered over: a caller may now
+/// `--cwd $A2A_HOME/worktrees/<other-id>`. Same uid, same tree — spec §5 already
+/// documents cross-worker isolation as honestly absent.
+fn append_implicit_worktrees_root(home: &A2aHome, roots: &mut Vec<PathBuf>) {
+    let Ok(worktrees) = std::fs::canonicalize(home.worktrees_dir()) else {
+        return;
+    };
+    // `starts_with` is component-wise, and a path starts with itself — so this
+    // is both the containment check and the no-duplicate check.
+    if roots.iter().any(|root| worktrees.starts_with(root)) {
+        return;
+    }
+    roots.push(worktrees);
 }
 
 /// Canonicalize each root (resolving symlinks such as macOS `/tmp` →
@@ -689,6 +737,7 @@ fn apply_lane_toml(
         "start_timeout_secs" => lc.start_timeout_secs = want_u64(dotted, v)?,
         "task_timeout_secs" => lc.task_timeout_secs = want_u64(dotted, v)?,
         "blocked_timeout_secs" => lc.blocked_timeout_secs = want_u64(dotted, v)?,
+        "allow_elevation" => lc.allow_elevation = want_bool(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -871,6 +920,7 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "start_timeout_secs" => lc.start_timeout_secs = parse_u64_str(key, s)?,
         "task_timeout_secs" => lc.task_timeout_secs = parse_u64_str(key, s)?,
         "blocked_timeout_secs" => lc.blocked_timeout_secs = parse_u64_str(key, s)?,
+        "allow_elevation" => lc.allow_elevation = parse_bool_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
     }
     Ok(())
@@ -909,7 +959,11 @@ mod tests {
             SandboxMode::WorkspaceWrite
         );
         assert_eq!(default_lane(Lane::Impl).effort, "high");
-        assert!(!default_lane(Lane::Impl).worktree_default);
+        // The impl lane — and only the impl lane — defaults to its own tree.
+        assert!(default_lane(Lane::Impl).worktree_default);
+        for lane in [Lane::Review, Lane::Research, Lane::General] {
+            assert!(!default_lane(lane).worktree_default, "{lane} must not");
+        }
         assert_eq!(default_lane(Lane::Review).sandbox, SandboxMode::OutboxOnly);
         assert_eq!(default_lane(Lane::Review).effort, "medium");
         assert!(!default_lane(Lane::Review).network);
@@ -980,8 +1034,12 @@ mod tests {
             "A2A_ADMISSION_LANES_IMPL_CAP"
         );
         // The layering test's key set is stable: admission is its own section.
-        assert_eq!(LANE_FIELDS.len(), 8);
+        assert_eq!(LANE_FIELDS.len(), 9);
         assert!(!LANE_FIELDS.contains(&"cap"));
+        // The §5 permission is a LANE key, appended last so the reported order
+        // of every key before it is untouched.
+        assert!(LANE_FIELDS.contains(&"allow_elevation"));
+        assert_eq!(*LANE_FIELDS.last().unwrap(), "allow_elevation");
     }
 
     /// A lane the map does not carry (a config from a newer binary) falls back
@@ -1251,5 +1309,38 @@ mod tests {
             "naming the HEADER allowlists no server at all"
         );
         assert!(SyncConfig::default().allow_http_header_servers.is_empty());
+    }
+
+    /// The implicit worktrees root: appended LAST when the home sits outside
+    /// every configured root, and completely absent when a configured root
+    /// already contains it — which is what keeps the two broker tests that pin
+    /// `allowed_roots` green without an edit.
+    #[test]
+    fn the_implicit_worktrees_root_is_appended_only_when_nothing_covers_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = A2aHome::resolve(Some(&tmp.path().join("outside"))).unwrap();
+        let canon_wt = std::fs::canonicalize(outside.worktrees_dir()).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let elsewhere = std::fs::canonicalize(&elsewhere).unwrap();
+
+        let mut roots = vec![elsewhere.clone()];
+        append_implicit_worktrees_root(&outside, &mut roots);
+        assert_eq!(roots, vec![elsewhere.clone(), canon_wt.clone()], "appended last");
+        // Idempotent: a second pass adds nothing, because the root now covers it.
+        append_implicit_worktrees_root(&outside, &mut roots);
+        assert_eq!(roots.len(), 2, "never duplicated: {roots:?}");
+
+        // A home INSIDE an allowed root leaves the list byte-identical.
+        let covered = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut roots = vec![covered.clone()];
+        append_implicit_worktrees_root(&outside, &mut roots);
+        assert_eq!(roots, vec![covered]);
+
+        // No worktrees directory (a home nothing has resolved) ⇒ no root.
+        let unresolved = A2aHome::adopt(tmp.path().join("never-made"));
+        let mut roots: Vec<PathBuf> = vec![];
+        append_implicit_worktrees_root(&unresolved, &mut roots);
+        assert!(roots.is_empty(), "{roots:?}");
     }
 }

@@ -59,6 +59,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
             SyncCmd::Skills { .. } => "sync skills",
             SyncCmd::Mcp { .. } => "sync mcp",
         },
+        Cmd::Verify { .. } => "verify",
+        Cmd::GenSkills { .. } => "__gen-skills",
     }
 }
 
@@ -175,13 +177,19 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.quiet,
             )
         }
-        Cmd::Gc { age, dry_run, all } => {
+        Cmd::Gc {
+            age,
+            dry_run,
+            all,
+            force,
+        } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::gc::run(
                 &home,
                 *age,
                 *dry_run,
                 *all,
+                *force,
                 cli.global.json,
                 cli.global.quiet,
             )
@@ -243,6 +251,26 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                     cli.global.quiet,
                 ),
             }
+        }
+        Cmd::Verify {
+            id,
+            force_verify,
+            timeout,
+        } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::verify::run(
+                &home,
+                id,
+                *force_verify,
+                timeout.unwrap_or(a2a::commands::verify::DEFAULT_TIMEOUT),
+                cli.global.json,
+                cli.global.quiet,
+            )
+        }
+        // No `A2aHome::resolve`: this command renders repo artifacts under
+        // `--out` and has no business touching a home tree at all.
+        Cmd::GenSkills { out, check } => {
+            a2a::commands::gen_skills::run(out, *check, cli.global.json, cli.global.quiet)
         }
     }
 }

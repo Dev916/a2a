@@ -43,3 +43,133 @@ fn tail_formats_filters_and_redacts_everywhere() {
     }
     assert!(disk.contains("[REDACTED:"), "at-rest redaction must have happened at ingest");
 }
+
+// --------------------------------------------------------------- WT column
+
+/// `git -C <dir> <args…>`, asserting success.
+fn git_ok(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git is on PATH");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Spawn one more general-lane worker into an existing home, in its own git
+/// worktree — the real thing `a2a spawn` now creates, not a staged genesis row.
+/// Returns its id and the branch, which is what `--json` must carry.
+fn spawn_with_a_worktree(home: &std::path::Path, tmp: &std::path::Path) -> (String, String) {
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
+    git_ok(&repo, &["config", "user.email", "a2a@example.invalid"]);
+    git_ok(&repo, &["config", "user.name", "a2a test"]);
+    git_ok(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git_ok(&repo, &["add", "a.txt"]);
+    git_ok(&repo, &["commit", "-q", "-m", "init"]);
+    let brief = write_brief(tmp, "do the thing\n");
+    let out = a2a(home, tmp)
+        .args(["--json", "spawn", "--lane", "general", "--worktree", "--cwd"])
+        .arg(&repo)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    (
+        v["data"]["id"].as_str().unwrap().to_string(),
+        v["data"]["worktree"]["branch"].as_str().unwrap().to_string(),
+    )
+}
+
+fn ls_stderr_and_stdout(home: &std::path::Path, tmp: &std::path::Path, all: bool) -> (String, String) {
+    let mut c = a2a(home, tmp);
+    c.arg("ls");
+    if all {
+        c.arg("--all");
+    }
+    let out = c.assert().success();
+    (
+        String::from_utf8_lossy(&out.get_output().stderr).to_string(),
+        String::from_utf8_lossy(&out.get_output().stdout).to_string(),
+    )
+}
+
+/// An all-plain fleet keeps the Phase-1 header byte for byte: the WT column is
+/// only worth a column when somebody has one.
+#[test]
+fn an_all_plain_fleet_keeps_the_phase_one_header() {
+    let (home, tmp, id) = spawn_with(&[]);
+    wait_dead(&home, &id, 10);
+    let (stderr, stdout) = ls_stderr_and_stdout(&home, tmp.path(), false);
+    assert!(
+        stderr.lines().any(|l| l == "ID  LANE  STATE  DWELL  LAST-EVENT"),
+        "header must be the Phase-1 one:\n{stderr}"
+    );
+    assert!(!stderr.contains("WT"), "no worktree, no column:\n{stderr}");
+    assert!(!stdout.contains(" wt "), "{stdout}");
+
+    let out = a2a(&home, tmp.path()).args(["--json", "ls"]).assert().success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["workers"][0]["worktree_branch"], serde_json::Value::Null);
+}
+
+/// One worker with a worktree grows the column for the whole listing — and the
+/// cell is a marker, because the branch's last segment is already column 1.
+/// The full branch stays in `--json`, where a caller can pipe it into git.
+#[test]
+fn a_mixed_fleet_grows_a_wt_column_with_markers_and_a_json_branch() {
+    let (home, tmp, plain) = spawn_with(&[]);
+    wait_dead(&home, &plain, 10);
+    let (treed, branch) = spawn_with_a_worktree(&home, tmp.path());
+    wait_dead(&home, &treed, 10);
+    for id in [&plain, &treed] {
+        a2a(&home, tmp.path()).args(["status", id]).assert().success();
+    }
+    assert_eq!(branch, format!("a2a/general/{treed}"));
+
+    let (stderr, stdout) = ls_stderr_and_stdout(&home, tmp.path(), false);
+    assert!(
+        stderr.lines().any(|l| l == "ID  LANE  STATE  WT  DWELL  LAST-EVENT"),
+        "the mixed header is a pin:\n{stderr}"
+    );
+    let treed_row = stdout.lines().find(|l| l.starts_with(&treed)).expect(&stdout);
+    let plain_row = stdout.lines().find(|l| l.starts_with(&plain)).expect(&stdout);
+    assert!(treed_row.contains(" wt "), "{treed_row}");
+    assert!(!treed_row.contains(&branch), "the table carries a marker, not the branch: {treed_row}");
+    assert!(plain_row.contains(" -  "), "a worker without one prints a dash: {plain_row}");
+    // the column is padded, so what follows it starts at the same offset
+    assert_eq!(
+        treed_row.find(" wt ").map(|i| i + 4),
+        plain_row.find(" -  ").map(|i| i + 4),
+        "columns must align:\n{treed_row}\n{plain_row}"
+    );
+
+    // `--all` inserts OWNER before WT, and the header says so.
+    let (stderr, _) = ls_stderr_and_stdout(&home, tmp.path(), true);
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l == "ID  LANE  STATE  OWNER  WT  DWELL  LAST-EVENT"),
+        "the widened header is a pin too:\n{stderr}"
+    );
+
+    let out = a2a(&home, tmp.path()).args(["--json", "ls"]).assert().success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let workers = v["data"]["workers"].as_array().unwrap();
+    for w in workers {
+        let expected = if w["id"] == treed.as_str() {
+            serde_json::json!(branch)
+        } else {
+            serde_json::Value::Null
+        };
+        assert_eq!(w["worktree_branch"], expected, "{w}");
+    }
+}

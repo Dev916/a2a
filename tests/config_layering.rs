@@ -19,7 +19,10 @@ fn defaults_match_spec_lane_table() {
     assert_eq!(v["data"]["lanes"]["impl"]["sandbox"], "workspace-write");
     assert_eq!(v["data"]["lanes"]["impl"]["model"], "gpt-5.5");
     assert_eq!(v["data"]["lanes"]["impl"]["effort"], "high");
-    assert_eq!(v["data"]["lanes"]["impl"]["worktree_default"], false);
+    // The impl lane — and only it — defaults to its own worktree now that
+    // `src/worktree.rs` can create one.
+    assert_eq!(v["data"]["lanes"]["impl"]["worktree_default"], true);
+    assert_eq!(v["data"]["lanes"]["general"]["worktree_default"], false);
     assert_eq!(v["data"]["lanes"]["review"]["sandbox"], "outbox-only");
     assert_eq!(v["data"]["lanes"]["review"]["effort"], "medium");
     assert_eq!(v["data"]["lanes"]["research"]["network"], true);
@@ -81,6 +84,11 @@ fn unknown_key_warns_on_stderr_but_succeeds() {
     );
 }
 
+/// Canonicalization and the dropped-root warning — plus the IMPLICIT worktrees
+/// root, which this home is the one existing case for: `A2A_HOME` is the
+/// tempdir itself (canonically `/private/var/folders/…` on macOS) while the one
+/// surviving allowed root is `/tmp` → `/private/tmp`, so `<home>/worktrees` is
+/// under no configured root and is appended LAST.
 #[test]
 fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
     let tmp = tempfile::tempdir().unwrap();
@@ -97,10 +105,18 @@ fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let roots = v["data"]["allowed_roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1, "missing root must be dropped: {roots:?}");
+    assert_eq!(roots.len(), 2, "missing root dropped, implicit one added: {roots:?}");
     assert_eq!(
         roots[0],
         serde_json::json!(std::fs::canonicalize("/tmp").unwrap().to_str().unwrap())
+    );
+    assert_eq!(
+        roots[1],
+        serde_json::json!(std::fs::canonicalize(tmp.path().join("worktrees"))
+            .unwrap()
+            .to_str()
+            .unwrap()),
+        "$A2A_HOME/worktrees is an allowed root by construction, and comes last"
     );
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(
@@ -108,6 +124,49 @@ fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
         "stderr must name the dropped root: {stderr}"
     );
     assert_eq!(v["data"]["origins"], serde_json::Value::Null);
+}
+
+/// The other half of the implicit root: a home INSIDE an allowed root leaves
+/// the list exactly as Phase 1 left it — one entry, no implicit anything.
+/// (This is the shape `tests/broker_lifecycle.rs` and `tests/cmd_broker.rs`
+/// pin, which is why neither of them needed an edit.)
+#[test]
+fn a_home_inside_an_allowed_root_adds_no_implicit_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", &home)
+        .env("A2A_ALLOWED_ROOTS", tmp.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let roots = v["data"]["allowed_roots"].as_array().unwrap();
+    assert_eq!(
+        roots,
+        &vec![serde_json::json!(std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .to_str()
+            .unwrap())],
+        "the configured root already covers the worktrees dir: {roots:?}"
+    );
+    // The origins key set is unchanged: the implicit root rides under
+    // `allowed_roots` rather than earning a name of its own.
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", &home)
+        .env("A2A_ALLOWED_ROOTS", tmp.path())
+        .args(["--json", "config", "show", "--origin"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let origins = v["data"]["origins"].as_object().unwrap();
+    assert_eq!(origins["allowed_roots"], "env");
+    assert!(
+        !origins.keys().any(|k| k.contains("worktrees")),
+        "no new origin key: {origins:?}"
+    );
 }
 
 /// The broker's own section: one key, a default of 300 (the leaked-daemon

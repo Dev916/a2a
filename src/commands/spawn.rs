@@ -7,15 +7,36 @@
 //! and no half-worker for `ls`/`gc` to trip over:
 //!
 //! ```text
-//! home+config → transport gate → elevation gate → cwd resolution
-//!   → brief parse+validate → secret scan → TRANSPORT SELECTION → id allocation
-//!   ───────────────────────── first write ─────────────────────────
-//!   → dir tree (0700) → context staging → brief.md + prompt.md
-//!   → ADMISSION (broker only: admit | queue | refuse)
-//!   → genesis event (WAL, carrying `queued` when the answer was "wait")
-//!   → detached spawn / broker Spawn frame
-//!                         → ProcessStarted (WAL, exec only)
+//! arg parse → cwd resolve → brief parse+validate → secret scan (brief + reason)
+//!   → ELEVATION GATE (lane permission + --reason, spec §5)
+//!   → transport selection (elevation forces exec)
+//!   → schema resolution (--schema > brief result_schema > impl-lane template)
+//!   → id allocation
+//!   → AUDIT APPEND ($A2A_HOME/audit.jsonl, elevated spawns only)
+//!   → worker dir tree → context staging
+//!   → WORKTREE CREATE (+ .git/info/exclude)
+//!   → admission → genesis → spawn/attach
 //! ```
+//!
+//! Two positions in there are deliberate and pinned. The **elevation gate** runs
+//! *after* the brief parse, because `--reason` is ingress-scanned by the same
+//! [`redact::scan_text`] pass the brief is, and *before* transport selection,
+//! because an elevation forces the exec transport (spec §5 forbids the broker
+//! socket from carrying one). The **audit append precedes the worker dir**: an
+//! audit line for a spawn that then failed is the safe direction, and a spawn
+//! that ran with no line is not.
+//!
+//! **The worktree is created here, CLI-side, and never by the broker**
+//! (spec §4.8). Its two halves sit on opposite sides of the first write for a
+//! reason: everything that can *refuse* — a cwd that is not a git work tree
+//! under an explicit `--worktree`, a `--base-ref` that names no commit, a repo
+//! with no commit to branch from — is decided in the gate, while the tree itself
+//! cannot be created until the id exists, because the id is its name. A failure
+//! in that window removes the worker dir *and* the half-made tree: it is the
+//! pre-genesis boundary, and the rule there is that nothing is left behind.
+//! From the create onwards the worker's `cwd` **is** the worktree — which is how
+//! `codex -C` and the broker's spawn frame both land in it without either of
+//! them knowing worktrees exist.
 //!
 //! **Admission is asked before genesis and answered by the broker** (spec §4.9),
 //! because the answer is part of genesis: a worker born at the cap is born
@@ -67,8 +88,9 @@ use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::ids;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
-use crate::state::WorkerSnapshot;
+use crate::state::{WorkerSnapshot, WorktreeRef};
 use crate::store::EventLog;
+use crate::worktree;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -78,6 +100,16 @@ use std::path::{Path, PathBuf};
 /// Total budget for everything staged into `context/` (spec §5 keeps the
 /// worker's read-side context curated, not a repo dump).
 const MAX_CONTEXT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The impl lane's default result schema (spec §4.9): devloop's
+/// `sample-task-result.json` shape, so a devloop-dispatched worker's result is
+/// parsed by devloop step 4.3.4 without an adapter. Compiled in, because a
+/// worker's schema must not depend on the a2a checkout still being where it was
+/// at spawn.
+pub const IMPL_RESULT_SCHEMA: &str = include_str!("../../templates/impl-result.schema.json");
+
+/// Where the chosen schema is materialized inside the worker directory.
+pub const WORKER_SCHEMA_FILE: &str = "result-schema.json";
 
 /// Id collision retries before we admit the generator is not helping.
 const ID_ATTEMPTS: usize = 16;
@@ -110,9 +142,6 @@ pub fn run(
     for w in &warnings {
         warn(w);
     }
-    if args.worktree {
-        warn("--worktree is not implemented in Phase 1 (worktrees land in Phase 4); spawning directly in --cwd");
-    }
 
     // ---- gates: nothing below this block has touched the filesystem --------
     let requested = transport_gate(args.transport.as_deref())?;
@@ -123,9 +152,9 @@ pub fn run(
         .get(&lane)
         .cloned()
         .expect("config::load seeds every lane");
-    elevation_gate(lane, &lane_cfg)?;
 
     let cwd_plan = resolve_cwd(lane, args.cwd.as_deref(), &cfg.allowed_roots)?;
+    let wt_gate = worktree_gate(args, &lane_cfg, &cwd_plan, &warn)?;
 
     let brief_text = std::fs::read_to_string(&args.brief).map_err(|e| {
         AppError::new(
@@ -136,20 +165,42 @@ pub fn run(
     })?;
     let parsed = parse_and_validate_brief(&brief_text, &args.brief, lane, &warn)?;
     scan_brief(&brief_text, &args.brief)?;
+    // The reason is INGRESS, exactly like the brief: it is operator text that
+    // this process is about to write to two files, so it is scanned on the same
+    // pass and refused on the same terms.
+    scan_reason(args.reason.as_deref())?;
 
-    if let Some(schema) = args.schema.as_deref() {
-        if !schema.is_file() {
-            return Err(AppError::new(
-                "SCHEMA_NOT_FOUND",
-                ExitCode::Precondition,
-                format!("--schema {}: not a readable file", schema.display()),
-            ));
-        }
-    }
+    // ---- the §5 elevation gate --------------------------------------------
+    //
+    // After the scan (see above) and before transport selection: an elevation
+    // forces exec, so the answer here decides which path the next gate takes.
+    let (sandbox, elevation_reason) = elevation_gate(
+        lane,
+        &lane_cfg,
+        args.danger_full_access,
+        args.reason.as_deref(),
+        requested,
+        &warn,
+    )?;
+
+    // The result schema, decided HERE with the other gates even though the copy
+    // lands at layout time: a `--schema` — or a brief `result_schema` — naming a
+    // file that is not there is a static precondition (exit 9), and a static
+    // refusal must not first autostart a broker it is never going to use.
+    let _ = plan_schema(lane, args.schema.as_deref(), &args.brief, &parsed)?;
 
     // The last gate: which transport will own this worker. A refusal here still
     // leaves nothing behind, and the answer is what the genesis event records.
-    let mut selected = select_transport(home.root(), requested)?;
+    //
+    // An ELEVATED spawn never reaches [`select_transport`] at all: spec §5 says
+    // the wire cannot request privilege, and Phase 4 may not teach the broker a
+    // per-spawn elevation, so the elevation *is* the transport decision. The
+    // short-circuit is why an elevated spawn performs no socket syscall — it
+    // cannot autostart a daemon it is then forbidden to use.
+    let mut selected = match &elevation_reason {
+        Some(_) => Selected::Exec { degraded: None },
+        None => select_transport(home.root(), requested)?,
+    };
     let transport = selected.transport();
     if let Selected::Exec {
         degraded: Some(err),
@@ -174,14 +225,36 @@ pub fn run(
     let now = Utc::now();
     let id = allocate_id(home, lane, now)?;
 
+    // ---- the audit line (spec §5) -----------------------------------------
+    //
+    // After the id, because the record names the worker, and BEFORE the worker
+    // dir, because the safe direction of the two failure modes is asymmetric: an
+    // audit line for a spawn that then failed is a question an operator can
+    // answer, and an elevated worker that ran with no line is not.
+    if let Some(reason) = &elevation_reason {
+        append_audit(
+            home,
+            &json!({
+                "ts": now.to_rfc3339(),
+                "id": id,
+                "lane": lane.as_str(),
+                "reason": reason,
+                "owner": owner,
+            }),
+        )?;
+    }
+
     // ---- first write ------------------------------------------------------
     let wdir = home.worker_dir(&id);
     create_dir_0700(&wdir).map_err(|e| io_err("creating the worker dir", e))?;
-    if let Err(e) = lay_out_worker(&wdir, args, &brief_text, &parsed) {
-        // Pre-genesis: this id never became a worker, so leave nothing behind.
-        let _ = std::fs::remove_dir_all(&wdir);
-        return Err(e);
-    }
+    let (schema_path, schema_source) = match lay_out_worker(&wdir, args, &brief_text, &parsed) {
+        Ok(schema) => schema,
+        Err(e) => {
+            // Pre-genesis: this id never became a worker, so leave nothing behind.
+            let _ = std::fs::remove_dir_all(&wdir);
+            return Err(e);
+        }
+    };
 
     let cwd = match cwd_plan {
         CwdPlan::Fixed(p) => p,
@@ -189,6 +262,42 @@ pub fn run(
             let scratch = wdir.join("scratch");
             std::fs::canonicalize(&scratch).unwrap_or(scratch)
         }
+    };
+
+    // ---- the worker's own tree (spec §4.8) ---------------------------------
+    //
+    // After the id (which names the branch and the directory) and before
+    // genesis (which records it), so the fold is lossless from the first row.
+    // Still pre-genesis: a failure here takes the worker dir AND the half-made
+    // tree with it.
+    let worktree = match wt_gate.create_from.as_deref() {
+        Some(base) => match worktree::create(home, &id, lane, &cwd, Some(base)) {
+            Ok(wt) => Some(wt),
+            Err(e) => {
+                discard_pre_genesis(home, &wdir, &id, worktree::repo_root(&cwd).as_deref());
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let cwd = match &worktree {
+        // The worktree IS the workspace from here on: `snap.cwd` is what
+        // `exec::build_argv` turns into `-C`, and what the broker's spawn frame
+        // carries as the worker's cwd.
+        Some(wt) => {
+            // Belt-and-braces (spec §4.8), and never fatal: a missing exclude
+            // line has never made a worktree wrong.
+            if let Err(e) = worktree::add_to_info_exclude(&wt.repo, &wt.path) {
+                warn(&format!(
+                    "could not add {} to the repo's info/exclude ({}): {}",
+                    wt.path.display(),
+                    e.code,
+                    e.message
+                ));
+            }
+            wt.path.clone()
+        }
+        None => cwd,
     };
 
     // ---- admission: the last thing that can refuse, and the first thing
@@ -204,7 +313,12 @@ pub fn run(
             match request_admission(client, &wdir, &cwd, lane, args.no_queue) {
                 Ok(admitted) => admitted,
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(&wdir);
+                    discard_pre_genesis(
+                        home,
+                        &wdir,
+                        &id,
+                        worktree.as_ref().map(|w| w.repo.as_path()),
+                    );
                     return Err(e);
                 }
             }
@@ -215,7 +329,20 @@ pub fn run(
     // ---- genesis: from here the worker exists and is readable --------------
     let mut snap = WorkerSnapshot::blank(&id, &cwd);
     snap.writable_roots = vec![wdir.join("outbox")];
-    snap.schema_path = args.schema.clone();
+    // The worker's OWN copy, never the caller's path: the schema has to outlive
+    // the brief moving, the flag's file being edited, and this repo being
+    // checked out somewhere else.
+    snap.schema_path = schema_path.clone();
+    snap.elevation_reason = elevation_reason.clone();
+    // The diff anchor `a2a verify` needs — recorded whether or not there is a
+    // worktree, and equal to the worktree's own base ref when there is one.
+    snap.base_ref = wt_gate.base_ref.clone();
+    snap.worktree = worktree.as_ref().map(|w| WorktreeRef {
+        path: w.path.clone(),
+        branch: w.branch.clone(),
+        base_ref: w.base_ref.clone(),
+        repo: w.repo.clone(),
+    });
     let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
     let mut genesis = json!({
             "fsm": "Spawn",
@@ -223,7 +350,7 @@ pub fn run(
             "lane": lane.as_str(),
             "cwd": cwd,
             "brief_sha": brief_sha,
-            "sandbox": lane_cfg.sandbox.as_str(),
+            "sandbox": sandbox.as_str(),
             "network": lane_cfg.network,
             "model": model,
             "effort": effort,
@@ -234,9 +361,47 @@ pub fn run(
             "requested_transport": requested.recorded(transport),
             "transport_selection": requested.selection(),
             "owner": owner,
-            "schema_path": args.schema,
+            "schema_path": schema_path,
             "created_at": now.to_rfc3339(),
     });
+    // WHICH rung of the precedence table produced that schema. In genesis, not
+    // on the snapshot: a snapshot-only write is swallowed by a rebuild from the
+    // WAL, and "this worker was judged against the lane's shipped default"
+    // is exactly the fact an operator needs when the default later changes.
+    if schema_path.is_some() {
+        genesis["schema_source"] = json!(schema_source);
+    }
+    // The elevation, in genesis for the same reason the worktree is: a worker
+    // that ran with full access must still say so after `state.json` is gone.
+    // The `transport_selection` OVERRIDE goes here rather than on the snapshot
+    // because the genesis fold is applied over the in-memory snapshot — a
+    // post-fold insert would be overwritten now and lost on a rebuild later.
+    // `Requested::selection()` still answers only `auto`/`explicit`; the third
+    // value is a call-site override, not a third enum arm.
+    if let Some(reason) = &elevation_reason {
+        genesis["elevation_reason"] = json!(reason);
+        if requested == Requested::Auto {
+            genesis["transport_selection"] = json!("elevation");
+        }
+    }
+    // The worktree, in genesis rather than only on the snapshot: `state.json` is
+    // a derived checkpoint, and a worktree only `state.json` knew about would be
+    // lost by a rebuild from zero — leaving a tree on disk that no `gc` could
+    // ever address. All four keys or none (the fold refuses a partial object).
+    if let Some(wt) = &worktree {
+        genesis["worktree_path"] = json!(wt.path);
+        genesis["worktree_branch"] = json!(wt.branch);
+        genesis["worktree_base_ref"] = json!(wt.base_ref);
+        genesis["worktree_repo"] = json!(wt.repo);
+    }
+    if let Some(base) = &wt_gate.base_ref {
+        genesis["base_ref"] = json!(base);
+    }
+    // Why a worker the lane would have given a tree has none — same reasoning:
+    // written where a rebuild can still read it (it reaches `snap.extra`).
+    if let Some(reason) = wt_gate.skipped {
+        genesis["worktree_skipped"] = json!(reason);
+    }
     // The admission answer, and ONLY when it is "wait": genesis stays the
     // Phase-1 shape for every worker that was admitted straight away, and the
     // fold reads an absent marker exactly as it reads `false`.
@@ -274,6 +439,16 @@ pub fn run(
         )?;
     }
 
+    // The tree a caller can `git -C` into, in the same four fields
+    // `status --json` reports — `null` for a worker that has none.
+    let worktree_payload = json!(snap.worktree);
+    // ` on a2a/<lane>/<id>`, appended to the human line: the branch IS the
+    // deliverable, so the one place a human sees the spawn should name it.
+    let on_branch = worktree
+        .as_ref()
+        .map(|w| format!(" on {}", w.branch))
+        .unwrap_or_default();
+
     // ---- hand the worker to its transport ---------------------------------
     if let Selected::AppServer(client) = selected {
         let snap = attach_to_broker(client, &mut log, &wdir, snap, lane, &cwd)?;
@@ -284,7 +459,7 @@ pub fn run(
                      the broker is at its admission cap"
                 ),
                 None => eprintln!(
-                    "a2a: spawned {id} ({lane} lane, app-server) in {}",
+                    "a2a: spawned {id} ({lane} lane, app-server) in {}{on_branch}",
                     cwd.display()
                 ),
             }
@@ -302,13 +477,14 @@ pub fn run(
                 "cwd": cwd,
                 "worker_dir": wdir,
                 "brief_sha": brief_sha,
-                "sandbox": lane_cfg.sandbox.as_str(),
+                "sandbox": sandbox.as_str(),
                 "network": lane_cfg.network,
                 "model": model,
                 "effort": effort,
                 // `null` unless this worker is waiting: the 1-based place in the
                 // admission queue (spec §4.9).
                 "queue_position": snap.queue_position,
+                "worktree": worktree_payload,
                 "deadline_at": snap.deadline_at,
             })
         } else {
@@ -326,11 +502,11 @@ pub fn run(
         cwd: &cwd,
         worker_dir: &wdir,
         epoch: snap.epoch,
-        sandbox: lane_cfg.sandbox,
+        sandbox,
         network: lane_cfg.network,
         model: &model,
         effort: &effort,
-        schema_path: args.schema.as_deref(),
+        schema_path: schema_path.as_deref(),
         prompt_file: &prompt_file,
         resume_session: None,
         env: &[],
@@ -372,7 +548,10 @@ pub fn run(
     )?;
 
     if !quiet {
-        eprintln!("a2a: spawned {id} ({lane} lane) in {}", cwd.display());
+        eprintln!(
+            "a2a: spawned {id} ({lane} lane) in {}{on_branch}",
+            cwd.display()
+        );
     }
     // stdout carries the machine payload: the envelope's `data` under --json,
     // the bare id otherwise.
@@ -387,10 +566,11 @@ pub fn run(
             "cwd": cwd,
             "worker_dir": wdir,
             "brief_sha": brief_sha,
-            "sandbox": lane_cfg.sandbox.as_str(),
+            "sandbox": sandbox.as_str(),
             "network": lane_cfg.network,
             "model": model,
             "effort": effort,
+            "worktree": worktree_payload,
             "deadline_at": snap.deadline_at,
         })
     } else {
@@ -567,23 +747,389 @@ fn attach_to_broker(
     Ok(serde_json::from_value(accepted).unwrap_or(snap))
 }
 
-/// `danger-full-access` needs the §5 elevation gate (lane permission AND an
-/// explicit `--danger-full-access --reason <text>`), which lands with
-/// worktrees in Phase 4. Until then a lane configured for it cannot spawn —
-/// silently downgrading would be worse than refusing.
-fn elevation_gate(lane: Lane, lane_cfg: &LaneConfig) -> Result<(), AppError> {
-    if lane_cfg.sandbox == SandboxMode::DangerFullAccess {
+/// The §5 elevation gate. Returns the sandbox the worker will actually run
+/// under, plus the audited reason when this spawn is an elevation.
+///
+/// Three things must line up before a worker gets `danger-full-access`, and
+/// **no two of them are enough**:
+///
+/// * the **permission** — `allow_elevation = true` on the lane, which only an
+///   operator editing config (or the matching `A2A_LANES_*` env var) can grant;
+/// * the **intent** — `--danger-full-access` on *this* spawn, because a lane
+///   configured for full access is a standing capability and elevation is a
+///   per-spawn act (spec §5). A config that elevated silently would make every
+///   future spawn on that lane an elevation nobody typed;
+/// * the **reason** — free text, recorded verbatim in `audit.jsonl` and on the
+///   worker, because an audit trail of *that it happened* without *why* is not
+///   an audit trail.
+///
+/// Every refusal is a static precondition (exit 9) decided before the first
+/// byte is written, so a refused elevation leaves no worker, no worktree and no
+/// audit line.
+fn elevation_gate(
+    lane: Lane,
+    lane_cfg: &LaneConfig,
+    danger_full_access: bool,
+    reason: Option<&str>,
+    requested: Requested,
+    warn: &dyn Fn(&str),
+) -> Result<(SandboxMode, Option<String>), AppError> {
+    if !danger_full_access {
+        // A reason with nothing to explain is not an error — but it is never
+        // silent either: the caller plainly *meant* to elevate.
+        if reason.is_some() {
+            warn("--reason has no effect without --danger-full-access");
+        }
+        if lane_cfg.sandbox == SandboxMode::DangerFullAccess {
+            return Err(if lane_cfg.allow_elevation {
+                // The permission is there; the per-spawn intent is not.
+                AppError::new(
+                    "ELEVATION_FLAG_REQUIRED",
+                    ExitCode::Precondition,
+                    format!(
+                        "lane `{lane}` is configured `sandbox = \"danger-full-access\"`, but \
+                         elevation is per-spawn intent (spec §5): a config alone never elevates"
+                    ),
+                )
+                .remedy(
+                    "re-run with `--danger-full-access --reason \"<why this needs full access>\"`",
+                )
+            } else {
+                not_permitted(lane)
+            });
+        }
+        return Ok((lane_cfg.sandbox, None));
+    }
+
+    // Intent given. Permission first: the flag can never grant itself one.
+    if !lane_cfg.allow_elevation {
+        return Err(not_permitted(lane));
+    }
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    let Some(reason) = reason else {
         return Err(AppError::new(
-            "ELEVATION_NOT_PERMITTED",
+            "ELEVATION_REASON_REQUIRED",
             ExitCode::Precondition,
             format!(
-                "lane `{lane}` is configured `sandbox = \"danger-full-access\"`, but the elevation \
-                 gate (`--danger-full-access --reason <text>`, spec §5) is not implemented in Phase 1"
+                "--danger-full-access on lane `{lane}` needs a reason: every elevation is \
+                 recorded in $A2A_HOME/audit.jsonl, and a record with no reason is not one"
             ),
         )
-        .remedy("give the lane a non-elevated sandbox in $A2A_HOME/config.toml"));
+        .remedy("re-run with --reason \"<why this needs full access>\""));
+    };
+    // Spec §5: the wire cannot request privilege, and Phase 4 does not teach the
+    // broker a per-spawn elevation — so an elevated spawn is an exec spawn, and
+    // a caller who *named* the socket is told rather than quietly re-routed.
+    if requested == Requested::AppServer {
+        return Err(AppError::new(
+            "ELEVATION_EXEC_ONLY",
+            ExitCode::Precondition,
+            "an elevated spawn runs on the exec transport: spec §5 forbids the broker socket \
+             from carrying an elevation, and the daemon resolves its own sandbox server-side",
+        )
+        .remedy(
+            "drop --transport app-server: spec §5 forbids the broker socket from carrying an \
+             elevation",
+        ));
     }
+    Ok((SandboxMode::DangerFullAccess, Some(reason.to_string())))
+}
+
+/// The one refusal both un-permitted paths share: the lane has no `allow_elevation`.
+fn not_permitted(lane: Lane) -> AppError {
+    AppError::new(
+        "ELEVATION_NOT_PERMITTED",
+        ExitCode::Precondition,
+        format!(
+            "lane `{lane}` may not run with `danger-full-access`: elevation needs a lane \
+             permission as well as the per-spawn flag (spec §5)"
+        ),
+    )
+    .remedy(format!(
+        "set `allow_elevation = true` under [lanes.{lane}] in $A2A_HOME/config.toml and re-run \
+         with --danger-full-access --reason \"<why>\""
+    ))
+}
+
+/// Ingress scan for `--reason` (spec §5) — the same pass, and the same refusal
+/// shape, the brief gets. The reason is about to be written to `audit.jsonl`
+/// *and* to the WAL, so a credential pasted into it would land in two files a
+/// refusal could no longer take back.
+fn scan_reason(reason: Option<&str>) -> Result<(), AppError> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let hits = redact::scan_text(reason);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let rules = hits
+        .iter()
+        .take(5)
+        .map(|h| h.rule)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(AppError::new(
+        "SECRET_IN_REASON",
+        ExitCode::Precondition,
+        format!(
+            "--reason contains {} secret-shaped value(s) ({rules}) — refusing to spawn \
+             (nothing was written)",
+            hits.len()
+        ),
+    )
+    .remedy("remove the credential from --reason; it is recorded verbatim in the audit log"))
+}
+
+/// `$A2A_HOME/audit.jsonl` — the append-only record of every elevation.
+pub const AUDIT_FILE: &str = "audit.jsonl";
+
+/// Append one line to `$A2A_HOME/audit.jsonl` (0600, `O_APPEND`, fsync'd).
+///
+/// Same append-before-act discipline as `gc`'s `index.jsonl` and the WAL: the
+/// line is complete and durable before the thing it records is allowed to
+/// happen. 0600 because the reason is operator text about a privileged
+/// operation, and this file outlives every worker it names.
+pub fn append_audit(home: &A2aHome, entry: &Value) -> Result<(), AppError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = home.root().join(AUDIT_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| io_err("opening audit.jsonl", e))?;
+    let mut line = serde_json::to_vec(entry).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("serializing an audit entry: {e}"),
+        )
+    })?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .map_err(|e| io_err("appending to audit.jsonl", e))?;
+    file.sync_data()
+        .map_err(|e| io_err("syncing audit.jsonl", e))?;
     Ok(())
+}
+
+/// The worktree decision, taken before the first byte is written.
+///
+/// Everything here is read-only on the workspace: the git probes are
+/// `rev-parse`, and the only thing they can do is refuse.
+#[derive(Debug, Default)]
+struct WorktreeGate {
+    /// The 40-hex commit to cut the branch from — `Some` exactly when a
+    /// worktree is to be created.
+    create_from: Option<String>,
+    /// The diff anchor to record, worktree or not (spec §4.5): the target
+    /// repo's `HEAD` at spawn, or `--base-ref` resolved.
+    base_ref: Option<String>,
+    /// Why a lane that defaults to a worktree did not get one.
+    skipped: Option<&'static str>,
+}
+
+/// `--worktree` ⇒ yes; `--no-worktree` ⇒ no; neither ⇒ the lane default.
+///
+/// The two-rule split on a cwd that is not a git work tree is deliberate and
+/// pinned: an **explicit** `--worktree` is a request, and a request that cannot
+/// be honoured is an error; a **lane default** is a policy, and refusing every
+/// legitimate non-repo impl worker in its name would be worse than proceeding
+/// without one. The skip is recorded (genesis, then `snap.extra`) rather than
+/// left as a stderr line nobody keeps.
+fn worktree_gate(
+    args: &SpawnArgs,
+    lane_cfg: &LaneConfig,
+    cwd_plan: &CwdPlan,
+    warn: &dyn Fn(&str),
+) -> Result<WorktreeGate, AppError> {
+    if args.no_worktree {
+        warn("--no-worktree: spawning directly in --cwd");
+    }
+    let wanted = args.worktree || (!args.no_worktree && lane_cfg.worktree_default);
+    // The research lane's cwd is inside the worker dir and does not exist yet;
+    // it is never a git work tree, and `--worktree` on it is the same refusal a
+    // non-repo `--cwd` gets.
+    let target = match cwd_plan {
+        CwdPlan::Fixed(p) => Some(p.as_path()),
+        CwdPlan::Scratch => None,
+    };
+    let repo = target.and_then(worktree::repo_root);
+    let Some(repo) = repo else {
+        if args.worktree {
+            let shown = target
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the research lane's scratch dir".to_string());
+            return Err(AppError::new(
+                "WORKTREE_NOT_A_REPO",
+                ExitCode::Precondition,
+                format!("--worktree: {shown} is not inside a git work tree"),
+            )
+            .remedy("run `git init` in --cwd, or pass --no-worktree to spawn directly in it"));
+        }
+        if wanted {
+            warn(&format!(
+                "the {} lane defaults to a worktree, but {} is not inside a git work tree — \
+                 spawning directly in it",
+                args.lane,
+                target.map(|p| p.display().to_string()).unwrap_or_default()
+            ));
+            return Ok(WorktreeGate {
+                skipped: Some("not-a-git-repo"),
+                ..WorktreeGate::default()
+            });
+        }
+        return Ok(WorktreeGate::default());
+    };
+    // Pinned here, in the gate, so an unresolvable `--base-ref` and a repo with
+    // no commit both refuse before anything is written — and so the commit the
+    // branch is cut from is the same one the snapshot records.
+    let base = match args.base_ref.as_deref() {
+        Some(r) => Some(worktree::resolve_commit(&repo, r)?),
+        None if wanted => Some(worktree::head_ref(&repo)?),
+        // No worktree and no explicit ref: the anchor is still worth recording,
+        // but an empty repo is not this spawn's problem.
+        None => worktree::head_ref(&repo).ok(),
+    };
+    Ok(WorktreeGate {
+        create_from: base.clone().filter(|_| wanted),
+        base_ref: base,
+        skipped: None,
+    })
+}
+
+/// Which schema this worker's result will be judged against — decided before
+/// anything is copied, so the decision can be taken in the gate block and acted
+/// on later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaChoice {
+    /// `--schema <file>`: the caller named it, so it wins outright.
+    Flag(PathBuf),
+    /// The brief's `result_schema`, already resolved against the brief's dir.
+    Brief(PathBuf),
+    /// The impl lane's compiled-in template ([`IMPL_RESULT_SCHEMA`]).
+    LaneDefault,
+}
+
+impl SchemaChoice {
+    /// The `schema_source` label recorded in genesis.
+    fn label(&self) -> &'static str {
+        match self {
+            SchemaChoice::Flag(_) => "flag",
+            SchemaChoice::Brief(_) => "brief",
+            SchemaChoice::LaneDefault => "lane-default",
+        }
+    }
+}
+
+/// The precedence table (spec §4.9), decided without touching the worker dir:
+/// **`--schema` > the brief's `result_schema` > the impl lane's template**.
+///
+/// The middle rung is resolved **relative to the brief's own directory** — a
+/// brief is a document that travels with its schema, and `./task.schema.json`
+/// in it means "beside me", not "beside whatever the operator's shell happened
+/// to be in". An absolute value is used as written.
+///
+/// The lane default is **impl-only**: it is devloop's result shape, and giving
+/// a research or general worker a schema it was never briefed for would fail it
+/// at the gate for something nobody asked of it.
+fn plan_schema(
+    lane: Lane,
+    flag: Option<&Path>,
+    brief_path: &Path,
+    brief: &Brief,
+) -> Result<Option<SchemaChoice>, AppError> {
+    if let Some(schema) = flag {
+        if !schema.is_file() {
+            return Err(schema_not_found(format!(
+                "--schema {}: not a readable file",
+                schema.display()
+            )));
+        }
+        return Ok(Some(SchemaChoice::Flag(schema.to_path_buf())));
+    }
+    if let Some(declared) = brief.result_schema.as_deref().map(str::trim) {
+        let raw = Path::new(declared);
+        let resolved = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            // `./x` and `x` are the same neighbour; joining the leading `.`
+            // through would only make every message about this path uglier.
+            brief_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(raw.strip_prefix(".").unwrap_or(raw))
+        };
+        if !resolved.is_file() {
+            return Err(schema_not_found(format!(
+                "the brief's `result_schema: {declared}` resolves to {}, which is not a readable \
+                 file",
+                resolved.display()
+            ))
+            .remedy(
+                "point `result_schema` at a file beside the brief (or give an absolute path), or \
+                 drop the key",
+            ));
+        }
+        return Ok(Some(SchemaChoice::Brief(resolved)));
+    }
+    Ok(match lane {
+        Lane::Impl => Some(SchemaChoice::LaneDefault),
+        _ => None,
+    })
+}
+
+fn schema_not_found(message: String) -> AppError {
+    AppError::new("SCHEMA_NOT_FOUND", ExitCode::Precondition, message)
+}
+
+/// `--schema` > brief `result_schema` (relative to the brief's dir) > the
+/// impl-lane default template — resolved **and materialized** as
+/// `<worker>/result-schema.json` (0600).
+///
+/// Returns the path recorded on the snapshot, in genesis and in
+/// [`SpawnSpec::schema_path`], plus the `schema_source` label. The copy is the
+/// point: a worker judged against a file outside its own directory is a worker
+/// whose verdict changes when somebody edits that file, or moves the repo the
+/// template shipped in.
+fn resolve_schema(
+    wdir: &Path,
+    lane: Lane,
+    flag: Option<&Path>,
+    brief_path: &Path,
+    brief: &Brief,
+) -> Result<(Option<PathBuf>, &'static str), AppError> {
+    let Some(choice) = plan_schema(lane, flag, brief_path, brief)? else {
+        return Ok((None, "none"));
+    };
+    let bytes = match &choice {
+        SchemaChoice::LaneDefault => IMPL_RESULT_SCHEMA.as_bytes().to_vec(),
+        SchemaChoice::Flag(p) | SchemaChoice::Brief(p) => std::fs::read(p).map_err(|e| {
+            schema_not_found(format!("reading the result schema {}: {e}", p.display()))
+        })?,
+    };
+    let dest = wdir.join(WORKER_SCHEMA_FILE);
+    write_0600(&dest, &bytes)?;
+    Ok((Some(dest), choice.label()))
+}
+
+/// Pre-genesis cleanup: this id never became a worker, so the worker dir AND
+/// any half-made tree go with it (an id with no `state.json` is a ghost, and a
+/// tree with no worker is one `gc` can never reach).
+///
+/// Best-effort by construction — the error already on its way out is the one
+/// worth reporting. The BRANCH is never touched: a2a does not delete branches.
+fn discard_pre_genesis(home: &A2aHome, wdir: &Path, id: &str, repo: Option<&Path>) {
+    let _ = std::fs::remove_dir_all(wdir);
+    let path = home.worktrees_dir().join(id);
+    if !path.exists() {
+        return;
+    }
+    if let Some(repo) = repo {
+        let _ = worktree::remove(repo, &path, true);
+    }
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// Research runs in its own scratch dir, never a repo and never `$HOME`
@@ -750,12 +1296,16 @@ fn tombstone_ids(home: &A2aHome) -> Vec<String> {
 }
 
 /// Everything written under a freshly created worker dir, before genesis.
+///
+/// Returns the materialized result schema and its `schema_source` label: the
+/// schema is a *worker file*, laid out here with the brief and the prompt, so
+/// that everything the worker is judged by lives in one directory.
 fn lay_out_worker(
     wdir: &Path,
     args: &SpawnArgs,
     brief_text: &str,
     parsed: &Brief,
-) -> Result<(), AppError> {
+) -> Result<(Option<PathBuf>, &'static str), AppError> {
     for d in WORKER_DIRS {
         create_dir_0700(&wdir.join(d)).map_err(|e| io_err("creating the worker dir tree", e))?;
     }
@@ -769,7 +1319,8 @@ fn lay_out_worker(
     } else {
         &parsed.body
     };
-    write_0600(&wdir.join("prompt.md"), prompt.as_bytes())
+    write_0600(&wdir.join("prompt.md"), prompt.as_bytes())?;
+    resolve_schema(wdir, args.lane, args.schema.as_deref(), &args.brief, parsed)
 }
 
 /// Stage `--context` files into `<worker>/context/`, applying both halves of
@@ -948,6 +1499,158 @@ mod tests {
             resolve_cwd(Lane::Research, None, &[]),
             Ok(CwdPlan::Scratch)
         ));
+    }
+
+    /// The published contract with devloop (spec §4.9 + the `sample-task-result.json`
+    /// shape). `required` is what `reconcile::schema_gate` actually enforces, so
+    /// its exact list — and its order, which is how a human reads the file — is
+    /// the pin that keeps devloop step 4.3.4 parsing without an adapter.
+    #[test]
+    fn the_shipped_impl_schema_pins_the_devloop_result_shape() {
+        let v: Value = serde_json::from_str(IMPL_RESULT_SCHEMA).expect("the template is JSON");
+        assert_eq!(v["$schema"], json!("https://json-schema.org/draft/2020-12/schema"));
+        assert_eq!(v["type"], json!("object"));
+        assert_eq!(v["additionalProperties"], json!(false));
+        let required: Vec<&str> = v["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .map(|k| k.as_str().expect("a key name"))
+            .collect();
+        assert_eq!(
+            required,
+            [
+                "status",
+                "iterations",
+                "summary",
+                "evidence",
+                "files_changed",
+                "next_step_hint"
+            ]
+        );
+        let props = &v["properties"];
+        assert_eq!(props["status"]["enum"], json!(["pass", "fail", "stuck"]));
+        assert_eq!(props["iterations"]["type"], json!("integer"));
+        assert_eq!(props["summary"]["type"], json!("string"));
+        assert_eq!(props["evidence"]["type"], json!("object"));
+        // Toolkit-dependent: the four playwright keys are DOCUMENTED, not
+        // required, and anything else a toolkit produces is allowed through.
+        assert_eq!(props["evidence"]["additionalProperties"], json!(true));
+        assert_eq!(props["evidence"].get("required"), None);
+        for key in [
+            "screenshots",
+            "console_errors",
+            "network_failures",
+            "logs_excerpts",
+        ] {
+            assert_eq!(props["evidence"]["properties"][key]["type"], json!("array"));
+        }
+        assert_eq!(props["files_changed"]["type"], json!("array"));
+        assert_eq!(props["files_changed"]["items"]["type"], json!("string"));
+        assert_eq!(props["next_step_hint"]["type"], json!(["string", "null"]));
+        // Every required key is described; `additionalProperties: false` would
+        // otherwise reject a key the schema itself asks for.
+        for key in &required {
+            assert!(props.get(key).is_some(), "`{key}` is required but undescribed");
+        }
+    }
+
+    /// The precedence table, exercised as a table: flag beats brief beats the
+    /// lane default, the brief's path is brief-relative, and a general-lane
+    /// worker with none of the three gets no schema at all.
+    #[test]
+    fn the_schema_precedence_table_resolves_flag_then_brief_then_lane_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let briefs = tmp.path().join("briefs");
+        std::fs::create_dir_all(&briefs).unwrap();
+        let brief_path = briefs.join("task.md");
+        std::fs::write(&brief_path, "x").unwrap();
+        // The brief's schema is a SIBLING of the brief, not of the cwd.
+        let sibling = briefs.join("task.schema.json");
+        std::fs::write(&sibling, r#"{"required":["verdict"]}"#).unwrap();
+        let flagged = tmp.path().join("flag.schema.json");
+        std::fs::write(&flagged, r#"{"required":["flagged"]}"#).unwrap();
+
+        let with_key = Brief {
+            result_schema: Some("./task.schema.json".to_string()),
+            ..Brief::default()
+        };
+        let without = Brief::default();
+
+        let case = |lane, flag: Option<&Path>, brief: &Brief| {
+            let wdir = tempfile::tempdir().unwrap();
+            let (path, source) = resolve_schema(wdir.path(), lane, flag, &brief_path, brief)
+                .expect("resolution succeeds");
+            let body = path
+                .as_ref()
+                .map(|p| std::fs::read_to_string(p).expect("the worker's own copy"));
+            // Whatever was chosen, the worker's copy is the recorded path.
+            if let Some(p) = &path {
+                assert_eq!(p, &wdir.path().join(WORKER_SCHEMA_FILE));
+            }
+            (source, body)
+        };
+
+        let (source, body) = case(Lane::Impl, Some(flagged.as_path()), &with_key);
+        assert_eq!(source, "flag");
+        assert_eq!(body.unwrap(), r#"{"required":["flagged"]}"#);
+
+        let (source, body) = case(Lane::Impl, None, &with_key);
+        assert_eq!(source, "brief");
+        assert_eq!(body.unwrap(), r#"{"required":["verdict"]}"#);
+
+        let (source, body) = case(Lane::Impl, None, &without);
+        assert_eq!(source, "lane-default");
+        assert_eq!(body.unwrap(), IMPL_RESULT_SCHEMA);
+
+        // The default is impl-only; every other lane keeps `schema_path: null`.
+        for lane in [Lane::General, Lane::Review, Lane::Research] {
+            let (source, body) = case(lane, None, &without);
+            assert_eq!(source, "none", "{lane}");
+            assert!(body.is_none(), "{lane}");
+        }
+        // …but an explicit flag still applies to them.
+        let (source, _) = case(Lane::General, Some(flagged.as_path()), &without);
+        assert_eq!(source, "flag");
+    }
+
+    /// Both rungs that name a file refuse the same way when it is not there:
+    /// exit 9, `SCHEMA_NOT_FOUND`, decided before anything is written.
+    #[test]
+    fn a_named_schema_that_is_missing_is_a_static_precondition_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brief_path = tmp.path().join("task.md");
+        std::fs::write(&brief_path, "x").unwrap();
+
+        let err = plan_schema(
+            Lane::Impl,
+            Some(&tmp.path().join("no-such.json")),
+            &brief_path,
+            &Brief::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "SCHEMA_NOT_FOUND");
+        assert_eq!(err.exit, ExitCode::Precondition);
+
+        let err = plan_schema(
+            Lane::Impl,
+            None,
+            &brief_path,
+            &Brief {
+                result_schema: Some("./no-such.json".to_string()),
+                ..Brief::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "SCHEMA_NOT_FOUND");
+        assert_eq!(err.exit, ExitCode::Precondition);
+        // The message names the RESOLVED path, since that is the one the
+        // operator has to go and look at.
+        assert!(
+            err.message.contains(&tmp.path().join("no-such.json").display().to_string()),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

@@ -168,6 +168,10 @@ pub enum Cmd {
         /// your own workers plus every unowned one (spec §4.8).
         #[arg(long)]
         all: bool,
+        /// Also reclaim workers whose worktree has uncommitted or unmerged
+        /// work — the worktree directory is deleted, the branch is not
+        #[arg(long)]
+        force: bool,
     },
     /// Check the environment a worker would be spawned into: one line per
     /// check, exit 9 if any of them fails
@@ -198,6 +202,29 @@ pub enum Cmd {
         cmd: SyncCmd,
     },
     // later tasks append variants here
+    /// Re-run the BRIEF's verify commands in the worker's workspace and write
+    /// verification.json. Never runs commands the worker proposed.
+    Verify {
+        /// Worker id, or any unambiguous prefix of one
+        id: String,
+        /// Run even when the diff touches execution-bearing paths (recorded
+        /// either way)
+        #[arg(long)]
+        force_verify: bool,
+        /// Kill any single verify command after this long — `30s`, `5m`, `2h`
+        /// (default: 10m)
+        #[arg(long, value_name = "DUR", value_parser = crate::commands::wait::parse_duration)]
+        timeout: Option<std::time::Duration>,
+    },
+    /// (hidden) render the generated skill artifacts from their in-repo sources
+    #[command(hide = true, name = "__gen-skills")]
+    GenSkills {
+        #[arg(long, value_name = "DIR")]
+        out: std::path::PathBuf,
+        /// Compare instead of writing; exit 9 naming any drifted artifact
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -246,7 +273,7 @@ pub struct SpawnArgs {
     /// exec otherwise; `app-server` demands the broker and exits 7 without one)
     #[arg(long)]
     pub transport: Option<String>,
-    /// Run in a git worktree (Phase 4; warns and is ignored today)
+    /// Run in a git worktree at $A2A_HOME/worktrees/<id> on branch a2a/<lane>/<id>
     #[arg(long)]
     pub worktree: bool,
     /// Fail rather than queue at the admission cap (app-server transport only)
@@ -256,6 +283,23 @@ pub struct SpawnArgs {
     /// Recorded at genesis, so it survives losing `state.json` (spec §4.8).
     #[arg(long)]
     pub owner: Option<String>,
+    /// Never create a worktree, even when the lane defaults to one
+    #[arg(long, conflicts_with = "worktree")]
+    pub no_worktree: bool,
+    /// Branch the worktree from this ref instead of the target repo's HEAD
+    #[arg(long, value_name = "REF")]
+    pub base_ref: Option<String>,
+    /// Run this ONE worker with `sandbox = danger-full-access` (spec §5).
+    /// Needs `allow_elevation = true` on the lane and a `--reason`; forces the
+    /// exec transport and appends a line to $A2A_HOME/audit.jsonl.
+    #[arg(long)]
+    pub danger_full_access: bool,
+    /// Why this spawn needs full access — recorded verbatim in the audit log
+    /// and on the worker. Required by `--danger-full-access`, ignored (with a
+    /// warning) without it. NO clap `requires`: the pairing is validated in the
+    /// §5 gate, so a missing reason is a typed envelope, not clap's exit 2.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
 }
 
 /// clap-facing mirror of [`crate::inbox::MsgKind`]; the domain enum stays free

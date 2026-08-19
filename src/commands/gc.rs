@@ -5,14 +5,16 @@
 //! comes back, and every rule below exists because deleting the wrong directory
 //! is the one mistake in this system that cannot be undone by replaying a log.
 //!
-//! **Terminal states only, with no force path.** `done`/`failed`/`cancelled` are
-//! absorbing; everything else — `running`, `awaiting-input`, `escalated`,
-//! `orphaned` — is a worker somebody can still act on. `orphaned` especially:
-//! spec §7 makes orphans exactly the population `a2a resume` exists for, so a
-//! `--force` that reaped them would delete the session ids that make recovery
-//! possible. There is deliberately no such flag in Phase 1; the remedy an
-//! operator gets names `a2a kill` first, which lands the worker in `cancelled`
-//! through the FSM and therefore through the WAL.
+//! **Terminal states only, and `--force` does not widen that.**
+//! `done`/`failed`/`cancelled` are absorbing; everything else — `running`,
+//! `awaiting-input`, `escalated`, `orphaned` — is a worker somebody can still
+//! act on. `orphaned` especially: spec §7 makes orphans exactly the population
+//! `a2a resume` exists for, so a flag that reaped them would delete the session
+//! ids that make recovery possible. Phase 4's `--force` widens the **worktree**
+//! rule and nothing else (see below): a non-terminal worker is never reclaimed
+//! with it or without it, and the remedy an operator gets names `a2a kill`
+//! first, which lands the worker in `cancelled` through the FSM and therefore
+//! through the WAL.
 //!
 //! **Reconcile before deciding.** A worker whose process died while nobody was
 //! watching is still recorded `running` on disk. Reconciling each candidate
@@ -64,9 +66,35 @@
 //! reported in `kept`, exactly like a non-terminal one: gc that silently skips
 //! things is gc that leaves an operator wondering where their disk went.
 //!
-//! Phase 4 adds the worktree rule from spec §7 (refuse to reclaim a worker whose
-//! git worktree is dirty or unmerged without `--force`); Phase 1 workers have no
-//! worktrees, so there is nothing yet to refuse.
+//! **The worktree rails** (spec §7). A worker that ran in its own git worktree
+//! holds two things gc must never destroy quietly: uncommitted work in the tree
+//! and commits on its branch the base ref never received. Each is a refusal —
+//! a `kept` row carrying the remedy that would change the answer — until
+//! `--force` says otherwise. git protects only the first of the two (a clean
+//! tree whose branch is ahead is removed by `git worktree remove` without a
+//! murmur), which is why the second rule has to live here.
+//!
+//! What no flag reaches is the **branch**: it is the deliverable a2a produces
+//! (spec §4.8, "a2a never merges branches"), and it outlives the tree, the
+//! worker directory and the tombstone. The tombstone is in fact what keeps it
+//! findable, which is why it carries `worktree_branch` and
+//! `worktree_base_ref`.
+//!
+//! Every git call runs `-C <wt.repo>` — the **parent** repo recorded in
+//! genesis. It is not derivable at gc time: a linked worktree's `.git` is a
+//! pointer file that dies with the directory, and `rev-parse --show-toplevel`
+//! run inside a linked worktree answers for that worktree, never its parent.
+//! The same recorded repo is what makes a *missing* tree recoverable: gc still
+//! owes it a `worktree prune`, and there would be nothing to run that against
+//! otherwise. When the parent repo itself is gone, gc asks git nothing, removes
+//! the orphaned directory and carries on — an unreachable repo must not make a
+//! worker un-reclaimable forever.
+//!
+//! Order of operations is the irreversibility order: **tombstone, then the
+//! tree, then the worker directory**. A worker directory deleted while its
+//! worktree was still registered would strand a git registration with no id
+//! left to name it, so a failed removal keeps the directory and reports a
+//! `skipped` row.
 
 use crate::commands::ls::last_event_ts;
 use crate::commands::owner;
@@ -75,7 +103,8 @@ use crate::home::A2aHome;
 use crate::ids;
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
-use crate::state::WorkerSnapshot;
+use crate::state::{WorkerSnapshot, WorktreeRef};
+use crate::worktree;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -96,11 +125,16 @@ const NON_TERMINAL_REMEDY: &str = "stop it first with `a2a kill <id>` (or let it
 const NOT_OWNER_REMEDY: &str =
     "re-run with `--all` to sweep the whole machine, or as that owner (`A2A_OWNER=<owner> a2a gc`)";
 
+/// How many dirty paths a `kept` row carries. Enough to recognise the work at a
+/// glance; not so many that one forgotten `target/` fills the payload.
+const DIRTY_SAMPLE: usize = 10;
+
 pub fn run(
     home: &A2aHome,
     age: Duration,
     dry_run: bool,
     all: bool,
+    force: bool,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
@@ -193,6 +227,21 @@ pub fn run(
             }));
             continue;
         }
+        // What git can still say about this worker's tree, decided once, here:
+        // the answer feeds the size report, the `--json` row, the refusal and
+        // the removal, and a second reading could disagree with the first.
+        let wt = match snap.worktree.clone() {
+            None => None,
+            Some(wt) => match plan_for(&name, &wt, force, &warn) {
+                Some(plan) => Some(WtInfo { wt, plan }),
+                // git answered with an error: a tree gc cannot judge is the
+                // last one it should delete, so the worker stays put.
+                None => {
+                    skipped.push(json!({"entry": name, "reason": "WORKTREE_STATUS_FAILED"}));
+                    continue;
+                }
+            },
+        };
         // The WAL's own account of when this worker last did anything. A worker
         // with no readable event falls back to when it entered its terminal
         // state, which is the next-most-honest answer available.
@@ -202,6 +251,7 @@ pub fn run(
             &name,
             &snap,
             &path,
+            wt,
             idle_secs,
             idle_secs >= age_secs,
         ));
@@ -209,7 +259,16 @@ pub fn run(
 
     reclaimable.sort_by(|a, b| a.id.cmp(&b.id));
     let reclaimable_bytes: u64 = reclaimable.iter().map(|c| c.bytes).sum();
-    let eligible: Vec<&Candidate> = reclaimable.iter().filter(|c| c.eligible).collect();
+    // The worktree rule applies to exactly the set gc would otherwise delete,
+    // and applies in a dry run too: `--dry-run` has to name what WOULD go, and
+    // a tree holding live work would not.
+    let mut eligible: Vec<&Candidate> = Vec::new();
+    for c in reclaimable.iter().filter(|c| c.eligible) {
+        match if force { None } else { c.worktree_hold() } {
+            Some(row) => kept.push(row),
+            None => eligible.push(c),
+        }
+    }
     let eligible_bytes: u64 = eligible.iter().map(|c| c.bytes).sum();
 
     let mut removed: Vec<String> = Vec::new();
@@ -220,6 +279,20 @@ pub fn run(
             // directory that still exists (recoverable, and visible in `ls`),
             // never a deleted worker whose session id is unrecoverable.
             append_tombstone(home, &c.tombstone(now))?;
+            // Then the tree, and only then the directory: the worker dir is
+            // the last thing that can name a worktree, so a registration must
+            // never outlive it. A failure here keeps the directory — the
+            // tombstone stands, exactly as it does for a failed remove below.
+            if let Some(info) = &c.worktree {
+                if let Err(e) = reclaim_worktree(info, force) {
+                    warn(format!(
+                        "{}: {}: {} — worker directory left in place",
+                        c.id, e.code, e.message
+                    ));
+                    skipped.push(json!({"entry": c.id, "reason": "worktree remove failed"}));
+                    continue;
+                }
+            }
             let dir = home.workers_dir().join(&c.id);
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {
@@ -286,6 +359,21 @@ pub fn run(
     Ok(Outcome::from(data))
 }
 
+/// What gc may do about one worker's worktree, decided once per sweep.
+enum WtPlan {
+    /// git spoke for the tree: this is what it said.
+    Live(worktree::Status),
+    /// The parent repo is unreachable, so git cannot be asked and there is no
+    /// registration left to prune — the directory is all that survives.
+    Orphaned,
+}
+
+/// A worker's worktree plus the plan for it.
+struct WtInfo {
+    wt: WorktreeRef,
+    plan: WtPlan,
+}
+
 /// A safely-named, terminal worker: reclaimable in principle, and `eligible`
 /// when `--age` also admits it.
 struct Candidate {
@@ -297,6 +385,7 @@ struct Candidate {
     bytes: u64,
     last_event_age_secs: i64,
     eligible: bool,
+    worktree: Option<WtInfo>,
 }
 
 impl Candidate {
@@ -304,6 +393,7 @@ impl Candidate {
         id: &str,
         snap: &WorkerSnapshot,
         dir: &Path,
+        worktree: Option<WtInfo>,
         last_event_age_secs: i64,
         eligible: bool,
     ) -> Self {
@@ -316,9 +406,18 @@ impl Candidate {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             cwd: snap.cwd.display().to_string(),
-            bytes: dir_bytes(dir),
+            // A worktree is disk this worker is holding just as surely as its
+            // own directory is, and it is usually the larger half — a report
+            // that counted only the worker dir would understate what gc is
+            // offering to give back.
+            bytes: dir_bytes(dir)
+                + worktree
+                    .as_ref()
+                    .map(|i| dir_bytes(&i.wt.path))
+                    .unwrap_or(0),
             last_event_age_secs,
             eligible,
+            worktree,
         }
     }
 
@@ -330,6 +429,11 @@ impl Candidate {
             "rollout_path": self.rollout_path,
             "cwd": self.cwd,
             "state": self.state,
+            // The branch outlives everything else about this worker, and once
+            // the directory is gone the tombstone is the only thing that can
+            // still name it — or say what it was cut from.
+            "worktree_branch": self.worktree.as_ref().map(|i| i.wt.branch.clone()),
+            "worktree_base_ref": self.worktree.as_ref().map(|i| i.wt.base_ref.clone()),
             "removed_at": now,
         })
     }
@@ -344,7 +448,127 @@ impl Candidate {
             "bytes": self.bytes,
             "last_event_age_secs": self.last_event_age_secs,
             "eligible": self.eligible,
+            "worktree": self.worktree_json(),
         })
+    }
+
+    /// The `worktree` cell of a `--json` candidate row: what the tree is, and
+    /// what it is holding, so `gc --dry-run` tells the whole truth.
+    fn worktree_json(&self) -> Value {
+        let Some(info) = &self.worktree else {
+            return Value::Null;
+        };
+        // `null`, not `0`, when git could not be asked: a zero there would be
+        // an answer rather than the absence of one.
+        let (ahead, dirty_count) = match &info.plan {
+            WtPlan::Live(s) => (json!(s.ahead), json!(s.dirty.len())),
+            WtPlan::Orphaned => (Value::Null, Value::Null),
+        };
+        json!({
+            "path": info.wt.path.display().to_string(),
+            "branch": info.wt.branch,
+            "ahead": ahead,
+            "dirty_count": dirty_count,
+        })
+    }
+
+    /// The refusal this worker's worktree imposes, as a `kept` row — or `None`
+    /// when there is nothing in the tree worth stopping for.
+    ///
+    /// Consulted only for an age-eligible candidate, and only without
+    /// `--force`. A tree that is already gone holds nothing and refuses
+    /// nothing; an unreachable parent repo cannot be asked and, per the
+    /// recovery rule, must not strand the worker either.
+    fn worktree_hold(&self) -> Option<Value> {
+        let info = self.worktree.as_ref()?;
+        let WtPlan::Live(s) = &info.plan else {
+            return None;
+        };
+        if !s.present {
+            return None;
+        }
+        if !s.dirty.is_empty() {
+            return Some(json!({
+                "id": self.id,
+                "state": self.state,
+                "reason": "worktree dirty",
+                "remedy": format!(
+                    "commit or discard the work in {}, or re-run gc --force",
+                    info.wt.path.display()
+                ),
+                "dirty": s.dirty.iter().take(DIRTY_SAMPLE).collect::<Vec<_>>(),
+            }));
+        }
+        if s.ahead > 0 {
+            return Some(json!({
+                "id": self.id,
+                "state": self.state,
+                "reason": "worktree unmerged",
+                "ahead": s.ahead,
+                "remedy": format!(
+                    "merge or cherry-pick {} (a2a never merges), or re-run gc --force",
+                    info.wt.branch
+                ),
+            }));
+        }
+        None
+    }
+}
+
+/// Ask git about a worker's tree — or decide it cannot be asked.
+///
+/// `None` means "git answered with an error": the caller skips the worker
+/// entirely, because a tree gc cannot judge is not a tree gc may delete. The
+/// checks are on **`wt.repo`**, the recorded parent, never on `wt.path`: the
+/// worktree's own `.git` is a pointer file that dies with the directory.
+fn plan_for(id: &str, wt: &WorktreeRef, force: bool, warn: &impl Fn(String)) -> Option<WtPlan> {
+    if !wt.repo.exists() || worktree::repo_root(&wt.repo).is_none() {
+        warn(format!(
+            "{id}: parent repo {} is gone — removing the orphaned worktree at {} without git",
+            wt.repo.display(),
+            wt.path.display()
+        ));
+        return Some(WtPlan::Orphaned);
+    }
+    match worktree::status(&wt.path, &wt.repo, &wt.branch, &wt.base_ref) {
+        Ok(s) => Some(WtPlan::Live(s)),
+        Err(e) if force => {
+            warn(format!(
+                "{id}: {}: {} — --force: removing {} as an orphan",
+                e.code,
+                e.message,
+                wt.path.display()
+            ));
+            Some(WtPlan::Orphaned)
+        }
+        Err(e) => {
+            warn(format!(
+                "{id}: {}: {} — skipped (re-run with --force to reclaim it anyway)",
+                e.code, e.message
+            ));
+            None
+        }
+    }
+}
+
+/// Take a reclaimed worker's tree away. Never its branch.
+fn reclaim_worktree(info: &WtInfo, force: bool) -> Result<(), AppError> {
+    match &info.plan {
+        // Gone by some other hand: nothing to remove, but the parent repo is
+        // still carrying a registration that only `wt.repo` can address.
+        WtPlan::Live(s) if !s.present => worktree::prune(&info.wt.repo),
+        WtPlan::Live(_) => worktree::remove(&info.wt.repo, &info.wt.path, force),
+        WtPlan::Orphaned => {
+            // Best-effort, because "orphaned" covers both a repo that is gone
+            // (nothing to prune, and git will simply fail) and one that would
+            // not answer for this tree (where a prune is the tidy thing to do).
+            let _ = worktree::prune(&info.wt.repo);
+            match std::fs::remove_dir_all(&info.wt.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io_err("removing an orphaned worktree", e)),
+            }
+        }
     }
 }
 
@@ -452,6 +676,17 @@ fn report(c: Counts, kept: &[Value], age_secs: i64, dry_run: bool) {
     if not_terminal > 0 {
         eprintln!("a2a: gc: kept {not_terminal} non-terminal worker(s) — {NON_TERMINAL_REMEDY}");
     }
+    let held = kept
+        .iter()
+        .filter(|k| {
+            k["reason"] == json!("worktree dirty") || k["reason"] == json!("worktree unmerged")
+        })
+        .count();
+    if held > 0 {
+        eprintln!(
+            "a2a: gc: kept {held} worker(s) with live worktree work — commit it, merge it, or re-run with --force (the branch is never deleted either way)"
+        );
+    }
 }
 
 /// Echo `--age` back in the spelling it was typed in, so the summary line reads
@@ -483,6 +718,16 @@ mod tests {
     use super::*;
     use crate::fsm::WorkerState;
 
+    /// A worktree on the snapshot, shaped like the one `spawn` records.
+    fn wt_ref(id: &str) -> WorktreeRef {
+        WorktreeRef {
+            path: std::path::PathBuf::from("/home/worktrees").join(id),
+            branch: format!("a2a/impl/{id}"),
+            base_ref: "0123456789abcdef0123456789abcdef01234567".into(),
+            repo: std::path::PathBuf::from("/repo"),
+        }
+    }
+
     #[test]
     fn tombstone_carries_every_field_the_id_outlives() {
         let tmp = tempfile::tempdir().unwrap();
@@ -490,7 +735,7 @@ mod tests {
         snap.state = WorkerState::Done;
         snap.session_id = Some("sess-9".into());
         snap.rollout_path = Some("/r/9.jsonl".into());
-        let c = Candidate::new("general-0814t1300-aaaa", &snap, tmp.path(), 42, true);
+        let c = Candidate::new("general-0814t1300-aaaa", &snap, tmp.path(), None, 42, true);
         let now = Utc::now();
         let t = c.tombstone(now);
         assert_eq!(t["id"], json!("general-0814t1300-aaaa"));
@@ -499,6 +744,169 @@ mod tests {
         assert_eq!(t["cwd"], json!(tmp.path().display().to_string()));
         assert_eq!(t["state"], json!("done"));
         assert!(t["removed_at"].is_string(), "removed_at must be stamped");
+        assert!(t["worktree_branch"].is_null(), "no worktree, no branch");
+        assert!(t["worktree_base_ref"].is_null());
+
+        // …and with a worktree, the two keys that keep the deliverable
+        // findable after the directory that named it is gone.
+        let id = "impl-0814t1300-bbbb";
+        let mut snap = WorkerSnapshot::new_for_test(id, tmp.path());
+        snap.state = WorkerState::Done;
+        snap.worktree = Some(wt_ref(id));
+        let live = WtPlan::Live(worktree::Status {
+            present: true,
+            dirty: vec![],
+            ahead: 0,
+        });
+        let c = Candidate::new(
+            id,
+            &snap,
+            tmp.path(),
+            Some(WtInfo {
+                wt: wt_ref(id),
+                plan: live,
+            }),
+            42,
+            true,
+        );
+        let t = c.tombstone(now);
+        assert_eq!(t["worktree_branch"], json!(format!("a2a/impl/{id}")));
+        assert_eq!(
+            t["worktree_base_ref"],
+            json!("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            t["state"],
+            json!("done"),
+            "the pre-existing keys are intact"
+        );
+    }
+
+    /// The two refusals, at the unit where their wording is decided: a `kept`
+    /// row that does not say what would change the answer is a dead end.
+    #[test]
+    fn a_dirty_or_unmerged_tree_is_a_kept_row_with_a_remedy_and_ten_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "impl-0814t1300-cccc";
+        let mut snap = WorkerSnapshot::new_for_test(id, tmp.path());
+        snap.state = WorkerState::Done;
+        snap.worktree = Some(wt_ref(id));
+        let candidate = |plan| {
+            Candidate::new(
+                id,
+                &snap,
+                tmp.path(),
+                Some(WtInfo {
+                    wt: wt_ref(id),
+                    plan,
+                }),
+                42,
+                true,
+            )
+        };
+
+        let dirty: Vec<String> = (0..25).map(|i| format!("src/f{i}.rs")).collect();
+        let c = candidate(WtPlan::Live(worktree::Status {
+            present: true,
+            dirty: dirty.clone(),
+            // Dirt wins over distance: it is the half git would refuse too.
+            ahead: 3,
+        }));
+        let row = c.worktree_hold().expect("uncommitted work is a refusal");
+        assert_eq!(row["reason"], json!("worktree dirty"));
+        assert_eq!(
+            row["remedy"],
+            json!(format!(
+                "commit or discard the work in /home/worktrees/{id}, or re-run gc --force"
+            ))
+        );
+        assert_eq!(
+            row["dirty"].as_array().unwrap().len(),
+            10,
+            "a sample, not the whole tree"
+        );
+        assert_eq!(row["dirty"][0], json!("src/f0.rs"));
+
+        let c = candidate(WtPlan::Live(worktree::Status {
+            present: true,
+            dirty: vec![],
+            ahead: 2,
+        }));
+        let row = c
+            .worktree_hold()
+            .expect("git does not protect this — a2a does");
+        assert_eq!(row["reason"], json!("worktree unmerged"));
+        assert_eq!(row["ahead"], json!(2));
+        assert_eq!(
+            row["remedy"],
+            json!(format!(
+                "merge or cherry-pick a2a/impl/{id} (a2a never merges), or re-run gc --force"
+            ))
+        );
+
+        // Clean and level: nothing to hold. Already gone, or unreachable:
+        // nothing to hold either — a refusal there would strand the worker.
+        for plan in [
+            WtPlan::Live(worktree::Status {
+                present: true,
+                dirty: vec![],
+                ahead: 0,
+            }),
+            WtPlan::Live(worktree::Status {
+                present: false,
+                dirty: vec![],
+                ahead: 0,
+            }),
+            WtPlan::Orphaned,
+        ] {
+            assert!(candidate(plan).worktree_hold().is_none());
+        }
+    }
+
+    /// The size report counts the tree, and the `--json` row says what it is.
+    #[test]
+    fn a_candidate_row_carries_the_worktree_and_its_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("worker");
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(dir.join("state.json"), vec![0u8; 100]).unwrap();
+        std::fs::write(tree.join("big.bin"), vec![0u8; 900]).unwrap();
+
+        let id = "impl-0814t1300-dddd";
+        let mut snap = WorkerSnapshot::new_for_test(id, tmp.path());
+        snap.state = WorkerState::Done;
+        let mut wt = wt_ref(id);
+        wt.path = tree.clone();
+        snap.worktree = Some(wt.clone());
+        let c = Candidate::new(
+            id,
+            &snap,
+            &dir,
+            Some(WtInfo {
+                wt,
+                plan: WtPlan::Live(worktree::Status {
+                    present: true,
+                    dirty: vec!["a.txt".into(), "b.txt".into()],
+                    ahead: 1,
+                }),
+            }),
+            42,
+            true,
+        );
+        assert_eq!(c.bytes, 1000, "the worker dir AND the tree it is holding");
+        let row = c.to_json();
+        assert_eq!(row["bytes"], json!(1000));
+        assert_eq!(row["worktree"]["path"], json!(tree.display().to_string()));
+        assert_eq!(row["worktree"]["branch"], json!(format!("a2a/impl/{id}")));
+        assert_eq!(row["worktree"]["ahead"], json!(1));
+        assert_eq!(row["worktree"]["dirty_count"], json!(2));
+
+        // No tree at all: a null cell, never a fabricated empty one.
+        let plain = Candidate::new(id, &snap, &dir, None, 42, true);
+        assert!(plain.to_json()["worktree"].is_null());
+        assert_eq!(plain.bytes, 100);
     }
 
     #[test]

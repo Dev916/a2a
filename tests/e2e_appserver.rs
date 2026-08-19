@@ -1273,6 +1273,7 @@ async fn real_steer_precondition_error_is_the_one_the_matcher_knows() {
         start_timeout_secs: 120,
         task_timeout_secs: 3600,
         blocked_timeout_secs: 1800,
+        allow_elevation: false,
     };
     let thread = adapter::thread_start(&client, &lane, &work, &work, budget)
         .await

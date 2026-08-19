@@ -7,17 +7,24 @@
 //! and no half-worker for `ls`/`gc` to trip over:
 //!
 //! ```text
-//! home+config → transport gate → elevation gate → cwd resolution
-//!   → WORKTREE GATE (--worktree | lane default | --no-worktree; base ref pinned)
-//!   → brief parse+validate → secret scan → TRANSPORT SELECTION → id allocation
-//!   ───────────────────────── first write ─────────────────────────
-//!   → dir tree (0700) → context staging → brief.md + prompt.md
+//! arg parse → cwd resolve → brief parse+validate → secret scan (brief + reason)
+//!   → ELEVATION GATE (lane permission + --reason, spec §5)
+//!   → transport selection (elevation forces exec)
+//!   → schema resolution (--schema > brief result_schema > impl-lane template)
+//!   → id allocation
+//!   → AUDIT APPEND ($A2A_HOME/audit.jsonl, elevated spawns only)
+//!   → worker dir tree → context staging
 //!   → WORKTREE CREATE (+ .git/info/exclude)
-//!   → ADMISSION (broker only: admit | queue | refuse)
-//!   → genesis event (WAL, carrying `queued` when the answer was "wait")
-//!   → detached spawn / broker Spawn frame
-//!                         → ProcessStarted (WAL, exec only)
+//!   → admission → genesis → spawn/attach
 //! ```
+//!
+//! Two positions in there are deliberate and pinned. The **elevation gate** runs
+//! *after* the brief parse, because `--reason` is ingress-scanned by the same
+//! [`redact::scan_text`] pass the brief is, and *before* transport selection,
+//! because an elevation forces the exec transport (spec §5 forbids the broker
+//! socket from carrying one). The **audit append precedes the worker dir**: an
+//! audit line for a spawn that then failed is the safe direction, and a spawn
+//! that ran with no line is not.
 //!
 //! **The worktree is created here, CLI-side, and never by the broker**
 //! (spec §4.8). Its two halves sit on opposite sides of the first write for a
@@ -135,7 +142,6 @@ pub fn run(
         .get(&lane)
         .cloned()
         .expect("config::load seeds every lane");
-    elevation_gate(lane, &lane_cfg)?;
 
     let cwd_plan = resolve_cwd(lane, args.cwd.as_deref(), &cfg.allowed_roots)?;
     let wt_gate = worktree_gate(args, &lane_cfg, &cwd_plan, &warn)?;
@@ -149,6 +155,23 @@ pub fn run(
     })?;
     let parsed = parse_and_validate_brief(&brief_text, &args.brief, lane, &warn)?;
     scan_brief(&brief_text, &args.brief)?;
+    // The reason is INGRESS, exactly like the brief: it is operator text that
+    // this process is about to write to two files, so it is scanned on the same
+    // pass and refused on the same terms.
+    scan_reason(args.reason.as_deref())?;
+
+    // ---- the §5 elevation gate --------------------------------------------
+    //
+    // After the scan (see above) and before transport selection: an elevation
+    // forces exec, so the answer here decides which path the next gate takes.
+    let (sandbox, elevation_reason) = elevation_gate(
+        lane,
+        &lane_cfg,
+        args.danger_full_access,
+        args.reason.as_deref(),
+        requested,
+        &warn,
+    )?;
 
     if let Some(schema) = args.schema.as_deref() {
         if !schema.is_file() {
@@ -162,7 +185,16 @@ pub fn run(
 
     // The last gate: which transport will own this worker. A refusal here still
     // leaves nothing behind, and the answer is what the genesis event records.
-    let mut selected = select_transport(home.root(), requested)?;
+    //
+    // An ELEVATED spawn never reaches [`select_transport`] at all: spec §5 says
+    // the wire cannot request privilege, and Phase 4 may not teach the broker a
+    // per-spawn elevation, so the elevation *is* the transport decision. The
+    // short-circuit is why an elevated spawn performs no socket syscall — it
+    // cannot autostart a daemon it is then forbidden to use.
+    let mut selected = match &elevation_reason {
+        Some(_) => Selected::Exec { degraded: None },
+        None => select_transport(home.root(), requested)?,
+    };
     let transport = selected.transport();
     if let Selected::Exec {
         degraded: Some(err),
@@ -186,6 +218,25 @@ pub fn run(
     let owner = owner::resolve(args.owner.as_deref());
     let now = Utc::now();
     let id = allocate_id(home, lane, now)?;
+
+    // ---- the audit line (spec §5) -----------------------------------------
+    //
+    // After the id, because the record names the worker, and BEFORE the worker
+    // dir, because the safe direction of the two failure modes is asymmetric: an
+    // audit line for a spawn that then failed is a question an operator can
+    // answer, and an elevated worker that ran with no line is not.
+    if let Some(reason) = &elevation_reason {
+        append_audit(
+            home,
+            &json!({
+                "ts": now.to_rfc3339(),
+                "id": id,
+                "lane": lane.as_str(),
+                "reason": reason,
+                "owner": owner,
+            }),
+        )?;
+    }
 
     // ---- first write ------------------------------------------------------
     let wdir = home.worker_dir(&id);
@@ -270,6 +321,7 @@ pub fn run(
     let mut snap = WorkerSnapshot::blank(&id, &cwd);
     snap.writable_roots = vec![wdir.join("outbox")];
     snap.schema_path = args.schema.clone();
+    snap.elevation_reason = elevation_reason.clone();
     // The diff anchor `a2a verify` needs — recorded whether or not there is a
     // worktree, and equal to the worktree's own base ref when there is one.
     snap.base_ref = wt_gate.base_ref.clone();
@@ -286,7 +338,7 @@ pub fn run(
             "lane": lane.as_str(),
             "cwd": cwd,
             "brief_sha": brief_sha,
-            "sandbox": lane_cfg.sandbox.as_str(),
+            "sandbox": sandbox.as_str(),
             "network": lane_cfg.network,
             "model": model,
             "effort": effort,
@@ -300,6 +352,19 @@ pub fn run(
             "schema_path": args.schema,
             "created_at": now.to_rfc3339(),
     });
+    // The elevation, in genesis for the same reason the worktree is: a worker
+    // that ran with full access must still say so after `state.json` is gone.
+    // The `transport_selection` OVERRIDE goes here rather than on the snapshot
+    // because the genesis fold is applied over the in-memory snapshot — a
+    // post-fold insert would be overwritten now and lost on a rebuild later.
+    // `Requested::selection()` still answers only `auto`/`explicit`; the third
+    // value is a call-site override, not a third enum arm.
+    if let Some(reason) = &elevation_reason {
+        genesis["elevation_reason"] = json!(reason);
+        if requested == Requested::Auto {
+            genesis["transport_selection"] = json!("elevation");
+        }
+    }
     // The worktree, in genesis rather than only on the snapshot: `state.json` is
     // a derived checkpoint, and a worktree only `state.json` knew about would be
     // lost by a rebuild from zero — leaving a tree on disk that no `gc` could
@@ -393,7 +458,7 @@ pub fn run(
                 "cwd": cwd,
                 "worker_dir": wdir,
                 "brief_sha": brief_sha,
-                "sandbox": lane_cfg.sandbox.as_str(),
+                "sandbox": sandbox.as_str(),
                 "network": lane_cfg.network,
                 "model": model,
                 "effort": effort,
@@ -418,7 +483,7 @@ pub fn run(
         cwd: &cwd,
         worker_dir: &wdir,
         epoch: snap.epoch,
-        sandbox: lane_cfg.sandbox,
+        sandbox,
         network: lane_cfg.network,
         model: &model,
         effort: &effort,
@@ -482,7 +547,7 @@ pub fn run(
             "cwd": cwd,
             "worker_dir": wdir,
             "brief_sha": brief_sha,
-            "sandbox": lane_cfg.sandbox.as_str(),
+            "sandbox": sandbox.as_str(),
             "network": lane_cfg.network,
             "model": model,
             "effort": effort,
@@ -663,22 +728,170 @@ fn attach_to_broker(
     Ok(serde_json::from_value(accepted).unwrap_or(snap))
 }
 
-/// `danger-full-access` needs the §5 elevation gate (lane permission AND an
-/// explicit `--danger-full-access --reason <text>`), which lands with
-/// worktrees in Phase 4. Until then a lane configured for it cannot spawn —
-/// silently downgrading would be worse than refusing.
-fn elevation_gate(lane: Lane, lane_cfg: &LaneConfig) -> Result<(), AppError> {
-    if lane_cfg.sandbox == SandboxMode::DangerFullAccess {
+/// The §5 elevation gate. Returns the sandbox the worker will actually run
+/// under, plus the audited reason when this spawn is an elevation.
+///
+/// Three things must line up before a worker gets `danger-full-access`, and
+/// **no two of them are enough**:
+///
+/// * the **permission** — `allow_elevation = true` on the lane, which only an
+///   operator editing config (or the matching `A2A_LANES_*` env var) can grant;
+/// * the **intent** — `--danger-full-access` on *this* spawn, because a lane
+///   configured for full access is a standing capability and elevation is a
+///   per-spawn act (spec §5). A config that elevated silently would make every
+///   future spawn on that lane an elevation nobody typed;
+/// * the **reason** — free text, recorded verbatim in `audit.jsonl` and on the
+///   worker, because an audit trail of *that it happened* without *why* is not
+///   an audit trail.
+///
+/// Every refusal is a static precondition (exit 9) decided before the first
+/// byte is written, so a refused elevation leaves no worker, no worktree and no
+/// audit line.
+fn elevation_gate(
+    lane: Lane,
+    lane_cfg: &LaneConfig,
+    danger_full_access: bool,
+    reason: Option<&str>,
+    requested: Requested,
+    warn: &dyn Fn(&str),
+) -> Result<(SandboxMode, Option<String>), AppError> {
+    if !danger_full_access {
+        // A reason with nothing to explain is not an error — but it is never
+        // silent either: the caller plainly *meant* to elevate.
+        if reason.is_some() {
+            warn("--reason has no effect without --danger-full-access");
+        }
+        if lane_cfg.sandbox == SandboxMode::DangerFullAccess {
+            return Err(if lane_cfg.allow_elevation {
+                // The permission is there; the per-spawn intent is not.
+                AppError::new(
+                    "ELEVATION_FLAG_REQUIRED",
+                    ExitCode::Precondition,
+                    format!(
+                        "lane `{lane}` is configured `sandbox = \"danger-full-access\"`, but \
+                         elevation is per-spawn intent (spec §5): a config alone never elevates"
+                    ),
+                )
+                .remedy(
+                    "re-run with `--danger-full-access --reason \"<why this needs full access>\"`",
+                )
+            } else {
+                not_permitted(lane)
+            });
+        }
+        return Ok((lane_cfg.sandbox, None));
+    }
+
+    // Intent given. Permission first: the flag can never grant itself one.
+    if !lane_cfg.allow_elevation {
+        return Err(not_permitted(lane));
+    }
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    let Some(reason) = reason else {
         return Err(AppError::new(
-            "ELEVATION_NOT_PERMITTED",
+            "ELEVATION_REASON_REQUIRED",
             ExitCode::Precondition,
             format!(
-                "lane `{lane}` is configured `sandbox = \"danger-full-access\"`, but the elevation \
-                 gate (`--danger-full-access --reason <text>`, spec §5) is not implemented in Phase 1"
+                "--danger-full-access on lane `{lane}` needs a reason: every elevation is \
+                 recorded in $A2A_HOME/audit.jsonl, and a record with no reason is not one"
             ),
         )
-        .remedy("give the lane a non-elevated sandbox in $A2A_HOME/config.toml"));
+        .remedy("re-run with --reason \"<why this needs full access>\""));
+    };
+    // Spec §5: the wire cannot request privilege, and Phase 4 does not teach the
+    // broker a per-spawn elevation — so an elevated spawn is an exec spawn, and
+    // a caller who *named* the socket is told rather than quietly re-routed.
+    if requested == Requested::AppServer {
+        return Err(AppError::new(
+            "ELEVATION_EXEC_ONLY",
+            ExitCode::Precondition,
+            "an elevated spawn runs on the exec transport: spec §5 forbids the broker socket \
+             from carrying an elevation, and the daemon resolves its own sandbox server-side",
+        )
+        .remedy(
+            "drop --transport app-server: spec §5 forbids the broker socket from carrying an \
+             elevation",
+        ));
     }
+    Ok((SandboxMode::DangerFullAccess, Some(reason.to_string())))
+}
+
+/// The one refusal both un-permitted paths share: the lane has no `allow_elevation`.
+fn not_permitted(lane: Lane) -> AppError {
+    AppError::new(
+        "ELEVATION_NOT_PERMITTED",
+        ExitCode::Precondition,
+        format!(
+            "lane `{lane}` may not run with `danger-full-access`: elevation needs a lane \
+             permission as well as the per-spawn flag (spec §5)"
+        ),
+    )
+    .remedy(format!(
+        "set `allow_elevation = true` under [lanes.{lane}] in $A2A_HOME/config.toml and re-run \
+         with --danger-full-access --reason \"<why>\""
+    ))
+}
+
+/// Ingress scan for `--reason` (spec §5) — the same pass, and the same refusal
+/// shape, the brief gets. The reason is about to be written to `audit.jsonl`
+/// *and* to the WAL, so a credential pasted into it would land in two files a
+/// refusal could no longer take back.
+fn scan_reason(reason: Option<&str>) -> Result<(), AppError> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let hits = redact::scan_text(reason);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let rules = hits
+        .iter()
+        .take(5)
+        .map(|h| h.rule)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(AppError::new(
+        "SECRET_IN_REASON",
+        ExitCode::Precondition,
+        format!(
+            "--reason contains {} secret-shaped value(s) ({rules}) — refusing to spawn \
+             (nothing was written)",
+            hits.len()
+        ),
+    )
+    .remedy("remove the credential from --reason; it is recorded verbatim in the audit log"))
+}
+
+/// `$A2A_HOME/audit.jsonl` — the append-only record of every elevation.
+pub const AUDIT_FILE: &str = "audit.jsonl";
+
+/// Append one line to `$A2A_HOME/audit.jsonl` (0600, `O_APPEND`, fsync'd).
+///
+/// Same append-before-act discipline as `gc`'s `index.jsonl` and the WAL: the
+/// line is complete and durable before the thing it records is allowed to
+/// happen. 0600 because the reason is operator text about a privileged
+/// operation, and this file outlives every worker it names.
+pub fn append_audit(home: &A2aHome, entry: &Value) -> Result<(), AppError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = home.root().join(AUDIT_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| io_err("opening audit.jsonl", e))?;
+    let mut line = serde_json::to_vec(entry).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("serializing an audit entry: {e}"),
+        )
+    })?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .map_err(|e| io_err("appending to audit.jsonl", e))?;
+    file.sync_data()
+        .map_err(|e| io_err("syncing audit.jsonl", e))?;
     Ok(())
 }
 

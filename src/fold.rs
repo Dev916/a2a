@@ -188,6 +188,14 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
         snap.extra
             .insert("transport_selection".to_string(), selection.clone());
     }
+    // Why this worker was allowed `danger-full-access` (spec §5). Genesis is
+    // the only writer of identity, and "this worker ran with full access, for
+    // this stated reason" is identity — a rebuild that dropped it would leave
+    // `audit.jsonl` as the only surviving copy of a fact the worker itself is
+    // supposed to carry.
+    if let Some(reason) = s("elevation_reason") {
+        snap.elevation_reason = Some(reason.to_string());
+    }
     // The result schema. Genesis has recorded this key since Phase 1 and the
     // fold never read it — harmless while nothing depended on it, and a silent
     // data loss the moment the impl-lane acceptance gate does. Fixed here,

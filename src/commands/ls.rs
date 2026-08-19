@@ -135,6 +135,10 @@ struct Row {
     /// marker; this string is the one a caller pipes into `git`, so it lives in
     /// `--json`.
     worktree_branch: Option<String>,
+    /// Why this worker was allowed `danger-full-access` (spec §5). An elevated
+    /// worker must never be visually identical to an ordinary one, so this
+    /// drives the `/ELEV` marker on the STATE cell as well as the `--json` key.
+    elevation_reason: Option<String>,
     created_at: Option<DateTime<Utc>>,
     dwell_secs: Option<i64>,
     last_event_age_secs: Option<i64>,
@@ -151,6 +155,7 @@ impl Row {
             transport: transport_of(Some(snap)),
             queue_position: snap.queue_position,
             worktree_branch: snap.worktree.as_ref().map(|w| w.branch.clone()),
+            elevation_reason: snap.elevation_reason.clone(),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -179,6 +184,9 @@ impl Row {
             worktree_branch: stale
                 .as_ref()
                 .and_then(|s| s.worktree.as_ref().map(|w| w.branch.clone())),
+            // Kept from the stale snapshot on purpose: a worker we can no
+            // longer reconcile is exactly the one whose elevation matters most.
+            elevation_reason: stale.as_ref().and_then(|s| s.elevation_reason.clone()),
             created_at: stale.as_ref().map(|s| s.created_at),
             dwell_secs: None,
             last_event_age_secs: last_event_ts(dir).map(|ts| age_secs(ts, now)),
@@ -197,6 +205,7 @@ impl Row {
             "transport": self.transport,
             "queue_position": self.queue_position,
             "worktree_branch": self.worktree_branch,
+            "elevation_reason": self.elevation_reason,
         })
     }
 
@@ -205,6 +214,20 @@ impl Row {
     /// for "not known", because both mean "there is no value here to act on".
     fn owner_cell(&self) -> &str {
         self.owner.as_deref().unwrap_or("-")
+    }
+
+    /// The STATE cell: `running`, or `running/ELEV` for an elevated worker.
+    ///
+    /// The marker rides the state rather than taking a column of its own
+    /// because elevation is rare and a column that is `-` for the whole fleet
+    /// costs every reader width for nothing — while a worker running with full
+    /// access must never be *visually identical* to an ordinary one (spec §5).
+    /// The reason itself is in `--json`, which is where a caller reads text.
+    fn state_cell(&self) -> String {
+        match self.elevation_reason {
+            Some(_) => format!("{}/ELEV", self.state),
+            None => self.state.clone(),
+        }
     }
 
     /// The WT column: a MARKER, not the branch.
@@ -283,7 +306,7 @@ fn humanize(secs: Option<i64>) -> String {
 fn render_table(rows: &[Row], all: bool) -> String {
     let idw = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
     let lanew = rows.iter().map(|r| r.lane.len()).max().unwrap_or(0);
-    let statew = rows.iter().map(|r| r.state.len()).max().unwrap_or(0);
+    let statew = rows.iter().map(|r| r.state_cell().len()).max().unwrap_or(0);
     let ownerw = rows.iter().map(|r| r.owner_cell().len()).max().unwrap_or(0);
     let wt = any_worktree(rows);
     let wtw = rows.iter().map(|r| r.wt_cell().len()).max().unwrap_or(0);
@@ -303,7 +326,7 @@ fn render_table(rows: &[Row], all: bool) -> String {
                 "{:<idw$}  {:<lanew$}  {:<statew$}  {owner}{worktree}{}  {}",
                 r.id,
                 r.lane,
-                r.state,
+                r.state_cell(),
                 humanize(r.dwell_secs),
                 humanize(r.last_event_age_secs),
             )
@@ -328,6 +351,7 @@ mod tests {
             transport: "exec".into(),
             queue_position: None,
             worktree_branch: None,
+            elevation_reason: None,
             created_at: None,
             dwell_secs: dwell,
             last_event_age_secs: None,

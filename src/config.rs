@@ -64,7 +64,7 @@ pub const ADMISSION_FIELDS: [&str; 2] = ["global_cap", "queue_cap"];
 pub const ADMISSION_LANE_FIELDS: [&str; 1] = ["cap"];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
-pub const LANE_FIELDS: [&str; 8] = [
+pub const LANE_FIELDS: [&str; 9] = [
     "sandbox",
     "network",
     "worktree_default",
@@ -73,6 +73,10 @@ pub const LANE_FIELDS: [&str; 8] = [
     "start_timeout_secs",
     "task_timeout_secs",
     "blocked_timeout_secs",
+    // APPENDED LAST on purpose: this array is the order `config show --origin`
+    // reports its keys in, and a new key inserted mid-list would renumber a
+    // surface other tools read.
+    "allow_elevation",
 ];
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -166,6 +170,15 @@ pub struct LaneConfig {
     pub start_timeout_secs: u64,
     pub task_timeout_secs: u64,
     pub blocked_timeout_secs: u64,
+    /// May a spawn on this lane ask for `danger-full-access` (spec §5)?
+    ///
+    /// **`false` for every lane by default, and it is a *permission*, not an
+    /// action**: it grants nothing on its own. An actual elevation additionally
+    /// needs the per-spawn intent (`--danger-full-access`) and an audited
+    /// `--reason`, so neither the config nor the flag can elevate a worker
+    /// alone — which is the whole shape of the §5 gate.
+    #[serde(default)]
+    pub allow_elevation: bool,
 }
 
 /// The `[broker]` section: what the daemon does about itself.
@@ -286,6 +299,8 @@ fn default_lane(lane: Lane) -> LaneConfig {
         start_timeout_secs: DEFAULT_START_TIMEOUT_SECS,
         task_timeout_secs: DEFAULT_TASK_TIMEOUT_SECS,
         blocked_timeout_secs: DEFAULT_BLOCKED_TIMEOUT_SECS,
+        // No lane may elevate until an operator says so, in writing, per lane.
+        allow_elevation: false,
     }
 }
 
@@ -616,6 +631,7 @@ fn apply_lane_toml(
         "start_timeout_secs" => lc.start_timeout_secs = want_u64(dotted, v)?,
         "task_timeout_secs" => lc.task_timeout_secs = want_u64(dotted, v)?,
         "blocked_timeout_secs" => lc.blocked_timeout_secs = want_u64(dotted, v)?,
+        "allow_elevation" => lc.allow_elevation = want_bool(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -751,6 +767,7 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "start_timeout_secs" => lc.start_timeout_secs = parse_u64_str(key, s)?,
         "task_timeout_secs" => lc.task_timeout_secs = parse_u64_str(key, s)?,
         "blocked_timeout_secs" => lc.blocked_timeout_secs = parse_u64_str(key, s)?,
+        "allow_elevation" => lc.allow_elevation = parse_bool_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
     }
     Ok(())
@@ -863,8 +880,12 @@ mod tests {
             "A2A_ADMISSION_LANES_IMPL_CAP"
         );
         // The layering test's key set is stable: admission is its own section.
-        assert_eq!(LANE_FIELDS.len(), 8);
+        assert_eq!(LANE_FIELDS.len(), 9);
         assert!(!LANE_FIELDS.contains(&"cap"));
+        // The §5 permission is a LANE key, appended last so the reported order
+        // of every key before it is untouched.
+        assert!(LANE_FIELDS.contains(&"allow_elevation"));
+        assert_eq!(*LANE_FIELDS.last().unwrap(), "allow_elevation");
     }
 
     /// A lane the map does not carry (a config from a newer binary) falls back

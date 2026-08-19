@@ -891,6 +891,7 @@ fn lane_cfg(sandbox: SandboxMode, network: bool, effort: &str) -> LaneConfig {
         start_timeout_secs: 120,
         task_timeout_secs: 3600,
         blocked_timeout_secs: 1800,
+        allow_elevation: false,
     }
 }
 

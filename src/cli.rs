@@ -257,6 +257,17 @@ pub struct SpawnArgs {
     /// Branch the worktree from this ref instead of the target repo's HEAD
     #[arg(long, value_name = "REF")]
     pub base_ref: Option<String>,
+    /// Run this ONE worker with `sandbox = danger-full-access` (spec §5).
+    /// Needs `allow_elevation = true` on the lane and a `--reason`; forces the
+    /// exec transport and appends a line to $A2A_HOME/audit.jsonl.
+    #[arg(long)]
+    pub danger_full_access: bool,
+    /// Why this spawn needs full access — recorded verbatim in the audit log
+    /// and on the worker. Required by `--danger-full-access`, ignored (with a
+    /// warning) without it. NO clap `requires`: the pairing is validated in the
+    /// §5 gate, so a missing reason is a typed envelope, not clap's exit 2.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
 }
 
 /// clap-facing mirror of [`crate::inbox::MsgKind`]; the domain enum stays free

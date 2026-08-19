@@ -51,6 +51,16 @@ fn fixture_repo(under: &Path) -> PathBuf {
     std::fs::canonicalize(&repo).unwrap()
 }
 
+/// A devloop-shaped result, for the stub to write as its last message.
+///
+/// The impl lane ships a DEFAULT result schema (spec §4.9), so
+/// `reconcile::conclude_turn` now runs the schema gate on every impl worker
+/// that produces a result — and the fixture's plain-text `done` fails it with
+/// `result.md is not JSON` ⇒ `failed{schema_violation}`. Every impl worker here
+/// that is expected to finish cleanly therefore pins this shape.
+const DEVLOOP_RESULT: &str =
+    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+
 /// The impl lane's brief has to declare its acceptance criteria and how they
 /// are verified (spec §4.7).
 fn impl_brief(dir: &Path) -> PathBuf {
@@ -134,7 +144,10 @@ fn the_impl_lane_defaults_to_its_own_worktree_and_codex_runs_in_it() {
         &repo,
         &brief,
         &[],
-        &[("STUB_ARGV_FILE", argv_file.to_str().unwrap())],
+        &[
+            ("STUB_ARGV_FILE", argv_file.to_str().unwrap()),
+            ("STUB_LAST_MSG", DEVLOOP_RESULT),
+        ],
     );
     let wt = std::fs::canonicalize(home.join("worktrees").join(&s.id)).unwrap();
     let branch = format!("a2a/impl/{}", s.id);
@@ -243,7 +256,16 @@ fn the_worktree_base_ref_and_schema_survive_losing_state_json() {
     let snap = read_snapshot(&home, &s.id);
     assert_eq!(snap["worktree"]["branch"], serde_json::json!(branch), "{snap}");
     assert_eq!(snap["base_ref"], serde_json::json!(base), "{snap}");
-    assert_eq!(snap["schema_path"], serde_json::json!(schema), "{snap}");
+    // The recorded path is the worker's OWN copy of the schema, not the flag's
+    // file: a worker is judged by something inside its own directory, so the
+    // verdict cannot change when the operator edits or moves the original.
+    let own = home.join("workers").join(&s.id).join("result-schema.json");
+    assert_eq!(snap["schema_path"], serde_json::json!(own), "{snap}");
+    assert_eq!(
+        std::fs::read_to_string(&own).unwrap(),
+        std::fs::read_to_string(&schema).unwrap()
+    );
+    assert_eq!(snap["schema_source"], serde_json::json!("flag"), "{snap}");
     assert!(
         snap.get("fold_rejections")
             .map(|r| r.as_array().is_some_and(|a| a.is_empty()))
@@ -296,7 +318,15 @@ fn a_lane_default_worktree_on_a_non_git_cwd_warns_and_proceeds() {
     std::fs::create_dir_all(&plain).unwrap();
     let brief = impl_brief(tmp.path());
 
-    let s = spawn(&home, tmp.path(), "impl", &plain, &brief, &[], &[]);
+    let s = spawn(
+        &home,
+        tmp.path(),
+        "impl",
+        &plain,
+        &brief,
+        &[],
+        &[("STUB_LAST_MSG", DEVLOOP_RESULT)],
+    );
     assert_eq!(s.data["worktree"], serde_json::Value::Null, "{}", s.data);
     assert!(
         s.stderr.contains("not inside a git work tree"),
@@ -336,7 +366,15 @@ fn no_worktree_opts_out_but_keeps_the_diff_anchor() {
     let repo = fixture_repo(tmp.path());
     let brief = impl_brief(tmp.path());
 
-    let s = spawn(&home, tmp.path(), "impl", &repo, &brief, &["--no-worktree"], &[]);
+    let s = spawn(
+        &home,
+        tmp.path(),
+        "impl",
+        &repo,
+        &brief,
+        &["--no-worktree"],
+        &[("STUB_LAST_MSG", DEVLOOP_RESULT)],
+    );
     assert!(
         s.stderr
             .lines()

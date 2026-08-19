@@ -115,6 +115,11 @@ struct WtWorker {
     branch: String,
 }
 
+/// A devloop-shaped result (`templates/impl-result.schema.json`) — what an impl
+/// worker has to write now that the lane ships a default schema.
+const DEVLOOP_RESULT: &str =
+    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+
 /// Spawn an impl-lane worker into a fresh repo (`seed` writes anything extra
 /// the base commit should carry), wait for it to die, and settle it so gc's
 /// own `reconcile` is a no-op.
@@ -134,6 +139,11 @@ fn spawn_worktree_worker(seed: impl FnOnce(&Path)) -> WtWorker {
     );
 
     let out = a2a(&home, tmp.path())
+        // The impl lane's default result schema (spec §4.9) is enforced on
+        // every impl result, so the fixture writes the devloop shape rather
+        // than the stub's plain-text `done` — a worker that reached its
+        // terminal state cleanly is the one gc's rails are about.
+        .env("STUB_LAST_MSG", DEVLOOP_RESULT)
         .args(["--json", "spawn", "--lane", "impl", "--cwd"])
         .arg(&repo)
         .arg("--brief")

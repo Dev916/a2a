@@ -101,6 +101,16 @@ use std::path::{Path, PathBuf};
 /// worker's read-side context curated, not a repo dump).
 const MAX_CONTEXT_BYTES: u64 = 10 * 1024 * 1024;
 
+/// The impl lane's default result schema (spec §4.9): devloop's
+/// `sample-task-result.json` shape, so a devloop-dispatched worker's result is
+/// parsed by devloop step 4.3.4 without an adapter. Compiled in, because a
+/// worker's schema must not depend on the a2a checkout still being where it was
+/// at spawn.
+pub const IMPL_RESULT_SCHEMA: &str = include_str!("../../templates/impl-result.schema.json");
+
+/// Where the chosen schema is materialized inside the worker directory.
+pub const WORKER_SCHEMA_FILE: &str = "result-schema.json";
+
 /// Id collision retries before we admit the generator is not helping.
 const ID_ATTEMPTS: usize = 16;
 
@@ -173,15 +183,11 @@ pub fn run(
         &warn,
     )?;
 
-    if let Some(schema) = args.schema.as_deref() {
-        if !schema.is_file() {
-            return Err(AppError::new(
-                "SCHEMA_NOT_FOUND",
-                ExitCode::Precondition,
-                format!("--schema {}: not a readable file", schema.display()),
-            ));
-        }
-    }
+    // The result schema, decided HERE with the other gates even though the copy
+    // lands at layout time: a `--schema` — or a brief `result_schema` — naming a
+    // file that is not there is a static precondition (exit 9), and a static
+    // refusal must not first autostart a broker it is never going to use.
+    let _ = plan_schema(lane, args.schema.as_deref(), &args.brief, &parsed)?;
 
     // The last gate: which transport will own this worker. A refusal here still
     // leaves nothing behind, and the answer is what the genesis event records.
@@ -241,11 +247,14 @@ pub fn run(
     // ---- first write ------------------------------------------------------
     let wdir = home.worker_dir(&id);
     create_dir_0700(&wdir).map_err(|e| io_err("creating the worker dir", e))?;
-    if let Err(e) = lay_out_worker(&wdir, args, &brief_text, &parsed) {
-        // Pre-genesis: this id never became a worker, so leave nothing behind.
-        let _ = std::fs::remove_dir_all(&wdir);
-        return Err(e);
-    }
+    let (schema_path, schema_source) = match lay_out_worker(&wdir, args, &brief_text, &parsed) {
+        Ok(schema) => schema,
+        Err(e) => {
+            // Pre-genesis: this id never became a worker, so leave nothing behind.
+            let _ = std::fs::remove_dir_all(&wdir);
+            return Err(e);
+        }
+    };
 
     let cwd = match cwd_plan {
         CwdPlan::Fixed(p) => p,
@@ -320,7 +329,10 @@ pub fn run(
     // ---- genesis: from here the worker exists and is readable --------------
     let mut snap = WorkerSnapshot::blank(&id, &cwd);
     snap.writable_roots = vec![wdir.join("outbox")];
-    snap.schema_path = args.schema.clone();
+    // The worker's OWN copy, never the caller's path: the schema has to outlive
+    // the brief moving, the flag's file being edited, and this repo being
+    // checked out somewhere else.
+    snap.schema_path = schema_path.clone();
     snap.elevation_reason = elevation_reason.clone();
     // The diff anchor `a2a verify` needs — recorded whether or not there is a
     // worktree, and equal to the worktree's own base ref when there is one.
@@ -349,9 +361,16 @@ pub fn run(
             "requested_transport": requested.recorded(transport),
             "transport_selection": requested.selection(),
             "owner": owner,
-            "schema_path": args.schema,
+            "schema_path": schema_path,
             "created_at": now.to_rfc3339(),
     });
+    // WHICH rung of the precedence table produced that schema. In genesis, not
+    // on the snapshot: a snapshot-only write is swallowed by a rebuild from the
+    // WAL, and "this worker was judged against the lane's shipped default"
+    // is exactly the fact an operator needs when the default later changes.
+    if schema_path.is_some() {
+        genesis["schema_source"] = json!(schema_source);
+    }
     // The elevation, in genesis for the same reason the worktree is: a worker
     // that ran with full access must still say so after `state.json` is gone.
     // The `transport_selection` OVERRIDE goes here rather than on the snapshot
@@ -487,7 +506,7 @@ pub fn run(
         network: lane_cfg.network,
         model: &model,
         effort: &effort,
-        schema_path: args.schema.as_deref(),
+        schema_path: schema_path.as_deref(),
         prompt_file: &prompt_file,
         resume_session: None,
         env: &[],
@@ -980,6 +999,121 @@ fn worktree_gate(
     })
 }
 
+/// Which schema this worker's result will be judged against — decided before
+/// anything is copied, so the decision can be taken in the gate block and acted
+/// on later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaChoice {
+    /// `--schema <file>`: the caller named it, so it wins outright.
+    Flag(PathBuf),
+    /// The brief's `result_schema`, already resolved against the brief's dir.
+    Brief(PathBuf),
+    /// The impl lane's compiled-in template ([`IMPL_RESULT_SCHEMA`]).
+    LaneDefault,
+}
+
+impl SchemaChoice {
+    /// The `schema_source` label recorded in genesis.
+    fn label(&self) -> &'static str {
+        match self {
+            SchemaChoice::Flag(_) => "flag",
+            SchemaChoice::Brief(_) => "brief",
+            SchemaChoice::LaneDefault => "lane-default",
+        }
+    }
+}
+
+/// The precedence table (spec §4.9), decided without touching the worker dir:
+/// **`--schema` > the brief's `result_schema` > the impl lane's template**.
+///
+/// The middle rung is resolved **relative to the brief's own directory** — a
+/// brief is a document that travels with its schema, and `./task.schema.json`
+/// in it means "beside me", not "beside whatever the operator's shell happened
+/// to be in". An absolute value is used as written.
+///
+/// The lane default is **impl-only**: it is devloop's result shape, and giving
+/// a research or general worker a schema it was never briefed for would fail it
+/// at the gate for something nobody asked of it.
+fn plan_schema(
+    lane: Lane,
+    flag: Option<&Path>,
+    brief_path: &Path,
+    brief: &Brief,
+) -> Result<Option<SchemaChoice>, AppError> {
+    if let Some(schema) = flag {
+        if !schema.is_file() {
+            return Err(schema_not_found(format!(
+                "--schema {}: not a readable file",
+                schema.display()
+            )));
+        }
+        return Ok(Some(SchemaChoice::Flag(schema.to_path_buf())));
+    }
+    if let Some(declared) = brief.result_schema.as_deref().map(str::trim) {
+        let raw = Path::new(declared);
+        let resolved = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            // `./x` and `x` are the same neighbour; joining the leading `.`
+            // through would only make every message about this path uglier.
+            brief_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(raw.strip_prefix(".").unwrap_or(raw))
+        };
+        if !resolved.is_file() {
+            return Err(schema_not_found(format!(
+                "the brief's `result_schema: {declared}` resolves to {}, which is not a readable \
+                 file",
+                resolved.display()
+            ))
+            .remedy(
+                "point `result_schema` at a file beside the brief (or give an absolute path), or \
+                 drop the key",
+            ));
+        }
+        return Ok(Some(SchemaChoice::Brief(resolved)));
+    }
+    Ok(match lane {
+        Lane::Impl => Some(SchemaChoice::LaneDefault),
+        _ => None,
+    })
+}
+
+fn schema_not_found(message: String) -> AppError {
+    AppError::new("SCHEMA_NOT_FOUND", ExitCode::Precondition, message)
+}
+
+/// `--schema` > brief `result_schema` (relative to the brief's dir) > the
+/// impl-lane default template — resolved **and materialized** as
+/// `<worker>/result-schema.json` (0600).
+///
+/// Returns the path recorded on the snapshot, in genesis and in
+/// [`SpawnSpec::schema_path`], plus the `schema_source` label. The copy is the
+/// point: a worker judged against a file outside its own directory is a worker
+/// whose verdict changes when somebody edits that file, or moves the repo the
+/// template shipped in.
+fn resolve_schema(
+    wdir: &Path,
+    lane: Lane,
+    flag: Option<&Path>,
+    brief_path: &Path,
+    brief: &Brief,
+) -> Result<(Option<PathBuf>, &'static str), AppError> {
+    let Some(choice) = plan_schema(lane, flag, brief_path, brief)? else {
+        return Ok((None, "none"));
+    };
+    let bytes = match &choice {
+        SchemaChoice::LaneDefault => IMPL_RESULT_SCHEMA.as_bytes().to_vec(),
+        SchemaChoice::Flag(p) | SchemaChoice::Brief(p) => std::fs::read(p).map_err(|e| {
+            schema_not_found(format!("reading the result schema {}: {e}", p.display()))
+        })?,
+    };
+    let dest = wdir.join(WORKER_SCHEMA_FILE);
+    write_0600(&dest, &bytes)?;
+    Ok((Some(dest), choice.label()))
+}
+
 /// Pre-genesis cleanup: this id never became a worker, so the worker dir AND
 /// any half-made tree go with it (an id with no `state.json` is a ghost, and a
 /// tree with no worker is one `gc` can never reach).
@@ -1162,12 +1296,16 @@ fn tombstone_ids(home: &A2aHome) -> Vec<String> {
 }
 
 /// Everything written under a freshly created worker dir, before genesis.
+///
+/// Returns the materialized result schema and its `schema_source` label: the
+/// schema is a *worker file*, laid out here with the brief and the prompt, so
+/// that everything the worker is judged by lives in one directory.
 fn lay_out_worker(
     wdir: &Path,
     args: &SpawnArgs,
     brief_text: &str,
     parsed: &Brief,
-) -> Result<(), AppError> {
+) -> Result<(Option<PathBuf>, &'static str), AppError> {
     for d in WORKER_DIRS {
         create_dir_0700(&wdir.join(d)).map_err(|e| io_err("creating the worker dir tree", e))?;
     }
@@ -1181,7 +1319,8 @@ fn lay_out_worker(
     } else {
         &parsed.body
     };
-    write_0600(&wdir.join("prompt.md"), prompt.as_bytes())
+    write_0600(&wdir.join("prompt.md"), prompt.as_bytes())?;
+    resolve_schema(wdir, args.lane, args.schema.as_deref(), &args.brief, parsed)
 }
 
 /// Stage `--context` files into `<worker>/context/`, applying both halves of
@@ -1360,6 +1499,158 @@ mod tests {
             resolve_cwd(Lane::Research, None, &[]),
             Ok(CwdPlan::Scratch)
         ));
+    }
+
+    /// The published contract with devloop (spec §4.9 + the `sample-task-result.json`
+    /// shape). `required` is what `reconcile::schema_gate` actually enforces, so
+    /// its exact list — and its order, which is how a human reads the file — is
+    /// the pin that keeps devloop step 4.3.4 parsing without an adapter.
+    #[test]
+    fn the_shipped_impl_schema_pins_the_devloop_result_shape() {
+        let v: Value = serde_json::from_str(IMPL_RESULT_SCHEMA).expect("the template is JSON");
+        assert_eq!(v["$schema"], json!("https://json-schema.org/draft/2020-12/schema"));
+        assert_eq!(v["type"], json!("object"));
+        assert_eq!(v["additionalProperties"], json!(false));
+        let required: Vec<&str> = v["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .map(|k| k.as_str().expect("a key name"))
+            .collect();
+        assert_eq!(
+            required,
+            [
+                "status",
+                "iterations",
+                "summary",
+                "evidence",
+                "files_changed",
+                "next_step_hint"
+            ]
+        );
+        let props = &v["properties"];
+        assert_eq!(props["status"]["enum"], json!(["pass", "fail", "stuck"]));
+        assert_eq!(props["iterations"]["type"], json!("integer"));
+        assert_eq!(props["summary"]["type"], json!("string"));
+        assert_eq!(props["evidence"]["type"], json!("object"));
+        // Toolkit-dependent: the four playwright keys are DOCUMENTED, not
+        // required, and anything else a toolkit produces is allowed through.
+        assert_eq!(props["evidence"]["additionalProperties"], json!(true));
+        assert_eq!(props["evidence"].get("required"), None);
+        for key in [
+            "screenshots",
+            "console_errors",
+            "network_failures",
+            "logs_excerpts",
+        ] {
+            assert_eq!(props["evidence"]["properties"][key]["type"], json!("array"));
+        }
+        assert_eq!(props["files_changed"]["type"], json!("array"));
+        assert_eq!(props["files_changed"]["items"]["type"], json!("string"));
+        assert_eq!(props["next_step_hint"]["type"], json!(["string", "null"]));
+        // Every required key is described; `additionalProperties: false` would
+        // otherwise reject a key the schema itself asks for.
+        for key in &required {
+            assert!(props.get(key).is_some(), "`{key}` is required but undescribed");
+        }
+    }
+
+    /// The precedence table, exercised as a table: flag beats brief beats the
+    /// lane default, the brief's path is brief-relative, and a general-lane
+    /// worker with none of the three gets no schema at all.
+    #[test]
+    fn the_schema_precedence_table_resolves_flag_then_brief_then_lane_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let briefs = tmp.path().join("briefs");
+        std::fs::create_dir_all(&briefs).unwrap();
+        let brief_path = briefs.join("task.md");
+        std::fs::write(&brief_path, "x").unwrap();
+        // The brief's schema is a SIBLING of the brief, not of the cwd.
+        let sibling = briefs.join("task.schema.json");
+        std::fs::write(&sibling, r#"{"required":["verdict"]}"#).unwrap();
+        let flagged = tmp.path().join("flag.schema.json");
+        std::fs::write(&flagged, r#"{"required":["flagged"]}"#).unwrap();
+
+        let with_key = Brief {
+            result_schema: Some("./task.schema.json".to_string()),
+            ..Brief::default()
+        };
+        let without = Brief::default();
+
+        let case = |lane, flag: Option<&Path>, brief: &Brief| {
+            let wdir = tempfile::tempdir().unwrap();
+            let (path, source) = resolve_schema(wdir.path(), lane, flag, &brief_path, brief)
+                .expect("resolution succeeds");
+            let body = path
+                .as_ref()
+                .map(|p| std::fs::read_to_string(p).expect("the worker's own copy"));
+            // Whatever was chosen, the worker's copy is the recorded path.
+            if let Some(p) = &path {
+                assert_eq!(p, &wdir.path().join(WORKER_SCHEMA_FILE));
+            }
+            (source, body)
+        };
+
+        let (source, body) = case(Lane::Impl, Some(flagged.as_path()), &with_key);
+        assert_eq!(source, "flag");
+        assert_eq!(body.unwrap(), r#"{"required":["flagged"]}"#);
+
+        let (source, body) = case(Lane::Impl, None, &with_key);
+        assert_eq!(source, "brief");
+        assert_eq!(body.unwrap(), r#"{"required":["verdict"]}"#);
+
+        let (source, body) = case(Lane::Impl, None, &without);
+        assert_eq!(source, "lane-default");
+        assert_eq!(body.unwrap(), IMPL_RESULT_SCHEMA);
+
+        // The default is impl-only; every other lane keeps `schema_path: null`.
+        for lane in [Lane::General, Lane::Review, Lane::Research] {
+            let (source, body) = case(lane, None, &without);
+            assert_eq!(source, "none", "{lane}");
+            assert!(body.is_none(), "{lane}");
+        }
+        // …but an explicit flag still applies to them.
+        let (source, _) = case(Lane::General, Some(flagged.as_path()), &without);
+        assert_eq!(source, "flag");
+    }
+
+    /// Both rungs that name a file refuse the same way when it is not there:
+    /// exit 9, `SCHEMA_NOT_FOUND`, decided before anything is written.
+    #[test]
+    fn a_named_schema_that_is_missing_is_a_static_precondition_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let brief_path = tmp.path().join("task.md");
+        std::fs::write(&brief_path, "x").unwrap();
+
+        let err = plan_schema(
+            Lane::Impl,
+            Some(&tmp.path().join("no-such.json")),
+            &brief_path,
+            &Brief::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "SCHEMA_NOT_FOUND");
+        assert_eq!(err.exit, ExitCode::Precondition);
+
+        let err = plan_schema(
+            Lane::Impl,
+            None,
+            &brief_path,
+            &Brief {
+                result_schema: Some("./no-such.json".to_string()),
+                ..Brief::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "SCHEMA_NOT_FOUND");
+        assert_eq!(err.exit, ExitCode::Precondition);
+        // The message names the RESOLVED path, since that is the one the
+        // operator has to go and look at.
+        assert!(
+            err.message.contains(&tmp.path().join("no-such.json").display().to_string()),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

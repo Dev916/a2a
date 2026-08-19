@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/a2a/templates/impl-result.schema.json",
+  "title": "a2a impl-lane result",
+  "description": "The result an impl-lane worker writes. This IS devloop's `sample-task-result.json` shape, so a devloop-dispatched worker's result is parsed by devloop step 4.3.4 without an adapter. a2a itself enforces only the top-level `required` list (src/reconcile.rs::schema_gate); the rest of this document is the published contract and the `--output-schema` payload handed to codex.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "iterations",
+    "summary",
+    "evidence",
+    "files_changed",
+    "next_step_hint"
+  ],
+  "properties": {
+    "status": {
+      "description": "`pass` only when every acceptance criterion was verified; `stuck` when the same failure repeated and the work needs a human.",
+      "enum": ["pass", "fail", "stuck"]
+    },
+    "iterations": {
+      "description": "How many implement/verify cycles this task took.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "summary": {
+      "description": "What was done and what was verified, in prose, with the evidence that backs each claim.",
+      "type": "string"
+    },
+    "evidence": {
+      "description": "Verification evidence. The sub-keys are toolkit-dependent — the four below are devloop's playwright set and are documented, not required; an `api` or `cli` task carries whatever its own toolkit produces.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "screenshots": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "console_errors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "network_failures": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "logs_excerpts": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "files_changed": {
+      "description": "Every file this task created or modified, repo-relative.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_step_hint": {
+      "description": "One sentence for whoever picks the work up next, or null when there is nothing to hand over.",
+      "type": ["string", "null"]
+    }
+  }
+}

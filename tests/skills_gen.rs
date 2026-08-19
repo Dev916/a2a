@@ -314,12 +314,121 @@ fn the_agents_section_is_fenced_and_carries_no_front_matter() {
 }
 
 #[test]
-fn the_orchestrate_placeholder_is_rendered_with_its_own_front_matter() {
+fn the_orchestrate_skill_is_rendered_with_its_own_front_matter() {
     let out = render_into_tempdir();
     let body = read(out.path(), ARTIFACTS[2]);
     assert!(body.starts_with("---\n"), "front matter opens the skill");
     assert!(body.contains("name: a2a-orchestrate"), "{body}");
     assert!(body.contains(PROVENANCE), "{body}");
+    // The skill is model-invoked, so the description IS the trigger — an
+    // orchestrator that never loads it is an orchestrator that guesses.
+    let front = flat(body.split("---").nth(1).expect("front matter"));
+    for trigger in ["dispatch a codex worker", "/a2a", "spawn a worker"] {
+        assert!(
+            front.contains(trigger),
+            "the description does not name the trigger `{trigger}`: {front}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The orchestrator protocol (spec §4.8)
+// ---------------------------------------------------------------------------
+
+/// The orchestrate source's own section set — a different list from the
+/// worker protocol's, checked against its own renderer.
+#[test]
+fn the_orchestrate_source_carries_exactly_the_pinned_sections_in_order() {
+    use a2a::commands::gen_skills::{parse_sections, ORCHESTRATE_SECTIONS, ORCHESTRATE_SRC};
+    let sections = parse_sections(ORCHESTRATE_SRC).expect("the source parses");
+    let ids: Vec<&str> = sections.iter().map(|s| s.id).collect();
+    assert_eq!(ids, ORCHESTRATE_SECTIONS.to_vec(), "section order is pinned");
+
+    let out = render_into_tempdir();
+    let body = read(out.path(), ARTIFACTS[2]);
+    let mut last = 0usize;
+    for s in &sections {
+        let at = body
+            .find(s.body.trim())
+            .unwrap_or_else(|| panic!("the artifact is missing section `{}`", s.id));
+        assert!(at >= last, "the artifact renders `{}` out of id order", s.id);
+        last = at;
+    }
+    assert!(
+        !body.contains("<!-- a2a:section "),
+        "the artifact leaked the source's section markers"
+    );
+}
+
+/// Every spec §4.8 bullet, as a substring of the rendered skill. These are what
+/// make the skill worth generating rather than writing by hand: each one is a
+/// sentence an orchestrator gets wrong by default.
+#[test]
+fn the_orchestrate_artifact_carries_every_dispatch_pin() {
+    let out = render_into_tempdir();
+    let body = flat(&read(out.path(), ARTIFACTS[2]));
+    for needle in [
+        // dispatch-choice: when a Codex worker beats a Claude subagent, and when
+        // it does not.
+        "Codex worker or Claude subagent",
+        "its own context window",
+        "Do **not** dispatch a Codex worker when",
+        // brief-writing: self-contained, per lane, and the two devices that make
+        // a memoryless worker finishable.
+        "memoryless",
+        "self-contained context",
+        "acceptance criteria",
+        "verify commands",
+        "files_in_scope",
+        "the highest-leverage anti-scope-creep device for a memoryless worker",
+        "if blocked on X with no answer, assume Y, proceed, record the assumption",
+        // monitor-loop: the cheap reads, and the expensive one, with its reason.
+        "a2a wait",
+        "a2a ls --json",
+        "Never stream `a2a tail` into the session",
+        "the orchestrator's context window is the scarcest resource in the system",
+        // answering-blocked: the file, and why argv is not it.
+        "a2a send <id> --message-file",
+        "--message-file -",
+        "argv is world-readable via `ps`",
+        // acceptance-gate: mechanical, the brief's commands, and the merge rule.
+        "a2a verify <id>",
+        "never commands the worker proposed",
+        "verification.json",
+        "scope.outside_scope",
+        "a2a never merges branches",
+        // worktree-hygiene.
+        "$A2A_HOME/worktrees/<id>",
+        "a2a/<lane>/<id>",
+        "no build artifacts",
+        "verify may rebuild",
+        "uncommitted or unmerged work unless you pass `--force`",
+        "the branch outlives `gc`",
+        // ownership.
+        "A2A_OWNER",
+        "orchestrator session id",
+        "`--all` opts in",
+        "must not answer each other's questions",
+        // devloop-dispatch: the corrected protocol.
+        "sequential against a single working tree",
+        "`.beads/`",
+        "`--no-worktree`",
+        "concurrency 1",
+        "`api` and `cli` only",
+        "degrades cross-runner",
+        "XcodeBuildMCP does not exist on Codex",
+        "fall back to a Claude subagent",
+        "the Codex worker writes the code, the Claude side verifies",
+        "sample-task-result.json",
+        "4.3.4",
+        "without an adapter",
+        "templates/impl-result.schema.json",
+    ] {
+        assert!(
+            body.contains(&flat(needle)),
+            "the a2a-orchestrate skill lost the clause `{needle}`"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

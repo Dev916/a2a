@@ -258,6 +258,11 @@ fn brief_text(verify_cmds: &[&str], files_in_scope: &[&str]) -> String {
     s
 }
 
+/// A devloop-shaped result (`templates/impl-result.schema.json`) — what an impl
+/// worker has to write now that the lane ships a default schema.
+const DEVLOOP_RESULT: &str =
+    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+
 /// Spawn one worker and settle it, so every later `reconcile` is a no-op and
 /// the events-differential assertion has a stable baseline.
 fn spawn_fixture(lane: &str, in_a_repo: bool, verify_cmds: &[&str], scope: &[&str]) -> Worker {
@@ -278,6 +283,11 @@ fn spawn_fixture(lane: &str, in_a_repo: bool, verify_cmds: &[&str], scope: &[&st
     std::fs::write(&brief, brief_text(verify_cmds, scope)).unwrap();
 
     let out = a2a(&home, tmp.path())
+        // The impl lane ships a default result schema (spec §4.9), so every
+        // impl worker's result goes through `schema_gate` — the fixture's
+        // plain-text `done` would land `failed{schema_violation}` and put every
+        // verify case below on a worker that failed for an unrelated reason.
+        .env("STUB_LAST_MSG", DEVLOOP_RESULT)
         .args(["--json", "spawn", "--lane", lane, "--cwd"])
         .arg(&work)
         .arg("--brief")

@@ -41,35 +41,17 @@ use std::path::Path;
 /// rendering of this file.
 pub const WORKER_PROTOCOL_SRC: &str = include_str!("../../skills/worker-protocol.md");
 
-/// TASK 8 ONLY. `skills/orchestrate-protocol.md` does not exist yet, and
-/// `include_str!` on a missing path is a hard compile error — so the
-/// orchestrator artifact is rendered from this inline, source-shaped literal
-/// (front matter + `a2a:section` markers, exactly like the real source), which
-/// is what lets the swap be a one-line change:
+/// THE source of the orchestrator protocol (spec §4.8) — the Claude side's
+/// half of the same contract: when to dispatch a Codex worker at all, how to
+/// write a brief a memoryless worker can finish, how to watch one without
+/// spending the context window the dispatch was meant to save, and how the
+/// acceptance gate stays mechanical.
 ///
-/// ```text
-/// pub const ORCHESTRATE_SRC: &str = include_str!("../../skills/orchestrate-protocol.md");
-/// ```
-///
-/// in the same commit that creates the file.
-const ORCHESTRATE_PLACEHOLDER: &str = r#"---
-name: a2a-orchestrate
-description: Placeholder for the a2a orchestrator protocol — dispatching a Codex worker, writing a brief, monitoring without burning context, answering a blocked worker, and the mechanical acceptance gate. Rendered from `skills/orchestrate-protocol.md` once that source exists.
-version: 0
----
-
-<!-- a2a:section placeholder -->
-## Not written yet
-
-This artifact is a placeholder. Its source, `skills/orchestrate-protocol.md`,
-arrives with the orchestrator-protocol task; the path is rendered today so that
-`a2a __gen-skills` always writes the same three artifacts and the drift gate
-covers all three from the start.
-
-Until then, orchestrator guidance lives in `a2a --help` and in §4.8 of
-`docs/superpowers/specs/2026-08-14-a2a-claude-codex-design.md`.
-<!-- a2a:end placeholder -->
-"#;
+/// It is a *separate* source from [`WORKER_PROTOCOL_SRC`] because the two
+/// audiences are different — the worker is told what it may do, the
+/// orchestrator is told what to ask for — but it goes through the same renderer
+/// and the same drift gate, so neither copy can quietly rot.
+pub const ORCHESTRATE_SRC: &str = include_str!("../../skills/orchestrate-protocol.md");
 
 /// The one line that tells a reader of a generated file where to send an edit.
 /// Identical in all three artifacts on purpose: the question it answers is
@@ -93,6 +75,20 @@ pub const REQUIRED_SECTIONS: [&str; 6] = [
     "progress-notices",
     "result-and-evidence",
     "worktree-notes",
+];
+
+/// The orchestrator protocol's sections, in render order — spec §4.8's bullets,
+/// one id each. Pinned for the same reason [`REQUIRED_SECTIONS`] is: a dropped
+/// section is a piece of guidance an orchestrator silently stops being given.
+pub const ORCHESTRATE_SECTIONS: [&str; 8] = [
+    "dispatch-choice",
+    "brief-writing",
+    "monitor-loop",
+    "answering-blocked",
+    "acceptance-gate",
+    "worktree-hygiene",
+    "ownership",
+    "devloop-dispatch",
 ];
 
 /// Relative paths under `--out`, in the order [`render`] returns them.
@@ -243,17 +239,34 @@ fn render_agents_section(src: &str) -> Result<String, AppError> {
     ))
 }
 
+/// A source's sections, past its front matter — the pair every id check starts
+/// from.
+fn sections_of(src: &str) -> Result<Vec<Section<'_>>, AppError> {
+    let (_front, body) = front_matter(src)?;
+    parse_sections(body)
+}
+
 /// `(relative path under --out, rendered bytes)` for all three artifacts.
+///
+/// Both sources are id-checked BEFORE anything is rendered: a source missing a
+/// section still renders a plausible-looking artifact, and the drift gate would
+/// happily bless it. The two lists are separate because the two protocols are
+/// (spec §4.7 for the worker, §4.8 for the orchestrator).
 pub fn render() -> Result<Vec<(&'static str, String)>, AppError> {
-    let worker_sections = {
-        let (_front, body) = front_matter(WORKER_PROTOCOL_SRC)?;
-        parse_sections(body)?
-    };
-    require_ids(&worker_sections, &REQUIRED_SECTIONS, "worker protocol")?;
+    require_ids(
+        &sections_of(WORKER_PROTOCOL_SRC)?,
+        &REQUIRED_SECTIONS,
+        "worker protocol",
+    )?;
+    require_ids(
+        &sections_of(ORCHESTRATE_SRC)?,
+        &ORCHESTRATE_SECTIONS,
+        "orchestrator protocol",
+    )?;
     Ok(vec![
         (ARTIFACTS[0], render_skill(WORKER_PROTOCOL_SRC)?),
         (ARTIFACTS[1], render_agents_section(WORKER_PROTOCOL_SRC)?),
-        (ARTIFACTS[2], render_skill(ORCHESTRATE_PLACEHOLDER)?),
+        (ARTIFACTS[2], render_skill(ORCHESTRATE_SRC)?),
     ])
 }
 
@@ -332,6 +345,18 @@ mod tests {
         assert_eq!(ids, REQUIRED_SECTIONS.to_vec());
         // Every section has prose; an empty block would render an artifact that
         // passes the drift gate and teaches a worker nothing.
+        for s in &sections {
+            assert!(s.body.len() > 80, "section `{}` is a stub", s.id);
+        }
+    }
+
+    #[test]
+    fn the_orchestrate_source_carries_exactly_the_pinned_sections_in_order() {
+        let (front, body) = front_matter(ORCHESTRATE_SRC).expect("front matter parses");
+        assert!(front.contains("name: a2a-orchestrate"), "{front}");
+        let sections = parse_sections(body).expect("sections parse");
+        let ids: Vec<&str> = sections.iter().map(|s| s.id).collect();
+        assert_eq!(ids, ORCHESTRATE_SECTIONS.to_vec());
         for s in &sections {
             assert!(s.body.len() > 80, "section `{}` is a stub", s.id);
         }

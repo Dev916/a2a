@@ -203,6 +203,15 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     if let Some(schema) = s("schema_path") {
         snap.schema_path = Some(schema.into());
     }
+    // WHICH rung of the precedence table chose it (`flag` | `brief` |
+    // `lane-default`). Bookkeeping the snapshot carries verbatim, like
+    // `transport_selection`: a worker judged against the impl lane's shipped
+    // default and one judged against an operator's own file are not the same
+    // worker, and only genesis can still say which this was after a rebuild.
+    if let Some(source) = raw.get("schema_source") {
+        snap.extra
+            .insert("schema_source".to_string(), source.clone());
+    }
     // The worker's own tree (spec §4.8). ALL FOUR keys or nothing: a half-built
     // `WorktreeRef` is a worktree no `gc` git call can address (each needs
     // `-C <repo>`), so a partial genesis row must read as "no worktree" rather

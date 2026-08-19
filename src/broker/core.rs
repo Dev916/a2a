@@ -5,6 +5,7 @@
 //!            ┌──────────────── CoreMsg (bounded mpsc) ────────────────┐
 //!  CLI/socket│ Spawn Send Interrupt Kill Resume List Status Subscribe │
 //!  internals │ ConnClosed ChildDied IdleCheck WorkerSettled           │
+//!            │ AutoReviewReady                                        │
 //!            └───────────────────────┬────────────────────────────────┘
 //!                                    ▼
 //!   child stdout ─▶ demux ─▶ BrokerCore ─▶ WorkerActor mailbox (per worker)
@@ -101,6 +102,13 @@ pub const PENDING_CAPACITY: usize = 256;
 /// The value `broker-health.json` carries while the app-server transport is
 /// latched off (spec §4.2: new spawns fall back to exec).
 pub const DEGRADED_EXEC: &str = "exec";
+
+/// Where an `auto_review` worker's findings land: in the **impl** worker's own
+/// directory (spec §4.8), beside the `result.json` they are about.
+///
+/// Its presence is also the idempotence guard — a `done` worker re-adopted by a
+/// fresh daemon is not reviewed twice.
+pub const REVIEW_JSON: &str = "review.json";
 
 pub const HEALTH_SCHEMA_VERSION: u32 = 1;
 
@@ -213,6 +221,22 @@ pub enum CoreMsg {
     /// was already closed has learned something, and should be told.
     ResetBreaker {
         reply: oneshot::Sender<bool>,
+    },
+    /// **The second hop of `auto_review`** (spec §4.8): an impl worker's diff
+    /// has been taken and its review brief built, off the registry task, and
+    /// the reviewer is ready to be admitted and seeded.
+    ///
+    /// A message rather than a call back into the core, for the reason every
+    /// other entry here is one: the diff is a subprocess and the brief is file
+    /// IO, and neither may happen on the task that also answers `status`,
+    /// `kill` and every notification the child sends. The detached task that
+    /// runs them therefore ends by *posting* its result, and the admission
+    /// decision — the part that must see the registry's caps — happens here,
+    /// in the one place that owns them.
+    AutoReviewReady {
+        impl_id: String,
+        impl_dir: PathBuf,
+        brief_text: String,
     },
 
     // ---- internal ---------------------------------------------------------
@@ -1160,6 +1184,14 @@ struct PendingFrame {
 
 pub struct BrokerCore {
     cfg: Config,
+    /// The home this daemon serves, kept because `auto_review` seeds a worker
+    /// through [`crate::commands::spawn::seed_worker`], which needs one.
+    ///
+    /// Stored at [`start`] rather than reconstructed from a worker `dir`'s
+    /// grandparent: `<home>/workers/<id>` is a layout fact, and a core that
+    /// re-derived its own home from a path some other component chose would be
+    /// one wrong `dir` away from writing outside it.
+    home: crate::home::A2aHome,
     spec: ChildSpec,
     /// The codex binary this broker pinned at start — path AND build. Every
     /// spawn is checked against it (spec §4.2).
@@ -1252,6 +1284,10 @@ pub async fn start(
 
     let mut core = BrokerCore {
         cfg,
+        // Adopted, not resolved: the layout gate ran when this process started
+        // and a second `A2aHome::resolve` here would re-create directories the
+        // daemon is already serving out of.
+        home: crate::home::A2aHome::adopt(home.clone()),
         spec,
         codex,
         tx: tx.clone(),
@@ -1430,6 +1466,10 @@ impl BrokerCore {
                 if settled.state == WorkerState::Failed {
                     self.on_failed_settlement().await;
                 }
+                // `auto_review` (spec §4.8), FIRST HOP. Cheap guards only: the
+                // work — a `git diff` and a brief — happens in the detached
+                // task this starts, never here. See [`on_settled_for_review`].
+                self.on_settled_for_review(&settled).await;
                 // A settled worker has released its slot: that IS the drain
                 // trigger (spec §4.9). Terminal or escalated, both — an
                 // escalated worker is waiting on a human, not on the transport.
@@ -1450,6 +1490,11 @@ impl BrokerCore {
                 }
                 let _ = reply.send(was_open);
             }
+            CoreMsg::AutoReviewReady {
+                impl_id,
+                impl_dir,
+                brief_text,
+            } => self.on_auto_review_ready(impl_id, impl_dir, brief_text).await,
             CoreMsg::Notification {
                 generation,
                 method,
@@ -1615,6 +1660,269 @@ impl BrokerCore {
                              "failures": h.failures, "window_secs": h.window_secs}))
                 .await;
         }
+    }
+
+    // -- auto_review (spec §4.8) --------------------------------------------
+
+    /// **First hop.** A worker settled: decide, from what is already in memory
+    /// (plus one small snapshot read), whether it earns a review — and if it
+    /// does, hand the *work* to a detached task and return.
+    ///
+    /// Nothing here awaits a subprocess or a `spawn_blocking`. The core loop is
+    /// `handle(msg).await` (see this module's header), so a `git diff` awaited
+    /// from this arm would stall `status`, `admit`, `kill`, `send` and the
+    /// notification demux for as long as git took on a repository nobody
+    /// promised would be small. The `tracker.spawn` below is the whole
+    /// difference between a hook and an outage.
+    async fn on_settled_for_review(&mut self, settled: &Settled) {
+        // The OTHER half of the feature: a reviewer that just settled reports
+        // back to the worker it reviewed — findings when it finished, a line
+        // naming its fate when it did not. Also detached: it takes a lock and
+        // rewrites another worker's WAL.
+        if let Some(worker) = self.workers.get(&settled.id) {
+            if worker.lane == crate::config::Lane::Review {
+                let dir = worker.dir.clone();
+                self.report_review_outcome(settled.id.clone(), dir, settled.state);
+            }
+        }
+
+        // ---- the guards, cheapest first ------------------------------------
+        if settled.state != WorkerState::Done {
+            return;
+        }
+        let Some(worker) = self.workers.get(&settled.id) else {
+            return;
+        };
+        if worker.lane != crate::config::Lane::Impl {
+            return;
+        }
+        // Only `lanes.impl.auto_review` is ever read — the key exists on every
+        // lane for surface uniformity and means nothing anywhere else.
+        if !self
+            .cfg
+            .lanes
+            .get(&crate::config::Lane::Impl)
+            .map(|l| l.auto_review)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let dir = worker.dir.clone();
+        // Idempotent across a broker restart that re-adopts a `done` worker:
+        // findings that already exist are not re-derived, and a second review
+        // would spend a second worker's quota to overwrite the first's answer.
+        if dir.join(REVIEW_JSON).exists() {
+            return;
+        }
+        // One small read — the same one `register` does on this task — because
+        // the worktree and the recursion marker live on the snapshot and
+        // nowhere else. Everything expensive is below the `tracker.spawn`.
+        let Ok(snap) = state::load_snapshot(&dir) else {
+            return;
+        };
+        // No recursion: a worker that IS a review never earns one. (A reviewer
+        // is a `review`-lane worker and would have been refused above; this
+        // guard is what makes that a property of the marker rather than a
+        // consequence of the lane check happening to run first.)
+        if snap.extra.contains_key("auto_review_of") {
+            return;
+        }
+        let Some(worktree) = snap.worktree.clone() else {
+            // Reviewing a diff that does not exist is worse than not reviewing:
+            // recorded, so an operator can see the feature declined rather than
+            // wonder whether it ran.
+            self.log
+                .line(json!({"ts": Utc::now(), "kind": "auto_review_skipped",
+                             "worker": settled.id, "reason": "no_worktree"}))
+                .await;
+            return;
+        };
+
+        let impl_id = settled.id.clone();
+        let tx = self.tx.clone();
+        let log = self.log.clone();
+        self.tracker.spawn(async move {
+            prepare_auto_review(impl_id, dir, worktree, tx, log).await;
+        });
+    }
+
+    /// **Second hop.** The brief is built: allocate the reviewer's id, ask
+    /// admission about *that* directory, then seed it.
+    ///
+    /// The order is the CLI's own (`spawn.rs`): the id and the directory PATH
+    /// exist before admission is asked, genesis does not, and a refusal
+    /// therefore leaves nothing behind at all.
+    async fn on_auto_review_ready(
+        &mut self,
+        impl_id: String,
+        impl_dir: PathBuf,
+        brief_text: String,
+    ) {
+        let now = Utc::now();
+        let id = match crate::commands::spawn::allocate_id(
+            &self.home,
+            crate::config::Lane::Review,
+            now,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.declined(&impl_id, &e).await;
+                return;
+            }
+        };
+        let dir = self.home.worker_dir(&id);
+
+        // `cwd: None` — the shape `check_cwd` returns `Ok(())` for, and the
+        // honest one here (spec §4.8). The field exists to re-validate a
+        // CALLER's cwd against the roots this daemon was started with, and
+        // there is no caller: the broker picked `<home>/workers/<id>` out of
+        // its own 0700 home. `~/.a2a` is not an allowed root on a real machine,
+        // so a request carrying it would be refused by `CWD_NOT_ALLOWED` and
+        // this feature would be green in a temp home and dead in production.
+        // The reviewer's real cwd is recorded where every cwd is — its genesis.
+        let req = SpawnRequest {
+            dir: dir.clone(),
+            cwd: None,
+            lane: Some(crate::config::Lane::Review),
+            no_queue: false,
+        };
+        // The reviewer counts against the caps like anything else: at the cap
+        // it QUEUES, and an outright refusal (`QUEUE_FULL`, `BREAKER_OPEN`)
+        // abandons the review and leaves the impl worker untouched.
+        let queued = match self.decide_admission(&req).await {
+            Ok(Admitted::Now) => false,
+            Ok(Admitted::Queued { .. }) => true,
+            Err(e) => {
+                self.declined(&impl_id, &e).await;
+                return;
+            }
+        };
+
+        // The reviewer inherits the impl worker's owner: `a2a ls --mine` and
+        // every owner-scoped mutation should reach the review the way they
+        // reach the work it is about.
+        let owner = state::load_snapshot(&impl_dir).ok().and_then(|s| s.owner);
+        let lane_cfg = self
+            .cfg
+            .lanes
+            .get(&crate::config::Lane::Review)
+            .cloned()
+            .expect("config::load seeds every lane");
+        let plan = crate::commands::spawn::SeedPlan {
+            id: id.clone(),
+            lane: crate::config::Lane::Review,
+            // Its OWN worker directory, like the research lane's scratch: the
+            // broker chose the path, it is inside the 0700 home, and a reviewer
+            // needs no repo because the diff is in its brief.
+            cwd: dir.clone(),
+            brief_text,
+            context: vec![],
+            // The review lane's shipped findings schema, through the SAME
+            // lane-default rung a `spawn --lane review` without `--schema`
+            // takes — which is what makes the reviewer's `result.json` exist,
+            // and therefore what makes `review.json` a findings document
+            // instead of a `{"raw": …}` transcript.
+            schema: Some(crate::commands::spawn::SchemaChoice::LaneDefault),
+            model: lane_cfg.model.clone(),
+            effort: lane_cfg.effort.clone(),
+            owner,
+            max_turns: lane_cfg.max_turns,
+            sandbox: lane_cfg.sandbox,
+            // The broker IS the app-server transport; there was no choice to
+            // make and nothing else to record.
+            transport: Transport::AppServer,
+            requested_transport: Transport::AppServer,
+            transport_selection: "auto",
+            elevation_reason: None,
+            worktree: None,
+            base_ref: None,
+            worktree_skipped: None,
+            lineage: None,
+            auto_review_of: Some(impl_id.clone()),
+            queued,
+        };
+        let cfg = self.cfg.clone();
+        let root = self.home.root().to_path_buf();
+        let seeded = tokio::task::spawn_blocking(move || {
+            let home = crate::home::A2aHome::adopt(root);
+            crate::commands::spawn::seed_worker(&home, &cfg, &plan, now)
+        })
+        .await;
+        let outcome = match seeded {
+            Ok(result) => result,
+            Err(e) => Err(AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("seeding an auto-review worker: {e}"),
+            )),
+        };
+        if let Err(e) = outcome {
+            // Nothing was committed, so give the slot back rather than leave it
+            // held against a directory that will never claim it.
+            self.admission.take_reservation(&dir);
+            self.admission.drop_queued(&id);
+            self.log
+                .line(json!({"ts": Utc::now(), "kind": "auto_review_skipped",
+                             "worker": impl_id, "reason": "seed_failed",
+                             "detail": redact::redact_egress(&e.message)}))
+                .await;
+            return;
+        }
+
+        // The second half of a spawn, exactly as the CLI's is: claim what
+        // admission granted — an actor now, or a place in the queue.
+        if let Err(e) = self.attach(dir).await {
+            self.declined(&impl_id, &e).await;
+            return;
+        }
+        self.log
+            .line(json!({"ts": Utc::now(), "kind": "auto_review_spawned",
+                         "worker": impl_id, "review": id}))
+            .await;
+    }
+
+    /// One `auto_review_declined` line. The impl worker is never touched: it
+    /// finished its work, and the fleet being busy is not its failure.
+    async fn declined(&self, impl_id: &str, e: &AppError) {
+        self.log
+            .line(json!({"ts": Utc::now(), "kind": "auto_review_declined",
+                         "worker": impl_id, "code": e.code}))
+            .await;
+    }
+
+    /// A settled reviewer's outcome, reported back to the worker it reviewed:
+    /// findings on `done`, and one `broker.jsonl` line naming its fate
+    /// otherwise.
+    ///
+    /// Detached: it takes `state.lock` on another worker's directory and
+    /// appends to that worker's WAL, neither of which belongs on the registry
+    /// task. Fire and forget by design — **a reviewer's failure never touches
+    /// the impl worker.** It finished its own work; a review that could not be
+    /// completed is a2a's problem to report, not a verdict to revise.
+    fn report_review_outcome(&self, review_id: String, review_dir: PathBuf, state: WorkerState) {
+        let root = self.home.root().to_path_buf();
+        let log = self.log.clone();
+        self.tracker.spawn(async move {
+            let named = review_id.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                review_outcome(&root, &review_id, &review_dir, state)
+            })
+            .await;
+            let line = match joined {
+                Ok(Ok(Some(line))) => line,
+                // Not an auto-review worker: somebody spawned a review by hand,
+                // and there is nowhere to report to.
+                Ok(Ok(None)) => return,
+                Ok(Err(e)) => json!({"kind": "auto_review_writeback_failed", "review": named,
+                                     "detail": format!("{}: {}", e.code,
+                                                       redact::redact_egress(&e.message))}),
+                Err(e) => json!({"kind": "auto_review_writeback_failed", "review": named,
+                                 "detail": format!("INTERNAL: {e}")}),
+            };
+            let mut line = line;
+            line["ts"] = json!(Utc::now());
+            log.line(line).await;
+        });
     }
 
     /// The admission decision, taken before a byte of genesis exists.
@@ -2631,6 +2939,164 @@ impl BrokerCore {
 
 /// Forward one child's notifications into the core mailbox; when the stream
 /// ends, that IS the child's death (stdout EOF).
+/// The detached half of `auto_review`'s first hop: take the diff, read the impl
+/// brief's acceptance criteria, build the review brief, post it back.
+///
+/// Everything expensive lives here, off the registry task — and the task ends
+/// by SENDING rather than by calling back into the core, because the admission
+/// decision has to be taken by the one owner of the caps.
+async fn prepare_auto_review(
+    impl_id: String,
+    impl_dir: PathBuf,
+    worktree: crate::state::WorktreeRef,
+    tx: mpsc::Sender<CoreMsg>,
+    log: BrokerLog,
+) {
+    let range = format!("{}..{}", worktree.base_ref, worktree.branch);
+    let diffed = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree.path)
+        .arg("diff")
+        .arg(&range)
+        .output()
+        .await;
+    // A git failure is NOT fatal to the impl worker: it did its work, and a
+    // review a2a could not prepare is a2a's problem. One line, and stop.
+    let diff = match diffed {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) => {
+            let detail = format!(
+                "git diff {range} exited {}: {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            log.line(json!({"ts": Utc::now(), "kind": "auto_review_skipped",
+                            "worker": impl_id, "reason": "git_diff_failed",
+                            "detail": redact::redact_egress(&detail)}))
+                .await;
+            return;
+        }
+        Err(e) => {
+            log.line(json!({"ts": Utc::now(), "kind": "auto_review_skipped",
+                            "worker": impl_id, "reason": "git_diff_failed",
+                            "detail": redact::redact_egress(&format!("running git: {e}"))}))
+                .await;
+            return;
+        }
+    };
+
+    // The criteria the impl worker was judged against become the criteria the
+    // review is *about*. A brief that has gone missing is not worth abandoning
+    // the review over — the diff is still reviewable.
+    //
+    // A plain `std::fs` read: this is the DETACHED task, not the registry one,
+    // and one small file beside a `git diff` that has already run is not worth
+    // a `spawn_blocking` hop of its own.
+    let criteria = std::fs::read_to_string(impl_dir.join("brief.md"))
+        .ok()
+        .and_then(|text| crate::brief::parse(&text).ok())
+        .map(|b| b.acceptance_criteria)
+        .unwrap_or_default();
+    let brief_text = crate::templates::review_auto_brief(&impl_id, &criteria, &diff);
+    let _ = tx
+        .send(CoreMsg::AutoReviewReady {
+            impl_id,
+            impl_dir,
+            brief_text,
+        })
+        .await;
+}
+
+/// Write a settled reviewer's outcome back, returning the `broker.jsonl` line
+/// that describes it (`None` = not an auto-review worker at all).
+///
+/// Sync — the caller runs it in `spawn_blocking`. Two properties are pinned:
+/// the write happens under the impl worker's own `state.lock` (it is that
+/// worker's directory, and every other writer takes it), and the envelope
+/// carries **no `fsm` key**, so the fold consumes the seq, rewrites the
+/// watermarks and moves no state. A review does not change the verdict on the
+/// work it reviewed — and a reviewer that never reached `done` writes nothing
+/// at all.
+fn review_outcome(
+    root: &Path,
+    review_id: &str,
+    review_dir: &Path,
+    state: WorkerState,
+) -> Result<Option<Value>, AppError> {
+    let snap = state::load_snapshot(review_dir).map_err(|e| {
+        AppError::new(
+            "SNAPSHOT_UNREADABLE",
+            ExitCode::Precondition,
+            format!("{}: {e}", review_dir.display()),
+        )
+    })?;
+    // Not an auto-review worker at all (somebody spawned a review by hand):
+    // there is nowhere to write back to, and that is not an error.
+    let Some(impl_id) = snap
+        .extra
+        .get("auto_review_of")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    // Anything but `done` and there are no findings to write. The impl worker
+    // is left exactly as it was: no `review.json`, no new lifecycle row, one
+    // line here naming what became of the reviewer.
+    if state != WorkerState::Done {
+        return Ok(Some(json!({"kind": "auto_review_failed", "worker": impl_id,
+                              "review": review_id, "state": state.as_str()})));
+    }
+    let impl_dir = crate::home::A2aHome::adopt(root.to_path_buf()).worker_dir(&impl_id);
+    if !impl_dir.is_dir() {
+        return Ok(None); // gc'd while the review ran
+    }
+
+    // The reviewer's `result.json` when the findings schema gate produced one;
+    // the raw transcript otherwise. The fallback is for a reviewer that FAILED
+    // its gate, not for one that never had a schema — `seed_worker` gives every
+    // auto-review worker the review lane's default.
+    let bytes = match std::fs::read(review_dir.join(reconcile::RESULT_JSON)) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let raw = std::fs::read_to_string(review_dir.join(reconcile::RESULT_MD))
+                .unwrap_or_default();
+            serde_json::to_vec(&json!({
+                "raw": raw,
+                "note": "the reviewer's result did not parse against the findings schema",
+            }))
+            .map_err(|e| AppError::new("INTERNAL", ExitCode::Internal, e.to_string()))?
+        }
+    };
+
+    let _lock = reconcile::lock_state(&impl_dir)?;
+    let path = impl_dir.join(REVIEW_JSON);
+    store::write_atomic(&path, &bytes)
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing {REVIEW_JSON}: {e}")))?;
+
+    let target = state::load_snapshot(&impl_dir).map_err(|e| {
+        AppError::new(
+            "SNAPSHOT_UNREADABLE",
+            ExitCode::Precondition,
+            format!("{}: {e}", impl_dir.display()),
+        )
+    })?;
+    let mut log = EventLog::open(&impl_dir)
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}")))?;
+    let now = Utc::now();
+    let mut env = Envelope::new(
+        target.epoch,
+        target.transport,
+        EventClass::Lifecycle,
+        EventKind::OutboxNotice,
+        json!({"review_of": review_id, "path": REVIEW_JSON}),
+        now,
+    );
+    fold::append_envelope_and_fold(&mut log, &impl_dir, target, &mut env, now)?;
+    Ok(Some(json!({"kind": "auto_review_written", "worker": impl_id,
+                   "review": review_id, "path": path})))
+}
+
 async fn notification_pump(
     mut notifications: mpsc::Receiver<RpcNotification>,
     tx: mpsc::Sender<CoreMsg>,
@@ -2881,17 +3347,19 @@ mod tests {
     use crate::config::Lane;
     use crate::home::A2aHome;
 
-    /// The registry's surface is these fifteen messages, and every one of them
+    /// The registry's surface is these sixteen messages, and every one of them
     /// is a message — not a lock, not a shared map, not a second door.
     ///
     /// Twelve of them were Task 7's; admission control (spec §4.9) added the two
     /// that bracket a spawn — `Admit` (may this worker run yet?) and `Enqueue`
-    /// (a previous instance's queue, replayed) — and the circuit breaker added
-    /// the fifteenth, `ResetBreaker`. `name()`'s `_ => "internal"` catch-all
-    /// means a new variant neither breaks the build nor fails the assertion, so
-    /// this list only stays true if every task that adds one comes here.
+    /// (a previous instance's queue, replayed) — the circuit breaker added the
+    /// fifteenth, `ResetBreaker`, and `auto_review` (spec §4.8) the sixteenth,
+    /// `AutoReviewReady`: the second hop of a hook whose first hop refuses to
+    /// do its work on this task. `name()`'s `_ => "internal"` catch-all means a
+    /// new variant neither breaks the build nor fails the assertion, so this
+    /// list only stays true if every task that adds one comes here.
     #[test]
-    fn the_registry_is_reached_by_exactly_these_fifteen_messages() {
+    fn the_registry_is_reached_by_exactly_these_sixteen_messages() {
         fn name(msg: &CoreMsg) -> &'static str {
             match msg {
                 CoreMsg::Admit { .. } => "Admit",
@@ -2909,6 +3377,7 @@ mod tests {
                 CoreMsg::IdleCheck { .. } => "IdleCheck",
                 CoreMsg::WorkerSettled(_) => "WorkerSettled",
                 CoreMsg::ResetBreaker { .. } => "ResetBreaker",
+                CoreMsg::AutoReviewReady { .. } => "AutoReviewReady",
                 // Plumbing: the demux, the supervisor and the thread-learner
                 // reach the registry through the same queue as everyone else.
                 _ => "internal",
@@ -2931,6 +3400,11 @@ mod tests {
             CoreMsg::IdleCheck { reply: oneshot::channel().0 },
             CoreMsg::WorkerSettled(Settled { id: "w".into(), state: WorkerState::Done }),
             CoreMsg::ResetBreaker { reply: oneshot::channel().0 },
+            CoreMsg::AutoReviewReady {
+                impl_id: "w".into(),
+                impl_dir: PathBuf::from("/tmp/w"),
+                brief_text: String::new(),
+            },
         ];
         let names: Vec<&str> = surface.iter().map(name).collect();
         assert_eq!(
@@ -2938,7 +3412,7 @@ mod tests {
             vec![
                 "Admit", "Spawn", "Enqueue", "Send", "Interrupt", "Kill", "Resume", "List",
                 "Status", "Subscribe", "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled",
-                "ResetBreaker"
+                "ResetBreaker", "AutoReviewReady"
             ]
         );
         // The mailbox is bounded — an unbounded queue in front of one owner is

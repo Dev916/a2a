@@ -13,10 +13,21 @@
 //!   → schema resolution (--schema > brief result_schema > impl-lane template)
 //!   → id allocation
 //!   → AUDIT APPEND ($A2A_HOME/audit.jsonl, elevated spawns only)
-//!   → worker dir tree → context staging
 //!   → WORKTREE CREATE (+ .git/info/exclude)
-//!   → admission → genesis → spawn/attach
+//!   → admission
+//!   → seed_worker: worker dir tree → context staging → genesis
+//!   → spawn/attach
 //! ```
+//!
+//! The last three steps used to interleave — the directory was laid out before
+//! the tree was cut and before admission answered. They were pulled apart when
+//! [`seed_worker`] was extracted so the broker's `auto_review` (spec §4.8)
+//! could seed a worker through the same code, and the order that fell out is
+//! the stricter one: **every refusal now happens before the first byte is
+//! written**, so "a refused spawn leaves no litter" stops depending on cleanup
+//! and starts being true by construction. The one exception is the research
+//! lane, whose cwd lives inside the worker dir and whose `scratch` is therefore
+//! created early so the path can be canonicalized at all.
 //!
 //! Two positions in there are deliberate and pinned. The **elevation gate** runs
 //! *after* the brief parse, because `--reason` is ingress-scanned by the same
@@ -143,6 +154,60 @@ pub struct Lineage {
     pub attempt: u32,
 }
 
+/// Everything [`seed_worker`] needs to lay a worker out and commit its genesis.
+///
+/// This struct exists so that the **broker** can seed a worker (spec §4.8's
+/// `auto_review`) through the CLI's own layout code rather than through a
+/// second, parallel implementation that would drift key by key. Every field
+/// genesis records is either here or derivable from `cfg` + [`Self::lane`] +
+/// the worker directory; the derivations are named in [`seed_worker`]'s body
+/// and each one is a decision, not an omission.
+pub struct SeedPlan {
+    /// Allocated by the CALLER, because both callers need it before they seed:
+    /// the CLI writes the audit line against it, and the broker asks
+    /// `decide_admission` about `<home>/workers/<id>` before a byte exists.
+    pub id: String,
+    pub lane: Lane,
+    pub cwd: PathBuf,
+    pub brief_text: String,
+    /// `--context` files to stage into `<worker>/context/`; empty for the
+    /// auto-review worker, whose whole context is its brief.
+    pub context: Vec<PathBuf>,
+    /// WHICH rung of the precedence table won, not the bytes: the copy into
+    /// `<worker>/result-schema.json` happens here, and `schema_source` has to
+    /// record the rung. The auto-review worker passes
+    /// [`SchemaChoice::LaneDefault`] so it is judged by the review lane's
+    /// shipped findings schema, exactly as `a2a spawn --lane review` is.
+    pub schema: Option<SchemaChoice>,
+    pub model: String,
+    pub effort: String,
+    pub owner: Option<String>,
+    pub max_turns: u64,
+    /// NOT derived from `cfg.lanes[lane].sandbox`: the §5 elevation gate is
+    /// what decides this, and a worker that ran with `danger-full-access` must
+    /// record the mode it actually ran with.
+    pub sandbox: SandboxMode,
+    /// Genesis records BOTH the resolved transport and what was asked for, plus
+    /// how it was chosen (`auto` | `explicit` | `elevation`).
+    pub transport: Transport,
+    pub requested_transport: Transport,
+    pub transport_selection: &'static str,
+    pub elevation_reason: Option<String>,
+    /// The tree this worker owns, already created — creating it is the CLI's
+    /// job (spec §4.8) and never the broker's.
+    pub worktree: Option<WorktreeRef>,
+    /// The diff anchor, recorded worktree or not.
+    pub base_ref: Option<String>,
+    /// Why a lane that defaults to a worktree has none.
+    pub worktree_skipped: Option<&'static str>,
+    pub lineage: Option<Lineage>,
+    /// The impl worker this one is reviewing (spec §4.8) — **not** `parent_id`:
+    /// a reviewer is not a retry of anything, and conflating the two would make
+    /// `max_attempts` count reviews.
+    pub auto_review_of: Option<String>,
+    pub queued: bool,
+}
+
 /// The ordinary spawn: no parent, and therefore a genesis row of exactly the
 /// shape Phase 1 wrote.
 pub fn run(
@@ -232,7 +297,7 @@ pub fn run_with_lineage(
     // lands at layout time: a `--schema` — or a brief `result_schema` — naming a
     // file that is not there is a static precondition (exit 9), and a static
     // refusal must not first autostart a broker it is never going to use.
-    let _ = plan_schema(lane, args.schema.as_deref(), brief_path, &parsed)?;
+    let schema_choice = plan_schema(lane, args.schema.as_deref(), brief_path, &parsed)?;
 
     // The last gate: which transport will own this worker. A refusal here still
     // leaves nothing behind, and the answer is what the genesis event records.
@@ -297,22 +362,27 @@ pub fn run_with_lineage(
         )?;
     }
 
-    // ---- first write ------------------------------------------------------
+    // ---- the worker's own directory ----------------------------------------
+    //
+    // Its PATH, not its contents: everything that can still refuse — the tree,
+    // admission — is asked first, and the layout happens once inside
+    // [`seed_worker`], which is the one seam the broker shares (spec §4.8).
     let wdir = home.worker_dir(&id);
-    create_dir_0700(&wdir).map_err(|e| io_err("creating the worker dir", e))?;
-    let (schema_path, schema_source) = match lay_out_worker(&wdir, args, &brief_text, &parsed) {
-        Ok(schema) => schema,
-        Err(e) => {
-            // Pre-genesis: this id never became a worker, so leave nothing behind.
-            let _ = std::fs::remove_dir_all(&wdir);
-            return Err(e);
-        }
-    };
 
     let cwd = match cwd_plan {
         CwdPlan::Fixed(p) => p,
         CwdPlan::Scratch => {
+            // The research lane's cwd lives INSIDE the worker dir, so this one
+            // directory is created before `seed_worker` lays out the rest: a
+            // path that does not exist cannot be canonicalized, and an
+            // uncanonicalized `/var/…` cwd is one the broker's own `check_cwd`
+            // would then compare against a `/private/var/…` scratch and refuse.
+            // `create_dir_0700` is idempotent, so seeding it again is a no-op.
             let scratch = wdir.join("scratch");
+            if let Err(e) = create_dir_0700(&scratch) {
+                discard_pre_genesis(home, &wdir, &id, None);
+                return Err(io_err("creating the worker dir tree", e));
+            }
             std::fs::canonicalize(&scratch).unwrap_or(scratch)
         }
     };
@@ -379,108 +449,63 @@ pub fn run_with_lineage(
         Selected::Exec { .. } => false,
     };
 
-    // ---- genesis: from here the worker exists and is readable --------------
-    let mut snap = WorkerSnapshot::blank(&id, &cwd);
-    snap.writable_roots = vec![wdir.join("outbox")];
-    // The worker's OWN copy, never the caller's path: the schema has to outlive
-    // the brief moving, the flag's file being edited, and this repo being
-    // checked out somewhere else.
-    snap.schema_path = schema_path.clone();
-    snap.elevation_reason = elevation_reason.clone();
-    // The diff anchor `a2a verify` needs — recorded whether or not there is a
-    // worktree, and equal to the worktree's own base ref when there is one.
-    snap.base_ref = wt_gate.base_ref.clone();
-    snap.worktree = worktree.as_ref().map(|w| WorktreeRef {
-        path: w.path.clone(),
-        branch: w.branch.clone(),
-        base_ref: w.base_ref.clone(),
-        repo: w.repo.clone(),
-    });
-    let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
-    let mut genesis = json!({
-            "fsm": "Spawn",
-            "id": id,
-            "lane": lane.as_str(),
-            "cwd": cwd,
-            "brief_sha": brief_sha,
-            "sandbox": sandbox.as_str(),
-            "network": lane_cfg.network,
-            "model": model,
-            "effort": effort,
-            "transport": transport,
-            // Spec §4.4: both are recorded. `requested` is the explicit value
-            // when one was given, and the resolved one otherwise — so it always
-            // answers "what was this worker asked to be", never "nothing".
-            "requested_transport": requested.recorded(transport),
-            "transport_selection": requested.selection(),
-            "owner": owner,
-            "schema_path": schema_path,
-            // The EFFECTIVE turn budget, in genesis for the same reason the
-            // model and the sandbox are: it is what this worker was judged
-            // against, and an operator editing the lane table afterwards must
-            // not retroactively change the verdict on a worker in flight.
-            "max_turns": max_turns,
-            "created_at": now.to_rfc3339(),
-    });
-    // WHICH rung of the precedence table produced that schema. In genesis, not
-    // on the snapshot: a snapshot-only write is swallowed by a rebuild from the
-    // WAL, and "this worker was judged against the lane's shipped default"
-    // is exactly the fact an operator needs when the default later changes.
-    if schema_path.is_some() {
-        genesis["schema_source"] = json!(schema_source);
-    }
-    // The elevation, in genesis for the same reason the worktree is: a worker
-    // that ran with full access must still say so after `state.json` is gone.
-    // The `transport_selection` OVERRIDE goes here rather than on the snapshot
-    // because the genesis fold is applied over the in-memory snapshot — a
-    // post-fold insert would be overwritten now and lost on a rebuild later.
-    // `Requested::selection()` still answers only `auto`/`explicit`; the third
-    // value is a call-site override, not a third enum arm.
-    if let Some(reason) = &elevation_reason {
-        genesis["elevation_reason"] = json!(reason);
-        if requested == Requested::Auto {
-            genesis["transport_selection"] = json!("elevation");
+    // ---- layout + genesis: from here the worker exists and is readable -----
+    //
+    // Through [`seed_worker`], the ONE seam that writes a worker's directory
+    // and its genesis row — so a broker-seeded auto-review worker (spec §4.8)
+    // is the same shape as this one, key for key.
+    let plan = SeedPlan {
+        id: id.clone(),
+        lane,
+        cwd: cwd.clone(),
+        brief_text: brief_text.clone(),
+        context: args.context.clone(),
+        schema: schema_choice,
+        model: model.clone(),
+        effort: effort.clone(),
+        owner: Some(owner.clone()),
+        max_turns,
+        sandbox,
+        transport,
+        // Spec §4.4: both are recorded. `requested` is the explicit value when
+        // one was given, and the resolved one otherwise — so it always answers
+        // "what was this worker asked to be", never "nothing".
+        requested_transport: requested.recorded(transport),
+        // `Requested::selection()` answers only `auto`/`explicit`; an elevated
+        // spawn never reached `select_transport` at all, so the elevation IS
+        // how the transport was chosen and says so.
+        transport_selection: match (&elevation_reason, requested) {
+            (Some(_), Requested::Auto) => "elevation",
+            _ => requested.selection(),
+        },
+        elevation_reason: elevation_reason.clone(),
+        worktree: worktree.as_ref().map(|w| WorktreeRef {
+            path: w.path.clone(),
+            branch: w.branch.clone(),
+            base_ref: w.base_ref.clone(),
+            repo: w.repo.clone(),
+        }),
+        base_ref: wt_gate.base_ref.clone(),
+        worktree_skipped: wt_gate.skipped,
+        lineage: lineage.clone(),
+        auto_review_of: None,
+        queued,
+    };
+    let (id, wdir, mut snap) = match seed_worker(home, &cfg, &plan, now) {
+        Ok(seeded) => seeded,
+        Err(e) => {
+            // Still pre-genesis: this id never became a worker, so the dir AND
+            // the half-made tree go with it.
+            discard_pre_genesis(home, &wdir, &id, worktree.as_ref().map(|w| w.repo.as_path()));
+            return Err(e);
         }
-    }
-    // The worktree, in genesis rather than only on the snapshot: `state.json` is
-    // a derived checkpoint, and a worktree only `state.json` knew about would be
-    // lost by a rebuild from zero — leaving a tree on disk that no `gc` could
-    // ever address. All four keys or none (the fold refuses a partial object).
-    if let Some(wt) = &worktree {
-        genesis["worktree_path"] = json!(wt.path);
-        genesis["worktree_branch"] = json!(wt.branch);
-        genesis["worktree_base_ref"] = json!(wt.base_ref);
-        genesis["worktree_repo"] = json!(wt.repo);
-    }
-    if let Some(base) = &wt_gate.base_ref {
-        genesis["base_ref"] = json!(base);
-    }
-    // Why a worker the lane would have given a tree has none — same reasoning:
-    // written where a rebuild can still read it (it reaches `snap.extra`).
-    if let Some(reason) = wt_gate.skipped {
-        genesis["worktree_skipped"] = json!(reason);
-    }
-    // The admission answer, and ONLY when it is "wait": genesis stays the
-    // Phase-1 shape for every worker that was admitted straight away, and the
-    // fold reads an absent marker exactly as it reads `false`.
-    if queued {
-        genesis["queued"] = json!(true);
-    }
-    // The retry lineage (spec §4.9), and ONLY when there is one: a plain
-    // spawn's genesis keeps its exact Phase-1/2 shape, and the fold reads an
-    // absent `attempt` exactly as it reads `1`.
-    if let Some(lineage) = &lineage {
-        genesis["parent_id"] = json!(lineage.parent_id);
-        genesis["attempt"] = json!(lineage.attempt);
-    }
-    let mut snap = append_and_fold(
-        &mut log,
-        &wdir,
-        snap,
-        EventKind::Spawned,
-        genesis,
-        now,
-    )?;
+    };
+    let schema_path = snap.schema_path.clone();
+    // Re-opened rather than handed back: `EventLog::open` resumes `next_seq`
+    // from the last parseable line, so the second open is the same log at the
+    // same place — and `seed_worker`'s signature stays the one the broker's
+    // `spawn_blocking` can call without owning a file handle across an await.
+    let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
 
     // A degradation is an EVENT (spec §4.4), not a log line: an orchestrator
     // reading the worker's own stream must be able to see that it asked for the
@@ -645,6 +670,144 @@ pub fn run_with_lineage(
     } else {
         Value::String(id)
     })
+}
+
+/// Lay a worker directory out and commit its genesis — the whole of what it
+/// takes to make a worker *exist*, and nothing else.
+///
+/// Two callers, deliberately one function: `a2a spawn` (above) and the broker's
+/// `auto_review` hook (spec §4.8, `broker::core`). A broker-seeded worker's
+/// directory tree and genesis row are therefore the same shape as a
+/// CLI-seeded one, key for key — a second implementation would agree on the day
+/// it was written and drift on every one after.
+///
+/// **Everything that can refuse a spawn has already run** by the time this is
+/// called: the brief is parsed and scanned, the elevation gate has answered,
+/// the transport is chosen, the worktree exists and admission has said yes or
+/// no. What is left is writing, and the only failure it has is IO — so a
+/// failure here removes the directory it created and leaves nothing behind
+/// (the caller owns any worktree cleanup: it created the tree, and this
+/// function is not told which repo it belongs to).
+///
+/// Three genesis values are DERIVED here rather than carried on [`SeedPlan`],
+/// each a decision and not a drop:
+///
+/// * `brief_sha` — [`brief::sha256_hex`] of `plan.brief_text`; a caller-supplied
+///   digest of text this function also writes is a second source of truth.
+/// * `network` — `cfg.lanes[plan.lane].network`; unlike the sandbox, no gate
+///   can override it, so the lane table is the only answer there could be.
+/// * `writable_roots` — `<worker>/outbox`, which is the worker directory this
+///   function just chose.
+///
+/// Sync, and takes no `&mut` anything: the broker calls it inside
+/// `spawn_blocking` (spec §4.2 — no blocking work on an actor task).
+pub fn seed_worker(
+    home: &A2aHome,
+    cfg: &config::Config,
+    plan: &SeedPlan,
+    now: chrono::DateTime<Utc>,
+) -> Result<(String, PathBuf, WorkerSnapshot), AppError> {
+    let lane_cfg = cfg
+        .lanes
+        .get(&plan.lane)
+        .cloned()
+        .expect("config::load seeds every lane");
+    let wdir = home.worker_dir(&plan.id);
+    create_dir_0700(&wdir).map_err(|e| io_err("creating the worker dir", e))?;
+    let (schema_path, schema_source) = match lay_out_worker(&wdir, plan) {
+        Ok(schema) => schema,
+        Err(e) => {
+            // Pre-genesis: this id never became a worker, so leave nothing behind.
+            let _ = std::fs::remove_dir_all(&wdir);
+            return Err(e);
+        }
+    };
+
+    let mut snap = WorkerSnapshot::blank(&plan.id, &plan.cwd);
+    snap.writable_roots = vec![wdir.join("outbox")];
+    // The worker's OWN copy, never the caller's path: the schema has to outlive
+    // the brief moving, the flag's file being edited, and this repo being
+    // checked out somewhere else.
+    snap.schema_path = schema_path.clone();
+    snap.elevation_reason = plan.elevation_reason.clone();
+    // The diff anchor `a2a verify` needs — recorded whether or not there is a
+    // worktree, and equal to the worktree's own base ref when there is one.
+    snap.base_ref = plan.base_ref.clone();
+    snap.worktree = plan.worktree.clone();
+    let mut log = EventLog::open(&wdir).map_err(|e| io_err("opening events.jsonl", e))?;
+    let mut genesis = json!({
+            "fsm": "Spawn",
+            "id": plan.id,
+            "lane": plan.lane.as_str(),
+            "cwd": plan.cwd,
+            "brief_sha": brief::sha256_hex(&plan.brief_text),
+            "sandbox": plan.sandbox.as_str(),
+            "network": lane_cfg.network,
+            "model": plan.model,
+            "effort": plan.effort,
+            "transport": plan.transport,
+            "requested_transport": plan.requested_transport,
+            "transport_selection": plan.transport_selection,
+            "owner": plan.owner,
+            "schema_path": schema_path,
+            // The EFFECTIVE turn budget, in genesis for the same reason the
+            // model and the sandbox are: it is what this worker was judged
+            // against, and an operator editing the lane table afterwards must
+            // not retroactively change the verdict on a worker in flight.
+            "max_turns": plan.max_turns,
+            "created_at": now.to_rfc3339(),
+    });
+    // WHICH rung of the precedence table produced that schema. In genesis, not
+    // on the snapshot: a snapshot-only write is swallowed by a rebuild from the
+    // WAL, and "this worker was judged against the lane's shipped default"
+    // is exactly the fact an operator needs when the default later changes.
+    if schema_path.is_some() {
+        genesis["schema_source"] = json!(schema_source);
+    }
+    // The elevation, in genesis for the same reason the worktree is: a worker
+    // that ran with full access must still say so after `state.json` is gone.
+    if let Some(reason) = &plan.elevation_reason {
+        genesis["elevation_reason"] = json!(reason);
+    }
+    // The worktree, in genesis rather than only on the snapshot: `state.json` is
+    // a derived checkpoint, and a worktree only `state.json` knew about would be
+    // lost by a rebuild from zero — leaving a tree on disk that no `gc` could
+    // ever address. All four keys or none (the fold refuses a partial object).
+    if let Some(wt) = &plan.worktree {
+        genesis["worktree_path"] = json!(wt.path);
+        genesis["worktree_branch"] = json!(wt.branch);
+        genesis["worktree_base_ref"] = json!(wt.base_ref);
+        genesis["worktree_repo"] = json!(wt.repo);
+    }
+    if let Some(base) = &plan.base_ref {
+        genesis["base_ref"] = json!(base);
+    }
+    // Why a worker the lane would have given a tree has none — same reasoning:
+    // written where a rebuild can still read it (it reaches `snap.extra`).
+    if let Some(reason) = plan.worktree_skipped {
+        genesis["worktree_skipped"] = json!(reason);
+    }
+    // The admission answer, and ONLY when it is "wait": genesis stays the
+    // Phase-1 shape for every worker that was admitted straight away, and the
+    // fold reads an absent marker exactly as it reads `false`.
+    if plan.queued {
+        genesis["queued"] = json!(true);
+    }
+    // The retry lineage (spec §4.9), and ONLY when there is one: a plain
+    // spawn's genesis keeps its exact Phase-1/2 shape, and the fold reads an
+    // absent `attempt` exactly as it reads `1`.
+    if let Some(lineage) = &plan.lineage {
+        genesis["parent_id"] = json!(lineage.parent_id);
+        genesis["attempt"] = json!(lineage.attempt);
+    }
+    // The auto-review marker (spec §4.8), and ONLY on a worker the broker made
+    // to review another's diff. Deliberately NOT `parent_id`: it is a different
+    // relation, and sharing the key would make `max_attempts` count reviews.
+    if let Some(reviewed) = &plan.auto_review_of {
+        genesis["auto_review_of"] = json!(reviewed);
+    }
+    let snap = append_and_fold(&mut log, &wdir, snap, EventKind::Spawned, genesis, now)?;
+    Ok((plan.id.clone(), wdir, snap))
 }
 
 /// The two lineage keys, added to a spawn payload ONLY when this spawn is a
@@ -1118,7 +1281,7 @@ fn worktree_gate(
 /// anything is copied, so the decision can be taken in the gate block and acted
 /// on later.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SchemaChoice {
+pub enum SchemaChoice {
     /// `--schema <file>`: the caller named it, so it wins outright.
     Flag(PathBuf),
     /// The brief's `result_schema`, already resolved against the brief's dir.
@@ -1130,7 +1293,7 @@ enum SchemaChoice {
 
 impl SchemaChoice {
     /// The `schema_source` label recorded in genesis.
-    fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             SchemaChoice::Flag(_) => "flag",
             SchemaChoice::Brief(_) => "brief",
@@ -1199,26 +1362,27 @@ fn schema_not_found(message: String) -> AppError {
     AppError::new("SCHEMA_NOT_FOUND", ExitCode::Precondition, message)
 }
 
-/// `--schema` > brief `result_schema` (relative to the brief's dir) > the
-/// lane's own default template — resolved **and materialized** as
-/// `<worker>/result-schema.json` (0600).
+/// Copy the schema [`plan_schema`] chose into `<worker>/result-schema.json`
+/// (0600), returning the path recorded on the snapshot, in genesis and in
+/// [`SpawnSpec::schema_path`], plus the `schema_source` label.
 ///
-/// Returns the path recorded on the snapshot, in genesis and in
-/// [`SpawnSpec::schema_path`], plus the `schema_source` label. The copy is the
-/// point: a worker judged against a file outside its own directory is a worker
-/// whose verdict changes when somebody edits that file, or moves the repo the
-/// template shipped in.
-fn resolve_schema(
+/// The **copy** is the point: a worker judged against a file outside its own
+/// directory is a worker whose verdict changes when somebody edits that file,
+/// or moves the repo the template shipped in.
+///
+/// Split from the *decision* ([`plan_schema`]) so that a caller with no brief
+/// on disk — the broker's `auto_review` worker, whose brief it built in memory
+/// — can still take a rung of the precedence table and get the same copy, the
+/// same path and the same label as a CLI spawn.
+fn materialize_schema(
     wdir: &Path,
     lane: Lane,
-    flag: Option<&Path>,
-    brief_path: &Path,
-    brief: &Brief,
+    choice: Option<&SchemaChoice>,
 ) -> Result<(Option<PathBuf>, &'static str), AppError> {
-    let Some(choice) = plan_schema(lane, flag, brief_path, brief)? else {
+    let Some(choice) = choice else {
         return Ok((None, "none"));
     };
-    let bytes = match &choice {
+    let bytes = match choice {
         SchemaChoice::LaneDefault => crate::templates::default_result_schema(lane)
             .expect("plan_schema only chooses LaneDefault for a lane that has one")
             .as_bytes()
@@ -1375,7 +1539,12 @@ fn scan_brief(text: &str, path: &Path) -> Result<(), AppError> {
 
 // ------------------------------------------------------------------- id + IO
 
-fn allocate_id(
+/// The next free worker id on `lane`.
+///
+/// `pub` because both seeding callers need one BEFORE they seed: the CLI writes
+/// the §5 audit line against it, and the broker asks `decide_admission` about
+/// `<home>/workers/<id>` while that directory still does not exist.
+pub fn allocate_id(
     home: &A2aHome,
     lane: Lane,
     now: chrono::DateTime<Utc>,
@@ -1420,31 +1589,30 @@ fn tombstone_ids(home: &A2aHome) -> Vec<String> {
 /// that everything the worker is judged by lives in one directory.
 fn lay_out_worker(
     wdir: &Path,
-    args: &SpawnArgs,
-    brief_text: &str,
-    parsed: &Brief,
+    plan: &SeedPlan,
 ) -> Result<(Option<PathBuf>, &'static str), AppError> {
     for d in WORKER_DIRS {
         create_dir_0700(&wdir.join(d)).map_err(|e| io_err("creating the worker dir tree", e))?;
     }
-    stage_context(wdir, &args.context)?;
-    write_0600(&wdir.join("brief.md"), brief_text.as_bytes())?;
+    stage_context(wdir, &plan.context)?;
+    write_0600(&wdir.join("brief.md"), plan.brief_text.as_bytes())?;
     // The prompt is the brief BODY (front matter is metadata for a2a, not
     // instructions for the worker); a body-less brief falls back to the whole
     // file rather than handing codex an empty stdin.
+    //
+    // Re-parsed from the text this function has just written rather than taken
+    // as a second argument: the brief that governs is the one on disk, and a
+    // caller-supplied parse of different text would be a way for the two to
+    // disagree. An unparseable brief cannot reach here from `a2a spawn` (the
+    // gate refused it) and falls back to the whole file if it ever does.
+    let parsed = brief::parse(&plan.brief_text).unwrap_or_default();
     let prompt = if parsed.body.trim().is_empty() {
-        brief_text
+        plan.brief_text.as_str()
     } else {
-        &parsed.body
+        parsed.body.as_str()
     };
     write_0600(&wdir.join("prompt.md"), prompt.as_bytes())?;
-    resolve_schema(
-        wdir,
-        args.require_lane(),
-        args.schema.as_deref(),
-        args.require_brief(),
-        parsed,
-    )
+    materialize_schema(wdir, plan.lane, plan.schema.as_ref())
 }
 
 /// Stage `--context` files into `<worker>/context/`, applying both halves of
@@ -1525,6 +1693,168 @@ fn io_err(ctx: &str, e: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed [`SeedPlan`] produces a genesis row with EXACTLY these keys and
+    /// values — the pin behind the `auto_review` refactor's central claim, that
+    /// a broker-seeded worker and a CLI-seeded one are the same worker.
+    ///
+    /// The key SET is asserted whole rather than key by key, because the
+    /// failure this guards against is a key silently going missing when the
+    /// spawn path is next reshaped, and an `assert` per key cannot see an
+    /// absence it was not told to look for.
+    #[test]
+    fn seed_worker_writes_exactly_the_genesis_keys_the_fold_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let (cfg, _, _) = config::load(&home).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let brief_text = "---\nlane: impl\nacceptance_criteria:\n  - it works\nverify:\n  - \"true\"\n---\nbody\n";
+        let plan = SeedPlan {
+            id: "impl-0819t1200-aaaa".to_string(),
+            lane: Lane::Impl,
+            cwd: PathBuf::from("/repo"),
+            brief_text: brief_text.to_string(),
+            context: vec![],
+            schema: Some(SchemaChoice::LaneDefault),
+            model: "gpt-5.5".to_string(),
+            effort: "high".to_string(),
+            owner: Some("test-owner".to_string()),
+            max_turns: 40,
+            sandbox: SandboxMode::WorkspaceWrite,
+            transport: Transport::Exec,
+            requested_transport: Transport::Exec,
+            transport_selection: "auto",
+            elevation_reason: None,
+            worktree: None,
+            base_ref: None,
+            worktree_skipped: None,
+            lineage: None,
+            auto_review_of: None,
+            queued: false,
+        };
+        let (id, wdir, snap) = seed_worker(&home, &cfg, &plan, now).unwrap();
+        assert_eq!(id, plan.id);
+        assert_eq!(wdir, home.worker_dir(&plan.id));
+
+        let line = std::fs::read_to_string(wdir.join("events.jsonl")).unwrap();
+        let env: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        let raw = env["raw"].as_object().unwrap();
+        let mut keys: Vec<&str> = raw.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "brief_sha",
+                "created_at",
+                "cwd",
+                "effort",
+                "fsm",
+                "id",
+                "lane",
+                "max_turns",
+                "model",
+                "network",
+                "owner",
+                "requested_transport",
+                "sandbox",
+                "schema_path",
+                "schema_source",
+                "transport",
+                "transport_selection",
+            ],
+            "the genesis key set for a plain impl spawn"
+        );
+        assert_eq!(raw["fsm"], "Spawn");
+        assert_eq!(raw["lane"], "impl");
+        assert_eq!(raw["cwd"], "/repo");
+        assert_eq!(raw["sandbox"], "workspace-write");
+        // DERIVED, not carried: `network` off the lane table, `brief_sha` off
+        // the very text this call wrote to `brief.md`.
+        assert_eq!(raw["network"], false);
+        assert_eq!(raw["brief_sha"], json!(brief::sha256_hex(brief_text)));
+        assert_eq!(raw["max_turns"], 40);
+        assert_eq!(raw["owner"], "test-owner");
+        assert_eq!(raw["created_at"], "2026-08-19T12:00:00+00:00");
+        assert_eq!(raw["schema_source"], "lane-default");
+        assert_eq!(
+            raw["schema_path"],
+            json!(wdir.join(WORKER_SCHEMA_FILE)),
+            "the worker's OWN copy of the schema"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wdir.join(WORKER_SCHEMA_FILE)).unwrap(),
+            crate::templates::IMPL_RESULT_SCHEMA
+        );
+        // ...and the derived third: the outbox is the one root this worker may
+        // write to, chosen from the directory this call laid out.
+        assert_eq!(snap.writable_roots, vec![wdir.join("outbox")]);
+        assert_eq!(snap.state, crate::fsm::WorkerState::Spawned);
+        // The prompt is the BODY, not the front matter.
+        assert_eq!(
+            std::fs::read_to_string(wdir.join("prompt.md")).unwrap(),
+            "body\n"
+        );
+        for d in WORKER_DIRS {
+            assert!(wdir.join(d).is_dir(), "{d}");
+        }
+    }
+
+    /// The conditional half: every key that appears only when the fact behind
+    /// it exists — and the auto-review marker, which is `auto_review_of` and
+    /// never `parent_id`.
+    #[test]
+    fn seed_worker_adds_the_conditional_genesis_keys_only_when_they_are_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let (cfg, _, _) = config::load(&home).unwrap();
+        let now = Utc::now();
+        let plan = SeedPlan {
+            id: "review-0819t1200-bbbb".to_string(),
+            lane: Lane::Review,
+            cwd: home.worker_dir("review-0819t1200-bbbb"),
+            brief_text: "---\nlane: review\nacceptance_criteria:\n  - look\n---\nbody\n"
+                .to_string(),
+            context: vec![],
+            schema: Some(SchemaChoice::LaneDefault),
+            model: "gpt-5.5".to_string(),
+            effort: "medium".to_string(),
+            owner: Some("test-owner".to_string()),
+            max_turns: 15,
+            sandbox: SandboxMode::OutboxOnly,
+            transport: Transport::AppServer,
+            requested_transport: Transport::AppServer,
+            transport_selection: "explicit",
+            elevation_reason: None,
+            worktree: None,
+            base_ref: None,
+            worktree_skipped: None,
+            lineage: None,
+            auto_review_of: Some("impl-0819t1200-aaaa".to_string()),
+            queued: true,
+        };
+        let (_, wdir, snap) = seed_worker(&home, &cfg, &plan, now).unwrap();
+        let line = std::fs::read_to_string(wdir.join("events.jsonl")).unwrap();
+        let env: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(env["raw"]["auto_review_of"], "impl-0819t1200-aaaa");
+        assert_eq!(env["raw"]["queued"], true);
+        assert!(env["raw"].get("parent_id").is_none(), "a review is not a retry");
+        assert!(env["raw"].get("attempt").is_none());
+        // ...and the fold puts the marker where `ls --json` reads it.
+        assert_eq!(
+            snap.extra.get("auto_review_of"),
+            Some(&json!("impl-0819t1200-aaaa"))
+        );
+        assert_eq!(snap.state, crate::fsm::WorkerState::Queued);
+        // The review lane's shipped default, applied through the lane-default
+        // rung — which is what makes the reviewer's `result.json` exist at all.
+        assert_eq!(env["raw"]["schema_source"], "lane-default");
+        assert_eq!(
+            std::fs::read_to_string(wdir.join(WORKER_SCHEMA_FILE)).unwrap(),
+            crate::templates::REVIEW_FINDINGS_SCHEMA
+        );
+    }
 
     #[test]
     fn allowlist_compares_whole_components() {
@@ -1731,7 +2061,8 @@ mod tests {
 
         let case = |lane, flag: Option<&Path>, brief: &Brief| {
             let wdir = tempfile::tempdir().unwrap();
-            let (path, source) = resolve_schema(wdir.path(), lane, flag, &brief_path, brief)
+            let choice = plan_schema(lane, flag, &brief_path, brief).expect("a resolvable schema");
+            let (path, source) = materialize_schema(wdir.path(), lane, choice.as_ref())
                 .expect("resolution succeeds");
             let body = path
                 .as_ref()

@@ -131,7 +131,7 @@ pub const SYNC_FIELDS: [&str; 3] = [
 ];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
-pub const LANE_FIELDS: [&str; 10] = [
+pub const LANE_FIELDS: [&str; 11] = [
     "sandbox",
     "network",
     "worktree_default",
@@ -147,6 +147,9 @@ pub const LANE_FIELDS: [&str; 10] = [
     // APPENDED LAST, same discipline: the turn budget joins the end of the
     // reported order rather than displacing a key another tool reads by index.
     "max_turns",
+    // APPENDED LAST, same discipline again (spec §4.8). The key exists on every
+    // lane for surface uniformity; only `lanes.impl.auto_review` is ever read.
+    "auto_review",
 ];
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -261,6 +264,22 @@ pub struct LaneConfig {
     /// would be a worker that can never take a turn, and this struct is only
     /// ever built by [`default_lane`] plus the layered overrides below.
     pub max_turns: u64,
+    /// Turn a finished worker's worktree diff into a review-lane worker whose
+    /// findings land as `<impl-worker>/review.json` (spec §4.8).
+    ///
+    /// **Only `lanes.impl.auto_review` is ever read.** The key exists on every
+    /// lane because `LANE_FIELDS` is one table and a per-lane surface with a
+    /// hole in it is a surface an operator has to remember the shape of — but
+    /// auto-review reviews an *implementation's diff*, so setting it on
+    /// `review`, `research` or `general` changes nothing at all (pinned by
+    /// `only_the_impl_lanes_auto_review_key_is_ever_read`). Reviewing a review
+    /// is a loop, and reviewing a lane that has no worktree is a no-op with
+    /// extra steps.
+    ///
+    /// `false` everywhere by default: spawning a second worker off the back of
+    /// the first spends an account's headroom, and that is an opt-in.
+    #[serde(default)]
+    pub auto_review: bool,
 }
 
 /// The `[broker]` section: what the daemon does about itself.
@@ -433,6 +452,8 @@ fn default_lane(lane: Lane) -> LaneConfig {
         // No lane may elevate until an operator says so, in writing, per lane.
         allow_elevation: false,
         max_turns,
+        // Nobody's quota is spent on a review nobody asked for.
+        auto_review: false,
     }
 }
 
@@ -834,6 +855,7 @@ fn apply_lane_toml(
         "blocked_timeout_secs" => lc.blocked_timeout_secs = want_u64(dotted, v)?,
         "allow_elevation" => lc.allow_elevation = want_bool(dotted, v)?,
         "max_turns" => lc.max_turns = want_u64(dotted, v)?,
+        "auto_review" => lc.auto_review = want_bool(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -1021,6 +1043,7 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "blocked_timeout_secs" => lc.blocked_timeout_secs = parse_u64_str(key, s)?,
         "allow_elevation" => lc.allow_elevation = parse_bool_str(key, s)?,
         "max_turns" => lc.max_turns = parse_u64_str(key, s)?,
+        "auto_review" => lc.auto_review = parse_bool_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
     }
     Ok(())
@@ -1163,14 +1186,65 @@ mod tests {
             "A2A_ADMISSION_LANES_IMPL_CAP"
         );
         // The layering test's key set is stable: admission is its own section.
-        assert_eq!(LANE_FIELDS.len(), 10);
+        assert_eq!(LANE_FIELDS.len(), 11);
         assert!(!LANE_FIELDS.contains(&"cap"));
         // The §5 permission is a LANE key, appended after the Phase-1 block so
         // the reported order of every key before it is untouched.
         assert!(LANE_FIELDS.contains(&"allow_elevation"));
         // ...and the Phase-5 turn budget is appended after THAT, for the same
         // reason. Whatever is last is the newest key, always.
-        assert_eq!(*LANE_FIELDS.last().unwrap(), "max_turns");
+        assert!(LANE_FIELDS.contains(&"max_turns"));
+        // ...and auto_review after THAT. Whatever is last is the newest key.
+        assert_eq!(*LANE_FIELDS.last().unwrap(), "auto_review");
+    }
+
+    /// `auto_review`'s surface (spec §4.8): a per-lane bool that is `false`
+    /// everywhere, with the ordinary env spelling — and a documented asymmetry,
+    /// namely that only the impl lane's copy is ever consulted.
+    #[test]
+    fn the_auto_review_surface_is_the_one_the_spec_pins() {
+        for lane in Lane::ALL {
+            assert!(!default_lane(lane).auto_review, "{lane}");
+        }
+        assert_eq!(
+            lane_env_key(Lane::Impl, "auto_review"),
+            "A2A_LANES_IMPL_AUTO_REVIEW"
+        );
+        assert_eq!(
+            lane_env_key(Lane::Review, "auto_review"),
+            "A2A_LANES_REVIEW_AUTO_REVIEW"
+        );
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        let table: toml::Table =
+            "[lanes.impl]\nauto_review = true\n[lanes.review]\nauto_review = true\n"
+                .parse()
+                .unwrap();
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert!(cfg.lanes[&Lane::Impl].auto_review);
+        // It PARSES on every lane (one table, one surface) — what it does not do
+        // is mean anything anywhere but `impl`; that half is pinned in
+        // `tests/auto_review.rs`, which is the only place behaviour lives.
+        assert!(cfg.lanes[&Lane::Review].auto_review);
+        assert_eq!(origins.get("lanes.impl.auto_review"), Some(&Origin::File));
+
+        let bad: toml::Table = "[lanes.impl]\nauto_review = \"yes\"\n".parse().unwrap();
+        let err = apply_file(&mut cfg, &mut origins, &mut warnings, &bad).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        assert!(
+            err.message.contains("lanes.impl.auto_review"),
+            "the failure names the dotted key: {}",
+            err.message
+        );
     }
 
     /// The turn-budget surface is PINNED (spec §4.9): four per-lane numbers,

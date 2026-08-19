@@ -154,6 +154,13 @@ struct Row {
     /// it is, and a chain is something a caller follows programmatically.
     parent_id: Option<String>,
     attempt: Option<u32>,
+    /// The impl worker whose diff this one was made to review (spec §4.8).
+    /// `null` for everybody else, and deliberately NOT folded into `parent_id`:
+    /// a reviewer is not a retry, and a caller walking the retry chain must not
+    /// be handed a review as one of its links.
+    ///
+    /// `--json` only, like the lineage keys above.
+    auto_review_of: Option<String>,
     /// Why this worker was allowed `danger-full-access` (spec §5). An elevated
     /// worker must never be visually identical to an ordinary one, so this
     /// drives the `/ELEV` marker on the STATE cell as well as the `--json` key.
@@ -178,6 +185,7 @@ impl Row {
             max_turns: snap.max_turns,
             parent_id: snap.parent_id.clone(),
             attempt: snap.attempt,
+            auto_review_of: extra_str(&snap.extra, "auto_review_of"),
             elevation_reason: snap.elevation_reason.clone(),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
@@ -211,6 +219,9 @@ impl Row {
             max_turns: stale.as_ref().and_then(|s| s.max_turns),
             parent_id: stale.as_ref().and_then(|s| s.parent_id.clone()),
             attempt: stale.as_ref().and_then(|s| s.attempt),
+            auto_review_of: stale
+                .as_ref()
+                .and_then(|s| extra_str(&s.extra, "auto_review_of")),
             // Kept from the stale snapshot on purpose: a worker we can no
             // longer reconcile is exactly the one whose elevation matters most.
             elevation_reason: stale.as_ref().and_then(|s| s.elevation_reason.clone()),
@@ -236,6 +247,7 @@ impl Row {
             "max_turns": self.max_turns,
             "parent_id": self.parent_id,
             "attempt": self.attempt,
+            "auto_review_of": self.auto_review_of,
             "elevation_reason": self.elevation_reason,
         })
     }
@@ -333,6 +345,12 @@ fn humanize(secs: Option<i64>) -> String {
 
 /// The five-column projection, plus OWNER when `--all` widened the question
 /// from "my fleet" to "this machine's fleet", plus WT when anybody in the
+/// One `snap.extra` key as a string — the shape every genesis-carried marker
+/// the snapshot does not have a typed field for arrives in.
+fn extra_str(extra: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    extra.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
 /// listing has a worktree.
 fn render_table(rows: &[Row], all: bool) -> String {
     let idw = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
@@ -386,6 +404,7 @@ mod tests {
             max_turns: None,
             parent_id: None,
             attempt: None,
+            auto_review_of: None,
             elevation_reason: None,
             created_at: None,
             dwell_secs: dwell,
@@ -532,6 +551,22 @@ mod tests {
         assert_eq!(
             r.to_json()["worktree_branch"],
             json!("a2a/impl/impl-0814t1301-bb")
+        );
+    }
+
+    /// The auto-review marker is a `--json` key of its own — `null` for every
+    /// worker nobody made to review anything, and never merged into
+    /// `parent_id`, which is the retry chain and a different relation.
+    #[test]
+    fn the_json_row_carries_the_auto_review_marker_separately_from_lineage() {
+        let mut r = row("review-0819t1200-bb", "done", Some(1));
+        assert_eq!(r.to_json()["auto_review_of"], Value::Null);
+        r.auto_review_of = Some("impl-0819t1200-aa".into());
+        assert_eq!(r.to_json()["auto_review_of"], json!("impl-0819t1200-aa"));
+        assert_eq!(
+            r.to_json()["parent_id"],
+            Value::Null,
+            "a review is not a retry of the worker it reviews"
         );
     }
 

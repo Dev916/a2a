@@ -277,6 +277,17 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     if let Some(attempt) = raw.get("attempt").and_then(|v| v.as_u64()) {
         snap.attempt = Some(attempt as u32);
     }
+    // The auto-review marker (spec §4.8): which impl worker's diff this worker
+    // was made to review. Bookkeeping the snapshot carries verbatim, like
+    // `schema_source` — and deliberately NOT `parent_id`, which is the retry
+    // chain `max_attempts` counts. A reviewer is not a retry of anything, and
+    // sharing the key would quarantine an impl worker for being reviewed twice.
+    // It reaches `snap.extra`, which is where `ls --json` reads it and where a
+    // rebuild from zero puts it back.
+    if let Some(reviewed) = raw.get("auto_review_of") {
+        snap.extra
+            .insert("auto_review_of".to_string(), reviewed.clone());
+    }
     snap.created_at = s("created_at")
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc))

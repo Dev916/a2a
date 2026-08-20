@@ -177,6 +177,15 @@ other session has context you do not have, its worker's question was written
 for it, and an answer from the wrong orchestrator is worse than a slow one. If
 you meant to take over a worker deliberately, do it explicitly with `--force`
 and say so in the message you send.
+
+**Issue-tracker provenance (beads).** When a `bd`-tracked issue is executed
+through a2a, record the executor on the issue so future agents can find — and
+resume — the session that did the work: `--set-metadata
+executor_provider=codex`, `executor_session=<the worker's session UUID from
+\`a2a status <id> --json\` (.data.session_id)>`, `a2a_worker=<worker id>`. A
+Claude-executed issue records `executor_provider=claude` and its own session
+id. The session UUID is the resumable identity: `codex exec resume
+<executor_session>` reopens the very session that wrote the code.
 <!-- a2a:end ownership -->
 
 <!-- a2a:section devloop-dispatch -->

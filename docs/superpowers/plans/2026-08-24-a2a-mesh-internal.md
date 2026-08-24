@@ -96,7 +96,7 @@ pub fn open_named(dir: &Path, base: &str, max_bytes: u64) -> io::Result<EventLog
 pub fn read_events_named(dir: &Path, base: &str, since_seq: u64) -> io::Result<Vec<Envelope>>;
 ```
 
-- [ ] Steps: failing tests (config surface, parametrized rotation, shapes/caps) → RED → implement (config → store generalization with every existing test green → mesh/mod.rs) → GREEN → full suite, zero warnings → commit `feat: mesh foundations — [mesh] config, peer shapes, name-parametrized event log` (--no-verify).
+- [x] Steps: failing tests (config surface, parametrized rotation, shapes/caps) → RED → implement (config → store generalization with every existing test green → mesh/mod.rs) → GREEN → full suite, zero warnings → commit `feat: mesh foundations — [mesh] config, peer shapes, name-parametrized event log` (--no-verify).
 
 ---
 
@@ -126,7 +126,7 @@ pub fn staleness(last_seen: DateTime<Utc>, retired: bool, now: DateTime<Utc>, st
 pub fn run(home: &A2aHome, cmd: &MeshCmd, json_mode: bool, quiet: bool) -> Result<Outcome, AppError>;
 ```
 
-- [ ] Steps: failing tests (resolution chain, idempotent re-register, cursor-at-tip, staleness boundaries, status gates) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh presence — register/heartbeat/retire/status with pinned session resolution` (--no-verify).
+- [x] Steps: failing tests (resolution chain, idempotent re-register, cursor-at-tip, staleness boundaries, status gates) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh presence — register/heartbeat/retire/status with pinned session resolution` (--no-verify).
 
 ---
 
@@ -152,7 +152,7 @@ pub fn post(home: &A2aHome, cfg: &Config, from: &PeerId, text: &str, refs: serde
 pub fn read(home: &A2aHome, since_seq: u64) -> Result<Vec<FeedEntry>, AppError>;
 ```
 
-- [ ] Steps: failing tests (post gates, since semantics, rotation-at-feed, daemonless) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh feed — posts over the parametrized rotated log` (--no-verify).
+- [x] Steps: failing tests (post gates, since semantics, rotation-at-feed, daemonless) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh feed — posts over the parametrized rotated log` (--no-verify).
 
 ---
 
@@ -186,7 +186,7 @@ pub struct RosterRow { pub peer: String, pub provider: String, pub worker_id: Op
 pub fn roster(home: &A2aHome, cfg: &Config, now: DateTime<Utc>) -> Result<Vec<RosterRow>, AppError>;
 ```
 
-- [ ] Steps: failing tests (target resolution incl. exit 3 + worker mapping, gates + forgiving-cap, fire-and-forget warning, inbox consume, roster union/merge) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh notes, inbox, and the union roster` (--no-verify).
+- [x] Steps: failing tests (target resolution incl. exit 3 + worker mapping, gates + forgiving-cap, fire-and-forget warning, inbox consume, roster union/merge) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh notes, inbox, and the union roster` (--no-verify).
 
 ---
 
@@ -213,7 +213,7 @@ pub fn inject(home: &A2aHome, cfg: &Config, id: &PeerId, now: DateTime<Utc>)
     -> Result<Option<String>, AppError>;   // None = nothing pending
 ```
 
-- [ ] Steps: failing tests (empty-silence, marker pins, budget+trailer+cursors, at-least-once) → RED → implement → GREEN → full suite, zero warnings → commit `feat: a2a mesh inject — bounded ambient digest with data-not-instructions wrapper` (--no-verify).
+- [x] Steps: failing tests (empty-silence, marker pins, budget+trailer+cursors, at-least-once) → RED → implement → GREEN → full suite, zero warnings → commit `feat: a2a mesh inject — bounded ambient digest with data-not-instructions wrapper` (--no-verify).
 
 ---
 
@@ -228,7 +228,7 @@ pub fn inject(home: &A2aHome, cfg: &Config, id: &PeerId, now: DateTime<Utc>)
 
 **Files:** Create `templates/mesh-hooks.json`; Modify `src/commands/mesh_cmd.rs`, `src/cli.rs` (`MeshCmd::Hooks { print: bool }`), `src/main.rs`, `tests/mesh_inject.rs` (extend).
 
-- [ ] Steps: failing tests (snippet validity + command-string pins, print-only, lifecycle-as-hooks) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh hook snippet and hooks --print (print-only, never installs)` (--no-verify).
+- [x] Steps: failing tests (snippet validity + command-string pins, print-only, lifecycle-as-hooks) → RED → implement → GREEN → full suite, zero warnings → commit `feat: mesh hook snippet and hooks --print (print-only, never installs)` (--no-verify).
 
 ---
 
@@ -255,7 +255,7 @@ pub fn route(home: &A2aHome, cfg: &Config, from_worker: &WorkerSnapshot, n: &Out
     -> Result<Routed, AppError>;   // Routed::{Delivered(PathBuf), Rejected(reason)} — renames source
 ```
 
-- [ ] Steps: failing tests (skill section + drift, exec sweep, app-server two-hop, rejected path, registry 17) → RED → implement (skill+regen → routing.rs → reconcile hook → actor/core hop) → GREEN → full suite, zero warnings → commit `feat: worker-originated mesh notes routed on both transports` (--no-verify).
+- [x] Steps: failing tests (skill section + drift, exec sweep, app-server two-hop, rejected path, registry 17) → RED → implement (skill+regen → routing.rs → reconcile hook → actor/core hop) → GREEN → full suite, zero warnings → commit `feat: worker-originated mesh notes routed on both transports` (--no-verify).
 
 ---
 
@@ -271,7 +271,7 @@ pub fn route(home: &A2aHome, cfg: &Config, from_worker: &WorkerSnapshot, n: &Out
 
 **Files:** Modify `src/commands/gc.rs`, `tests/cmd_gc.rs` (extend at END); Test additions in `tests/mesh_presence.rs` if the staleness helper needs a gc-facing variant.
 
-- [ ] Steps: failing tests (both refusal directions, preview surfacing, feed-untouched) → RED → implement → GREEN → full suite (cmd_gc in isolation too — load-flaky) → zero warnings → commit `feat: gc mesh sweep — retired/ancient peers reclaimed, unread notes surfaced` (--no-verify).
+- [x] Steps: failing tests (both refusal directions, preview surfacing, feed-untouched) → RED → implement → GREEN → full suite (cmd_gc in isolation too — load-flaky) → zero warnings → commit `feat: gc mesh sweep — retired/ancient peers reclaimed, unread notes surfaced` (--no-verify).
 
 ---
 
@@ -292,7 +292,7 @@ pub fn route(home: &A2aHome, cfg: &Config, from_worker: &WorkerSnapshot, n: &Out
 
 **Files:** Create `tests/mesh_e2e.rs`, `tests/mesh_live.rs`; Modify `README.md`.
 
-- [ ] Steps: write the e2e → fix what it exposes (owning modules, never weakened assertions) → GREEN → gated smoke written + run once locally → README → full suite, zero warnings → commit `feat: mesh e2e on both transports, gated live smoke, docs` (--no-verify).
+- [x] Steps: write the e2e → fix what it exposes (owning modules, never weakened assertions) → GREEN → gated smoke written + run once locally → README → full suite, zero warnings → commit `feat: mesh e2e on both transports, gated live smoke, docs` (--no-verify).
 
 ---
 

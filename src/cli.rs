@@ -241,6 +241,11 @@ pub enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Local agent mesh presence, feed and notes
+    Mesh {
+        #[command(subcommand)]
+        cmd: MeshCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -406,4 +411,51 @@ pub enum SyncCmd {
         #[arg(long)]
         migrate_untrack: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum MeshCmd {
+    /// Register this session in mesh presence
+    Register(MeshPeerArgs),
+    /// Refresh this session's mesh presence
+    Heartbeat {
+        #[command(flatten)]
+        peer: MeshPeerArgs,
+        #[arg(long)]
+        working_on: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+    },
+    /// Mark this session retired in mesh presence
+    Retire(MeshPeerArgs),
+    /// Set this session's explicit mesh status; empty text clears it
+    Status {
+        #[command(flatten)]
+        peer: MeshPeerArgs,
+        text: String,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct MeshPeerArgs {
+    #[arg(long)]
+    pub session: Option<String>,
+    #[arg(long, value_enum, default_value_t = MeshProviderArg::Claude)]
+    pub provider: MeshProviderArg,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[value(rename_all = "lowercase")]
+pub enum MeshProviderArg {
+    Claude,
+    Codex,
+}
+
+impl From<MeshProviderArg> for crate::mesh::Provider {
+    fn from(provider: MeshProviderArg) -> Self {
+        match provider {
+            MeshProviderArg::Claude => crate::mesh::Provider::Claude,
+            MeshProviderArg::Codex => crate::mesh::Provider::Codex,
+        }
+    }
 }

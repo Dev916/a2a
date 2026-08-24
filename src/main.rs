@@ -1,4 +1,4 @@
-use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd, SyncCmd};
+use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, SyncCmd};
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
 use clap::Parser;
@@ -63,6 +63,12 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Verify { .. } => "verify",
         Cmd::Respawn { .. } => "respawn",
         Cmd::GenSkills { .. } => "__gen-skills",
+        Cmd::Mesh { cmd } => match cmd {
+            MeshCmd::Register(_) => "mesh register",
+            MeshCmd::Heartbeat { .. } => "mesh heartbeat",
+            MeshCmd::Retire(_) => "mesh retire",
+            MeshCmd::Status { .. } => "mesh status",
+        },
     }
 }
 
@@ -287,6 +293,10 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
         // `--out` and has no business touching a home tree at all.
         Cmd::GenSkills { out, check } => {
             a2a::commands::gen_skills::run(out, *check, cli.global.json, cli.global.quiet)
+        }
+        Cmd::Mesh { cmd } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            a2a::commands::mesh_cmd::run(&home, cmd, cli.global.json, cli.global.quiet)
         }
     }
 }

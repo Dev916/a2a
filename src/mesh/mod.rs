@@ -161,3 +161,5 @@ fn cap_for(code: &str) -> Option<usize> {
 fn invalid_peer_id(message: impl Into<String>) -> AppError {
     AppError::new("PEER_ID_INVALID", ExitCode::Precondition, message)
 }
+
+pub mod presence;

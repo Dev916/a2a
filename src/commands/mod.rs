@@ -138,3 +138,4 @@ pub mod sync_cmd;
 pub mod verify;
 pub mod gen_skills;
 pub mod respawn;
+pub mod mesh_cmd;

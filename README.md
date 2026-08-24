@@ -553,6 +553,71 @@ entire tree — that is how the test suite stays hermetic. Two variables are
 switches rather than settings: `A2A_BROKER_DISABLE=1`
 ([Transports](#transports)) and `A2A_OWNER` ([Owner scoping](#owner-scoping)).
 
+## Mesh
+
+The mesh is the same-machine coordination plane for Claude Code sessions and
+Codex workers. A peer id is always `<provider>:<uuid>`, where provider is
+`claude` or `codex`; on disk that becomes `mesh/peers/<provider>-<uuid>/`.
+Codex peers also surface their a2a `worker_id` when the session belongs to a
+known worker, so a note target may be either `codex:<session>` or the worker id.
+
+The everyday loop is five commands:
+
+```bash
+a2a mesh roster --json              # who is present, stale, retired, and unread counts
+a2a mesh post -                     # append to the shared feed from stdin
+a2a mesh note <peer-or-worker> -    # send a directed note from stdin
+a2a mesh inbox --consume            # read your notes and archive them
+a2a mesh status -                   # set or clear your short status from stdin
+```
+
+Claude Code hooks are opt-in. Print the snippet, then merge it into your
+`~/.claude/settings.json` yourself:
+
+```bash
+a2a mesh hooks --print
+```
+
+The snippet wires SessionStart to `register` + `inject`, UserPromptSubmit to
+`heartbeat` + `inject`, and SessionEnd to `retire`. a2a never edits your hook
+settings because installing a live hook changes when agent context is augmented;
+that stays a human-controlled step.
+
+Mesh text limits are forgiving backstops, not style rules. They stop runaway
+loops from filling disk and refuse oversized input with exit 9 rather than
+truncating it.
+
+| plane | cap | refusal |
+|---|---:|---|
+| note | 1,048,576 bytes | `NOTE_TOO_LARGE` |
+| post | 262,144 bytes | `POST_TOO_LARGE` |
+| status | 4,096 bytes | `STATUS_TOO_LARGE` |
+
+Every post, note and status is scanned on ingress; secret-shaped text refuses
+with `SECRET_IN_POST`, `SECRET_IN_NOTE` or `SECRET_IN_STATUS` and the value is
+not written. Roster, feed, inbox and inject output is redacted on egress.
+
+Workers can originate notes without writing outside their worker directory by
+dropping this JSON in `outbox/<seq>.note.json`:
+
+```json
+{"to":"claude:0a1ec845-4394-449e-a098-e0e01cb19887","text":"handoff for the next turn","refs":{"worker":["impl-0824t2201-q4ag"]}}
+```
+
+On reconcile, a note to a Claude peer lands in that peer's mesh inbox; a note to
+a Codex peer or worker id rides the existing `a2a send` queue. The broker uses
+the same shape at turn end for app-server workers.
+
+The live smoke is read-only and ignored by default:
+
+```bash
+A2A_MESH_LIVE=1 cargo test --test mesh_live -- --ignored
+```
+
+It parses `roster --json` and `feed --json` against your real `~/.a2a` and
+checks a before/after hash of `~/.a2a/mesh` (or its absence) so those reads prove
+they wrote nothing. It does not register, post or install hooks.
+
 ## Sync: giving Codex workers the same capability layer
 
 Two one-way mirrors from the Claude side into the Codex home, both governed by a

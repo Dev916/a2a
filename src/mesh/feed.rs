@@ -12,15 +12,7 @@ pub fn post(
     text: &str,
     refs: serde_json::Value,
 ) -> Result<u64, AppError> {
-    scan_or_refuse(text, "SECRET_IN_POST")?;
-    let len = text.len();
-    if len > POST_MAX_BYTES {
-        return Err(AppError::new(
-            "POST_TOO_LARGE",
-            ExitCode::Precondition,
-            format!("text is {len} bytes, exceeding cap {POST_MAX_BYTES} bytes"),
-        ));
-    }
+    validate_post_text(text)?;
 
     let entry = FeedEntry {
         seq: 0,
@@ -38,8 +30,24 @@ pub fn post(
         .map_err(|e| io_err("appending feed.jsonl", e))
 }
 
+pub fn validate_post_text(text: &str) -> Result<(), AppError> {
+    scan_or_refuse(text, "SECRET_IN_POST")?;
+    let len = text.len();
+    if len > POST_MAX_BYTES {
+        return Err(AppError::new(
+            "POST_TOO_LARGE",
+            ExitCode::Precondition,
+            format!("text is {len} bytes, exceeding cap {POST_MAX_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn read(home: &A2aHome, since_seq: u64) -> Result<Vec<FeedEntry>, AppError> {
-    let root = mesh_root(home);
+    let root = home.root().join("mesh");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
     let mut entries = Vec::new();
     for value in store::read_json_named(&root, "feed", since_seq)
         .map_err(|e| io_err("reading feed.jsonl", e))?

@@ -4,7 +4,7 @@ use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::ids;
 use crate::inbox::MsgKind;
 use crate::mesh::{
-    feed, mesh_root, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider,
+    feed, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider,
     INJECT_BUDGET_BYTES, NOTE_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode};
@@ -525,7 +525,7 @@ fn worker_for_peer(home: &A2aHome, peer: &PeerId) -> Result<Option<(String, Work
 }
 
 fn peer_ids(home: &A2aHome) -> Result<Vec<PeerId>, AppError> {
-    let peers = mesh_root(home).join("peers");
+    let peers = home.root().join("mesh").join("peers");
     let entries = match fs::read_dir(&peers) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

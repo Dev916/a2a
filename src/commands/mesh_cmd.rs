@@ -72,6 +72,7 @@ pub fn run(
         } => {
             let id = peer_id(peer)?;
             let text = post_text(text.as_deref(), message_file.as_deref())?;
+            feed::validate_post_text(&text)?;
             let mut p = load_or_register(home, &id)?;
             p.last_seen = Utc::now();
             p.retired = false;

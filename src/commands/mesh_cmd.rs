@@ -147,6 +147,16 @@ pub fn run(
             }
             Ok(Outcome::from(Value::String(human_roster(&rows))))
         }
+        MeshCmd::Inject { peer, json } => {
+            let id = peer_id(peer)?;
+            let Some(block) = notes::inject(home, cfg, &id, Utc::now())? else {
+                return Ok(Outcome::from(Value::Null));
+            };
+            if json_mode || *json {
+                return Ok(Outcome::from(json!({ "block": block })));
+            }
+            Ok(Outcome::from(Value::String(block)))
+        }
     }
 }
 

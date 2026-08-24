@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub const NOTE_MAX_BYTES: usize = 1_048_576;
 pub const POST_MAX_BYTES: usize = 262_144;
 pub const STATUS_MAX_BYTES: usize = 4_096;
+pub const INJECT_BUDGET_BYTES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {

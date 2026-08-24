@@ -51,6 +51,22 @@ pub fn save(home: &A2aHome, p: &Presence) -> Result<(), AppError> {
         .map_err(|e| io_err("writing presence.json", e))
 }
 
+pub fn save_inject_cursors(
+    home: &A2aHome,
+    p: &mut Presence,
+    feed_seq: u64,
+    inbox: Option<String>,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    p.cursors.feed_seq = feed_seq;
+    if let Some(inbox) = inbox {
+        p.cursors.inbox = Some(inbox);
+    }
+    p.last_seen = now;
+    p.retired = false;
+    save(home, p)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Label {

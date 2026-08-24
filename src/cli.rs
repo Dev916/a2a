@@ -494,6 +494,14 @@ pub enum MeshCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Emit this peer's bounded ambient mesh digest
+    Inject {
+        #[command(flatten)]
+        peer: MeshPeerArgs,
+        /// Emit the digest block as a JSON string
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args)]

@@ -73,6 +73,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Note { .. } => "mesh note",
             MeshCmd::Inbox { .. } => "mesh inbox",
             MeshCmd::Roster { .. } => "mesh roster",
+            MeshCmd::Inject { .. } => "mesh inject",
         },
     }
 }

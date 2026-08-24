@@ -43,6 +43,9 @@ pub const IMPL_RESULT_SCHEMA: &str = include_str!("../templates/impl-result.sche
 /// reads the findings afterwards.
 pub const REVIEW_FINDINGS_SCHEMA: &str = include_str!("../templates/review-findings.schema.json");
 
+/// Claude Code hooks settings fragment for ambient mesh registration and injection.
+pub const MESH_HOOKS_JSON: &str = include_str!("../templates/mesh-hooks.json");
+
 const IMPL_BRIEF: &str = include_str!("../templates/impl-brief.md");
 const REVIEW_BRIEF: &str = include_str!("../templates/review-brief.md");
 const RESEARCH_BRIEF: &str = include_str!("../templates/research-brief.md");

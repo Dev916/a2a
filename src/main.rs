@@ -74,6 +74,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Inbox { .. } => "mesh inbox",
             MeshCmd::Roster { .. } => "mesh roster",
             MeshCmd::Inject { .. } => "mesh inject",
+            MeshCmd::Hooks { .. } => "mesh hooks",
         },
     }
 }
@@ -301,6 +302,9 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             a2a::commands::gen_skills::run(out, *check, cli.global.json, cli.global.quiet)
         }
         Cmd::Mesh { cmd } => {
+            if let MeshCmd::Hooks { print } = cmd {
+                return a2a::commands::mesh_cmd::run_hooks(*print);
+            }
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             let (cfg, _, _) = a2a::config::load(&home)?;
             a2a::commands::mesh_cmd::run(&home, &cfg, cmd, cli.global.json, cli.global.quiet)

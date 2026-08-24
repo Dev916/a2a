@@ -502,6 +502,12 @@ pub enum MeshCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print the Claude Code hooks settings fragment; never installs it
+    Hooks {
+        /// Emit the snippet to stdout
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 #[derive(clap::Args)]

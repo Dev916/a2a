@@ -157,7 +157,25 @@ pub fn run(
             }
             Ok(Outcome::from(Value::String(block)))
         }
+        MeshCmd::Hooks { print } => run_hooks(*print),
     }
+}
+
+pub fn run_hooks(print: bool) -> Result<Outcome, AppError> {
+    if !print {
+        return Err(AppError::new(
+            "MESH_HOOKS_PRINT_REQUIRED",
+            ExitCode::Precondition,
+            "use --print; a2a never edits Claude Code settings",
+        ));
+    }
+    eprintln!("a2a: merge this into ~/.claude/settings.json yourself — a2a never edits your settings");
+    Ok(Outcome::from(Value::String(
+        crate::templates::MESH_HOOKS_JSON
+            .strip_suffix('\n')
+            .unwrap_or(crate::templates::MESH_HOOKS_JSON)
+            .to_string(),
+    )))
 }
 
 fn peer_id(args: &MeshPeerArgs) -> Result<PeerId, AppError> {

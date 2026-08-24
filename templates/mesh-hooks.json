@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "a2a mesh register --session \"$CLAUDE_SESSION_ID\" && a2a mesh inject --session \"$CLAUDE_SESSION_ID\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "a2a mesh heartbeat --session \"$CLAUDE_SESSION_ID\" && a2a mesh inject --session \"$CLAUDE_SESSION_ID\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "a2a mesh retire --session \"$CLAUDE_SESSION_ID\""
+          }
+        ]
+      }
+    ]
+  }
+}

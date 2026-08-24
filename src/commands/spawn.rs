@@ -2015,17 +2015,24 @@ mod tests {
         assert_eq!(props["iterations"]["type"], json!("integer"));
         assert_eq!(props["summary"]["type"], json!("string"));
         assert_eq!(props["evidence"]["type"], json!("object"));
-        // Toolkit-dependent: the four playwright keys are DOCUMENTED, not
-        // required, and anything else a toolkit produces is allowed through.
-        assert_eq!(props["evidence"]["additionalProperties"], json!(true));
-        assert_eq!(props["evidence"].get("required"), None);
-        for key in [
-            "screenshots",
-            "console_errors",
-            "network_failures",
-            "logs_excerpts",
-        ] {
-            assert_eq!(props["evidence"]["properties"][key]["type"], json!("array"));
+        // The model API's strict structured outputs require every object to be
+        // CLOSED with a complete `required` list — an open `evidence` was
+        // rejected live with `invalid_json_schema` (bug a2a-5n2). Evidence is
+        // therefore exactly `logs_excerpts`; the playwright-only keys are
+        // deliberately ABSENT (strict mode would force every worker to emit
+        // them), and their absence is part of this pin.
+        assert_eq!(props["evidence"]["additionalProperties"], json!(false));
+        assert_eq!(props["evidence"]["required"], json!(["logs_excerpts"]));
+        assert_eq!(
+            props["evidence"]["properties"]["logs_excerpts"]["type"],
+            json!("array")
+        );
+        for absent in ["screenshots", "console_errors", "network_failures"] {
+            assert_eq!(
+                props["evidence"]["properties"].get(absent),
+                None,
+                "`{absent}` must stay out of the strict schema"
+            );
         }
         assert_eq!(props["files_changed"]["type"], json!("array"));
         assert_eq!(props["files_changed"]["items"]["type"], json!("string"));

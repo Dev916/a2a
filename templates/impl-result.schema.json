@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/a2a/templates/impl-result.schema.json",
   "title": "a2a impl-lane result",
-  "description": "The result an impl-lane worker writes. This IS devloop's `sample-task-result.json` shape, so a devloop-dispatched worker's result is parsed by devloop step 4.3.4 without an adapter. a2a itself enforces only the top-level `required` list (src/reconcile.rs::schema_gate); the rest of this document is the published contract and the `--output-schema` payload handed to codex.",
+  "description": "The result an impl-lane worker writes. This IS devloop's `sample-task-result.json` shape, so a devloop-dispatched worker's result is parsed by devloop step 4.3.4 without an adapter. a2a itself enforces only the top-level `required` list (src/reconcile.rs::schema_gate); the rest of this document is the published contract and the `--output-schema` payload handed to codex. Every object here is CLOSED (additionalProperties: false) with a complete `required` list because the model API's strict structured outputs demand it \u2014 the first real impl spawn was rejected with invalid_json_schema: \"In context=('properties','evidence'), 'additionalProperties' is required to be supplied and to be false.\" (bug a2a-5n2, 2026-08-24). Evidence is therefore narrowed to `logs_excerpts`: cli/api tasks \u2014 the only kinds dispatched to codex \u2014 carry log excerpts; richer toolkit evidence (screenshots etc.) belongs to Claude-side subagents, whose results are not schema-gated by the API.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -16,7 +16,11 @@
   "properties": {
     "status": {
       "description": "`pass` only when every acceptance criterion was verified; `stuck` when the same failure repeated and the work needs a human.",
-      "enum": ["pass", "fail", "stuck"]
+      "enum": [
+        "pass",
+        "fail",
+        "stuck"
+      ]
     },
     "iterations": {
       "description": "How many implement/verify cycles this task took.",
@@ -28,36 +32,34 @@
       "type": "string"
     },
     "evidence": {
-      "description": "Verification evidence. The sub-keys are toolkit-dependent — the four below are devloop's playwright set and are documented, not required; an `api` or `cli` task carries whatever its own toolkit produces.",
+      "description": "Verification evidence. Closed object per strict structured outputs; `logs_excerpts` is the one universal channel \u2014 command output excerpts backing the summary's claims.",
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
+      "required": [
+        "logs_excerpts"
+      ],
       "properties": {
-        "screenshots": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "console_errors": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "network_failures": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
         "logs_excerpts": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
     "files_changed": {
       "description": "Every file this task created or modified, repo-relative.",
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     },
     "next_step_hint": {
       "description": "One sentence for whoever picks the work up next, or null when there is nothing to hand over.",
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     }
   }
 }

@@ -70,6 +70,9 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Status { .. } => "mesh status",
             MeshCmd::Post { .. } => "mesh post",
             MeshCmd::Feed { .. } => "mesh feed",
+            MeshCmd::Note { .. } => "mesh note",
+            MeshCmd::Inbox { .. } => "mesh inbox",
+            MeshCmd::Roster { .. } => "mesh roster",
         },
     }
 }

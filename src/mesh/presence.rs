@@ -51,7 +51,8 @@ pub fn save(home: &A2aHome, p: &Presence) -> Result<(), AppError> {
         .map_err(|e| io_err("writing presence.json", e))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Label {
     Active,
     Stale,

@@ -164,3 +164,4 @@ fn invalid_peer_id(message: impl Into<String>) -> AppError {
 
 pub mod presence;
 pub mod feed;
+pub mod notes;

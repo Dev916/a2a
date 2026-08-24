@@ -459,6 +459,41 @@ pub enum MeshCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Send a directed mesh note to a peer or worker id
+    Note {
+        #[command(flatten)]
+        peer: MeshPeerArgs,
+        /// Target peer id, peer uuid/prefix, or worker id
+        target: String,
+        /// Use `-` to read the note from stdin
+        stdin: Option<String>,
+        /// Read note text from this file
+        #[arg(long, value_name = "FILE")]
+        message_file: Option<PathBuf>,
+        /// Add a bead reference to the note
+        #[arg(long = "ref-beads", value_name = "ID")]
+        ref_beads: Vec<String>,
+        /// Add a worker reference to the note
+        #[arg(long = "ref-worker", value_name = "ID")]
+        ref_worker: Vec<String>,
+    },
+    /// Read this peer's unread mesh notes
+    Inbox {
+        #[command(flatten)]
+        peer: MeshPeerArgs,
+        /// Emit full note entries as JSON
+        #[arg(long)]
+        json: bool,
+        /// Move listed notes to inbox/read and advance the inbox cursor
+        #[arg(long)]
+        consume: bool,
+    },
+    /// List mesh peers and live codex workers; pending codex rows are not addressable
+    Roster {
+        /// Emit full roster rows as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args)]

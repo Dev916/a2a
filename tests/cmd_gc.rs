@@ -1,6 +1,7 @@
 // tests/cmd_gc.rs
 mod common;
 use common::*;
+use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -395,4 +396,171 @@ fn a_worktree_removal_failure_keeps_the_worker_directory_and_the_tombstone() {
         w.id.as_str(),
         "the tombstone stands — the id stays retired"
     );
+}
+
+// ===========================================================================
+// Task 8: mesh peer sweep.
+// ===========================================================================
+
+fn mesh_peer_dir(home: &Path, session: &str) -> PathBuf {
+    home.join("mesh")
+        .join("peers")
+        .join(format!("claude-{session}"))
+}
+
+fn register_mesh_peer(home: &Path, tmp: &Path, session: &str) {
+    a2a(home, tmp)
+        .args(["mesh", "register", "--session", session])
+        .assert()
+        .success();
+}
+
+fn set_mesh_presence(home: &Path, session: &str, days_old: i64, retired: bool) {
+    let path = mesh_peer_dir(home, session).join("presence.json");
+    let mut p: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    p["last_seen"] = serde_json::json!(Utc::now() - ChronoDuration::days(days_old));
+    p["retired"] = serde_json::json!(retired);
+    a2a::store::write_atomic(&path, p.to_string().as_bytes()).unwrap();
+}
+
+fn write_unread_mesh_note(home: &Path, session: &str, seq: u64, from: &str, text: &str) {
+    let inbox = mesh_peer_dir(home, session).join("inbox");
+    std::fs::create_dir_all(inbox.join("read")).unwrap();
+    let note = serde_json::json!({
+        "from": from,
+        "to": format!("claude:{session}"),
+        "ts": Utc::now(),
+        "kind": "note",
+        "text": text,
+        "refs": {}
+    });
+    let path = inbox.join(format!("{seq:06}-1-deadbeef.note.json"));
+    a2a::store::write_atomic(&path, note.to_string().as_bytes()).unwrap();
+}
+
+fn mesh_reclaimed_peers(data: &Value) -> Vec<String> {
+    data["mesh"]["reclaimable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["peer"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_ancient_stale_peers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let active = "11111111-1111-4111-8111-111111111111";
+    let retired = "22222222-2222-4222-8222-222222222222";
+    let stale_old = "33333333-3333-4333-8333-333333333333";
+    let stale_under_gc = "44444444-4444-4444-8444-444444444444";
+
+    for session in [active, retired, stale_old, stale_under_gc] {
+        register_mesh_peer(&home, tmp.path(), session);
+    }
+    set_mesh_presence(&home, retired, 0, true);
+    set_mesh_presence(&home, stale_old, 8, false);
+    set_mesh_presence(&home, stale_under_gc, 6, false);
+
+    let feed = home.join("mesh").join("feed.jsonl");
+    std::fs::write(&feed, "{\"seq\":1,\"text\":\"keep me\"}\n").unwrap();
+    let feed_before = std::fs::read_to_string(&feed).unwrap();
+
+    write_unread_mesh_note(
+        &home,
+        retired,
+        1,
+        "claude:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "plain first line\nsecond line",
+    );
+    write_unread_mesh_note(
+        &home,
+        retired,
+        2,
+        "claude:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "secret sk-abc123456789012345678901\nsecond line",
+    );
+
+    let out = a2a(&home, tmp.path())
+        .args(["--json", "gc", "--dry-run"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let data = &v["data"];
+    assert_eq!(
+        mesh_reclaimed_peers(data),
+        vec![
+            format!("claude:{retired}"),
+            format!("claude:{stale_old}"),
+        ],
+        "{data}"
+    );
+    let retired_row = data["mesh"]["reclaimable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["peer"] == format!("claude:{retired}"))
+        .unwrap();
+    assert!(retired_row["bytes"].as_u64().unwrap() > 0, "{retired_row}");
+    assert_eq!(retired_row["unread_notes"], 2, "{retired_row}");
+    assert_eq!(retired_row["notes_preview"].as_array().unwrap().len(), 2, "{retired_row}");
+    assert_eq!(
+        retired_row["notes_preview"][0]["first_line"],
+        "plain first line",
+        "{retired_row}"
+    );
+    assert!(
+        retired_row["notes_preview"][1]["first_line"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:"),
+        "{retired_row}"
+    );
+    assert!(
+        !retired_row.to_string().contains("sk-abc123456789012345678901"),
+        "preview leaked a secret: {retired_row}"
+    );
+    assert!(mesh_peer_dir(&home, active).is_dir(), "dry-run keeps active peer");
+    assert!(mesh_peer_dir(&home, retired).is_dir(), "dry-run keeps retired peer");
+    assert!(mesh_peer_dir(&home, stale_old).is_dir(), "dry-run keeps stale peer");
+    assert!(
+        mesh_peer_dir(&home, stale_under_gc).is_dir(),
+        "dry-run keeps stale-under-gc-threshold peer"
+    );
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), feed_before);
+
+    let out = a2a(&home, tmp.path())
+        .args(["gc", "--dry-run"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains(&format!("claude:{retired}")), "{stderr}");
+    assert!(stderr.contains("unread_notes=2"), "{stderr}");
+    assert!(stderr.contains("plain first line"), "{stderr}");
+    assert!(stderr.contains("[REDACTED:"), "{stderr}");
+    assert!(
+        !stderr.contains("sk-abc123456789012345678901"),
+        "human report leaked a secret: {stderr}"
+    );
+
+    let out = a2a(&home, tmp.path())
+        .args(["--json", "gc"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        v["data"]["mesh"]["removed"],
+        serde_json::json!([format!("claude:{retired}"), format!("claude:{stale_old}")]),
+        "{v}"
+    );
+    assert!(mesh_peer_dir(&home, active).is_dir(), "active peer survives gc");
+    assert!(
+        mesh_peer_dir(&home, stale_under_gc).is_dir(),
+        "stale-under-threshold peer survives gc"
+    );
+    assert!(!mesh_peer_dir(&home, retired).exists(), "retired peer removed");
+    assert!(!mesh_peer_dir(&home, stale_old).exists(), "ancient stale peer removed");
+    assert!(feed.exists(), "gc never touches the shared feed");
+    assert_eq!(std::fs::read_to_string(&feed).unwrap(), feed_before);
 }

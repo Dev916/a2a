@@ -101,7 +101,9 @@ use crate::commands::owner;
 use crate::config;
 use crate::home::A2aHome;
 use crate::ids;
+use crate::mesh::{notes, presence, PeerId, Presence};
 use crate::output::{AppError, ExitCode, Outcome};
+use crate::redact;
 use crate::reconcile::reconcile;
 use crate::state::{WorkerSnapshot, WorktreeRef};
 use crate::worktree;
@@ -310,6 +312,8 @@ pub fn run(
         }
     }
 
+    let mesh = sweep_mesh(home, &cfg, now, dry_run, &warn)?;
+
     if !quiet {
         report(
             Counts {
@@ -324,6 +328,7 @@ pub fn run(
             age_secs,
             dry_run,
         );
+        report_mesh(&mesh, dry_run);
     }
 
     let data = if json_mode {
@@ -340,6 +345,7 @@ pub fn run(
             "reclaimed_bytes": reclaimed_bytes,
             "kept": kept,
             "skipped": skipped,
+            "mesh": mesh.to_json(),
         })
     } else {
         // stdout carries the ids and nothing else — the list a caller pipes into
@@ -357,6 +363,226 @@ pub fn run(
         }
     };
     Ok(Outcome::from(data))
+}
+
+/// The mesh half of a gc run. It is separate from worker reclaim on purpose:
+/// workers keep their tombstone/worktree rails, and mesh peers have their own
+/// much smaller lifecycle (retired, or stale past `[mesh].gc_after_days`).
+struct MeshSweep {
+    reclaimable: Vec<MeshCandidate>,
+    kept: Vec<Value>,
+    skipped: Vec<Value>,
+    removed: Vec<String>,
+    reclaimed_bytes: u64,
+}
+
+impl MeshSweep {
+    fn empty() -> Self {
+        Self {
+            reclaimable: Vec::new(),
+            kept: Vec::new(),
+            skipped: Vec::new(),
+            removed: Vec::new(),
+            reclaimed_bytes: 0,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let reclaimable_bytes: u64 = self.reclaimable.iter().map(|c| c.bytes).sum();
+        json!({
+            "reclaimable": self.reclaimable.iter().map(MeshCandidate::to_json).collect::<Vec<_>>(),
+            "reclaimable_bytes": reclaimable_bytes,
+            "eligible": self.reclaimable.iter().map(|c| c.peer.as_str()).collect::<Vec<_>>(),
+            "eligible_bytes": reclaimable_bytes,
+            "removed": self.removed,
+            "reclaimed_bytes": self.reclaimed_bytes,
+            "kept": self.kept,
+            "skipped": self.skipped,
+        })
+    }
+}
+
+struct MeshCandidate {
+    peer: String,
+    dir_name: String,
+    bytes: u64,
+    unread_notes: usize,
+    notes_preview: Vec<Value>,
+    reason: &'static str,
+    last_seen_age_secs: i64,
+}
+
+impl MeshCandidate {
+    fn to_json(&self) -> Value {
+        json!({
+            "peer": self.peer,
+            "bytes": self.bytes,
+            "unread_notes": self.unread_notes,
+            "notes_preview": self.notes_preview,
+            "reason": self.reason,
+            "last_seen_age_secs": self.last_seen_age_secs,
+        })
+    }
+}
+
+fn sweep_mesh(
+    home: &A2aHome,
+    cfg: &config::Config,
+    now: DateTime<Utc>,
+    dry_run: bool,
+    warn: &impl Fn(String),
+) -> Result<MeshSweep, AppError> {
+    let peers = home.root().join("mesh").join("peers");
+    let entries = match std::fs::read_dir(&peers) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MeshSweep::empty()),
+        Err(e) => return Err(io_err("listing mesh peers", e)),
+    };
+
+    let gc_after_secs = cfg
+        .mesh
+        .gc_after_days
+        .saturating_mul(86_400)
+        .min(i64::MAX as u64) as i64;
+    let mut sweep = MeshSweep::empty();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| io_err("listing mesh peers", e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = peers.join(&name);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn(format!("mesh/peers/{name}: unreadable ({e}) — skipped"));
+                sweep.skipped.push(json!({"entry": name, "reason": "unreadable"}));
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            warn(format!(
+                "mesh/peers/{name}: symlinked entry — skipped (gc never follows a link out of the home tree)"
+            ));
+            sweep.skipped.push(json!({"entry": name, "reason": "symlink"}));
+            continue;
+        }
+        if !meta.is_dir() {
+            warn(format!("mesh/peers/{name}: not a directory — skipped"));
+            sweep.skipped.push(json!({"entry": name, "reason": "not a directory"}));
+            continue;
+        }
+        let Some(id) = mesh_peer_from_dir_name(&name) else {
+            warn(format!(
+                "mesh/peers/{name}: not a valid peer directory — skipped (gc only removes what it can name)"
+            ));
+            sweep.skipped.push(json!({"entry": name, "reason": "invalid peer id"}));
+            continue;
+        };
+        let peer = id.to_string();
+        let Some(presence) = presence::load(home, &id)? else {
+            sweep.kept.push(json!({
+                "peer": peer,
+                "reason": "missing presence",
+            }));
+            continue;
+        };
+        let last_seen_age_secs = (now - presence.last_seen).num_seconds().max(0);
+        let label = presence::staleness(
+            presence.last_seen,
+            presence.retired,
+            now,
+            cfg.mesh.stale_after_secs,
+        );
+        let reason = mesh_reclaim_reason(&presence, label, last_seen_age_secs, gc_after_secs);
+        let Some(reason) = reason else {
+            sweep.kept.push(json!({
+                "peer": peer,
+                "reason": if label == presence::Label::Active {
+                    "active"
+                } else {
+                    "stale under gc threshold"
+                },
+                "last_seen_age_secs": last_seen_age_secs,
+            }));
+            continue;
+        };
+        let unread = match notes::unread(home, &id) {
+            Ok(unread) => unread,
+            Err(e) => {
+                warn(format!(
+                    "mesh/peers/{name}: {}: {} — skipped",
+                    e.code, e.message
+                ));
+                sweep.skipped.push(json!({"entry": name, "reason": e.code}));
+                continue;
+            }
+        };
+        sweep.reclaimable.push(MeshCandidate {
+            peer,
+            dir_name: name,
+            bytes: dir_bytes(&path),
+            unread_notes: unread.len(),
+            notes_preview: mesh_notes_preview(&unread),
+            reason,
+            last_seen_age_secs,
+        });
+    }
+
+    sweep.reclaimable.sort_by(|a, b| a.peer.cmp(&b.peer));
+
+    if !dry_run {
+        for c in &sweep.reclaimable {
+            let dir = peers.join(&c.dir_name);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    sweep.removed.push(c.peer.clone());
+                    sweep.reclaimed_bytes += c.bytes;
+                }
+                Err(e) => {
+                    warn(format!("mesh/peers/{}: could not remove: {e}", c.dir_name));
+                    sweep
+                        .skipped
+                        .push(json!({"entry": c.dir_name, "reason": "remove failed"}));
+                }
+            }
+        }
+    }
+
+    Ok(sweep)
+}
+
+fn mesh_reclaim_reason(
+    presence: &Presence,
+    label: presence::Label,
+    last_seen_age_secs: i64,
+    gc_after_secs: i64,
+) -> Option<&'static str> {
+    if presence.retired {
+        return Some("retired");
+    }
+    if label == presence::Label::Stale && last_seen_age_secs >= gc_after_secs {
+        return Some("stale");
+    }
+    None
+}
+
+fn mesh_notes_preview(unread: &[(std::path::PathBuf, crate::mesh::Note)]) -> Vec<Value> {
+    if unread.len() > 5 {
+        return Vec::new();
+    }
+    unread
+        .iter()
+        .map(|(_, note)| {
+            json!({
+                "from": redact::redact_egress(&note.from),
+                "first_line": redact::redact_egress(note.text.lines().next().unwrap_or("")),
+            })
+        })
+        .collect()
+}
+
+fn mesh_peer_from_dir_name(name: &str) -> Option<PeerId> {
+    let (provider, uuid) = name.split_once('-')?;
+    PeerId::parse(&format!("{provider}:{uuid}")).ok()
 }
 
 /// What gc may do about one worker's worktree, decided once per sweep.
@@ -686,6 +912,45 @@ fn report(c: Counts, kept: &[Value], age_secs: i64, dry_run: bool) {
         eprintln!(
             "a2a: gc: kept {held} worker(s) with live worktree work — commit it, merge it, or re-run with --force (the branch is never deleted either way)"
         );
+    }
+}
+
+fn report_mesh(mesh: &MeshSweep, dry_run: bool) {
+    let bytes: u64 = mesh.reclaimable.iter().map(|c| c.bytes).sum();
+    if dry_run {
+        eprintln!(
+            "a2a: gc --dry-run: {} mesh peer(s) eligible under [mesh].gc_after_days ({}) — nothing was deleted",
+            mesh.reclaimable.len(),
+            human_bytes(bytes),
+        );
+    } else if !mesh.reclaimable.is_empty() || !mesh.removed.is_empty() {
+        eprintln!(
+            "a2a: gc: removed {} mesh peer(s), {} reclaimed",
+            mesh.removed.len(),
+            human_bytes(mesh.reclaimed_bytes),
+        );
+    }
+
+    let rows = mesh
+        .reclaimable
+        .iter()
+        .filter(|c| dry_run || mesh.removed.contains(&c.peer))
+        .collect::<Vec<_>>();
+    for c in rows {
+        eprintln!(
+            "a2a: gc: mesh peer {} bytes={} unread_notes={} reason={}",
+            c.peer,
+            human_bytes(c.bytes),
+            c.unread_notes,
+            c.reason,
+        );
+        for note in &c.notes_preview {
+            eprintln!(
+                "a2a: gc:   {} -> {}",
+                note["from"].as_str().unwrap_or(""),
+                note["first_line"].as_str().unwrap_or("")
+            );
+        }
     }
 }
 

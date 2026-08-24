@@ -48,7 +48,7 @@
 //! `Deliver`/`Interrupt`, so a post-restart delivery can never be written into a
 //! dead child's stdin.
 
-use super::core::{state_change_line, BrokerLog};
+use super::core::{state_change_line, BrokerLog, CoreMsg};
 use crate::adapter::{self, AdapterRef, SendPath, TurnSpec};
 use crate::config::{Config, LaneConfig};
 use crate::events::{self, Envelope, EventClass, EventKind};
@@ -222,7 +222,7 @@ fn gone(id: &str) -> AppError {
 /// `cfg` is owned by the actor because two of its jobs need lane policy on
 /// every step: the per-turn sandbox/effort it re-supplies to `turn/start`, and
 /// the deadlines it arms from `start`/`task`/`blocked_timeout_secs`.
-// Eight: the actor's dependency set, one parameter each, and every one of them
+// Nine: the actor's dependency set, one parameter each, and every one of them
 // is a distinct thing the core owns. Bundling them into a struct would move the
 // same list somewhere else and cost the two call sites their one-line edits.
 #[allow(clippy::too_many_arguments)]
@@ -232,11 +232,22 @@ pub fn spawn_worker_actor(
     cfg: Config,
     adapter_rx: watch::Receiver<AdapterRef>,
     settle_tx: mpsc::Sender<Settled>,
+    core_tx: mpsc::Sender<CoreMsg>,
     cancel: CancellationToken,
     tracker: &TaskTracker,
     log: BrokerLog,
 ) -> WorkerHandle {
-    let (handle, actor) = build_worker_actor(dir, snap, cfg, adapter_rx, settle_tx, cancel, log);
+    let (handle, actor) = build_worker_actor(
+        dir,
+        snap,
+        cfg,
+        adapter_rx,
+        settle_tx,
+        core_tx,
+        cancel,
+        tracker.clone(),
+        log,
+    );
     tracker.spawn(actor);
     handle
 }
@@ -247,13 +258,16 @@ pub fn spawn_worker_actor(
 /// needs the two apart: it spawns actors into a `JoinSet` (tracked, so shutdown
 /// still waits for them) so that a panicking actor is reported as a panic
 /// against exactly one worker instead of vanishing into a detached task.
+#[allow(clippy::too_many_arguments)]
 pub fn build_worker_actor(
     dir: PathBuf,
     snap: WorkerSnapshot,
     cfg: Config,
     adapter_rx: watch::Receiver<AdapterRef>,
     settle_tx: mpsc::Sender<Settled>,
+    core_tx: mpsc::Sender<CoreMsg>,
     cancel: CancellationToken,
+    tracker: TaskTracker,
     log: BrokerLog,
 ) -> (WorkerHandle, impl std::future::Future<Output = ()> + Send + 'static) {
     let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
@@ -265,7 +279,9 @@ pub fn build_worker_actor(
         cfg,
         adapter_rx,
         settle_tx,
+        core_tx,
         cancel,
+        tracker,
         log,
         rx,
         trace: TraceBuffer::new(TRACE_BUFFER_CAPACITY),
@@ -286,7 +302,9 @@ pub struct WorkerActor {
     cfg: Config,
     adapter_rx: watch::Receiver<AdapterRef>,
     settle_tx: mpsc::Sender<Settled>,
+    core_tx: mpsc::Sender<CoreMsg>,
     cancel: CancellationToken,
+    tracker: TaskTracker,
     /// The fleet's transition log (spec §4.5). `BrokerLog` is `Clone` over an
     /// mpsc sender, so holding one here adds no writer and no channel: the
     /// broker's dedicated log task remains the sole writer of `broker.jsonl`.
@@ -750,6 +768,35 @@ impl WorkerActor {
         if let Err(e) = outcome {
             self.warn("concluding the turn", &e);
         }
+        self.scan_mesh_notes_after_turn();
+    }
+
+    fn scan_mesh_notes_after_turn(&self) {
+        if !crate::mesh::routing::has_unrouted_note(&self.dir) {
+            return;
+        }
+        let worker_id = self.snap.id.clone();
+        let dir = self.dir.clone();
+        let tx = self.core_tx.clone();
+        self.tracker.spawn(async move {
+            let notes = match crate::mesh::routing::scan_outbox(&dir) {
+                Ok(notes) => notes,
+                Err(e) => {
+                    eprintln!("a2a broker: {worker_id}: scanning mesh notes: {e}");
+                    return;
+                }
+            };
+            if notes.is_empty() {
+                return;
+            }
+            let _ = tx
+                .send(CoreMsg::MeshNotesReady {
+                    worker_id,
+                    dir,
+                    notes,
+                })
+                .await;
+        });
     }
 
     // -- commands -----------------------------------------------------------
@@ -1491,6 +1538,7 @@ mod tests {
             "fake-witness",
         ));
         let (settle_tx, settle_rx) = mpsc::channel(16);
+        let (core_tx, _core_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
         // A real `BrokerLog` writing into the harness's temp dir, MOVED into
@@ -1503,6 +1551,7 @@ mod tests {
             cfg,
             adapter_rx,
             settle_tx,
+            core_tx,
             cancel.clone(),
             &tracker,
             log,

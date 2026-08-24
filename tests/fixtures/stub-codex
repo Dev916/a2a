@@ -1,7 +1,7 @@
 #!/bin/sh
 # stub-codex: scripted `codex exec --json` stand-in.
 # Env knobs: STUB_SLEEP, STUB_EXIT, STUB_LAST_MSG, STUB_NO_RESULT, STUB_LEAK,
-#            STUB_EMIT_QUESTION, STUB_RECORD (dir for resume recordings), STUB_RESUME_FAIL
+#            STUB_EMIT_QUESTION, STUB_MESH_NOTE, STUB_RECORD (dir for resume recordings), STUB_RESUME_FAIL
 #            STUB_ARGV_FILE (file; the whole argv, every run),
 #            STUB_PWD_FILE (file; this child's own working directory)
 out=""; outbox=""; resume=0
@@ -38,6 +38,9 @@ if [ -n "$STUB_DUMP_ENV" ]; then env > "$STUB_DUMP_ENV"; fi
 [ -n "$STUB_SLEEP" ] && sleep "$STUB_SLEEP"
 if [ -n "$STUB_EMIT_QUESTION" ] && [ -n "$outbox" ]; then
   printf '%s\n' '{"seq":1,"question":"A or B?","blocking":true}' > "$outbox/1.question.json"
+fi
+if [ -n "$STUB_MESH_NOTE" ] && [ -n "$outbox" ]; then
+  printf '%s\n' "$STUB_MESH_NOTE" > "$outbox/1.note.json"
 fi
 printf '%s\n' '{"type":"turn.completed","id":"t1"}'
 if [ -n "$out" ] && [ -z "$STUB_NO_RESULT" ] && [ -z "$STUB_EMIT_QUESTION" ]; then

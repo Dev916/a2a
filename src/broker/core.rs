@@ -5,7 +5,7 @@
 //!            ┌──────────────── CoreMsg (bounded mpsc) ────────────────┐
 //!  CLI/socket│ Spawn Send Interrupt Kill Resume List Status Subscribe │
 //!  internals │ ConnClosed ChildDied IdleCheck WorkerSettled           │
-//!            │ AutoReviewReady                                        │
+//!            │ AutoReviewReady MeshNotesReady                         │
 //!            └───────────────────────┬────────────────────────────────┘
 //!                                    ▼
 //!   child stdout ─▶ demux ─▶ BrokerCore ─▶ WorkerActor mailbox (per worker)
@@ -51,6 +51,7 @@ use crate::events::{self, Envelope, EventClass, EventKind, Transport};
 use crate::fold;
 use crate::fsm::{FailureClass, WorkerState};
 use crate::inbox;
+use crate::mesh::routing::{OutboxNote, Routed};
 use crate::output::{AppError, ExitCode};
 use crate::protocol::RpcNotification;
 use crate::redact;
@@ -237,6 +238,16 @@ pub enum CoreMsg {
         impl_id: String,
         impl_dir: PathBuf,
         brief_text: String,
+    },
+    /// Worker-originated mesh notes found by a `WorkerActor` at turn end.
+    ///
+    /// The actor only detected and read files from its own worker directory;
+    /// cross-worker effects are routed from the core side through the shared
+    /// mesh routing implementation, off this registry task.
+    MeshNotesReady {
+        worker_id: String,
+        dir: PathBuf,
+        notes: Vec<OutboxNote>,
     },
 
     // ---- internal ---------------------------------------------------------
@@ -1523,6 +1534,11 @@ impl BrokerCore {
                 impl_dir,
                 brief_text,
             } => self.on_auto_review_ready(impl_id, impl_dir, brief_text).await,
+            CoreMsg::MeshNotesReady {
+                worker_id,
+                dir,
+                notes,
+            } => self.on_mesh_notes_ready(worker_id, dir, notes),
             CoreMsg::Notification {
                 generation,
                 method,
@@ -1916,6 +1932,47 @@ impl BrokerCore {
             .line(json!({"ts": Utc::now(), "kind": "auto_review_declined",
                          "worker": impl_id, "code": e.code}))
             .await;
+    }
+
+    fn on_mesh_notes_ready(&self, worker_id: String, dir: PathBuf, notes: Vec<OutboxNote>) {
+        let root = self.home.root().to_path_buf();
+        let cfg = self.cfg.clone();
+        let log = self.log.clone();
+        self.tracker.spawn(async move {
+            for note in notes {
+                let to = note.note_to.clone();
+                let worker = worker_id.clone();
+                let route_root = root.clone();
+                let route_cfg = cfg.clone();
+                let route_dir = dir.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    let home = crate::home::A2aHome::adopt(route_root);
+                    let snap = state::load_snapshot(&route_dir).map_err(AppError::from)?;
+                    crate::mesh::routing::route(&home, &route_cfg, &snap, &note)
+                })
+                .await;
+                let line = match joined {
+                    Ok(Ok(Routed::Delivered(_))) => {
+                        json!({"ts": Utc::now(), "kind": "mesh_note_routed",
+                               "worker": worker, "to": to})
+                    }
+                    Ok(Ok(Routed::Rejected(reason))) => {
+                        json!({"ts": Utc::now(), "kind": "mesh_note_rejected",
+                               "worker": worker, "to": to, "reason": reason})
+                    }
+                    Ok(Err(e)) => {
+                        json!({"ts": Utc::now(), "kind": "mesh_note_rejected",
+                               "worker": worker, "to": to, "reason": e.code})
+                    }
+                    Err(e) => {
+                        json!({"ts": Utc::now(), "kind": "mesh_note_rejected",
+                               "worker": worker, "to": to,
+                               "reason": "INTERNAL", "detail": e.to_string()})
+                    }
+                };
+                log.line(line).await;
+            }
+        });
     }
 
     /// A settled reviewer's outcome, reported back to the worker it reviewed:
@@ -2382,7 +2439,9 @@ impl BrokerCore {
             self.cfg.clone(),
             self.adapter_rx.clone(),
             self.settle_tx.clone(),
+            self.tx.clone(),
             self.cancel.child_token(),
+            self.tracker.clone(),
             self.log.clone(),
         );
         let tracked = self.tracker.track_future(actor);
@@ -3405,19 +3464,20 @@ mod tests {
     use crate::config::Lane;
     use crate::home::A2aHome;
 
-    /// The registry's surface is these sixteen messages, and every one of them
+    /// The registry's surface is these seventeen messages, and every one of them
     /// is a message — not a lock, not a shared map, not a second door.
     ///
     /// Twelve of them were Task 7's; admission control (spec §4.9) added the two
     /// that bracket a spawn — `Admit` (may this worker run yet?) and `Enqueue`
     /// (a previous instance's queue, replayed) — the circuit breaker added the
-    /// fifteenth, `ResetBreaker`, and `auto_review` (spec §4.8) the sixteenth,
-    /// `AutoReviewReady`: the second hop of a hook whose first hop refuses to
-    /// do its work on this task. `name()`'s `_ => "internal"` catch-all means a
+    /// fifteenth, `ResetBreaker`, `auto_review` (spec §4.8) the sixteenth,
+    /// `AutoReviewReady`, and worker-originated mesh notes the seventeenth:
+    /// both are second hops whose first hop refuses to do its work on this
+    /// task. `name()`'s `_ => "internal"` catch-all means a
     /// new variant neither breaks the build nor fails the assertion, so this
     /// list only stays true if every task that adds one comes here.
     #[test]
-    fn the_registry_is_reached_by_exactly_these_sixteen_messages() {
+    fn the_registry_is_reached_by_exactly_these_seventeen_messages() {
         fn name(msg: &CoreMsg) -> &'static str {
             match msg {
                 CoreMsg::Admit { .. } => "Admit",
@@ -3436,6 +3496,7 @@ mod tests {
                 CoreMsg::WorkerSettled(_) => "WorkerSettled",
                 CoreMsg::ResetBreaker { .. } => "ResetBreaker",
                 CoreMsg::AutoReviewReady { .. } => "AutoReviewReady",
+                CoreMsg::MeshNotesReady { .. } => "MeshNotesReady",
                 // Plumbing: the demux, the supervisor and the thread-learner
                 // reach the registry through the same queue as everyone else.
                 _ => "internal",
@@ -3463,6 +3524,11 @@ mod tests {
                 impl_dir: PathBuf::from("/tmp/w"),
                 brief_text: String::new(),
             },
+            CoreMsg::MeshNotesReady {
+                worker_id: "w".into(),
+                dir: PathBuf::from("/tmp/w"),
+                notes: Vec::new(),
+            },
         ];
         let names: Vec<&str> = surface.iter().map(name).collect();
         assert_eq!(
@@ -3470,7 +3536,7 @@ mod tests {
             vec![
                 "Admit", "Spawn", "Enqueue", "Send", "Interrupt", "Kill", "Resume", "List",
                 "Status", "Subscribe", "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled",
-                "ResetBreaker", "AutoReviewReady"
+                "ResetBreaker", "AutoReviewReady", "MeshNotesReady"
             ]
         );
         // The mailbox is bounded — an unbounded queue in front of one owner is

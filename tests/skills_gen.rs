@@ -222,6 +222,12 @@ fn both_codex_artifacts_carry_the_prompt_contract() {
             "Work only in the assigned cwd/worktree",
             "no build artifacts",
             "verify may rebuild",
+            // Worker-originated mesh notes.
+            "outbox/<seq>.note.json",
+            "\"to\": \"<peer-id or worker-id>\"",
+            "fire-and-forget",
+            "a2a routes it after your turn ends",
+            "secrets are refused",
         ] {
             assert!(
                 body.contains(&flat(needle)),

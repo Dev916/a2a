@@ -33,6 +33,8 @@ into the child — production spawns pass zero extra pairs):
                        turn/started, as fast as the pipe takes them — the burst
                        a `tail --follow` has to carry with no gaps and no
                        duplicates
+  FAKE_MESH_NOTE       JSON object to write once as <cwd>/outbox/1.note.json
+                       during each thread's first turn
 
 SCENARIOS
   happy            thread/started -> turn/started -> item/completed{agentMessage}
@@ -347,6 +349,17 @@ def write_outbox_question(cwd):
     os.replace(tmp, os.path.join(outbox, "1.question.json"))
 
 
+def write_outbox_note(cwd, payload):
+    outbox = os.path.join(cwd, "outbox")
+    os.makedirs(outbox, exist_ok=True)
+    tmp = os.path.join(outbox, ".1.note.json.tmp")
+    with open(tmp, "w") as f:
+        f.write(payload)
+        if not payload.endswith("\n"):
+            f.write("\n")
+    os.replace(tmp, os.path.join(outbox, "1.note.json"))
+
+
 # ---------------------------------------------------------------------------
 # request handling
 # ---------------------------------------------------------------------------
@@ -397,6 +410,11 @@ def handle_request(req_id, method, params):
         notify("turn/started", {"threadId": thread_id, "turn": turn_obj(turn_id, "inProgress")})
         for _ in range(FLOOD):
             emit_agent_message(thread_id, turn_id)
+        mesh_note = os.environ.get("FAKE_MESH_NOTE")
+        note_key = "mesh_note:%s" % thread_id
+        if mesh_note and not FLAGS.get(note_key):
+            set_flag(note_key, True)
+            write_outbox_note(THREADS.get(thread_id, {}).get("cwd") or os.getcwd(), mesh_note)
 
         if SCENARIO == "crash-mid-turn" and LAUNCH == 1:
             die(70)

@@ -461,7 +461,7 @@ fn resolve_peer_prefix(home: &A2aHome, s: &str) -> Result<Option<PeerId>, AppErr
     }
 }
 
-fn write_note_file(home: &A2aHome, peer: &PeerId, note: &Note) -> Result<PathBuf, AppError> {
+pub(crate) fn write_note_file(home: &A2aHome, peer: &PeerId, note: &Note) -> Result<PathBuf, AppError> {
     let inbox = peer_dir(home, peer).join("inbox");
     create_dir_0700(&inbox.join("read")).map_err(|e| io_err("creating peer inbox", e))?;
     let seq = next_seq(&inbox);
@@ -493,7 +493,7 @@ fn seq_of(name: &str) -> Option<u64> {
     name.split('-').next()?.parse::<u64>().ok()
 }
 
-fn routable_worker(
+pub(crate) fn routable_worker(
     home: &A2aHome,
     target: &Target,
     peer: &PeerId,

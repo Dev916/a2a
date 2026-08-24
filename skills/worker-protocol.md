@@ -95,6 +95,26 @@ and why. An honest partial result is worth more than a confident one that does
 not survive re-checking.
 <!-- a2a:end result-and-evidence -->
 
+<!-- a2a:section mesh-notes -->
+## Worker-originated mesh notes
+
+To send a directed note to another local agent, write
+`outbox/<seq>.note.json`:
+
+```json
+{"to": "<peer-id or worker-id>", "text": "…", "refs": {}}
+```
+
+This is fire-and-forget. The worker only writes its own outbox; a2a routes it
+after your turn ends and renames the source file so you can see the outcome.
+A routed note becomes
+`outbox/<seq>.note.routed.json`; a refused note becomes
+`outbox/<seq>.note.rejected.json`.
+
+Do not put secrets in mesh notes. Note text is scanned before routing, and
+secrets are refused rather than delivered.
+<!-- a2a:end mesh-notes -->
+
 <!-- a2a:section worktree-notes -->
 ## You are probably in a git worktree
 

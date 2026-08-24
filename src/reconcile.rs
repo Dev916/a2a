@@ -87,8 +87,14 @@ pub fn reconcile(
             format!("no worker `{id}`"),
         ));
     }
-    let _lock = lock_state(&dir)?;
-    reconcile_locked(home.root(), &dir, cfg, now)
+    let snap = {
+        let _lock = lock_state(&dir)?;
+        reconcile_locked(home.root(), &dir, cfg, now)?
+    };
+    if snap.transport == Transport::Exec {
+        route_outbox_notes(home, cfg, &dir, &snap);
+    }
+    Ok(snap)
 }
 
 /// Everything from here down assumes `state.lock` is held.
@@ -630,6 +636,33 @@ pub fn has_unanswered_question(dir: &Path, last_answer_seq: u64) -> bool {
         }
     }
     false
+}
+
+fn route_outbox_notes(home: &A2aHome, cfg: &Config, dir: &Path, snap: &WorkerSnapshot) {
+    let notes = match crate::mesh::routing::scan_outbox(dir) {
+        Ok(notes) => notes,
+        Err(e) => {
+            eprintln!("a2a: warning: {}: scanning mesh notes: {e}", snap.id);
+            return;
+        }
+    };
+    for note in notes {
+        match crate::mesh::routing::route(home, cfg, snap, &note) {
+            Ok(crate::mesh::routing::Routed::Delivered(_)) => {}
+            Ok(crate::mesh::routing::Routed::Rejected(reason)) => {
+                eprintln!(
+                    "a2a: warning: {}: rejected mesh note to {}: {}",
+                    snap.id, note.note_to, reason
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "a2a: warning: {}: routing mesh note to {}: {}: {}",
+                    snap.id, note.note_to, e.code, e.message
+                );
+            }
+        }
+    }
 }
 
 /// Did `epoch` begin with an `a2a resume` that never saw a turn start?

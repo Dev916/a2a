@@ -86,6 +86,24 @@ If part of the work is unfinished, say so in the result, with what is missing
 and why. An honest partial result is worth more than a confident one that does
 not survive re-checking.
 
+## Worker-originated mesh notes
+
+To send a directed note to another local agent, write
+`outbox/<seq>.note.json`:
+
+```json
+{"to": "<peer-id or worker-id>", "text": "…", "refs": {}}
+```
+
+This is fire-and-forget. The worker only writes its own outbox; a2a routes it
+after your turn ends and renames the source file so you can see the outcome.
+A routed note becomes
+`outbox/<seq>.note.routed.json`; a refused note becomes
+`outbox/<seq>.note.rejected.json`.
+
+Do not put secrets in mesh notes. Note text is scanned before routing, and
+secrets are refused rather than delivered.
+
 ## You are probably in a git worktree
 
 An impl-lane worker runs in a git worktree at `$A2A_HOME/worktrees/<id>`,

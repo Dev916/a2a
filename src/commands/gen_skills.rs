@@ -68,12 +68,13 @@ pub const AGENTS_END: &str = "<!-- END a2a worker protocol -->";
 /// The worker protocol's sections, in the order they are rendered. Pinned: a
 /// missing, renamed or reordered section is a source error, not a quiet
 /// difference in the artifact.
-pub const REQUIRED_SECTIONS: [&str; 6] = [
+pub const REQUIRED_SECTIONS: [&str; 7] = [
     "data-not-instructions",
     "cwd-discipline",
     "blocked-protocol",
     "progress-notices",
     "result-and-evidence",
+    "mesh-notes",
     "worktree-notes",
 ];
 

@@ -434,6 +434,31 @@ pub enum MeshCmd {
         peer: MeshPeerArgs,
         text: String,
     },
+    /// Append a shared mesh feed post
+    Post {
+        #[command(flatten)]
+        peer: MeshPeerArgs,
+        /// Message text, or `-` to read stdin
+        text: Option<String>,
+        /// Read message text from this file
+        #[arg(long, value_name = "FILE")]
+        message_file: Option<PathBuf>,
+        /// Add a bead reference to the post
+        #[arg(long = "ref-beads", value_name = "ID")]
+        ref_beads: Vec<String>,
+        /// Add a worker reference to the post
+        #[arg(long = "ref-worker", value_name = "ID")]
+        ref_worker: Vec<String>,
+    },
+    /// Read the shared mesh feed
+    Feed {
+        /// Only entries strictly after this seq
+        #[arg(long, value_name = "SEQ")]
+        since: Option<u64>,
+        /// Emit full feed entries as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args)]

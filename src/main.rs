@@ -68,6 +68,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Heartbeat { .. } => "mesh heartbeat",
             MeshCmd::Retire(_) => "mesh retire",
             MeshCmd::Status { .. } => "mesh status",
+            MeshCmd::Post { .. } => "mesh post",
+            MeshCmd::Feed { .. } => "mesh feed",
         },
     }
 }
@@ -296,7 +298,8 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
         }
         Cmd::Mesh { cmd } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            a2a::commands::mesh_cmd::run(&home, cmd, cli.global.json, cli.global.quiet)
+            let (cfg, _, _) = a2a::config::load(&home)?;
+            a2a::commands::mesh_cmd::run(&home, &cfg, cmd, cli.global.json, cli.global.quiet)
         }
     }
 }

@@ -114,8 +114,10 @@ impl EventLog {
             let data = fs::read(&path)?;
             let mut end_of_complete = 0usize;
             for line in complete_lines(&data) {
-                if let Ok(e) = serde_json::from_slice::<crate::events::Envelope>(line.bytes_) {
-                    last_seq = e.seq;
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line.bytes_) {
+                    if let Some(seq) = v.get("seq").and_then(serde_json::Value::as_u64) {
+                        last_seq = last_seq.max(seq);
+                    }
                     end_of_complete = line.end;
                 } else {
                     break;
@@ -140,8 +142,12 @@ impl EventLog {
             if rotated.exists() {
                 let data = fs::read(&rotated)?;
                 for line in complete_lines(&data) {
-                    match serde_json::from_slice::<crate::events::Envelope>(line.bytes_) {
-                        Ok(e) => last_seq = last_seq.max(e.seq),
+                    match serde_json::from_slice::<serde_json::Value>(line.bytes_) {
+                        Ok(v) => {
+                            if let Some(seq) = v.get("seq").and_then(serde_json::Value::as_u64) {
+                                last_seq = last_seq.max(seq);
+                            }
+                        }
                         Err(_) => break, // torn tail: it and everything after are not history
                     }
                 }
@@ -193,6 +199,46 @@ impl EventLog {
         Ok(env.seq)
     }
 
+    /// Stamp an object-shaped JSON row with `seq`, append it as one complete
+    /// line, and rotate the named log with the same durability as [`Self::append`].
+    ///
+    /// This is for named logs whose row shape is not [`crate::events::Envelope`]
+    /// (currently the mesh feed). The rotation marker is a bookkeeping row
+    /// without a `seq`, so application-level cursors remain gapless.
+    pub fn append_json(&mut self, value: &mut serde_json::Value) -> io::Result<u64> {
+        let Some(obj) = value.as_object_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "log row must be a JSON object",
+            ));
+        };
+        obj.insert(
+            "seq".to_string(),
+            serde_json::Value::Number(self.next_seq.into()),
+        );
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        if self.max_bytes != 0
+            && self.bytes > 0
+            && self.bytes + line.len() as u64 > self.max_bytes
+        {
+            self.rotate_json()?;
+            let obj = value.as_object_mut().expect("object shape checked above");
+            obj.insert(
+                "seq".to_string(),
+                serde_json::Value::Number(self.next_seq.into()),
+            );
+            line = serde_json::to_vec(value)?;
+            line.push(b'\n');
+        }
+        self.file.write_all(&line)?;
+        self.file.sync_data()?;
+        self.bytes += line.len() as u64;
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        Ok(seq)
+    }
+
     /// Rename the current generation aside, open a fresh log, and write the
     /// rotation marker as its first line.
     ///
@@ -204,21 +250,7 @@ impl EventLog {
         use crate::events::{EventClass, EventKind, Envelope};
 
         let names = LogNames::new(&self.base)?;
-        let path = self.dir.join(&names.current);
-        let rotated = self.dir.join(&names.rotated);
-        // Single-generation retention: a `.1` already here is about to be lost,
-        // and that is a fact the log records rather than one a reader infers.
-        let discarded_prior_generation = rotated.exists();
-        fs::rename(&path, &rotated)?; // atomic, replaces any existing `.1`
-        File::open(&self.dir)?.sync_all()?; // the rename is durable before anything else
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)?;
-        // ... and so is the fresh file's own directory entry, or a crash could
-        // lose an `fsync`ed append to a file nobody can find.
-        File::open(&self.dir)?.sync_all()?;
+        let discarded_prior_generation = self.rotate_files(&names)?;
         self.bytes = 0;
 
         // `next_seq` is NOT reset: seqs continue across the split, which is what
@@ -244,6 +276,44 @@ impl EventLog {
         self.bytes += line.len() as u64;
         self.next_seq += 1;
         Ok(())
+    }
+
+    fn rotate_json(&mut self) -> io::Result<()> {
+        let names = LogNames::new(&self.base)?;
+        let discarded_prior_generation = self.rotate_files(&names)?;
+        self.bytes = 0;
+        let marker = serde_json::json!({
+            "kind": "events_rotated",
+            "ts": chrono::Utc::now(),
+            "rotated_to": names.rotated,
+            "last_rotated_seq": self.next_seq.saturating_sub(1),
+            "discarded_prior_generation": discarded_prior_generation,
+        });
+        let mut line = serde_json::to_vec(&marker)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
+        self.file.sync_data()?;
+        self.bytes += line.len() as u64;
+        Ok(())
+    }
+
+    fn rotate_files(&mut self, names: &LogNames) -> io::Result<bool> {
+        let path = self.dir.join(&names.current);
+        let rotated = self.dir.join(&names.rotated);
+        // Single-generation retention: a `.1` already here is about to be lost,
+        // and that is a fact the log records rather than one a reader infers.
+        let discarded_prior_generation = rotated.exists();
+        fs::rename(&path, &rotated)?; // atomic, replaces any existing `.1`
+        File::open(&self.dir)?.sync_all()?; // the rename is durable before anything else
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
+        // ... and so is the fresh file's own directory entry, or a crash could
+        // lose an `fsync`ed append to a file nobody can find.
+        File::open(&self.dir)?.sync_all()?;
+        Ok(discarded_prior_generation)
     }
 }
 
@@ -274,6 +344,20 @@ pub fn read_events_named(
     let mut out = vec![];
     read_one_file(&dir.join(&names.rotated), since_seq, &mut out)?;
     read_one_file(&dir.join(&names.current), since_seq, &mut out)?;
+    Ok(out)
+}
+
+/// Read object-shaped rows from a named log with `seq > since_seq`, spanning
+/// the retained generation first and then the current file.
+pub fn read_json_named(
+    dir: &Path,
+    base: &str,
+    since_seq: u64,
+) -> io::Result<Vec<serde_json::Value>> {
+    let names = LogNames::new(base)?;
+    let mut out = vec![];
+    read_one_json_file(&dir.join(&names.rotated), since_seq, &mut out)?;
+    read_one_json_file(&dir.join(&names.current), since_seq, &mut out)?;
     Ok(out)
 }
 
@@ -323,6 +407,39 @@ fn read_one_file(
         }
     }
     Ok(())
+}
+
+fn read_one_json_file(
+    path: &Path,
+    since_seq: u64,
+    out: &mut Vec<serde_json::Value>,
+) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let data = fs::read(path)?;
+    for line in complete_lines(&data) {
+        match serde_json::from_slice::<serde_json::Value>(line.bytes_) {
+            Ok(v) => push_json_after(v, since_seq, out),
+            Err(_) => return Ok(()),
+        }
+    }
+    if let Some(tail) = trailing_fragment(&data) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(tail) {
+            push_json_after(v, since_seq, out);
+        }
+    }
+    Ok(())
+}
+
+fn push_json_after(value: serde_json::Value, since_seq: u64, out: &mut Vec<serde_json::Value>) {
+    if value
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|seq| seq > since_seq)
+    {
+        out.push(value);
+    }
 }
 
 struct Line<'a> {

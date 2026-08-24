@@ -221,6 +221,87 @@ fn broker_events_max_bytes_defaults_to_ten_mebibytes_and_names_its_layer() {
     assert_eq!(v["data"]["origins"]["broker.events_max_bytes"], "env");
 }
 
+/// The mesh section (spec §10): the feed cap, staleness window and gc horizon
+/// report default origins, layer through file/env, reject malformed values with
+/// the dotted key, and warn on unknown siblings.
+#[test]
+fn mesh_defaults_layer_and_name_bad_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["mesh"]["feed_max_bytes"], 10_485_760);
+    assert_eq!(v["data"]["mesh"]["stale_after_secs"], 900);
+    assert_eq!(v["data"]["mesh"]["gc_after_days"], 7);
+    for key in [
+        "mesh.feed_max_bytes",
+        "mesh.stale_after_secs",
+        "mesh.gc_after_days",
+    ] {
+        assert_eq!(v["data"]["origins"][key], "default", "{key}");
+    }
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[mesh]\nfeed_max_bytes = 65536\nstale_after_secs = 30\ngc_after_days = 2\nsurprise = 1\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show", "--origin"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["mesh"]["feed_max_bytes"], 65536);
+    assert_eq!(v["data"]["mesh"]["stale_after_secs"], 30);
+    assert_eq!(v["data"]["mesh"]["gc_after_days"], 2);
+    assert_eq!(v["data"]["origins"]["mesh.feed_max_bytes"], "file");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("mesh.surprise"), "{stderr}");
+
+    let v = show(
+        tmp.path(),
+        &[
+            ("A2A_MESH_FEED_MAX_BYTES", "0"),
+            ("A2A_MESH_STALE_AFTER_SECS", "45"),
+            ("A2A_MESH_GC_AFTER_DAYS", "10"),
+        ],
+        true,
+    );
+    assert_eq!(v["data"]["mesh"]["feed_max_bytes"], 0);
+    assert_eq!(v["data"]["mesh"]["stale_after_secs"], 45);
+    assert_eq!(v["data"]["mesh"]["gc_after_days"], 10);
+    assert_eq!(v["data"]["origins"]["mesh.gc_after_days"], "env");
+
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .env("A2A_MESH_STALE_AFTER_SECS", "soon")
+        .args(["--json", "config", "show"])
+        .assert()
+        .failure();
+    let e: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(e["error"]["code"], "CONFIG_INVALID");
+    assert!(
+        e["error"]["message"].as_str().unwrap().contains("mesh.stale_after_secs"),
+        "{e}"
+    );
+
+    std::fs::write(tmp.path().join("config.toml"), "[mesh]\ngc_after_days = \"later\"\n")
+        .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .failure();
+    let e: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(e["error"]["code"], "CONFIG_INVALID");
+    assert!(
+        e["error"]["message"].as_str().unwrap().contains("mesh.gc_after_days"),
+        "{e}"
+    );
+}
+
 /// The admission section (spec §4.9): three numbers with the same
 /// defaults < file < env precedence every other key obeys, named in `--origin`
 /// as `admission.global_cap`, `admission.queue_cap` and

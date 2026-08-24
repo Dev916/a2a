@@ -23,3 +23,4 @@ pub mod store;
 pub mod sync;
 pub mod templates;
 pub mod worktree;
+pub mod mesh;

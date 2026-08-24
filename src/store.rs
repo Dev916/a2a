@@ -71,8 +71,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub struct EventLog {
     file: File,
     next_seq: u64,
-    /// The worker directory, kept so a rotation can rename in place.
+    /// The directory, kept so a rotation can rename in place.
     dir: PathBuf,
+    /// Basename without `.jsonl`; `"events"` for the worker WAL.
+    base: String,
     /// Bytes in the CURRENT file (`0` right after a rotation).
     bytes: u64,
     /// Rotate past this; `0` disables rotation entirely.
@@ -87,7 +89,7 @@ impl EventLog {
     /// per command — so the cap stays a detail of the two writers that can
     /// actually produce volume (see [`Self::open_capped`]).
     pub fn open(worker_dir: &Path) -> io::Result<Self> {
-        Self::open_capped(worker_dir, crate::config::DEFAULT_EVENTS_MAX_BYTES)
+        Self::open_named(worker_dir, "events", crate::config::DEFAULT_EVENTS_MAX_BYTES)
     }
 
     /// [`Self::open`] with an explicit cap in bytes; `0` disables rotation.
@@ -98,7 +100,14 @@ impl EventLog {
     /// resumed after a rotation still continues the whole history rather than
     /// restarting inside the new generation.
     pub fn open_capped(worker_dir: &Path, max_bytes: u64) -> io::Result<Self> {
-        let path = worker_dir.join(EVENTS_FILE);
+        Self::open_named(worker_dir, "events", max_bytes)
+    }
+
+    /// Open (creating if needed) `<dir>/<base>.jsonl` for appending, with one
+    /// retained rotated generation at `<base>.jsonl.1`.
+    pub fn open_named(dir: &Path, base: &str, max_bytes: u64) -> io::Result<Self> {
+        let names = LogNames::new(base)?;
+        let path = dir.join(&names.current);
         let mut last_seq = 0u64;
         let mut bytes = 0u64;
         if path.exists() {
@@ -127,7 +136,7 @@ impl EventLog {
         // line already holds the maximum. (After a rename the fresh file is
         // empty for exactly one append — that is the window this covers.)
         if last_seq == 0 {
-            let rotated = worker_dir.join(EVENTS_ROTATED_FILE);
+            let rotated = dir.join(&names.rotated);
             if rotated.exists() {
                 let data = fs::read(&rotated)?;
                 for line in complete_lines(&data) {
@@ -146,7 +155,8 @@ impl EventLog {
         Ok(Self {
             file,
             next_seq: last_seq + 1,
-            dir: worker_dir.to_path_buf(),
+            dir: dir.to_path_buf(),
+            base: base.to_string(),
             bytes,
             max_bytes,
         })
@@ -193,8 +203,9 @@ impl EventLog {
     fn rotate(&mut self, trigger: &crate::events::Envelope) -> io::Result<()> {
         use crate::events::{EventClass, EventKind, Envelope};
 
-        let path = self.dir.join(EVENTS_FILE);
-        let rotated = self.dir.join(EVENTS_ROTATED_FILE);
+        let names = LogNames::new(&self.base)?;
+        let path = self.dir.join(&names.current);
+        let rotated = self.dir.join(&names.rotated);
         // Single-generation retention: a `.1` already here is about to be lost,
         // and that is a fact the log records rather than one a reader infers.
         let discarded_prior_generation = rotated.exists();
@@ -219,7 +230,7 @@ impl EventLog {
             EventClass::Lifecycle,
             EventKind::EventsRotated,
             serde_json::json!({
-                "rotated_to": EVENTS_ROTATED_FILE,
+                "rotated_to": names.rotated,
                 "last_rotated_seq": last_rotated_seq,
                 "discarded_prior_generation": discarded_prior_generation,
             }),
@@ -236,6 +247,12 @@ impl EventLog {
     }
 }
 
+/// [`EventLog::open_named`] as a module-level helper for callers that do not
+/// already spell the log type.
+pub fn open_named(dir: &Path, base: &str, max_bytes: u64) -> io::Result<EventLog> {
+    EventLog::open_named(dir, base, max_bytes)
+}
+
 /// Read every parseable envelope with `seq > since_seq`, tolerating a torn
 /// trailing line (it and everything after it are dropped, without an error).
 ///
@@ -244,10 +261,39 @@ impl EventLog {
 /// an unrotated log would have produced, minus whatever a *second* rotation
 /// already discarded.
 pub fn read_events(worker_dir: &Path, since_seq: u64) -> io::Result<Vec<crate::events::Envelope>> {
+    read_events_named(worker_dir, "events", since_seq)
+}
+
+/// Read every parseable envelope with `seq > since_seq` from a named log.
+pub fn read_events_named(
+    dir: &Path,
+    base: &str,
+    since_seq: u64,
+) -> io::Result<Vec<crate::events::Envelope>> {
+    let names = LogNames::new(base)?;
     let mut out = vec![];
-    read_one_file(&worker_dir.join(EVENTS_ROTATED_FILE), since_seq, &mut out)?;
-    read_one_file(&worker_dir.join(EVENTS_FILE), since_seq, &mut out)?;
+    read_one_file(&dir.join(&names.rotated), since_seq, &mut out)?;
+    read_one_file(&dir.join(&names.current), since_seq, &mut out)?;
     Ok(out)
+}
+
+struct LogNames {
+    current: String,
+    rotated: String,
+}
+
+impl LogNames {
+    fn new(base: &str) -> io::Result<Self> {
+        if base.is_empty() || base.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "log base must be a non-empty file basename",
+            ));
+        }
+        let current = format!("{base}.jsonl");
+        let rotated = format!("{current}.1");
+        Ok(Self { current, rotated })
+    }
 }
 
 /// One generation, with the torn-tail tolerance applied to IT — a torn line in
@@ -478,5 +524,36 @@ mod tests {
         assert_eq!(log.max_bytes, crate::config::DEFAULT_EVENTS_MAX_BYTES);
         let capped = EventLog::open_capped(tmp.path(), 0).unwrap();
         assert_eq!(capped.max_bytes, 0, "0 is a value, not an unset");
+    }
+
+    #[test]
+    fn a_named_log_rotates_and_reads_across_the_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let one = line_len(&padded(100));
+        let mut log = EventLog::open_named(dir, "feed", one * 2 + one / 2).unwrap();
+        for _ in 0..3 {
+            log.append(&mut padded(100)).unwrap();
+        }
+
+        assert!(dir.join("feed.jsonl").exists());
+        assert!(dir.join("feed.jsonl.1").exists());
+        assert!(!dir.join(EVENTS_FILE).exists(), "the base name is honored");
+        let seqs: Vec<u64> = read_events_named(dir, "feed", 0)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            (1..=4).collect::<Vec<_>>(),
+            "seqs stay continuous across the named split"
+        );
+        let marker = read_events_named(dir, "feed", 0)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == EventKind::EventsRotated)
+            .unwrap();
+        assert_eq!(marker.raw["rotated_to"], json!("feed.jsonl.1"));
     }
 }

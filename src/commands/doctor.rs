@@ -1251,6 +1251,7 @@ mod tests {
             broker: Default::default(),
             admission: Default::default(),
             sync: Default::default(),
+            mesh: Default::default(),
         };
         assert_eq!(resolve_codex(&cfg), Some(bin));
         cfg.codex_bin = Some(PathBuf::from("/nonexistent/codex"));

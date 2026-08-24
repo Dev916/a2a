@@ -49,6 +49,10 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// DISCARD, and "discard nothing" is the conservative direction.
 pub const DEFAULT_EVENTS_MAX_BYTES: u64 = 10_485_760;
 
+pub const DEFAULT_FEED_MAX_BYTES: u64 = 10_485_760;
+pub const DEFAULT_STALE_AFTER_SECS: u64 = 900;
+pub const DEFAULT_GC_AFTER_DAYS: u64 = 7;
+
 /// Every `[broker]` key, in the order `config show --origin` reports them.
 pub const BROKER_FIELDS: [&str; 2] = ["idle_timeout_secs", "events_max_bytes"];
 
@@ -145,6 +149,9 @@ pub const SYNC_FIELDS: [&str; 3] = [
     "allow_http_header_servers",
     "claude_config_dir",
 ];
+
+/// Every `[mesh]` key, in the order `config show --origin` reports them.
+pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
 pub const LANE_FIELDS: [&str; 11] = [
@@ -400,6 +407,27 @@ pub struct SyncConfig {
     pub claude_config_dir: Option<PathBuf>,
 }
 
+/// The `[mesh]` section: same-machine agent mesh read/write horizons.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+pub struct MeshConfig {
+    /// Bytes of `feed.jsonl` before it rotates; `0` disables rotation.
+    pub feed_max_bytes: u64,
+    /// Seconds since last heartbeat before roster reads label a peer stale.
+    pub stale_after_secs: u64,
+    /// Days after retirement/staleness before `gc` may reclaim mesh peer dirs.
+    pub gc_after_days: u64,
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        MeshConfig {
+            feed_max_bytes: DEFAULT_FEED_MAX_BYTES,
+            stale_after_secs: DEFAULT_STALE_AFTER_SECS,
+            gc_after_days: DEFAULT_GC_AFTER_DAYS,
+        }
+    }
+}
+
 impl SyncConfig {
     /// Whether `server` may carry extra HTTP headers into the codex config.
     /// Takes a SERVER name — see [`SyncConfig::allow_http_header_servers`].
@@ -421,6 +449,7 @@ pub struct Config {
     pub broker: BrokerConfig,
     pub admission: AdmissionConfig,
     pub sync: SyncConfig,
+    pub mesh: MeshConfig,
 }
 
 #[derive(Serialize, PartialEq, Clone, Copy, Debug)]
@@ -506,6 +535,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     for field in SYNC_FIELDS {
         origins.insert(format!("sync.{field}"), Origin::Default);
     }
+    for field in MESH_FIELDS {
+        origins.insert(format!("mesh.{field}"), Origin::Default);
+    }
 
     let mut lanes = BTreeMap::new();
     for lane in Lane::ALL {
@@ -525,6 +557,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
         broker: BrokerConfig::default(),
         admission: AdmissionConfig::default(),
         sync: SyncConfig::default(),
+        mesh: MeshConfig::default(),
     };
 
     let path = home.root().join("config.toml");
@@ -683,8 +716,31 @@ fn apply_file(
                 }
             }
             "sync" => apply_sync_file(cfg, origins, warnings, value)?,
+            "mesh" => apply_mesh_file(cfg, origins, warnings, value)?,
             other => warnings.push(format!("unknown config key: {other}")),
         }
+    }
+    Ok(())
+}
+
+/// `[mesh]` — the feed cap and read-time lifecycle windows.
+fn apply_mesh_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value
+        .as_table()
+        .ok_or_else(|| cfg_err(format!("mesh: expected a table, got {}", value.type_str())))?;
+    for (field, v) in fields {
+        let dotted = format!("mesh.{field}");
+        if !MESH_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        apply_mesh_toml(&mut cfg.mesh, &dotted, field, v)?;
+        origins.insert(dotted, Origin::File);
     }
     Ok(())
 }
@@ -856,6 +912,21 @@ fn apply_broker_toml(
     Ok(())
 }
 
+fn apply_mesh_toml(
+    mesh: &mut MeshConfig,
+    dotted: &str,
+    field: &str,
+    v: &toml::Value,
+) -> Result<(), AppError> {
+    match field {
+        "feed_max_bytes" => mesh.feed_max_bytes = want_u64(dotted, v)?,
+        "stale_after_secs" => mesh.stale_after_secs = want_u64(dotted, v)?,
+        "gc_after_days" => mesh.gc_after_days = want_u64(dotted, v)?,
+        _ => unreachable!("field membership checked by caller"),
+    }
+    Ok(())
+}
+
 fn apply_lane_toml(
     lc: &mut LaneConfig,
     dotted: &str,
@@ -910,6 +981,11 @@ pub fn admission_lane_env_key(lane: Lane, field: &str) -> String {
 /// `config show` and cannot be set from a config file.
 pub fn sync_env_key(field: &str) -> String {
     format!("A2A_SYNC_{}", field.to_ascii_uppercase())
+}
+
+/// `A2A_MESH_<FIELD>` — the env spelling of one `[mesh]` key.
+pub fn mesh_env_key(field: &str) -> String {
+    format!("A2A_MESH_{}", field.to_ascii_uppercase())
 }
 
 /// `A2A_LANES_<LANE>_<FIELD>` (upper-cased) plus top-level `A2A_ALLOWED_ROOTS`
@@ -1020,6 +1096,22 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
             _ => unreachable!("field membership fixed by SYNC_FIELDS"),
         }
         origins.insert(format!("sync.{field}"), Origin::Env);
+    }
+    for field in MESH_FIELDS {
+        let key = mesh_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        let dotted = format!("mesh.{field}");
+        let value = parse_u64_str(&dotted, raw.trim())?;
+        match field {
+            "feed_max_bytes" => cfg.mesh.feed_max_bytes = value,
+            "stale_after_secs" => cfg.mesh.stale_after_secs = value,
+            "gc_after_days" => cfg.mesh.gc_after_days = value,
+            _ => unreachable!("field membership fixed by MESH_FIELDS"),
+        }
+        origins.insert(dotted, Origin::Env);
     }
     Ok(())
 }
@@ -1167,6 +1259,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -1265,6 +1358,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -1327,6 +1421,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -1380,6 +1475,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -1420,6 +1516,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
@@ -1475,6 +1572,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -1511,6 +1609,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
@@ -1539,6 +1638,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
         let mut warnings = vec![];
@@ -1572,6 +1672,7 @@ mod tests {
                 broker: BrokerConfig::default(),
                 admission: AdmissionConfig::default(),
                 sync: SyncConfig::default(),
+                mesh: MeshConfig::default(),
             };
             let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
             assert_eq!(err.code, "CONFIG_INVALID");
@@ -1598,6 +1699,64 @@ mod tests {
         );
         assert_eq!(comma_list(" x-cli , docusign ,"), ["x-cli", "docusign"]);
         assert!(comma_list("  ").is_empty());
+    }
+
+    #[test]
+    fn the_mesh_surface_is_the_one_the_spec_pins() {
+        let mesh = MeshConfig::default();
+        assert_eq!(mesh.feed_max_bytes, 10_485_760);
+        assert_eq!(mesh.stale_after_secs, 900);
+        assert_eq!(mesh.gc_after_days, 7);
+        assert_eq!(DEFAULT_FEED_MAX_BYTES, 10_485_760);
+        assert_eq!(DEFAULT_STALE_AFTER_SECS, 900);
+        assert_eq!(DEFAULT_GC_AFTER_DAYS, 7);
+        assert_eq!(
+            MESH_FIELDS,
+            ["feed_max_bytes", "stale_after_secs", "gc_after_days"]
+        );
+        assert_eq!(
+            mesh_env_key("feed_max_bytes"),
+            "A2A_MESH_FEED_MAX_BYTES"
+        );
+        assert_eq!(
+            mesh_env_key("stale_after_secs"),
+            "A2A_MESH_STALE_AFTER_SECS"
+        );
+        assert_eq!(mesh_env_key("gc_after_days"), "A2A_MESH_GC_AFTER_DAYS");
+
+        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n"
+            .parse()
+            .unwrap();
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert_eq!(cfg.mesh.feed_max_bytes, 4096);
+        assert_eq!(cfg.mesh.stale_after_secs, 60);
+        assert_eq!(cfg.mesh.gc_after_days, 3);
+        assert_eq!(origins.get("mesh.feed_max_bytes"), Some(&Origin::File));
+        assert!(
+            warnings.iter().any(|w| w.contains("mesh.bogus")),
+            "{warnings:?}"
+        );
+
+        let bad: toml::Table = "[mesh]\nfeed_max_bytes = \"big\"\n".parse().unwrap();
+        let err = apply_file(&mut cfg, &mut origins, &mut warnings, &bad).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        assert!(
+            err.message.contains("mesh.feed_max_bytes"),
+            "the failure names the dotted key: {}",
+            err.message
+        );
     }
 
     /// The allowlist holds SERVER names, not header names. Both readings are

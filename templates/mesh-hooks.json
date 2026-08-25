@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "a2a mesh register --session \"$CLAUDE_SESSION_ID\" && a2a mesh inject --session \"$CLAUDE_SESSION_ID\""
+            "command": "S=$(jq -r '.session_id // empty' 2>/dev/null); a2a mesh register --session \"$S\" && a2a mesh inject --session \"$S\"",
+            "timeout": 10
           }
         ]
       }
@@ -17,7 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "a2a mesh heartbeat --session \"$CLAUDE_SESSION_ID\" && a2a mesh inject --session \"$CLAUDE_SESSION_ID\""
+            "command": "S=$(jq -r '.session_id // empty' 2>/dev/null); a2a mesh heartbeat --session \"$S\" && a2a mesh inject --session \"$S\"",
+            "timeout": 10
           }
         ]
       }
@@ -28,7 +30,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "a2a mesh retire --session \"$CLAUDE_SESSION_ID\""
+            "command": "S=$(jq -r '.session_id // empty' 2>/dev/null); a2a mesh retire --session \"$S\"",
+            "timeout": 10
           }
         ]
       }

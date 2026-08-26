@@ -86,7 +86,7 @@ pub fn verify_token(token_b64: &str, roots: &RootSet, clock: &dyn Clock) -> Resu
 pub fn mint_ulid(clock: &dyn Clock) -> String;
 ```
 
-- [ ] Steps: failing tests → RED → implement (deps → keys/certs → claims/canonical verify → skew/clock) → GREEN → focused tests + zero warnings → orchestrator gates+commits `feat: mesh l2 keys — fleet root, gateway identity, strict tokens, pinned TLS certs`.
+- [x] Steps: failing tests → RED → implement (deps → keys/certs → claims/canonical verify → skew/clock) → GREEN → focused tests + zero warnings → orchestrator gates+commits `feat: mesh l2 keys — fleet root, gateway identity, strict tokens, pinned TLS certs`.
 
 ---
 
@@ -109,7 +109,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/registry.rs`, `migrations/mesh_l2_0001.sql`, `tests/mesh_registry.rs`; Modify `Cargo.toml`(+lock), `src/mesh/mod.rs`, `src/cli.rs` (`MeshCmd::Fleet{..}` appended), `src/commands/mesh_cmd.rs`, `src/main.rs`.
 
-- [ ] Steps: failing tests → RED → implement (dep → migration → trait+fake → Pg pins → fleet CLI) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 registry — migration, pinned sqlx client, fleet CLI`.
+- [x] Steps: failing tests → RED → implement (dep → migration → trait+fake → Pg pins → fleet CLI) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 registry — migration, pinned sqlx client, fleet CLI`.
 
 ---
 
@@ -128,7 +128,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/wire.rs`, `tests/mesh_wire.rs`; Modify `Cargo.toml`(+lock), `src/mesh/mod.rs`.
 
-- [ ] Steps: failing tests → RED → implement (frames/codec → TLS plumbing → handshake) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 wire — NDJSON frames, mutual PoP handshake, fingerprint-pinned TLS`.
+- [x] Steps: failing tests → RED → implement (frames/codec → TLS plumbing → handshake) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 wire — NDJSON frames, mutual PoP handshake, fingerprint-pinned TLS`.
 
 ---
 
@@ -146,7 +146,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/gateway/mod.rs`, `tests/mesh_gateway_lifecycle.rs`; Modify `src/config.rs`, `src/mesh/mod.rs`, `src/cli.rs` (`MeshCmd::Gateway{..}`), `src/commands/mesh_cmd.rs`, `src/main.rs`, the actor source-scan test.
 
-- [ ] Steps: failing tests → RED → implement (config → lifecycle → supervisor/restart → shutdown) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 gateway skeleton — supervised lifecycle, bounded shutdown, [mesh.gateway] config`.
+- [x] Steps: failing tests → RED → implement (config → lifecycle → supervisor/restart → shutdown) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 gateway skeleton — supervised lifecycle, bounded shutdown, [mesh.gateway] config`.
 
 ---
 
@@ -165,7 +165,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/gateway/link.rs`, `tests/mesh_gateway_links.rs`; Modify `src/mesh/gateway/mod.rs`.
 
-- [ ] Steps: failing tests → RED → implement (accept/dial/dedup → liveness → damping → mailboxes/shed) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 links — liveness, flap damping, classed mailboxes, visible shed`.
+- [x] Steps: failing tests → RED → implement (accept/dial/dedup → liveness → damping → mailboxes/shed) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 links — liveness, flap damping, classed mailboxes, visible shed`.
 
 ---
 
@@ -184,7 +184,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/gateway/replicate.rs`, `tests/mesh_gateway_feed.rs`; Modify `src/mesh/mod.rs` (FeedEntry fields), `src/mesh/feed.rs` (render), `src/commands/gc.rs` (trim + watermark, extending the existing sweep), `src/mesh/gateway/mod.rs`.
 
-- [ ] Steps: failing tests → RED → implement (shape → durability/cursors → dedup/compaction → watcher push) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 feed replication — per-origin logs, downward-repairing cursors, compaction watermarks`.
+- [x] Steps: failing tests → RED → implement (shape → durability/cursors → dedup/compaction → watcher push) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 feed replication — per-origin logs, downward-repairing cursors, compaction watermarks`.
 
 ---
 
@@ -201,7 +201,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Modify `src/mesh/gateway/replicate.rs`, `src/mesh/gateway/mod.rs`, `src/mesh/wire.rs` (frames exist since T3 — handlers here); Test `tests/mesh_gateway_feed.rs` (extend).
 
-- [ ] Steps: failing tests → RED → implement (want/catch-up → relay → digest loop → revocation re-check) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 catch-up, anti-entropy, transitive relay`.
+- [x] Steps: failing tests → RED → implement (want/catch-up → relay → digest loop → revocation re-check) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 catch-up, anti-entropy, transitive relay`.
 
 ---
 
@@ -220,7 +220,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/gateway/notes_wire.rs`, `tests/mesh_gateway_notes.rs`; Modify `src/mesh/mod.rs` (Note.note_id), `src/mesh/notes.rs` (remote spool branch), `src/mesh/gateway/mod.rs`.
 
-- [ ] Steps: failing tests → RED → implement (shape → spool/deliver/ack → dedup → retries/refusals) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 notes — durable spool, idempotent remote delivery through full ingress`.
+- [x] Steps: failing tests → RED → implement (shape → spool/deliver/ack → dedup → retries/refusals) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 notes — durable spool, idempotent remote delivery through full ingress`.
 
 ---
 
@@ -237,7 +237,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/gateway/presence_wire.rs`, `tests/mesh_gateway_presence.rs`; Modify `src/mesh/mod.rs`, `src/mesh/presence.rs`, `src/mesh/notes.rs` (roster), `src/commands/gc.rs` (extend), `src/mesh/gateway/mod.rs`.
 
-- [ ] Steps: failing tests → RED → implement (shape/counter → gossip/merge → roster → retirement/gc) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 presence — counter-LWW gossip, via rendering, origin retirement`.
+- [x] Steps: failing tests → RED → implement (shape/counter → gossip/merge → roster → retirement/gc) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 presence — counter-LWW gossip, via rendering, origin retirement`.
 
 ---
 
@@ -253,7 +253,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `src/mesh/gateway/expose.rs`, `tests/mesh_gateway_expose.rs`; Modify `src/mesh/gateway/mod.rs`, `src/mesh/registry.rs` (row cert_fpr wiring if not already).
 
-- [ ] Steps: failing tests → RED → implement (trait + none/manual → ngrok API client → re-upsert loop → pin wiring) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 exposure — pluggable providers, ngrok TCP tunnels, cert-fpr publication`.
+- [x] Steps: failing tests → RED → implement (trait + none/manual → ngrok API client → re-upsert loop → pin wiring) → GREEN → focused + zero warnings → orchestrator gates+commits `feat: mesh l2 exposure — pluggable providers, ngrok TCP tunnels, cert-fpr publication`.
 
 ---
 
@@ -269,7 +269,7 @@ pub fn mint_ulid(clock: &dyn Clock) -> String;
 
 **Files:** Create `tests/mesh_gateway_e2e.rs`, `tests/mesh_l2_live.rs`; Modify `README.md`.
 
-- [ ] Steps: write the e2e → fix what it exposes (owning modules, never weakened assertions) → GREEN → gated tier written (run once locally by the ORCHESTRATOR against real Neon at the gate) → README → full suite, zero warnings → orchestrator gates+commits `feat: mesh l2 e2e on loopback fleets, gated Neon live tier, docs`.
+- [x] Steps: write the e2e → fix what it exposes (owning modules, never weakened assertions) → GREEN → gated tier written (run once locally by the ORCHESTRATOR against real Neon at the gate) → README → full suite, zero warnings → orchestrator gates+commits `feat: mesh l2 e2e on loopback fleets, gated Neon live tier, docs`.
 
 ---
 

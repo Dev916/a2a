@@ -109,6 +109,8 @@ pub struct Note {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FeedEntry {
     pub seq: u64,
+    pub origin: Option<String>,
+    pub origin_seq: Option<u64>,
     pub from: String,
     pub ts: DateTime<Utc>,
     pub text: String,

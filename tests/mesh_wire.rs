@@ -126,6 +126,8 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
             origin: "gw-a".to_string(),
             entries: vec![FeedEntry {
                 seq: 1,
+                origin: Some("gw-a".to_string()),
+                origin_seq: Some(1),
                 from: "codex:1".to_string(),
                 ts: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 text: "post".to_string(),

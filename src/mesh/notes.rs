@@ -396,7 +396,7 @@ fn format_inject_note(note: &InjectNote) -> String {
 fn format_inject_feed(entry: &FeedEntry) -> String {
     crate::redact::redact_egress(&format!(
         "{} {}: {}",
-        entry.seq,
+        feed::origin_citation(entry),
         short_peer(&entry.from),
         entry.text
     ))

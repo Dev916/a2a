@@ -101,7 +101,7 @@ use crate::commands::owner;
 use crate::config;
 use crate::home::A2aHome;
 use crate::ids;
-use crate::mesh::{notes, presence, PeerId, Presence};
+use crate::mesh::{gateway::replicate, notes, presence, PeerId, Presence};
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::redact;
 use crate::reconcile::reconcile;
@@ -374,6 +374,7 @@ struct MeshSweep {
     skipped: Vec<Value>,
     removed: Vec<String>,
     reclaimed_bytes: u64,
+    feed_compaction: Value,
 }
 
 impl MeshSweep {
@@ -384,6 +385,7 @@ impl MeshSweep {
             skipped: Vec::new(),
             removed: Vec::new(),
             reclaimed_bytes: 0,
+            feed_compaction: Value::Null,
         }
     }
 
@@ -398,6 +400,7 @@ impl MeshSweep {
             "reclaimed_bytes": self.reclaimed_bytes,
             "kept": self.kept,
             "skipped": self.skipped,
+            "feed_compaction": self.feed_compaction,
         })
     }
 }
@@ -432,10 +435,20 @@ fn sweep_mesh(
     dry_run: bool,
     warn: &impl Fn(String),
 ) -> Result<MeshSweep, AppError> {
+    let mut sweep = MeshSweep::empty();
+    if !dry_run {
+        let mut cursors = replicate::CursorStore::load_or_rebuild(home)?;
+        let retain_days = cfg.mesh.gateway.feed_retain_days.min(i64::MAX as u64);
+        let retain = chrono::Duration::days(retain_days as i64);
+        let compaction = replicate::compact_feed(home, cfg, now, retain, &mut cursors)?;
+        sweep.feed_compaction = serde_json::to_value(compaction)
+            .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing feed compaction: {e}")))?;
+    }
+
     let peers = home.root().join("mesh").join("peers");
     let entries = match std::fs::read_dir(&peers) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MeshSweep::empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(sweep),
         Err(e) => return Err(io_err("listing mesh peers", e)),
     };
 
@@ -444,8 +457,6 @@ fn sweep_mesh(
         .gc_after_days
         .saturating_mul(86_400)
         .min(i64::MAX as u64) as i64;
-    let mut sweep = MeshSweep::empty();
-
     for entry in entries {
         let entry = entry.map_err(|e| io_err("listing mesh peers", e))?;
         let name = entry.file_name().to_string_lossy().into_owned();

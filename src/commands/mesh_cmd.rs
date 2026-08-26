@@ -316,7 +316,7 @@ fn human_feed(entries: &[FeedEntry]) -> String {
         .map(|entry| {
             crate::redact::redact_egress(&format!(
                 "{} {} {} — {}",
-                entry.seq,
+                feed::origin_citation(entry),
                 entry.ts.to_rfc3339_opts(SecondsFormat::Secs, true),
                 short_peer(&entry.from),
                 entry.text.lines().next().unwrap_or("")

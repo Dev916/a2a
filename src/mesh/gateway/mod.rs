@@ -23,6 +23,7 @@ pub mod link;
 pub mod notes_wire;
 pub mod presence_wire;
 pub mod replicate;
+pub mod expose;
 
 pub const GATEWAY_LOCK: &str = "gateway.lock";
 pub const GATEWAY_PID: &str = "gateway.pid";

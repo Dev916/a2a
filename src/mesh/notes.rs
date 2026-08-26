@@ -1,21 +1,19 @@
 use crate::commands::send;
 use crate::config::Config;
-use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::home::{create_dir_0700, A2aHome};
 use crate::ids;
 use crate::inbox::MsgKind;
 use crate::mesh::{
-    feed, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider,
+    feed, gateway::notes_wire, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider,
     INJECT_BUDGET_BYTES, NOTE_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode};
 use crate::state::{load_snapshot, WorkerSnapshot};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub enum Target {
@@ -75,6 +73,7 @@ pub fn write_note(
 
     let peer = target_peer(to);
     let note = Note {
+        note_id: Some(notes_wire::mint_note_id()),
         from: from.to_string(),
         to: peer.to_string(),
         ts: Utc::now(),
@@ -83,6 +82,9 @@ pub fn write_note(
         refs,
         extra: serde_json::Map::new(),
     };
+    if let Some((from_gateway, to_gateway)) = remote_gateway_route(home, peer)? {
+        return notes_wire::spool_note(home, _cfg, &from_gateway, &to_gateway, note);
+    }
     let path = write_note_file(home, peer, &note)?;
 
     if let Some((worker_id, snap)) = routable_worker(home, to, peer)? {
@@ -462,31 +464,25 @@ fn resolve_peer_prefix(home: &A2aHome, s: &str) -> Result<Option<PeerId>, AppErr
 }
 
 pub(crate) fn write_note_file(home: &A2aHome, peer: &PeerId, note: &Note) -> Result<PathBuf, AppError> {
-    let inbox = peer_dir(home, peer).join("inbox");
-    create_dir_0700(&inbox.join("read")).map_err(|e| io_err("creating peer inbox", e))?;
-    let seq = next_seq(&inbox);
-    let path = inbox.join(format!(
-        "{seq:06}-{}-{}.note.json",
-        Utc::now().timestamp_millis().max(0),
-        rand8_hex()
-    ));
-    let bytes = serde_json::to_vec_pretty(note).map_err(|e| data_err("serializing note", e))?;
-    let mut f = write_new_0600(&path).map_err(|e| io_err("writing note", e))?;
-    f.write_all(&bytes).map_err(|e| io_err("writing note", e))?;
-    f.write_all(b"\n").map_err(|e| io_err("writing note", e))?;
-    f.sync_all().map_err(|e| io_err("syncing note", e))?;
-    Ok(path)
+    notes_wire::write_note_file_with_id(home, peer, note)
 }
 
-fn next_seq(inbox: &Path) -> u64 {
-    [inbox.to_path_buf(), inbox.join("read")]
-        .into_iter()
-        .filter_map(|dir| fs::read_dir(dir).ok())
-        .flat_map(|entries| entries.flatten())
-        .filter_map(|e| seq_of(&e.file_name().to_string_lossy()))
-        .max()
-        .unwrap_or(0)
-        + 1
+fn remote_gateway_route(home: &A2aHome, peer: &PeerId) -> Result<Option<(String, String)>, AppError> {
+    let Some(from_gateway) = feed::existing_gateway_id(home) else {
+        return Ok(None);
+    };
+    let Some(p) = presence::load(home, peer)? else {
+        return Ok(None);
+    };
+    let Some(to_gateway) = p
+        .extra
+        .get("home_gateway")
+        .and_then(Value::as_str)
+        .filter(|gateway| !gateway.is_empty() && *gateway != from_gateway)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((from_gateway, to_gateway.to_string())))
 }
 
 fn seq_of(name: &str) -> Option<u64> {
@@ -579,10 +575,6 @@ fn brief_title(home: &A2aHome, worker_id: &str, snap: &WorkerSnapshot) -> String
         .map(|line| line.trim_start_matches('#').trim().to_string())
         .filter(|line| !line.is_empty())
         .unwrap_or_else(|| snap.state.as_str().to_string())
-}
-
-fn rand8_hex() -> String {
-    format!("{:08x}", rand::thread_rng().gen::<u32>())
 }
 
 fn io_err(context: &'static str, e: std::io::Error) -> AppError {

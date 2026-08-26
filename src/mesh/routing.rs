@@ -100,6 +100,7 @@ pub fn route(
     let target = notes::resolve_target(home, cfg, &n.note_to)?;
     let peer = notes::target_peer(&target);
     let note = crate::mesh::Note {
+        note_id: Some(crate::mesh::gateway::notes_wire::mint_note_id()),
         from: from.to_string(),
         to: peer.to_string(),
         ts: chrono::Utc::now(),

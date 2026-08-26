@@ -20,6 +20,7 @@ use tokio_util::task::TaskTracker;
 use futures_util::FutureExt;
 
 pub mod link;
+pub mod notes_wire;
 pub mod replicate;
 
 pub const GATEWAY_LOCK: &str = "gateway.lock";

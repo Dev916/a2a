@@ -85,6 +85,7 @@ fn serde_shapes_tolerate_unknown_keys() {
         "future": true
     }))
     .unwrap();
+    assert_eq!(note.note_id, None);
     assert_eq!(note.extra["future"], true);
 
     let feed: FeedEntry = serde_json::from_value(json!({

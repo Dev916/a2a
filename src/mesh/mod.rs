@@ -96,6 +96,8 @@ pub struct Cursors {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Note {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
     pub from: String,
     pub to: String,
     pub ts: DateTime<Utc>,

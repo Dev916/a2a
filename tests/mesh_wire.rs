@@ -94,6 +94,7 @@ fn identity(home: &A2aHome, key: SigningKey, gateway_id: &str, now: i64) -> Hand
 
 fn note() -> Note {
     Note {
+        note_id: Some("01K3KV00000000000000000009".to_string()),
         from: "codex:from".to_string(),
         to: "claude:to".to_string(),
         ts: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),

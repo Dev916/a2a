@@ -105,7 +105,11 @@ fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let roots = v["data"]["allowed_roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 2, "missing root dropped, implicit one added: {roots:?}");
+    assert_eq!(
+        roots.len(),
+        2,
+        "missing root dropped, implicit one added: {roots:?}"
+    );
     assert_eq!(
         roots[0],
         serde_json::json!(std::fs::canonicalize("/tmp").unwrap().to_str().unwrap())
@@ -178,8 +182,7 @@ fn broker_idle_timeout_defaults_to_300_and_names_its_layer() {
     let v = show(tmp.path(), &[], true);
     assert_eq!(v["data"]["broker"]["idle_timeout_secs"], 300);
     assert_eq!(
-        v["data"]["origins"]["broker.idle_timeout_secs"],
-        "default",
+        v["data"]["origins"]["broker.idle_timeout_secs"], "default",
         "a value nobody set still says where it came from"
     );
 
@@ -282,12 +285,18 @@ fn mesh_defaults_layer_and_name_bad_values() {
     let e: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(e["error"]["code"], "CONFIG_INVALID");
     assert!(
-        e["error"]["message"].as_str().unwrap().contains("mesh.stale_after_secs"),
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mesh.stale_after_secs"),
         "{e}"
     );
 
-    std::fs::write(tmp.path().join("config.toml"), "[mesh]\ngc_after_days = \"later\"\n")
-        .unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[mesh]\ngc_after_days = \"later\"\n",
+    )
+    .unwrap();
     let out = Command::cargo_bin("a2a")
         .unwrap()
         .env("A2A_HOME", tmp.path())
@@ -297,7 +306,10 @@ fn mesh_defaults_layer_and_name_bad_values() {
     let e: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(e["error"]["code"], "CONFIG_INVALID");
     assert!(
-        e["error"]["message"].as_str().unwrap().contains("mesh.gc_after_days"),
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mesh.gc_after_days"),
         "{e}"
     );
 }
@@ -342,7 +354,10 @@ fn admission_caps_default_to_8_32_4_and_name_their_layer() {
     );
     assert_eq!(v["data"]["origins"]["admission.global_cap"], "file");
     assert_eq!(v["data"]["origins"]["admission.lanes.impl.cap"], "file");
-    assert_eq!(v["data"]["origins"]["admission.lanes.review.cap"], "default");
+    assert_eq!(
+        v["data"]["origins"]["admission.lanes.review.cap"],
+        "default"
+    );
 
     let v = show(
         tmp.path(),
@@ -421,7 +436,10 @@ fn sync_allowlists_default_to_empty_and_name_their_layer() {
         serde_json::json!([]),
         "nothing is allowlisted until an operator says so"
     );
-    assert_eq!(v["data"]["sync"]["claude_config_dir"], serde_json::Value::Null);
+    assert_eq!(
+        v["data"]["sync"]["claude_config_dir"],
+        serde_json::Value::Null
+    );
     for key in [
         "sync.allow_skills",
         "sync.allow_http_header_servers",
@@ -448,7 +466,10 @@ fn sync_allowlists_default_to_empty_and_name_their_layer() {
         v["data"]["sync"]["allow_http_header_servers"],
         serde_json::json!(["ghl"])
     );
-    assert_eq!(v["data"]["sync"]["claude_config_dir"], "/tmp/claude-from-file");
+    assert_eq!(
+        v["data"]["sync"]["claude_config_dir"],
+        "/tmp/claude-from-file"
+    );
     assert_eq!(v["data"]["origins"]["sync.allow_skills"], "file");
     assert_eq!(v["data"]["origins"]["sync.claude_config_dir"], "file");
 
@@ -471,7 +492,10 @@ fn sync_allowlists_default_to_empty_and_name_their_layer() {
         v["data"]["sync"]["allow_http_header_servers"],
         serde_json::json!(["ghl", "linear"])
     );
-    assert_eq!(v["data"]["sync"]["claude_config_dir"], "/tmp/claude-from-env");
+    assert_eq!(
+        v["data"]["sync"]["claude_config_dir"],
+        "/tmp/claude-from-env"
+    );
     for key in [
         "sync.allow_skills",
         "sync.allow_http_header_servers",

@@ -45,7 +45,11 @@ fn hash_mesh() -> Option<BTreeMap<String, String>> {
         entries.sort_by_key(|e| e.path());
         for entry in entries {
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             let ty = entry.file_type().unwrap();
             if ty.is_dir() {
                 out.insert(format!("{rel}/"), String::new());

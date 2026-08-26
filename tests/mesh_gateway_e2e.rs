@@ -9,7 +9,7 @@ use a2a::mesh::gateway::{
 use a2a::mesh::keys::{fleet_init, sign_token, RootSet, TestClock, TokenClaims};
 use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
 use a2a::mesh::wire::{
-    accept_pinned, handshake_acceptor, handshake_dialer, test_link, connect_pinned, Frame,
+    accept_pinned, connect_pinned, handshake_acceptor, handshake_dialer, test_link, Frame,
     HandshakeIdentity, OriginWant, TlsIdentity, MAX_FRAME_BYTES,
 };
 use a2a::mesh::{Note, PeerId, Presence};
@@ -93,12 +93,21 @@ fn note(from: &str, to: &str, text: &str, note_id: &str) -> Note {
 
 fn note_files(home: &Path, peer: &str) -> Vec<PathBuf> {
     let id = PeerId::parse(peer).unwrap();
-    let inbox = home.join("mesh").join("peers").join(id.dir_name()).join("inbox");
+    let inbox = home
+        .join("mesh")
+        .join("peers")
+        .join(id.dir_name())
+        .join("inbox");
     let mut files = match fs::read_dir(inbox) {
         Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
-    files.retain(|p| p.file_name().unwrap().to_string_lossy().ends_with(".note.json"));
+    files.retain(|p| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".note.json")
+    });
     files.sort();
     files
 }
@@ -108,7 +117,12 @@ fn json_files(dir: &Path) -> Vec<PathBuf> {
         Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
-    files.retain(|p| p.file_name().unwrap().to_string_lossy().ends_with(".note.json"));
+    files.retain(|p| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".note.json")
+    });
     files.sort();
     files
 }
@@ -133,7 +147,11 @@ fn write_presence(home: &Path, peer: &str, home_gateway: Option<&str>, seq: u64,
     if let Some(gateway) = home_gateway {
         value["home_gateway"] = json!(gateway);
     }
-    fs::write(dir.join("presence.json"), serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    fs::write(
+        dir.join("presence.json"),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -292,7 +310,9 @@ async fn fleet_e2e_replicates_feeds_routes_notes_and_merges_presence() {
         .get_output()
         .stdout
         .clone();
-    assert!(String::from_utf8(injected).unwrap().contains("remote ingress note"));
+    assert!(String::from_utf8(injected)
+        .unwrap()
+        .contains("remote ingress note"));
 
     let lost_ack = note(
         "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -303,7 +323,10 @@ async fn fleet_e2e_replicates_feeds_routes_notes_and_merges_presence() {
     notes_wire::spool_note(&home_a, &cfg, "gw-a", "gw-b", lost_ack.clone()).unwrap();
     let queued = json_files(&home_a.root().join("mesh").join("outbound").join("gw-b"));
     let envelope = notes_wire::read_spooled(queued.last().unwrap()).unwrap();
-    assert_eq!(notes_wire::receive_note(&home_b, &cfg, &envelope).unwrap(), NoteAck::Delivered);
+    assert_eq!(
+        notes_wire::receive_note(&home_b, &cfg, &envelope).unwrap(),
+        NoteAck::Delivered
+    );
     let before = note_files(home_b.root(), target).len();
     let redelivery = deliver_spooled_once(
         &cfg,
@@ -317,7 +340,11 @@ async fn fleet_e2e_replicates_feeds_routes_notes_and_merges_presence() {
     )
     .unwrap();
     assert_eq!(redelivery.duplicates, 1);
-    assert_eq!(note_files(home_b.root(), target).len(), before, "lost ack leaves exactly one inbox file");
+    assert_eq!(
+        note_files(home_b.root(), target).len(),
+        before,
+        "lost ack leaves exactly one inbox file"
+    );
 
     notes_wire::spool_note(
         &home_a,
@@ -388,7 +415,13 @@ async fn fleet_e2e_replicates_feeds_routes_notes_and_merges_presence() {
     .unwrap();
     assert_eq!(rejected.rejected, 1);
     for home in [&home_a, &home_b] {
-        let log = fs::read_to_string(home.root().join("mesh").join("gateway").join("gateway.jsonl")).unwrap();
+        let log = fs::read_to_string(
+            home.root()
+                .join("mesh")
+                .join("gateway")
+                .join("gateway.jsonl"),
+        )
+        .unwrap();
         assert!(log.contains(trace_id), "{log}");
     }
 
@@ -412,12 +445,17 @@ async fn fleet_e2e_replicates_feeds_routes_notes_and_merges_presence() {
     let cached = a2a::mesh::presence::load(&home_c, &PeerId::parse(target).unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(cached.status.as_deref(), Some("counter wins over skewed clock"));
+    assert_eq!(
+        cached.status.as_deref(),
+        Some("counter wins over skewed clock")
+    );
 
     let mut first = StdRng::seed_from_u64(7);
     let mut second = StdRng::seed_from_u64(99);
-    let a = a2a::mesh::gateway::link::jittered_redial_backoff(5, Duration::from_secs(60), &mut first);
-    let b = a2a::mesh::gateway::link::jittered_redial_backoff(5, Duration::from_secs(60), &mut second);
+    let a =
+        a2a::mesh::gateway::link::jittered_redial_backoff(5, Duration::from_secs(60), &mut first);
+    let b =
+        a2a::mesh::gateway::link::jittered_redial_backoff(5, Duration::from_secs(60), &mut second);
     assert!(a.abs_diff(b) > Duration::from_millis(1), "{a:?} vs {b:?}");
 }
 
@@ -440,7 +478,9 @@ async fn loopback_tls_frames_run_when_loopback_bind_is_available() {
         let frame = side.recv().await.unwrap().unwrap();
         side.send(&frame).await.unwrap();
     });
-    let mut client = connect_pinned(&format!("wss://{addr}/"), &fpr).await.unwrap();
+    let mut client = connect_pinned(&format!("wss://{addr}/"), &fpr)
+        .await
+        .unwrap();
     let frame = Frame::Ack {
         ref_id: "loopback".to_string(),
         outcome: "ok".to_string(),
@@ -513,13 +553,16 @@ async fn assert_refused_by_acceptor(
     let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
     let (mut accept, mut dial) = test_link(&clock).await;
     let accept_id = accept_id.clone();
-    let accept_task = tokio::spawn(async move {
-        handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await
-    });
+    let accept_task =
+        tokio::spawn(
+            async move { handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await },
+        );
 
     let roots = RootSet::load(home).unwrap();
     let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
-    let dial_err = handshake_dialer(&mut dial, &dial_id, &roots, &clock).await.unwrap_err();
+    let dial_err = handshake_dialer(&mut dial, &dial_id, &roots, &clock)
+        .await
+        .unwrap_err();
     let accept_err = accept_task.await.unwrap().unwrap_err();
     assert_eq!(accept_err.code, code);
     assert_eq!(dial_err.code, "WIRE_PEER_ERR");

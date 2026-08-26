@@ -216,9 +216,7 @@ fn exit_for(state: WorkerState) -> ExitCode {
         WorkerState::Failed => ExitCode::WorkerFailed,
         WorkerState::AwaitingInput | WorkerState::Escalated => ExitCode::Blocked,
         WorkerState::Orphaned => ExitCode::Orphaned,
-        WorkerState::Spawned | WorkerState::Queued | WorkerState::Running => {
-            ExitCode::NotTerminal
-        }
+        WorkerState::Spawned | WorkerState::Queued | WorkerState::Running => ExitCode::NotTerminal,
         WorkerState::Unknown => ExitCode::Internal,
     }
 }

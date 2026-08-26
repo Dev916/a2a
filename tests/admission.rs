@@ -320,7 +320,11 @@ fn at_the_cap_a_spawn_queues_and_the_next_settle_admits_it() {
         .iter()
         .map(|w| w["id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(ids, vec![a.clone()], "only the admitted worker has an actor");
+    assert_eq!(
+        ids,
+        vec![a.clone()],
+        "only the admitted worker has an actor"
+    );
 
     // `ls` says the same thing, which is where an operator actually reads it.
     let listed = run(a2a(&home, tmp.path(), &["--json", "ls"]), &scratch, "ls");
@@ -410,16 +414,24 @@ fn a_full_queue_refuses_with_queue_full_and_a_retry_hint() {
         &scratch,
         "third",
     );
-    assert_eq!(third.code, 9, "a full queue is a precondition: {}", third.stderr);
+    assert_eq!(
+        third.code, 9,
+        "a full queue is a precondition: {}",
+        third.stderr
+    );
     let err = third.error();
     assert_eq!(err["code"], json!("QUEUE_FULL"), "{err}");
     assert_eq!(
-        err["data"]["retry_after_secs"], json!(30),
+        err["data"]["retry_after_secs"],
+        json!(30),
         "the one refusal that clears on its own says when to come back: {err}"
     );
     assert_eq!(err["data"]["queue_cap"], json!(1), "{err}");
     assert!(
-        err["remedy"].as_str().unwrap_or_default().contains("queue_cap"),
+        err["remedy"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("queue_cap"),
         "the refusal names the knob: {err}"
     );
     assert_eq!(
@@ -468,7 +480,11 @@ fn no_queue_refuses_at_capacity_rather_than_waiting() {
         &scratch,
         "refused",
     );
-    assert_eq!(refused.code, 9, "at capacity is a precondition: {}", refused.stderr);
+    assert_eq!(
+        refused.code, 9,
+        "at capacity is a precondition: {}",
+        refused.stderr
+    );
     let err = refused.error();
     assert_eq!(err["code"], json!("AT_CAPACITY"), "{err}");
     assert_eq!(err["data"]["global_cap"], json!(1), "{err}");
@@ -517,7 +533,12 @@ fn a_resume_at_the_cap_is_refused_rather_than_queued() {
     cmd.arg(json!({"dir": finished}).to_string());
     let refused = run(cmd, &scratch, "resume");
     assert_eq!(refused.code, 9, "a resume at the cap: {}", refused.stderr);
-    assert_eq!(refused.error()["code"], json!("AT_CAPACITY"), "{}", refused.stdout);
+    assert_eq!(
+        refused.error()["code"],
+        json!("AT_CAPACITY"),
+        "{}",
+        refused.stdout
+    );
     assert_eq!(
         snap_of(&home, "general-0817t1200-fini").unwrap()["state"],
         json!("done"),
@@ -563,7 +584,12 @@ fn killing_a_queued_worker_cancels_it_and_it_is_never_admitted() {
         "kill-queued",
     );
     assert_eq!(killed.code, 0, "kill on a queued worker: {}", killed.stderr);
-    assert_eq!(killed.data()["state"], json!("cancelled"), "{}", killed.stdout);
+    assert_eq!(
+        killed.data()["state"],
+        json!("cancelled"),
+        "{}",
+        killed.stdout
+    );
     assert_eq!(
         killed.data()["signal"],
         json!("broker"),
@@ -665,7 +691,8 @@ fn queued_workers_survive_a_broker_death_and_the_next_broker_re_enqueues_them() 
         "the queued worker is re-enqueued, in created_at order: {info}"
     );
     assert_eq!(
-        info["queued"], json!(1),
+        info["queued"],
+        json!(1),
         "and it is in THIS broker's queue, waiting for a slot: {info}"
     );
     assert_eq!(
@@ -722,10 +749,7 @@ fn exec_spawns_do_not_count_against_the_brokers_cap() {
         exec.stdout
     );
     let id = exec.data()["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        snap_of(&home, &id).unwrap()["queue_position"],
-        Value::Null
-    );
+    assert_eq!(snap_of(&home, &id).unwrap()["queue_position"], Value::Null);
     assert_eq!(
         broker_info(&home, tmp.path(), &scratch, "info")["queued"],
         json!(0),

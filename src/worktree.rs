@@ -82,12 +82,19 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
 /// revision` and exits 128 rather than 1, so the refusal keys off *any* nonzero
 /// status and survives both spellings of the probe.
 pub fn head_ref(repo: &Path) -> Result<String, AppError> {
-    let run = git(&argv_in(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]))?;
+    let run = git(&argv_in(
+        repo,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    ))?;
     if !run.ok() {
         return Err(AppError::new(
             "WORKTREE_NO_BASE",
             ExitCode::Precondition,
-            format!("{} has no commit to branch from{}", repo.display(), why(&run)),
+            format!(
+                "{} has no commit to branch from{}",
+                repo.display(),
+                why(&run)
+            ),
         )
         .remedy(format!(
             "make at least one commit in {} — a worktree needs a base ref to branch from",
@@ -103,7 +110,10 @@ pub fn head_ref(repo: &Path) -> Result<String, AppError> {
 /// tag resolves to the commit it points at, not to the tag object).
 pub fn resolve_commit(repo: &Path, refname: &str) -> Result<String, AppError> {
     let peeled = format!("{refname}^{{commit}}");
-    let run = git(&argv_in(repo, &["rev-parse", "--verify", "--quiet", &peeled]))?;
+    let run = git(&argv_in(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &peeled],
+    ))?;
     if !run.ok() {
         return Err(AppError::new(
             "WORKTREE_BASE_UNKNOWN",
@@ -180,7 +190,10 @@ pub fn create(
         return Err(AppError::new(
             "WORKTREE_CREATE_FAILED",
             ExitCode::Precondition,
-            format!("could not create a worktree at {}: {evidence}", path.display()),
+            format!(
+                "could not create a worktree at {}: {evidence}",
+                path.display()
+            ),
         )
         .remedy("check the repo is healthy (`git worktree list`) and the home is writable"));
     }
@@ -528,7 +541,11 @@ fn diff_failed(dir: &Path, run: &Run) -> AppError {
     AppError::new(
         "WORKTREE_DIFF_FAILED",
         ExitCode::Precondition,
-        format!("could not diff {} against its base{}", dir.display(), why(run)),
+        format!(
+            "could not diff {} against its base{}",
+            dir.display(),
+            why(run)
+        ),
     )
     .remedy("check the base ref still exists in the parent repo")
 }

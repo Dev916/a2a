@@ -1,21 +1,20 @@
 use crate::cli::{MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshPeerArgs};
 use crate::config::Config;
-use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::home::A2aHome;
 use crate::mesh::{
     feed,
     notes::{self, RosterRow},
     presence,
     registry::{
-        staleness, FileRegistry, GatewayRow, PgRegistry, Registry,
-        DEFAULT_REGISTRY_HEARTBEAT_SECS, DEFAULT_REGISTRY_TIMEOUT_SECS,
+        open_registry, read_registry_env, staleness, write_registry_env, GatewayRow, Registry,
+        DEFAULT_REGISTRY_HEARTBEAT_SECS,
     },
     scan_or_refuse, FeedEntry, Note, PeerId, Provider, STATUS_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Read;
 use std::path::Path;
 
 const MESH_L2_MIGRATION_SQL: &str = include_str!("../../migrations/mesh_l2_0001.sql");
@@ -63,9 +62,9 @@ pub fn run(
             let mut text = text.clone();
             if text == "-" {
                 text.clear();
-                std::io::stdin()
-                    .read_to_string(&mut text)
-                    .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}")))?;
+                std::io::stdin().read_to_string(&mut text).map_err(|e| {
+                    AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}"))
+                })?;
             }
             refuse_status(&text)?;
             let mut p = load_or_register(home, &id)?;
@@ -95,8 +94,9 @@ pub fn run(
         MeshCmd::Feed { since, json } => {
             let entries = feed::read(home, since.unwrap_or(0))?;
             if json_mode || *json {
-                let value = serde_json::to_value(entries)
-                    .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing feed: {e}")))?;
+                let value = serde_json::to_value(entries).map_err(|e| {
+                    AppError::new("DATA", ExitCode::Internal, format!("serializing feed: {e}"))
+                })?;
                 return Ok(Outcome::from(crate::commands::tail::redact_value(&value)));
             }
             if entries.is_empty() {
@@ -115,7 +115,14 @@ pub fn run(
             let from = peer_id(peer)?;
             let text = note_text(stdin.as_deref(), message_file.as_deref())?;
             let target = notes::resolve_target(home, cfg, target)?;
-            notes::write_note(home, cfg, &from, &target, &text, refs(ref_beads, ref_worker))?;
+            notes::write_note(
+                home,
+                cfg,
+                &from,
+                &target,
+                &text,
+                refs(ref_beads, ref_worker),
+            )?;
             if !quiet {
                 if let Some(state) = notes::target_warning(home, &target)? {
                     eprintln!(
@@ -139,8 +146,13 @@ pub fn run(
                 notes::consume(home, &id, &files)?;
             }
             if json_mode || *json {
-                let value = serde_json::to_value(notes_only)
-                    .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing inbox: {e}")))?;
+                let value = serde_json::to_value(notes_only).map_err(|e| {
+                    AppError::new(
+                        "DATA",
+                        ExitCode::Internal,
+                        format!("serializing inbox: {e}"),
+                    )
+                })?;
                 return Ok(Outcome::from(crate::commands::tail::redact_value(&value)));
             }
             if notes_only.is_empty() {
@@ -151,8 +163,13 @@ pub fn run(
         MeshCmd::Roster { json } => {
             let rows = notes::roster(home, cfg, Utc::now())?;
             if json_mode || *json {
-                let value = serde_json::to_value(rows)
-                    .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing roster: {e}")))?;
+                let value = serde_json::to_value(rows).map_err(|e| {
+                    AppError::new(
+                        "DATA",
+                        ExitCode::Internal,
+                        format!("serializing roster: {e}"),
+                    )
+                })?;
                 return Ok(Outcome::from(crate::commands::tail::redact_value(&value)));
             }
             if rows.is_empty() {
@@ -184,7 +201,9 @@ pub fn run_hooks(print: bool) -> Result<Outcome, AppError> {
             "use --print; a2a never edits Claude Code settings",
         ));
     }
-    eprintln!("a2a: merge this into ~/.claude/settings.json yourself — a2a never edits your settings");
+    eprintln!(
+        "a2a: merge this into ~/.claude/settings.json yourself — a2a never edits your settings"
+    );
     Ok(Outcome::from(Value::String(
         crate::templates::MESH_HOOKS_JSON
             .strip_suffix('\n')
@@ -245,21 +264,25 @@ fn post_text(text: Option<&str>, message_file: Option<&Path>) -> Result<String, 
         )),
         (Some("-"), None) => {
             let mut text = String::new();
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}")))?;
+            std::io::stdin().read_to_string(&mut text).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}"))
+            })?;
             Ok(text)
         }
         (Some(text), None) => Ok(text.to_string()),
         (None, Some(path)) if path == Path::new("-") => {
             let mut text = String::new();
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}")))?;
+            std::io::stdin().read_to_string(&mut text).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}"))
+            })?;
             Ok(text)
         }
         (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
-            AppError::new("IO", ExitCode::Precondition, format!("reading {}: {e}", path.display()))
+            AppError::new(
+                "IO",
+                ExitCode::Precondition,
+                format!("reading {}: {e}", path.display()),
+            )
         }),
         (None, None) => Err(AppError::new(
             "POST_MESSAGE_REQUIRED",
@@ -278,9 +301,9 @@ fn note_text(stdin: Option<&str>, message_file: Option<&Path>) -> Result<String,
         )),
         (Some("-"), None) => {
             let mut text = String::new();
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}")))?;
+            std::io::stdin().read_to_string(&mut text).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}"))
+            })?;
             Ok(text)
         }
         (Some(_), None) => Err(AppError::new(
@@ -290,13 +313,17 @@ fn note_text(stdin: Option<&str>, message_file: Option<&Path>) -> Result<String,
         )),
         (None, Some(path)) if path == Path::new("-") => {
             let mut text = String::new();
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}")))?;
+            std::io::stdin().read_to_string(&mut text).map_err(|e| {
+                AppError::new("IO", ExitCode::Internal, format!("reading stdin: {e}"))
+            })?;
             Ok(text)
         }
         (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
-            AppError::new("IO", ExitCode::Precondition, format!("reading {}: {e}", path.display()))
+            AppError::new(
+                "IO",
+                ExitCode::Precondition,
+                format!("reading {}: {e}", path.display()),
+            )
         }),
         (None, None) => Err(AppError::new(
             "NOTE_MESSAGE_REQUIRED",
@@ -390,15 +417,17 @@ fn short_peer(peer: &str) -> String {
     format!("{}:{}", provider, uuid.chars().take(8).collect::<String>())
 }
 
-fn run_fleet(
-    home: &A2aHome,
-    cmd: &MeshFleetCmd,
-    json_mode: bool,
-) -> Result<Outcome, AppError> {
+fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outcome, AppError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| AppError::new("RUNTIME", ExitCode::Internal, format!("starting registry runtime: {e}")))?;
+        .map_err(|e| {
+            AppError::new(
+                "RUNTIME",
+                ExitCode::Internal,
+                format!("starting registry runtime: {e}"),
+            )
+        })?;
     match cmd {
         MeshFleetCmd::Init { registry } => {
             let fleet = crate::mesh::keys::fleet_init(home)?;
@@ -468,92 +497,16 @@ fn run_gateway(
     }
 }
 
-enum RegistryHandle {
-    File(FileRegistry),
-    Pg(PgRegistry),
-}
-
-impl RegistryHandle {
-    async fn apply_migration(&self, sql: &str) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.init_schema(),
-            RegistryHandle::Pg(registry) => registry.apply_migration(sql).await,
-        }
-    }
-}
-
-impl Registry for RegistryHandle {
-    async fn upsert_self(&self, row: GatewayRow) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.upsert_self(row).await,
-            RegistryHandle::Pg(registry) => registry.upsert_self(row).await,
-        }
-    }
-
-    async fn heartbeat(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
-            RegistryHandle::Pg(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
-        }
-    }
-
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.discover(fleet_id).await,
-            RegistryHandle::Pg(registry) => registry.discover(fleet_id).await,
-        }
-    }
-
-    async fn retire_self(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
-            RegistryHandle::Pg(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
-        }
-    }
-
-    async fn revoke(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.revoke(fleet_id, gateway_id, now).await,
-            RegistryHandle::Pg(registry) => registry.revoke(fleet_id, gateway_id, now).await,
-        }
-    }
-
-    async fn schema_version(&self) -> Result<i32, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.schema_version().await,
-            RegistryHandle::Pg(registry) => registry.schema_version().await,
-        }
-    }
-}
-
-fn open_registry(url: &str) -> Result<RegistryHandle, AppError> {
-    if let Some(path) = url.strip_prefix("file://") {
-        return Ok(RegistryHandle::File(FileRegistry::new(Path::new(path))));
-    }
-    PgRegistry::connect_lazy(url, DEFAULT_REGISTRY_TIMEOUT_SECS).map(RegistryHandle::Pg)
-}
-
 fn registry_input(registry: &str) -> Result<String, AppError> {
     if registry == "-" {
         let mut text = String::new();
-        std::io::stdin()
-            .read_to_string(&mut text)
-            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading registry URL: {e}")))?;
+        std::io::stdin().read_to_string(&mut text).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading registry URL: {e}"),
+            )
+        })?;
         let url = text.trim();
         if url.is_empty() {
             return Err(AppError::new(
@@ -571,46 +524,6 @@ fn registry_input(registry: &str) -> Result<String, AppError> {
             ExitCode::Precondition,
             "registry URL was empty",
         ));
-    }
-    Ok(url.to_string())
-}
-
-fn registry_env_path(home: &A2aHome) -> std::path::PathBuf {
-    home.root().join("mesh").join("fleet").join("registry.env")
-}
-
-fn write_registry_env(home: &A2aHome, url: &str) -> Result<(), AppError> {
-    let path = registry_env_path(home);
-    if let Some(parent) = path.parent() {
-        create_dir_0700(parent)
-            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("creating fleet dir: {e}")))?;
-    }
-    let mut f = write_new_0600(&path)
-        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing registry env: {e}")))?;
-    f.write_all(format!("{url}\n").as_bytes())
-        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing registry env: {e}")))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("setting registry env mode: {e}")))
-}
-
-fn read_registry_env(home: &A2aHome) -> Result<String, AppError> {
-    let path = registry_env_path(home);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        AppError::new(
-            "REGISTRY_URL_REQUIRED",
-            ExitCode::Precondition,
-            format!("reading registry env: {e}"),
-        )
-        .remedy("run `a2a mesh fleet init --registry -`")
-    })?;
-    let url = text.trim();
-    if url.is_empty() {
-        return Err(AppError::new(
-            "REGISTRY_URL_REQUIRED",
-            ExitCode::Precondition,
-            "registry env is empty",
-        )
-        .remedy("run `a2a mesh fleet init --registry -`"));
     }
     Ok(url.to_string())
 }

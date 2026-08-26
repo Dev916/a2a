@@ -131,7 +131,14 @@ fn write_brief(dir: &Path, name: &str, body: &str) -> PathBuf {
 /// One spawn that trips Task 1's zero budget on its first turn: the cheapest
 /// `failed` settlement this suite can produce, and the only failure generator
 /// the breaker cases need.
-fn spawn_failing(home: &Path, root: &Path, scratch: &Path, tag: &str, brief: &Path, work: &Path) -> Ran {
+fn spawn_failing(
+    home: &Path,
+    root: &Path,
+    scratch: &Path,
+    tag: &str,
+    brief: &Path,
+    work: &Path,
+) -> Ran {
     let mut cmd = a2a(
         home,
         root,
@@ -174,7 +181,11 @@ fn two_failures_open_the_breaker_and_the_next_spawn_is_refused() {
     assert_eq!(first.code, 0, "spawn one: {}", first.stderr);
     let a = first.data()["id"].as_str().unwrap().to_string();
     let failed = until_state(&home, &a, "failed");
-    assert_eq!(failed["failure_class"], json!("budget_exhausted"), "{failed}");
+    assert_eq!(
+        failed["failure_class"],
+        json!("budget_exhausted"),
+        "{failed}"
+    );
 
     // Failure two — the one that opens it.
     let second = spawn_failing(&home, tmp.path(), &scratch, "two", &brief, &work);
@@ -206,7 +217,9 @@ fn two_failures_open_the_breaker_and_the_next_spawn_is_refused() {
     assert_eq!(err["data"]["failures"], json!(2), "{}", refused.stdout);
     assert_eq!(err["data"]["window_secs"], json!(300), "{}", refused.stdout);
     assert!(
-        err["data"]["opened_at"].as_str().is_some_and(|s| s.contains('T')),
+        err["data"]["opened_at"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')),
         "the moment it opened, in rfc3339: {}",
         refused.stdout
     );
@@ -240,9 +253,16 @@ fn two_failures_open_the_breaker_and_the_next_spawn_is_refused() {
         "status",
     );
     assert_eq!(status.code, 0, "broker status: {}", status.stderr);
-    assert_eq!(status.data()["breaker"]["open"], json!(true), "{}", status.stdout);
+    assert_eq!(
+        status.data()["breaker"]["open"],
+        json!(true),
+        "{}",
+        status.stdout
+    );
     assert!(
-        status.stderr.contains(", breaker OPEN (2 failures in 300s)"),
+        status
+            .stderr
+            .contains(", breaker OPEN (2 failures in 300s)"),
         "the human line is loud about it: {:?}",
         status.stderr
     );
@@ -254,7 +274,12 @@ fn two_failures_open_the_breaker_and_the_next_spawn_is_refused() {
         "reset",
     );
     assert_eq!(reset.code, 0, "reset-breaker: {}", reset.stderr);
-    assert_eq!(reset.data(), json!({"reset": true, "was_open": true}), "{}", reset.stdout);
+    assert_eq!(
+        reset.data(),
+        json!({"reset": true, "was_open": true}),
+        "{}",
+        reset.stdout
+    );
 
     // The door is open again. This one carries no `max_turns` override, so it
     // keeps the general lane's default budget and simply runs — the assertion
@@ -393,7 +418,11 @@ fn a_socket_resume_meets_the_same_door_and_a_restart_is_the_second_reset_path() 
     let mut cmd = a2a(&home, tmp.path(), &["--json", "__broker-call", "resume"]);
     cmd.arg(json!({"dir": seeded}).to_string());
     let refused = run(cmd, &scratch, "resume");
-    assert_eq!(refused.code, 9, "a resume with the breaker open: {}", refused.stderr);
+    assert_eq!(
+        refused.code, 9,
+        "a resume with the breaker open: {}",
+        refused.stderr
+    );
     assert_eq!(
         refused.error()["code"],
         json!("BREAKER_OPEN"),
@@ -480,7 +509,11 @@ fn a_queued_worker_still_drains_while_the_breaker_is_open() {
 
     // A holds the general slot: five turns allowed, one turn opened, held open.
     let ran_a = run(
-        spawn_cmd("general", &general_brief, &[("A2A_LANES_GENERAL_MAX_TURNS", "5")]),
+        spawn_cmd(
+            "general",
+            &general_brief,
+            &[("A2A_LANES_GENERAL_MAX_TURNS", "5")],
+        ),
         &scratch,
         "a",
     );
@@ -490,21 +523,33 @@ fn a_queued_worker_still_drains_while_the_breaker_is_open() {
 
     // B can only wait: the general lane's cap is one, and A has it.
     let ran_b = run(spawn_cmd("general", &general_brief, &[]), &scratch, "b");
-    assert_eq!(ran_b.code, 0, "a queued spawn still SUCCEEDS: {}", ran_b.stderr);
+    assert_eq!(
+        ran_b.code, 0,
+        "a queued spawn still SUCCEEDS: {}",
+        ran_b.stderr
+    );
     let b = ran_b.data()["id"].as_str().unwrap().to_string();
     assert_eq!(ran_b.data()["state"], json!("queued"), "{}", ran_b.stdout);
     assert_eq!(ran_b.data()["queue_position"], json!(1), "{}", ran_b.stdout);
 
     // C runs in the OTHER lane, fails on its first turn, and opens the breaker.
     let ran_c = run(
-        spawn_cmd("review", &review_brief, &[("A2A_LANES_REVIEW_MAX_TURNS", "0")]),
+        spawn_cmd(
+            "review",
+            &review_brief,
+            &[("A2A_LANES_REVIEW_MAX_TURNS", "0")],
+        ),
         &scratch,
         "c",
     );
     assert_eq!(ran_c.code, 0, "C: {}", ran_c.stderr);
     let c = ran_c.data()["id"].as_str().unwrap().to_string();
     let failed = until_state(&home, &c, "failed");
-    assert_eq!(failed["failure_class"], json!("budget_exhausted"), "{failed}");
+    assert_eq!(
+        failed["failure_class"],
+        json!("budget_exhausted"),
+        "{failed}"
+    );
     until("the breaker to open", || {
         (health(&home)["breaker"]["open"] == json!(true)).then_some(())
     });
@@ -541,7 +586,12 @@ fn a_queued_worker_still_drains_while_the_breaker_is_open() {
         "{}",
         ran_d.stdout
     );
-    assert_eq!(ran_d.error()["data"]["failures"], json!(1), "{}", ran_d.stdout);
+    assert_eq!(
+        ran_d.error()["data"]["failures"],
+        json!(1),
+        "{}",
+        ran_d.stdout
+    );
 
     drop(guard);
     common::assert_no_broker_left(&home);

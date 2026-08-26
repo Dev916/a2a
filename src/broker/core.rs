@@ -54,8 +54,8 @@ use crate::inbox;
 use crate::mesh::routing::{OutboxNote, Routed};
 use crate::output::{AppError, ExitCode};
 use crate::protocol::RpcNotification;
-use crate::redact;
 use crate::reconcile;
+use crate::redact;
 use crate::responder;
 use crate::rpc::{RpcError, ServerRequestFrame};
 use crate::state::{self, save_snapshot, WorkerSnapshot};
@@ -423,7 +423,10 @@ impl CoreHandle {
     }
 
     /// A resume off the socket: new work, and held to the cap.
-    pub async fn resume_checked(&self, dir: impl Into<PathBuf>) -> Result<WorkerSnapshot, AppError> {
+    pub async fn resume_checked(
+        &self,
+        dir: impl Into<PathBuf>,
+    ) -> Result<WorkerSnapshot, AppError> {
         let dir = dir.into();
         self.ask(move |reply| CoreMsg::Resume {
             dir,
@@ -436,7 +439,8 @@ impl CoreHandle {
     /// Re-enqueue a worker the previous instance left `queued`.
     pub async fn enqueue_worker(&self, dir: impl Into<PathBuf>) -> Result<(), AppError> {
         let dir = dir.into();
-        self.ask(move |reply| CoreMsg::Enqueue { dir, reply }).await?
+        self.ask(move |reply| CoreMsg::Enqueue { dir, reply })
+            .await?
     }
 
     pub async fn send(&self, id: &str, text: impl Into<String>) -> Result<SendPath, AppError> {
@@ -610,7 +614,8 @@ pub fn is_auth_expiry(message: &str) -> bool {
         return true;
     }
     // The generic shape: something about auth, something about expiry.
-    (m.contains("auth") || m.contains("credential")) && (m.contains("expire") || m.contains("invalid"))
+    (m.contains("auth") || m.contains("credential"))
+        && (m.contains("expire") || m.contains("invalid"))
 }
 
 /// The human-readable message inside an `error` notification, wherever the
@@ -746,9 +751,7 @@ fn at_capacity(lane: crate::config::Lane, global_cap: u64, lane_cap: u64) -> App
     AppError::new(
         "AT_CAPACITY",
         ExitCode::Precondition,
-        format!(
-            "the broker is at its admission cap (global {global_cap}, {lane} lane {lane_cap})"
-        ),
+        format!("the broker is at its admission cap (global {global_cap}, {lane} lane {lane_cap})"),
     )
     .remedy("wait for a worker to finish, raise `admission.global_cap`, or drop `--no-queue`")
     .data(json!({"global_cap": global_cap, "lane_cap": lane_cap, "lane": lane.as_str()}))
@@ -1164,14 +1167,20 @@ pub async fn fail_worker(
     let detail = redact::redact_egress(&detail);
     let joined = tokio::task::spawn_blocking(move || {
         let _lock = reconcile::lock_state(&dir)?;
-        let snap = state::load_snapshot(&dir)
-            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading state.json: {e}")))?;
+        let snap = state::load_snapshot(&dir).map_err(|e| {
+            AppError::new("IO", ExitCode::Internal, format!("reading state.json: {e}"))
+        })?;
         // A worker that already finished is not made to fail retroactively.
         if snap.state.is_terminal() {
             return Ok(());
         }
-        let mut log =
-            EventLog::open(&dir).map_err(|e| AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}")))?;
+        let mut log = EventLog::open(&dir).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("opening events.jsonl: {e}"),
+            )
+        })?;
         let mut snap = fold::append_and_fold(
             &mut log,
             &dir,
@@ -1182,8 +1191,9 @@ pub async fn fail_worker(
             Utc::now(),
         )?;
         reconcile::arm_deadline(&mut snap, &cfg);
-        save_snapshot(&dir, &snap)
-            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}")))?;
+        save_snapshot(&dir, &snap).map_err(|e| {
+            AppError::new("IO", ExitCode::Internal, format!("writing state.json: {e}"))
+        })?;
         Ok::<_, AppError>(())
     })
     .await;
@@ -1533,7 +1543,10 @@ impl BrokerCore {
                 impl_id,
                 impl_dir,
                 brief_text,
-            } => self.on_auto_review_ready(impl_id, impl_dir, brief_text).await,
+            } => {
+                self.on_auto_review_ready(impl_id, impl_dir, brief_text)
+                    .await
+            }
             CoreMsg::MeshNotesReady {
                 worker_id,
                 dir,
@@ -1547,7 +1560,9 @@ impl BrokerCore {
             CoreMsg::ServerRequest { generation, frame } => {
                 self.on_server_request(generation, frame).await
             }
-            CoreMsg::ChildDied { generation, detail } => self.on_child_died(generation, detail).await,
+            CoreMsg::ChildDied { generation, detail } => {
+                self.on_child_died(generation, detail).await
+            }
             CoreMsg::ChildStarted {
                 generation,
                 outcome,
@@ -1803,17 +1818,15 @@ impl BrokerCore {
         brief_text: String,
     ) {
         let now = Utc::now();
-        let id = match crate::commands::spawn::allocate_id(
-            &self.home,
-            crate::config::Lane::Review,
-            now,
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                self.declined(&impl_id, &e).await;
-                return;
-            }
-        };
+        let id =
+            match crate::commands::spawn::allocate_id(&self.home, crate::config::Lane::Review, now)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    self.declined(&impl_id, &e).await;
+                    return;
+                }
+            };
         let dir = self.home.worker_dir(&id);
 
         // `cwd: None` — the shape `check_cwd` returns `Ok(())` for, and the
@@ -2046,10 +2059,7 @@ impl BrokerCore {
         self.admission
             .queue
             .push_back(Ticket::new(req.dir.clone(), lane));
-        let position = self
-            .admission
-            .position_of(&req.dir)
-            .expect("just pushed");
+        let position = self.admission.position_of(&req.dir).expect("just pushed");
         Ok(Admitted::Queued { position })
     }
 
@@ -2155,7 +2165,10 @@ impl BrokerCore {
             })
             .await;
             if let Ok(Err(e)) = joined {
-                eprintln!("a2a broker: recording a queue position: {}: {}", e.code, e.message);
+                eprintln!(
+                    "a2a broker: recording a queue position: {}: {}",
+                    e.code, e.message
+                );
             }
         }
     }
@@ -2223,7 +2236,11 @@ impl BrokerCore {
                 return Ok::<Option<(String, u32)>, AppError>(None);
             }
             let mut log = EventLog::open(&owned).map_err(|e| {
-                AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}"))
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("opening events.jsonl: {e}"),
+                )
             })?;
             let mut snap = fold::append_and_fold(
                 &mut log,
@@ -2297,7 +2314,11 @@ impl BrokerCore {
                 return Ok::<Option<(String, u32)>, AppError>(None);
             }
             let mut log = EventLog::open(&dir).map_err(|e| {
-                AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}"))
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("opening events.jsonl: {e}"),
+                )
             })?;
             let from = snap.state;
             let mut snap = fold::append_and_fold(
@@ -2515,15 +2536,20 @@ impl BrokerCore {
             let cfg = self.cfg.clone();
             let detail_for_log = detail.clone();
             self.log
-                .line(json!({"ts": Utc::now(), "kind": "worker_panic", "worker": id,
-                             "detail": redact::redact_egress(&detail_for_log)}))
+                .line(
+                    json!({"ts": Utc::now(), "kind": "worker_panic", "worker": id,
+                             "detail": redact::redact_egress(&detail_for_log)}),
+                )
                 .await;
             // Spawned, so one worker's fsync cannot stall the registry — and
             // every sibling actor is untouched by construction: they are
             // separate tasks in the same JoinSet.
             self.tracker.spawn(async move {
                 if let Err(e) = fail_worker(dir, cfg, FailureClass::InternalPanic, detail).await {
-                    eprintln!("a2a broker: recording a panicked worker: {}: {}", e.code, e.message);
+                    eprintln!(
+                        "a2a broker: recording a panicked worker: {}: {}",
+                        e.code, e.message
+                    );
                 }
             });
         }
@@ -2714,8 +2740,13 @@ impl BrokerCore {
             Ok(()) => return,
             Err(mpsc::error::TrySendError::Full(msg)) => msg,
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.log_unroutable("worker_mailbox_closed", method, &Value::Null, Some(worker_id))
-                    .await;
+                self.log_unroutable(
+                    "worker_mailbox_closed",
+                    method,
+                    &Value::Null,
+                    Some(worker_id),
+                )
+                .await;
                 return;
             }
         };
@@ -2742,10 +2773,7 @@ impl BrokerCore {
         if let Some(obj) = raw.as_object_mut() {
             obj.insert("fsm".to_string(), json!("ProcessExited"));
             obj.insert("code".to_string(), Value::Null);
-            obj.insert(
-                "detail".to_string(),
-                json!(redact::redact_egress(&message)),
-            );
+            obj.insert("detail".to_string(), json!(redact::redact_egress(&message)));
             obj.insert(
                 "failure_class".to_string(),
                 json!(FailureClass::AuthExpired),
@@ -2927,12 +2955,8 @@ impl BrokerCore {
             .map(|w| (w.handle.id().to_string(), w.handle.clone(), w.dir.clone()))
             .collect();
         if !workers.is_empty() {
-            self.tracker.spawn(reattach(
-                workers,
-                self.cfg.clone(),
-                adapter,
-                generation,
-            ));
+            self.tracker
+                .spawn(reattach(workers, self.cfg.clone(), adapter, generation));
         }
     }
 
@@ -3019,7 +3043,9 @@ impl BrokerCore {
     async fn schedule_repromotion(&mut self) {
         let wait = self.supervision.repromotion_interval;
         self.health.next_promotion_probe_at = Some(
-            Utc::now() + chrono::Duration::from_std(wait).unwrap_or_else(|_| chrono::Duration::seconds(300)),
+            Utc::now()
+                + chrono::Duration::from_std(wait)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(300)),
         );
         self.publish_health().await;
         let generation = self.generation;
@@ -3161,8 +3187,10 @@ fn review_outcome(
     // is left exactly as it was: no `review.json`, no new lifecycle row, one
     // line here naming what became of the reviewer.
     if state != WorkerState::Done {
-        return Ok(Some(json!({"kind": "auto_review_failed", "worker": impl_id,
-                              "review": review_id, "state": state.as_str()})));
+        return Ok(Some(
+            json!({"kind": "auto_review_failed", "worker": impl_id,
+                              "review": review_id, "state": state.as_str()}),
+        ));
     }
     let impl_dir = crate::home::A2aHome::adopt(root.to_path_buf()).worker_dir(&impl_id);
     if !impl_dir.is_dir() {
@@ -3176,8 +3204,8 @@ fn review_outcome(
     let bytes = match std::fs::read(review_dir.join(reconcile::RESULT_JSON)) {
         Ok(bytes) => bytes,
         Err(_) => {
-            let raw = std::fs::read_to_string(review_dir.join(reconcile::RESULT_MD))
-                .unwrap_or_default();
+            let raw =
+                std::fs::read_to_string(review_dir.join(reconcile::RESULT_MD)).unwrap_or_default();
             serde_json::to_vec(&json!({
                 "raw": raw,
                 "note": "the reviewer's result did not parse against the findings schema",
@@ -3188,8 +3216,13 @@ fn review_outcome(
 
     let _lock = reconcile::lock_state(&impl_dir)?;
     let path = impl_dir.join(REVIEW_JSON);
-    store::write_atomic(&path, &bytes)
-        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing {REVIEW_JSON}: {e}")))?;
+    store::write_atomic(&path, &bytes).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("writing {REVIEW_JSON}: {e}"),
+        )
+    })?;
 
     let target = state::load_snapshot(&impl_dir).map_err(|e| {
         AppError::new(
@@ -3198,8 +3231,13 @@ fn review_outcome(
             format!("{}: {e}", impl_dir.display()),
         )
     })?;
-    let mut log = EventLog::open(&impl_dir)
-        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("opening events.jsonl: {e}")))?;
+    let mut log = EventLog::open(&impl_dir).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("opening events.jsonl: {e}"),
+        )
+    })?;
     let now = Utc::now();
     let mut env = Envelope::new(
         target.epoch,
@@ -3210,8 +3248,10 @@ fn review_outcome(
         now,
     );
     fold::append_envelope_and_fold(&mut log, &impl_dir, target, &mut env, now)?;
-    Ok(Some(json!({"kind": "auto_review_written", "worker": impl_id,
-                   "review": review_id, "path": path})))
+    Ok(Some(
+        json!({"kind": "auto_review_written", "worker": impl_id,
+                   "review": review_id, "path": path}),
+    ))
 }
 
 async fn notification_pump(
@@ -3504,21 +3544,61 @@ mod tests {
         }
         let dir = PathBuf::from("/tmp/w");
         let surface = vec![
-            CoreMsg::Admit { req: SpawnRequest::adopt(dir.clone()), reply: oneshot::channel().0 },
-            CoreMsg::Spawn { req: SpawnRequest::adopt(dir.clone()), reply: oneshot::channel().0 },
-            CoreMsg::Enqueue { dir: dir.clone(), reply: oneshot::channel().0 },
-            CoreMsg::Send { id: "w".into(), text: "hi".into(), reply: oneshot::channel().0 },
-            CoreMsg::Interrupt { id: "w".into(), reply: oneshot::channel().0 },
-            CoreMsg::Kill { id: "w".into(), reply: oneshot::channel().0 },
-            CoreMsg::Resume { dir, capped: true, reply: oneshot::channel().0 },
-            CoreMsg::List { reply: oneshot::channel().0 },
-            CoreMsg::Status { id: "w".into(), reply: oneshot::channel().0 },
-            CoreMsg::Subscribe { reply: oneshot::channel().0 },
+            CoreMsg::Admit {
+                req: SpawnRequest::adopt(dir.clone()),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Spawn {
+                req: SpawnRequest::adopt(dir.clone()),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Enqueue {
+                dir: dir.clone(),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Send {
+                id: "w".into(),
+                text: "hi".into(),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Interrupt {
+                id: "w".into(),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Kill {
+                id: "w".into(),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Resume {
+                dir,
+                capped: true,
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::List {
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Status {
+                id: "w".into(),
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::Subscribe {
+                reply: oneshot::channel().0,
+            },
             CoreMsg::ConnClosed { conn: 1 },
-            CoreMsg::ChildDied { generation: 1, detail: "eof".into() },
-            CoreMsg::IdleCheck { reply: oneshot::channel().0 },
-            CoreMsg::WorkerSettled(Settled { id: "w".into(), state: WorkerState::Done }),
-            CoreMsg::ResetBreaker { reply: oneshot::channel().0 },
+            CoreMsg::ChildDied {
+                generation: 1,
+                detail: "eof".into(),
+            },
+            CoreMsg::IdleCheck {
+                reply: oneshot::channel().0,
+            },
+            CoreMsg::WorkerSettled(Settled {
+                id: "w".into(),
+                state: WorkerState::Done,
+            }),
+            CoreMsg::ResetBreaker {
+                reply: oneshot::channel().0,
+            },
             CoreMsg::AutoReviewReady {
                 impl_id: "w".into(),
                 impl_dir: PathBuf::from("/tmp/w"),
@@ -3534,9 +3614,23 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "Admit", "Spawn", "Enqueue", "Send", "Interrupt", "Kill", "Resume", "List",
-                "Status", "Subscribe", "ConnClosed", "ChildDied", "IdleCheck", "WorkerSettled",
-                "ResetBreaker", "AutoReviewReady", "MeshNotesReady"
+                "Admit",
+                "Spawn",
+                "Enqueue",
+                "Send",
+                "Interrupt",
+                "Kill",
+                "Resume",
+                "List",
+                "Status",
+                "Subscribe",
+                "ConnClosed",
+                "ChildDied",
+                "IdleCheck",
+                "WorkerSettled",
+                "ResetBreaker",
+                "AutoReviewReady",
+                "MeshNotesReady"
             ]
         );
         // The mailbox is bounded — an unbounded queue in front of one owner is
@@ -3566,7 +3660,9 @@ mod tests {
         assert_eq!(a.position_of(Path::new("/tmp/workers/general-c")), Some(3));
         assert_eq!(a.position_of(Path::new("/tmp/workers/nobody")), None);
 
-        let dropped = a.drop_queued("general-a").expect("the head is in the queue");
+        let dropped = a
+            .drop_queued("general-a")
+            .expect("the head is in the queue");
         assert_eq!(dropped.id, "general-a");
         assert_eq!(
             a.position_of(Path::new("/tmp/workers/general-c")),
@@ -3595,7 +3691,11 @@ mod tests {
         let dropped = a.expire();
         assert_eq!(dropped, vec!["impl-abandoned", "impl-unclaimed"]);
         assert_eq!(a.reserved.len(), 1, "a fresh reservation is untouched");
-        assert_eq!(a.queue.len(), 1, "a claimed worker waits as long as it takes");
+        assert_eq!(
+            a.queue.len(),
+            1,
+            "a claimed worker waits as long as it takes"
+        );
         assert_eq!(a.queue[0].id, "impl-waiting");
     }
 
@@ -3614,7 +3714,10 @@ mod tests {
         let at = at_capacity(Lane::Impl, 8, 4);
         assert_eq!(at.code, "AT_CAPACITY");
         assert_eq!(at.exit, ExitCode::Precondition);
-        assert_eq!(at.data.as_ref().and_then(|d| d.get("lane")), Some(&json!("impl")));
+        assert_eq!(
+            at.data.as_ref().and_then(|d| d.get("lane")),
+            Some(&json!("impl"))
+        );
         assert!(
             at.message.contains("global 8") && at.message.contains("impl lane 4"),
             "the refusal names both caps: {}",
@@ -3692,7 +3795,10 @@ mod tests {
             "sandbox denied write to /etc/passwd",
             "connection reset by peer",
         ] {
-            assert!(!is_auth_expiry(message), "{message} must not be auth_expired");
+            assert!(
+                !is_auth_expiry(message),
+                "{message} must not be auth_expired"
+            );
         }
     }
 
@@ -3755,7 +3861,10 @@ mod tests {
         }
         // Nothing proceeds while the pilot is still going.
         tokio::time::sleep(Duration::from_secs(5)).await;
-        assert!(waiters.iter().all(|w| !w.is_finished()), "a waiter jumped the gate");
+        assert!(
+            waiters.iter().all(|w| !w.is_finished()),
+            "a waiter jumped the gate"
+        );
 
         let _ = pilot.send(true);
         for waiter in waiters {
@@ -3779,7 +3888,9 @@ mod tests {
             _ => unreachable!(),
         };
         let waiter = match gate.acquire() {
-            GatePass::Wait(mut rx) => tokio::spawn(async move { rx.wait_for(|d| *d).await.is_ok() }),
+            GatePass::Wait(mut rx) => {
+                tokio::spawn(async move { rx.wait_for(|d| *d).await.is_ok() })
+            }
             _ => unreachable!(),
         };
         drop(pilot);
@@ -3891,9 +4002,14 @@ mod tests {
         // Idempotent where it matters: a worker that already finished is not
         // re-failed by a late corpse report.
         let before = snap.last_applied_seq;
-        fail_worker(dir.clone(), cfg, FailureClass::InternalPanic, "again".into())
-            .await
-            .unwrap();
+        fail_worker(
+            dir.clone(),
+            cfg,
+            FailureClass::InternalPanic,
+            "again".into(),
+        )
+        .await
+        .unwrap();
         let after = state::load_snapshot(&dir).unwrap();
         assert_eq!(after.last_applied_seq, before, "no second row");
     }
@@ -3959,7 +4075,10 @@ mod tests {
                 "failure {n} must not open a disabled breaker"
             );
         }
-        assert!(!breaker.is_open(), "fifty failures, threshold zero, still shut");
+        assert!(
+            !breaker.is_open(),
+            "fifty failures, threshold zero, still shut"
+        );
         assert_eq!(breaker.health(300).failures, 0);
     }
 
@@ -4039,12 +4158,15 @@ mod tests {
         assert!(breaker.record_failure(base, Utc::now(), 1, window));
         assert!(breaker.reset(), "it had been open");
         assert!(!breaker.is_open());
-        assert_eq!(breaker.health(300), BreakerHealth {
-            open: false,
-            failures: 0,
-            window_secs: 300,
-            opened_at: None,
-        });
+        assert_eq!(
+            breaker.health(300),
+            BreakerHealth {
+                open: false,
+                failures: 0,
+                window_secs: 300,
+                opened_at: None,
+            }
+        );
         assert!(!breaker.reset(), "the second reset reset nothing");
         // The window went with it: the threshold is met from scratch.
         assert!(breaker.record_failure(base + Duration::from_secs(1), Utc::now(), 1, window));
@@ -4059,7 +4181,11 @@ mod tests {
         breaker.record_failure(Instant::now(), at, 1, Duration::from_secs(300));
         let err = breaker_open(&breaker.health(300));
         assert_eq!(err.code, "BREAKER_OPEN");
-        assert_eq!(err.exit, ExitCode::Precondition, "exit 9, like every static refusal");
+        assert_eq!(
+            err.exit,
+            ExitCode::Precondition,
+            "exit 9, like every static refusal"
+        );
         assert_eq!(
             err.remedy.as_deref(),
             Some("`a2a broker reset-breaker` once the cause is fixed, or `a2a broker restart`")

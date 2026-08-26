@@ -287,9 +287,9 @@ impl World {
     /// The reviewer the daemon made for `impl_id`, once it exists.
     fn until_reviewer(&self, impl_id: &str) -> Value {
         until(&format!("a review worker for {impl_id}"), || {
-            self.rows().into_iter().find(|r| {
-                r["lane"] == json!("review") && r["auto_review_of"] == json!(impl_id)
-            })
+            self.rows()
+                .into_iter()
+                .find(|r| r["lane"] == json!("review") && r["auto_review_of"] == json!(impl_id))
         })
     }
 }
@@ -390,7 +390,11 @@ fn a_finished_impl_worktree_becomes_a_reviewer_whose_findings_land_as_review_jso
             .collect();
         (!found.is_empty()).then_some(found)
     });
-    assert_eq!(notices.len(), 1, "exactly one writeback notice: {notices:?}");
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one writeback notice: {notices:?}"
+    );
     assert_eq!(notices[0]["kind"], json!("outbox_notice"));
     assert_eq!(
         notices[0]["raw"],
@@ -436,7 +440,10 @@ fn a_diff_over_the_cap_is_truncated_with_the_pinned_marker() {
     w.until_state(&id, "running");
     // Comfortably over 204800 bytes of diff body, in one file so the marker
     // lands inside the hunk rather than between files.
-    let big = format!("// {DIFF_MARKER}\n{}", "// filler filler filler\n".repeat(12_000));
+    let big = format!(
+        "// {DIFF_MARKER}\n{}",
+        "// filler filler filler\n".repeat(12_000)
+    );
     w.commit_in_worktree(&id, "src/big.rs", &big);
     w.finish(&id, "send-impl");
     w.until_state(&id, "done");
@@ -475,9 +482,9 @@ fn an_impl_worker_without_a_worktree_is_skipped_and_says_so() {
     w.until_state(&id, "done");
 
     let line = until("an auto_review_skipped line", || {
-        w.broker_log().into_iter().find(|l| {
-            l["kind"] == json!("auto_review_skipped") && l["worker"] == json!(id)
-        })
+        w.broker_log()
+            .into_iter()
+            .find(|l| l["kind"] == json!("auto_review_skipped") && l["worker"] == json!(id))
     });
     assert_eq!(line["reason"], json!("no_worktree"), "{line}");
 
@@ -571,12 +578,19 @@ fn a_failing_git_diff_is_recorded_and_leaves_the_impl_worker_alone() {
     });
     assert_eq!(line["worker"], json!(id), "{line}");
     assert!(
-        line["detail"].as_str().unwrap_or_default().contains("git diff"),
+        line["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("git diff"),
         "the line says what failed: {line}"
     );
 
     let after = w.snap(&id).unwrap();
-    assert_eq!(after["state"], json!("done"), "the impl worker is untouched: {after}");
+    assert_eq!(
+        after["state"],
+        json!("done"),
+        "the impl worker is untouched: {after}"
+    );
     assert!(!w.worker_dir(&id).join("review.json").exists());
 
     drop(guard);
@@ -652,7 +666,11 @@ fn the_reviewer_is_admitted_queued_or_declined_like_any_other_spawn() {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(ids, vec![id.clone()], "only the impl worker exists: {ids:?}");
+    assert_eq!(
+        ids,
+        vec![id.clone()],
+        "only the impl worker exists: {ids:?}"
+    );
     assert_eq!(w.snap(&id).unwrap()["state"], json!("done"));
 
     drop(guard);
@@ -682,11 +700,7 @@ fn a_reviewer_that_never_finishes_never_touches_the_impl_worker() {
     // It is `hang-turn`: the reviewer is mid-turn and will never finish on its
     // own, which is what makes the kill the only thing that ends it.
     w.until_state(&rid, "running");
-    let killed = run(
-        w.cli(&["--json", "kill", &rid]),
-        &w.scratch,
-        "kill-review",
-    );
+    let killed = run(w.cli(&["--json", "kill", &rid]), &w.scratch, "kill-review");
     assert_eq!(killed.code, 0, "kill: {} {}", killed.stdout, killed.stderr);
     let fate = w.until_state(&rid, "cancelled");
     assert_eq!(fate["state"], json!("cancelled"), "{fate}");
@@ -702,7 +716,10 @@ fn a_reviewer_that_never_finishes_never_touches_the_impl_worker() {
 
     let after = w.snap(&id).unwrap();
     assert_eq!(after["state"], json!("done"), "{after}");
-    assert_eq!(after["entered_state_at"], done["entered_state_at"], "{after}");
+    assert_eq!(
+        after["entered_state_at"], done["entered_state_at"],
+        "{after}"
+    );
     assert!(!w.worker_dir(&id).join("review.json").exists());
     assert_eq!(
         std::fs::read_to_string(w.worker_dir(&id).join("events.jsonl"))
@@ -782,10 +799,9 @@ fn a_reviewed_worker_is_not_reviewed_again_after_a_broker_restart() {
 /// neighbours are: the failure mode is a stall under load, not a wrong answer.
 #[test]
 fn the_worker_settled_arm_never_awaits_a_subprocess_or_a_blocking_task() {
-    let core = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/broker/core.rs"),
-    )
-    .expect("src/broker/core.rs");
+    let core =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/broker/core.rs"))
+            .expect("src/broker/core.rs");
 
     // The arm itself: from `CoreMsg::WorkerSettled(settled) => {` to the
     // matching close, found by brace depth.
@@ -809,7 +825,12 @@ fn the_worker_settled_arm_never_awaits_a_subprocess_or_a_blocking_task() {
         }
     }
     let arm = &body[..end];
-    for forbidden in ["spawn_blocking", "Command::new", "std::fs::read", "load_snapshot("] {
+    for forbidden in [
+        "spawn_blocking",
+        "Command::new",
+        "std::fs::read",
+        "load_snapshot(",
+    ] {
         // `state::load_snapshot` IS allowed (it is the one small read the
         // guards need, and `register` does the same on this task); everything
         // that forks a process or parks a thread is not.

@@ -111,10 +111,17 @@ fn scan_or_refuse_enforces_caps_and_secret_scan() {
     let err = scan_or_refuse(&(cap_sized + "x"), "STATUS_TOO_LARGE").unwrap_err();
     assert_eq!(err.exit, ExitCode::Precondition);
     assert_eq!(err.code, "STATUS_TOO_LARGE");
-    assert!(err.message.contains(&STATUS_MAX_BYTES.to_string()), "{}", err.message);
+    assert!(
+        err.message.contains(&STATUS_MAX_BYTES.to_string()),
+        "{}",
+        err.message
+    );
 
-    let err = scan_or_refuse("OPENAI_API_KEY=sk-abc123456789012345678901", "SECRET_IN_STATUS")
-        .unwrap_err();
+    let err = scan_or_refuse(
+        "OPENAI_API_KEY=sk-abc123456789012345678901",
+        "SECRET_IN_STATUS",
+    )
+    .unwrap_err();
     assert_eq!(err.exit, ExitCode::Precondition);
     assert_eq!(err.code, "SECRET_IN_STATUS");
     assert!(err.message.contains("openai_key"), "{}", err.message);

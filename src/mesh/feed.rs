@@ -89,7 +89,8 @@ pub fn origin_citation(entry: &FeedEntry) -> String {
 }
 
 pub fn existing_gateway_id(home: &A2aHome) -> Option<String> {
-    let text = std::fs::read_to_string(home.root().join("mesh").join("gateway").join("gw.key")).ok()?;
+    let text =
+        std::fs::read_to_string(home.root().join("mesh").join("gateway").join("gw.key")).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     value
         .get("gateway_id")

@@ -87,7 +87,11 @@ pub fn gossip_frame(home: &A2aHome, local_gateway_id: &str) -> Result<Frame, App
         let Some(mut p) = presence::load(home, &id)? else {
             continue;
         };
-        if p.home_gateway.as_deref().filter(|s| !s.is_empty()).is_none() {
+        if p.home_gateway
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
             p.home_gateway = Some(local_gateway_id.to_string());
         }
         peers.push(p);
@@ -240,7 +244,9 @@ fn registry_retirable(cached: &CachedGateway, now: DateTime<Utc>, gc_after_secs:
     if cached.revoked_at.is_none() && cached.missing_since.is_none() {
         return false;
     }
-    now.signed_duration_since(cached.last_heartbeat).num_seconds() > gc_after_secs
+    now.signed_duration_since(cached.last_heartbeat)
+        .num_seconds()
+        > gc_after_secs
 }
 
 fn peer_ids(home: &A2aHome) -> Result<Vec<PeerId>, AppError> {
@@ -253,7 +259,11 @@ fn peer_ids(home: &A2aHome) -> Result<Vec<PeerId>, AppError> {
     let mut out = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| io_err("reading mesh peers", e))?;
-        if !entry.file_type().map_err(|e| io_err("reading mesh peers", e))?.is_dir() {
+        if !entry
+            .file_type()
+            .map_err(|e| io_err("reading mesh peers", e))?
+            .is_dir()
+        {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -279,13 +289,18 @@ fn archive_outbound(home: &A2aHome, gateway_id: &str) -> Result<usize, AppError>
     let mut archived = 0usize;
     for entry in fs::read_dir(&source).map_err(|e| io_err("reading outbound origin", e))? {
         let entry = entry.map_err(|e| io_err("reading outbound origin", e))?;
-        if !entry.file_type().map_err(|e| io_err("reading outbound origin", e))?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|e| io_err("reading outbound origin", e))?
+            .is_file()
+        {
             continue;
         }
         let name = entry.file_name();
         let to = dest.join(&name);
         if to.exists() {
-            fs::remove_file(entry.path()).map_err(|e| io_err("removing duplicate retired spool", e))?;
+            fs::remove_file(entry.path())
+                .map_err(|e| io_err("removing duplicate retired spool", e))?;
         } else {
             fs::rename(entry.path(), to).map_err(|e| io_err("retiring outbound spool", e))?;
         }
@@ -295,12 +310,7 @@ fn archive_outbound(home: &A2aHome, gateway_id: &str) -> Result<usize, AppError>
     Ok(archived)
 }
 
-fn log_origin_retired(
-    home: &A2aHome,
-    gateway_id: &str,
-    archived: usize,
-    cursors_dropped: bool,
-) {
+fn log_origin_retired(home: &A2aHome, gateway_id: &str, archived: usize, cursors_dropped: bool) {
     let dir = home.root().join("mesh").join("gateway");
     if create_dir_0700(&dir).is_err() {
         return;
@@ -359,11 +369,17 @@ where
 }
 
 fn presence_state_path(home: &A2aHome) -> PathBuf {
-    home.root().join("mesh").join("gateway").join(PRESENCE_STATE_FILE)
+    home.root()
+        .join("mesh")
+        .join("gateway")
+        .join(PRESENCE_STATE_FILE)
 }
 
 fn registry_cache_path(home: &A2aHome) -> PathBuf {
-    home.root().join("mesh").join("gateway").join(REGISTRY_CACHE_FILE)
+    home.root()
+        .join("mesh")
+        .join("gateway")
+        .join(REGISTRY_CACHE_FILE)
 }
 
 fn io_err(context: &'static str, e: std::io::Error) -> AppError {

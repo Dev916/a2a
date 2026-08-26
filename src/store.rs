@@ -89,7 +89,11 @@ impl EventLog {
     /// per command — so the cap stays a detail of the two writers that can
     /// actually produce volume (see [`Self::open_capped`]).
     pub fn open(worker_dir: &Path) -> io::Result<Self> {
-        Self::open_named(worker_dir, "events", crate::config::DEFAULT_EVENTS_MAX_BYTES)
+        Self::open_named(
+            worker_dir,
+            "events",
+            crate::config::DEFAULT_EVENTS_MAX_BYTES,
+        )
     }
 
     /// [`Self::open`] with an explicit cap in bytes; `0` disables rotation.
@@ -181,9 +185,7 @@ impl EventLog {
         // `self.bytes > 0` is what keeps an oversized single line from rotating
         // a FRESH file forever: rotating an empty log buys nothing and the next
         // append would be just as oversized.
-        if self.max_bytes != 0
-            && self.bytes > 0
-            && self.bytes + line.len() as u64 > self.max_bytes
+        if self.max_bytes != 0 && self.bytes > 0 && self.bytes + line.len() as u64 > self.max_bytes
         {
             self.rotate(env)?;
             // The marker consumed a seq, so the caller's envelope is restamped
@@ -218,9 +220,7 @@ impl EventLog {
         );
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
-        if self.max_bytes != 0
-            && self.bytes > 0
-            && self.bytes + line.len() as u64 > self.max_bytes
+        if self.max_bytes != 0 && self.bytes > 0 && self.bytes + line.len() as u64 > self.max_bytes
         {
             self.rotate_json()?;
             let obj = value.as_object_mut().expect("object shape checked above");
@@ -247,7 +247,7 @@ impl EventLog {
     /// events either side of it, and a fold fencing a stale epoch fences the
     /// marker with them.
     fn rotate(&mut self, trigger: &crate::events::Envelope) -> io::Result<()> {
-        use crate::events::{EventClass, EventKind, Envelope};
+        use crate::events::{Envelope, EventClass, EventKind};
 
         let names = LogNames::new(&self.base)?;
         let discarded_prior_generation = self.rotate_files(&names)?;
@@ -476,7 +476,7 @@ fn trailing_fragment(data: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventClass, EventKind, Envelope, Transport};
+    use crate::events::{Envelope, EventClass, EventKind, Transport};
     use serde_json::json;
 
     /// One envelope with `pad` bytes of filler, so a test can say how big a
@@ -532,11 +532,18 @@ mod tests {
         assert_eq!(m[0].class, EventClass::Lifecycle);
         assert_eq!(m[0].epoch, 3, "the triggering envelope's epoch");
         assert_eq!(m[0].transport, Transport::AppServer, "and its transport");
-        assert!(m[0].raw.get("fsm").is_none(), "bookkeeping, not an FSM edge");
+        assert!(
+            m[0].raw.get("fsm").is_none(),
+            "bookkeeping, not an FSM edge"
+        );
 
         // seq continues across the split: 8 events + 1 marker, gapless from 1.
         let seqs: Vec<u64> = read_events(dir, 0).unwrap().iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, (1..=9).collect::<Vec<_>>(), "gapless across the split");
+        assert_eq!(
+            seqs,
+            (1..=9).collect::<Vec<_>>(),
+            "gapless across the split"
+        );
         assert_eq!(m[0].seq, 7, "the marker is the new file's first line");
     }
 

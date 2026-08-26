@@ -102,14 +102,14 @@ fn note_files(home: &Path, provider: &str, session: &str) -> Vec<PathBuf> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => panic!("reading note inbox: {e}"),
     }
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".note.json"))
-        })
-        .collect();
+    .flatten()
+    .map(|e| e.path())
+    .filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".note.json"))
+    })
+    .collect();
     out.sort();
     out
 }
@@ -215,8 +215,14 @@ fn appserver_turn_end_routes_worker_note_to_claude_peer_and_logs_outcome() {
         .assert()
         .success();
     let brief = common::write_brief(tmp.path(), "write a mesh note\n");
-    let note = json!({"to": format!("claude:{claude}"), "text": "from app worker", "refs": {}}).to_string();
-    let mut cmd = broker_cli(&home, tmp.path(), &fake_state, &["--json", "spawn", "--lane", "research", "--brief"]);
+    let note = json!({"to": format!("claude:{claude}"), "text": "from app worker", "refs": {}})
+        .to_string();
+    let mut cmd = broker_cli(
+        &home,
+        tmp.path(),
+        &fake_state,
+        &["--json", "spawn", "--lane", "research", "--brief"],
+    );
     cmd.arg(&brief).env("FAKE_MESH_NOTE", note);
     let spawned = run(cmd, &scratch, "spawn");
     let Some(d) = require_appserver(&spawned) else {
@@ -232,7 +238,11 @@ fn appserver_turn_end_routes_worker_note_to_claude_peer_and_logs_outcome() {
             None
         }
     });
-    assert!(home.join("workers").join(&id).join("outbox/1.note.routed.json").exists());
+    assert!(home
+        .join("workers")
+        .join(&id)
+        .join("outbox/1.note.routed.json")
+        .exists());
     let routed = until("mesh_note_routed broker log line", || {
         broker_events(&home).into_iter().find(|v| {
             v["kind"] == "mesh_note_routed"
@@ -256,7 +266,12 @@ fn appserver_worker_note_to_codex_worker_lands_in_target_send_inbox() {
     seed_worker(&home, target, target_session, WorkerState::AwaitingInput);
     let brief = common::write_brief(tmp.path(), "write a mesh note\n");
     let note = json!({"to": target, "text": "queued from app worker", "refs": {}}).to_string();
-    let mut cmd = broker_cli(&home, tmp.path(), &fake_state, &["--json", "spawn", "--lane", "research", "--brief"]);
+    let mut cmd = broker_cli(
+        &home,
+        tmp.path(),
+        &fake_state,
+        &["--json", "spawn", "--lane", "research", "--brief"],
+    );
     cmd.arg(&brief).env("FAKE_MESH_NOTE", note);
     let spawned = run(cmd, &scratch, "spawn");
     let Some(d) = require_appserver(&spawned) else {
@@ -275,9 +290,16 @@ fn appserver_worker_note_to_codex_worker_lands_in_target_send_inbox() {
         (files.len() == 1).then_some(files)
     });
     let queued_text = fs::read_to_string(&queued[0]).unwrap();
-    assert!(queued_text.contains("queued from app worker"), "{queued_text}");
+    assert!(
+        queued_text.contains("queued from app worker"),
+        "{queued_text}"
+    );
     assert_eq!(note_files(&home, "codex", target_session).len(), 1);
-    assert!(home.join("workers").join(&source).join("outbox/1.note.routed.json").exists());
+    assert!(home
+        .join("workers")
+        .join(&source)
+        .join("outbox/1.note.routed.json")
+        .exists());
 }
 
 #[test]
@@ -295,7 +317,12 @@ fn appserver_secret_worker_note_is_rejected_without_delivery_and_logged() {
         .success();
     let brief = common::write_brief(tmp.path(), "write a mesh note\n");
     let note = json!({"to": format!("claude:{claude}"), "text": format!("ghp_{}", "a".repeat(40)), "refs": {}}).to_string();
-    let mut cmd = broker_cli(&home, tmp.path(), &fake_state, &["--json", "spawn", "--lane", "research", "--brief"]);
+    let mut cmd = broker_cli(
+        &home,
+        tmp.path(),
+        &fake_state,
+        &["--json", "spawn", "--lane", "research", "--brief"],
+    );
     cmd.arg(&brief).env("FAKE_MESH_NOTE", note);
     let spawned = run(cmd, &scratch, "spawn");
     let Some(d) = require_appserver(&spawned) else {

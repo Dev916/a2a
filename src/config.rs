@@ -404,7 +404,10 @@ impl AdmissionConfig {
     /// This lane's cap, falling back to the global one for a lane the map
     /// somehow does not carry (a config written by a newer binary).
     pub fn lane_cap(&self, lane: Lane) -> u64 {
-        self.lanes.get(&lane).map(|l| l.cap).unwrap_or(self.global_cap)
+        self.lanes
+            .get(&lane)
+            .map(|l| l.cap)
+            .unwrap_or(self.global_cap)
     }
 }
 
@@ -916,9 +919,7 @@ fn apply_admission_file(
                         continue;
                     }
                     let cap = want_u64(&dotted, lv)?;
-                    cfg.admission
-                        .lanes
-                        .insert(lane, LaneAdmission { cap });
+                    cfg.admission.lanes.insert(lane, LaneAdmission { cap });
                     origins.insert(dotted, Origin::File);
                 }
             }
@@ -1144,12 +1145,8 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         };
         let raw = raw.to_string_lossy().into_owned();
         match field {
-            "idle_timeout_secs" => {
-                cfg.broker.idle_timeout_secs = parse_u64_str(&key, raw.trim())?
-            }
-            "events_max_bytes" => {
-                cfg.broker.events_max_bytes = parse_u64_str(&key, raw.trim())?
-            }
+            "idle_timeout_secs" => cfg.broker.idle_timeout_secs = parse_u64_str(&key, raw.trim())?,
+            "events_max_bytes" => cfg.broker.events_max_bytes = parse_u64_str(&key, raw.trim())?,
             _ => unreachable!("field membership fixed by BROKER_FIELDS"),
         }
         origins.insert(format!("broker.{field}"), Origin::Env);
@@ -1385,7 +1382,10 @@ mod tests {
     fn the_broker_idle_timeout_defaults_to_five_minutes() {
         assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 300);
         assert_eq!(BrokerConfig::default().idle_timeout_secs, 300);
-        assert_eq!(broker_env_key("idle_timeout_secs"), "A2A_BROKER_IDLE_TIMEOUT_SECS");
+        assert_eq!(
+            broker_env_key("idle_timeout_secs"),
+            "A2A_BROKER_IDLE_TIMEOUT_SECS"
+        );
     }
 
     /// The `events.jsonl` cap (spec §4.5): ten mebibytes, one env spelling, and
@@ -1407,9 +1407,10 @@ mod tests {
 
     #[test]
     fn the_broker_section_walks_its_keys_and_warns_on_unknown() {
-        let table: toml::Table = "[broker]\nidle_timeout_secs = 45\nevents_max_bytes = 4096\nbogus = 1\n"
-            .parse()
-            .unwrap();
+        let table: toml::Table =
+            "[broker]\nidle_timeout_secs = 45\nevents_max_bytes = 4096\nbogus = 1\n"
+                .parse()
+                .unwrap();
         let mut cfg = Config {
             codex_bin: None,
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
@@ -1648,10 +1649,7 @@ mod tests {
             "one lane's override leaves the others alone"
         );
         assert_eq!(origins.get("admission.global_cap"), Some(&Origin::File));
-        assert_eq!(
-            origins.get("admission.lanes.impl.cap"),
-            Some(&Origin::File)
-        );
+        assert_eq!(origins.get("admission.lanes.impl.cap"), Some(&Origin::File));
         for unknown in [
             "admission.bogus",
             "admission.lanes.impl.nope",
@@ -1679,7 +1677,11 @@ mod tests {
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
-        assert!(err.message.contains("admission.global_cap"), "{}", err.message);
+        assert!(
+            err.message.contains("admission.global_cap"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -1811,7 +1813,9 @@ mod tests {
         assert_eq!(origins.get("sync.allow_skills"), Some(&Origin::File));
         assert_eq!(origins.get("sync.claude_config_dir"), Some(&Origin::File));
         assert!(
-            warnings.iter().any(|w| w.contains("sync.allow_http_headers")),
+            warnings
+                .iter()
+                .any(|w| w.contains("sync.allow_http_headers")),
             "the near-miss spelling warns rather than silently doing nothing: {warnings:?}"
         );
     }
@@ -1873,19 +1877,17 @@ mod tests {
             MESH_FIELDS,
             ["feed_max_bytes", "stale_after_secs", "gc_after_days"]
         );
-        assert_eq!(
-            mesh_env_key("feed_max_bytes"),
-            "A2A_MESH_FEED_MAX_BYTES"
-        );
+        assert_eq!(mesh_env_key("feed_max_bytes"), "A2A_MESH_FEED_MAX_BYTES");
         assert_eq!(
             mesh_env_key("stale_after_secs"),
             "A2A_MESH_STALE_AFTER_SECS"
         );
         assert_eq!(mesh_env_key("gc_after_days"), "A2A_MESH_GC_AFTER_DAYS");
 
-        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n"
-            .parse()
-            .unwrap();
+        let table: toml::Table =
+            "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n"
+                .parse()
+                .unwrap();
         let mut cfg = Config {
             codex_bin: None,
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
@@ -1957,7 +1959,11 @@ mod tests {
 
         let mut roots = vec![elsewhere.clone()];
         append_implicit_worktrees_root(&outside, &mut roots);
-        assert_eq!(roots, vec![elsewhere.clone(), canon_wt.clone()], "appended last");
+        assert_eq!(
+            roots,
+            vec![elsewhere.clone(), canon_wt.clone()],
+            "appended last"
+        );
         // Idempotent: a second pass adds nothing, because the root now covers it.
         append_implicit_worktrees_root(&outside, &mut roots);
         assert_eq!(roots.len(), 2, "never duplicated: {roots:?}");

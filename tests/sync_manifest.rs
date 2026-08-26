@@ -62,7 +62,9 @@ fn the_manifest_round_trips_at_0600() {
     assert_eq!(back.schema_version, SCHEMA_VERSION);
     assert_eq!(back.entries, m.entries);
     assert_eq!(
-        back.owns(Kind::Skill, "default", "techniques").unwrap().kind,
+        back.owns(Kind::Skill, "default", "techniques")
+            .unwrap()
+            .kind,
         Kind::Skill
     );
     assert!(back.owns(Kind::Skill, "default", "linear").is_none());

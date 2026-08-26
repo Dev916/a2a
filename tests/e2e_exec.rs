@@ -65,7 +65,10 @@ fn stub_happy_pipeline_spawn_wait_status_result_gc() {
         .assert()
         .code(0);
     let printed = String::from_utf8_lossy(&res.get_output().stdout).to_string();
-    assert!(printed.contains("A2A-STUB-OK"), "result stdout was: {printed}");
+    assert!(
+        printed.contains("A2A-STUB-OK"),
+        "result stdout was: {printed}"
+    );
 
     // gc --dry-run → lists the finished worker, deletes nothing
     let gc = a2a(&home, tmp.path())
@@ -140,8 +143,14 @@ fn stub_blocked_pipeline_wait_blocked_send_wait_result() {
         .assert()
         .code(0);
     let printed = String::from_utf8_lossy(&res.get_output().stdout).to_string();
-    assert!(!printed.trim().is_empty(), "answered worker must have a result");
-    assert!(printed.contains("A2A-ANSWERED-B"), "result stdout was: {printed}");
+    assert!(
+        !printed.trim().is_empty(),
+        "answered worker must have a result"
+    );
+    assert!(
+        printed.contains("A2A-ANSWERED-B"),
+        "result stdout was: {printed}"
+    );
 }
 
 /// Tier 5: the only test that runs a real `codex`.
@@ -264,7 +273,9 @@ fn real_codex_smoke() {
     // …and specifically that the agent message came from a real transport line,
     // not from a synthetic envelope we wrote ourselves.
     assert!(
-        kinds.iter().any(|k| k.starts_with("agent_message <-") && !k.contains("(synthetic)")),
+        kinds
+            .iter()
+            .any(|k| k.starts_with("agent_message <-") && !k.contains("(synthetic)")),
         "the worker's own message must map from a real exec line: {kinds:?}"
     );
 }

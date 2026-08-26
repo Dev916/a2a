@@ -241,7 +241,11 @@ fn an_edited_destination_is_refused_and_a_moved_source_is_synced() {
 
     // The SOURCE moved on instead: that is an ordinary update.
     copy_tree(&src, &dst);
-    std::fs::write(dst.join("SKILL.md"), std::fs::read(src.join("SKILL.md")).unwrap()).unwrap();
+    std::fs::write(
+        dst.join("SKILL.md"),
+        std::fs::read(src.join("SKILL.md")).unwrap(),
+    )
+    .unwrap();
     let mut manifest = Manifest::default();
     owned(
         &mut manifest,
@@ -288,7 +292,10 @@ fn a_vanished_source_is_removed_unless_the_destination_drifted() {
         "{}",
         entry.detail
     );
-    assert!(ghost_dst.join("SKILL.md").exists(), "planning deletes nothing");
+    assert!(
+        ghost_dst.join("SKILL.md").exists(),
+        "planning deletes nothing"
+    );
 }
 
 /// `plan()` reads and nothing else. Two runs produce an identical `Plan` — the

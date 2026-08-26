@@ -212,7 +212,10 @@ fn until_turn_started(home: &Path, allowed: &Path, scratch: &Path, id: &str) {
         if tailed.code != 0 {
             return None;
         }
-        let events = tailed.data()["events"].as_array().cloned().unwrap_or_default();
+        let events = tailed.data()["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         events
             .iter()
             .any(|e| e["kind"] == json!("turn_started"))
@@ -241,11 +244,18 @@ fn wal_lifecycle(home: &Path, id: &str) -> Vec<(u64, String)> {
 /// through: three whitespace-separated fields, seq first.
 fn parse_line(line: &str) -> (u64, String) {
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
-    assert_eq!(parts.len(), 3, "line contract is `<seq> <ts> <kind>`: {line}");
+    assert_eq!(
+        parts.len(),
+        3,
+        "line contract is `<seq> <ts> <kind>`: {line}"
+    );
     let seq: u64 = parts[0]
         .parse()
         .unwrap_or_else(|_| panic!("the first field is a seq: {line}"));
-    assert!(parts[1].ends_with('Z'), "the second field is a timestamp: {line}");
+    assert!(
+        parts[1].ends_with('Z'),
+        "the second field is a timestamp: {line}"
+    );
     (seq, parts[2].to_string())
 }
 
@@ -266,7 +276,15 @@ fn spawn_app_server(
     let mut cmd = a2a(
         home,
         allowed,
-        &["--json", "spawn", "--lane", "general", "--transport", "app-server", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "app-server",
+            "--cwd",
+        ],
     );
     cmd.arg(cwd)
         .arg("--brief")
@@ -307,7 +325,11 @@ fn follow_replays_the_log_then_streams_live_frames_and_exits_at_the_terminal_sta
     );
 
     let follower = Follower::start(
-        a2a(&home, tmp.path(), &["tail", &id, "--follow", "--timeout", "30s"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["tail", &id, "--follow", "--timeout", "30s"],
+        ),
         &scratch,
         "follow",
     );
@@ -330,10 +352,17 @@ fn follow_replays_the_log_then_streams_live_frames_and_exits_at_the_terminal_sta
     assert_eq!(sent.code, 0, "send: {}", sent.stderr);
 
     let out = follower.finish(40);
-    assert_eq!(out.code, 0, "a settled worker ends the follow: {}", out.stderr);
+    assert_eq!(
+        out.code, 0,
+        "a settled worker ends the follow: {}",
+        out.stderr
+    );
     let seen = parsed(&out.lines);
     let after = wal_lifecycle(&home, &id);
-    assert_eq!(seen, after, "the follow is the WAL's lifecycle projection, whole");
+    assert_eq!(
+        seen, after,
+        "the follow is the WAL's lifecycle projection, whole"
+    );
     assert!(
         seen.iter().any(|(_, k)| k == "turn_completed"),
         "the live half arrived: {seen:?}"
@@ -362,7 +391,11 @@ fn follow_gives_up_at_its_timeout_rather_than_blocking_forever() {
 
     let started = Instant::now();
     let out = Follower::start(
-        a2a(&home, tmp.path(), &["tail", &id, "--follow", "--timeout", "2s"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["tail", &id, "--follow", "--timeout", "2s"],
+        ),
         &scratch,
         "follow",
     )
@@ -404,7 +437,11 @@ fn a_broker_shutdown_mid_follow_is_a_notice_on_stderr_and_a_zero_exit() {
     until_turn_started(&home, tmp.path(), &scratch, &id);
 
     let follower = Follower::start(
-        a2a(&home, tmp.path(), &["tail", &id, "--follow", "--timeout", "60s"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["tail", &id, "--follow", "--timeout", "60s"],
+        ),
         &scratch,
         "follow",
     );
@@ -447,7 +484,15 @@ fn an_exec_worker_follows_through_the_poll_fallback_with_the_same_flags_and_exit
     let mut cmd = a2a(
         &home,
         tmp.path(),
-        &["--json", "spawn", "--lane", "general", "--transport", "exec", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "exec",
+            "--cwd",
+        ],
     );
     cmd.arg(&work)
         .arg("--brief")
@@ -458,7 +503,11 @@ fn an_exec_worker_follows_through_the_poll_fallback_with_the_same_flags_and_exit
     assert_eq!(spawned.data()["transport"], json!("exec"));
     let id = spawned.data()["id"].as_str().unwrap().to_string();
 
-    let mut follow = a2a(&home, tmp.path(), &["tail", &id, "--follow", "--timeout", "30s"]);
+    let mut follow = a2a(
+        &home,
+        tmp.path(),
+        &["tail", &id, "--follow", "--timeout", "30s"],
+    );
     follow.env("A2A_CODEX_BIN", common::stub_path());
     let out = Follower::start(follow, &scratch, "follow").finish(40);
 
@@ -504,7 +553,11 @@ fn a_flood_of_events_arrives_with_no_gaps_and_no_duplicates() {
     );
 
     let out = Follower::start(
-        a2a(&home, tmp.path(), &["tail", &id, "--follow", "--timeout", "60s"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["tail", &id, "--follow", "--timeout", "60s"],
+        ),
         &scratch,
         "follow",
     )
@@ -513,7 +566,11 @@ fn a_flood_of_events_arrives_with_no_gaps_and_no_duplicates() {
 
     let seen = parsed(&out.lines);
     let wal = wal_lifecycle(&home, &id);
-    assert!(wal.len() > 60, "the flood really happened: {} rows", wal.len());
+    assert!(
+        wal.len() > 60,
+        "the flood really happened: {} rows",
+        wal.len()
+    );
     assert_eq!(seen, wal, "no gaps, no duplicates: the stream IS the log");
     let mut seqs: Vec<u64> = seen.iter().map(|(s, _)| *s).collect();
     let before = seqs.len();
@@ -624,7 +681,11 @@ fn a_follow_client_keeps_an_idle_broker_alive() {
     });
 
     let follower = Follower::start(
-        a2a(&home, tmp.path(), &["tail", id, "--follow", "--timeout", "12s"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["tail", id, "--follow", "--timeout", "12s"],
+        ),
         &scratch,
         "follow",
     );
@@ -650,7 +711,11 @@ fn a_follow_client_keeps_an_idle_broker_alive() {
     );
 
     let out = follower.finish(30);
-    assert_eq!(out.code, 6, "the follow ended on its own timeout: {}", out.stderr);
+    assert_eq!(
+        out.code, 6,
+        "the follow ended on its own timeout: {}",
+        out.stderr
+    );
     // ... and once nobody is watching, the safety net works again.
     until("the unwatched broker to retire itself", || {
         (!alive(pid)).then_some(())

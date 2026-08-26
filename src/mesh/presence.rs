@@ -47,8 +47,7 @@ pub fn save(home: &A2aHome, p: &Presence) -> Result<(), AppError> {
     create_dir_0700(&peer_dir(home, &id)).map_err(|e| io_err("creating peer directory", e))?;
     let bytes =
         serde_json::to_vec_pretty(p).map_err(|e| data_err("serializing presence.json", e))?;
-    write_atomic(&presence_path(home, &id), &bytes)
-        .map_err(|e| io_err("writing presence.json", e))
+    write_atomic(&presence_path(home, &id), &bytes).map_err(|e| io_err("writing presence.json", e))
 }
 
 pub fn save_inject_cursors(
@@ -91,7 +90,11 @@ pub fn staleness(
     }
 }
 
-pub(crate) fn new_presence(home: &A2aHome, id: &PeerId, now: DateTime<Utc>) -> Result<Presence, AppError> {
+pub(crate) fn new_presence(
+    home: &A2aHome,
+    id: &PeerId,
+    now: DateTime<Utc>,
+) -> Result<Presence, AppError> {
     Ok(Presence {
         peer: id.to_string(),
         provider: id.provider.to_string(),

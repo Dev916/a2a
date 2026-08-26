@@ -229,7 +229,10 @@ fn status_sets_clears_caps_and_refuses_secret_values() {
         .args(["mesh", "status", "--session", session, ""])
         .assert()
         .success();
-    assert_eq!(read_presence(tmp.path(), "claude", session)["status"], Value::Null);
+    assert_eq!(
+        read_presence(tmp.path(), "claude", session)["status"],
+        Value::Null
+    );
 
     let out = cli(tmp.path())
         .args([

@@ -96,16 +96,19 @@ pub fn run(
         .unwrap_or(false);
     // The machine is the authority on whether this worker can be resumed at
     // all; its rejection carries the remedy, so it is surfaced verbatim.
-    fsm::step(snap.state, snap.state_reason, &FsmEvent::Resume { answer_queued }).map_err(
-        |rejected| {
-            AppError::new(
-                "ILLEGAL_TRANSITION",
-                ExitCode::Precondition,
-                rejected.to_string(),
-            )
-            .remedy(rejected.reason)
-        },
-    )?;
+    fsm::step(
+        snap.state,
+        snap.state_reason,
+        &FsmEvent::Resume { answer_queued },
+    )
+    .map_err(|rejected| {
+        AppError::new(
+            "ILLEGAL_TRANSITION",
+            ExitCode::Precondition,
+            rejected.to_string(),
+        )
+        .remedy(rejected.reason)
+    })?;
 
     // Everything below mutates the worker, so it runs under `state.lock`.
     let _lock = reconcile::lock_state(&dir)?;
@@ -225,7 +228,12 @@ pub fn run(
             }
         );
     }
-    Ok(Outcome::from(payload(&id, &snap, message.is_some(), json_mode)))
+    Ok(Outcome::from(payload(
+        &id,
+        &snap,
+        message.is_some(),
+        json_mode,
+    )))
 }
 
 /// A worker with no recorded codex session id cannot be resumed: there is no

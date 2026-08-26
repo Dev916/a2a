@@ -101,10 +101,13 @@ use crate::commands::owner;
 use crate::config;
 use crate::home::A2aHome;
 use crate::ids;
-use crate::mesh::{gateway::{presence_wire, replicate}, notes, presence, PeerId, Presence};
+use crate::mesh::{
+    gateway::{presence_wire, replicate},
+    notes, presence, PeerId, Presence,
+};
 use crate::output::{AppError, ExitCode, Outcome};
-use crate::redact;
 use crate::reconcile::reconcile;
+use crate::redact;
 use crate::state::{WorkerSnapshot, WorktreeRef};
 use crate::worktree;
 use chrono::{DateTime, Utc};
@@ -444,8 +447,13 @@ fn sweep_mesh(
         let retain_days = cfg.mesh.gateway.feed_retain_days.min(i64::MAX as u64);
         let retain = chrono::Duration::days(retain_days as i64);
         let compaction = replicate::compact_feed(home, cfg, now, retain, &mut cursors)?;
-        sweep.feed_compaction = serde_json::to_value(compaction)
-            .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing feed compaction: {e}")))?;
+        sweep.feed_compaction = serde_json::to_value(compaction).map_err(|e| {
+            AppError::new(
+                "DATA",
+                ExitCode::Internal,
+                format!("serializing feed compaction: {e}"),
+            )
+        })?;
     }
 
     let peers = home.root().join("mesh").join("peers");
@@ -462,8 +470,13 @@ fn sweep_mesh(
         .min(i64::MAX as u64) as i64;
     if !dry_run {
         let retirement = presence_wire::retire_stale_origins(home, now, gc_after_secs)?;
-        sweep.origin_retirement = serde_json::to_value(retirement)
-            .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing origin retirement: {e}")))?;
+        sweep.origin_retirement = serde_json::to_value(retirement).map_err(|e| {
+            AppError::new(
+                "DATA",
+                ExitCode::Internal,
+                format!("serializing origin retirement: {e}"),
+            )
+        })?;
     }
     let local_gateway = crate::mesh::feed::existing_gateway_id(home);
     for entry in entries {
@@ -474,7 +487,9 @@ fn sweep_mesh(
             Ok(m) => m,
             Err(e) => {
                 warn(format!("mesh/peers/{name}: unreadable ({e}) — skipped"));
-                sweep.skipped.push(json!({"entry": name, "reason": "unreadable"}));
+                sweep
+                    .skipped
+                    .push(json!({"entry": name, "reason": "unreadable"}));
                 continue;
             }
         };
@@ -482,19 +497,25 @@ fn sweep_mesh(
             warn(format!(
                 "mesh/peers/{name}: symlinked entry — skipped (gc never follows a link out of the home tree)"
             ));
-            sweep.skipped.push(json!({"entry": name, "reason": "symlink"}));
+            sweep
+                .skipped
+                .push(json!({"entry": name, "reason": "symlink"}));
             continue;
         }
         if !meta.is_dir() {
             warn(format!("mesh/peers/{name}: not a directory — skipped"));
-            sweep.skipped.push(json!({"entry": name, "reason": "not a directory"}));
+            sweep
+                .skipped
+                .push(json!({"entry": name, "reason": "not a directory"}));
             continue;
         }
         let Some(id) = mesh_peer_from_dir_name(&name) else {
             warn(format!(
                 "mesh/peers/{name}: not a valid peer directory — skipped (gc only removes what it can name)"
             ));
-            sweep.skipped.push(json!({"entry": name, "reason": "invalid peer id"}));
+            sweep
+                .skipped
+                .push(json!({"entry": name, "reason": "invalid peer id"}));
             continue;
         };
         let peer = id.to_string();
@@ -512,7 +533,10 @@ fn sweep_mesh(
             now,
             cfg.mesh.stale_after_secs,
         );
-        let home_gateway = presence.home_gateway.as_deref().filter(|gateway| !gateway.is_empty());
+        let home_gateway = presence
+            .home_gateway
+            .as_deref()
+            .filter(|gateway| !gateway.is_empty());
         let remote_homed = home_gateway
             .map(|gateway| local_gateway.as_deref() != Some(gateway))
             .unwrap_or(false);
@@ -671,10 +695,7 @@ impl Candidate {
             id: id.to_string(),
             state: snap.state.as_str().to_string(),
             session_id: snap.session_id.clone(),
-            rollout_path: snap
-                .rollout_path
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            rollout_path: snap.rollout_path.as_ref().map(|p| p.display().to_string()),
             cwd: snap.cwd.display().to_string(),
             // A worktree is disk this worker is holding just as surely as its
             // own directory is, and it is usually the larger half — a report
@@ -1276,7 +1297,15 @@ mod tests {
     /// a well-formed worker id may ever be joined onto `workers/` and removed.
     #[test]
     fn only_well_formed_ids_can_name_a_removal_candidate() {
-        for hostile in ["..evil", "not-an-id", "..", ".", "evil-link", "", "../../etc"] {
+        for hostile in [
+            "..evil",
+            "not-an-id",
+            "..",
+            ".",
+            "evil-link",
+            "",
+            "../../etc",
+        ] {
             assert!(!ids::is_valid(hostile), "{hostile} must never pass");
         }
         assert!(ids::is_valid("general-0814t1300-aaaa"));

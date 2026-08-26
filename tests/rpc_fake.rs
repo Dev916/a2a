@@ -12,13 +12,13 @@
 #[path = "common/fidelity.rs"]
 mod fidelity;
 
+use a2a::adapter::{self, AdapterRef, SendPath, TurnSpec};
+use a2a::config::{LaneConfig, SandboxMode};
 use a2a::protocol::{
     InitializeParams, InitializeResponse, RpcNotification, SandboxModeParam, SandboxPolicy,
     ThreadResumeParams, ThreadStartParams, ThreadStartResponse, TurnInterruptParams,
     TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams, UserInput,
 };
-use a2a::adapter::{self, AdapterRef, SendPath, TurnSpec};
-use a2a::config::{LaneConfig, SandboxMode};
 use a2a::responder::{self, Disposition};
 use a2a::rpc::{Client, Incoming, RpcError, UNPARSEABLE_METHOD};
 use serde_json::{json, Value};
@@ -288,7 +288,10 @@ async fn concurrent_in_flight_requests_correlate_by_id_not_by_arrival_order() {
     for line in raw.lines() {
         let rec: Value = serde_json::from_str(line).unwrap();
         let frame = &rec["frame"];
-        match (rec["dir"].as_str(), frame.get("method").and_then(|m| m.as_str())) {
+        match (
+            rec["dir"].as_str(),
+            frame.get("method").and_then(|m| m.as_str()),
+        ) {
             (Some("in"), Some("thread/loaded/list")) => probe_id = frame["id"].as_u64(),
             (Some("in"), Some("thread/start")) => start_id = frame["id"].as_u64(),
             (Some("out"), None) => {
@@ -385,7 +388,10 @@ async fn crash_mid_turn_resolves_child_died_and_the_relaunch_resumes() {
     let thread_id = ts.thread.id.clone();
     f.start_turn(&thread_id, "go").await;
 
-    assert_eq!(f.notes_until("turn/started").await.last().unwrap(), "turn/started");
+    assert_eq!(
+        f.notes_until("turn/started").await.last().unwrap(),
+        "turn/started"
+    );
     // The child is gone: the stream ends rather than hanging.
     match tokio::time::timeout(WAIT, f.incoming.notifications.recv()).await {
         Ok(None) => {}
@@ -464,7 +470,10 @@ async fn server_requests_are_routed_and_the_turn_waits_for_the_answer() {
     f.init().await;
     let ts = f.start_thread(&work_dir(root.path())).await;
     f.start_turn(&ts.thread.id, "rm -rf /").await;
-    assert_eq!(f.notes_until("turn/started").await.last().unwrap(), "turn/started");
+    assert_eq!(
+        f.notes_until("turn/started").await.last().unwrap(),
+        "turn/started"
+    );
 
     let req = tokio::time::timeout(WAIT, f.incoming.server_requests.recv())
         .await
@@ -532,7 +541,10 @@ async fn the_responder_denies_the_exec_approval_and_only_then_does_the_turn_comp
     f.init().await;
     let ts = f.start_thread(&work_dir(root.path())).await;
     f.start_turn(&ts.thread.id, "rm -rf /").await;
-    assert_eq!(f.notes_until("turn/started").await.last().unwrap(), "turn/started");
+    assert_eq!(
+        f.notes_until("turn/started").await.last().unwrap(),
+        "turn/started"
+    );
 
     let req = tokio::time::timeout(WAIT, f.incoming.server_requests.recv())
         .await
@@ -636,7 +648,10 @@ async fn blocked_scenario_writes_the_question_into_the_thread_cwd_before_complet
     // in later tasks relies on.
     let q = work.join("outbox/1.question.json");
     let body: Value = serde_json::from_str(&std::fs::read_to_string(&q).unwrap()).unwrap();
-    assert_eq!(body, json!({"seq": 1, "question": "A or B?", "blocking": true}));
+    assert_eq!(
+        body,
+        json!({"seq": 1, "question": "A or B?", "blocking": true})
+    );
     assert!(seen.contains(&"turn/completed".to_string()));
     f.shutdown().await;
 
@@ -698,7 +713,10 @@ async fn hang_turn_holds_the_turn_open_until_interrupted() {
     let ts = f.start_thread(&work_dir(root.path())).await;
     let turn = f.start_turn(&ts.thread.id, "spin forever").await;
 
-    assert_eq!(f.notes_until("turn/started").await.last().unwrap(), "turn/started");
+    assert_eq!(
+        f.notes_until("turn/started").await.last().unwrap(),
+        "turn/started"
+    );
     f.assert_quiet().await; // it never completes on its own
 
     let _: Value = f
@@ -730,7 +748,10 @@ async fn hang_turn_completes_when_steered() {
     f.init().await;
     let ts = f.start_thread(&work_dir(root.path())).await;
     let turn = f.start_turn(&ts.thread.id, "spin").await;
-    assert_eq!(f.notes_until("turn/started").await.last().unwrap(), "turn/started");
+    assert_eq!(
+        f.notes_until("turn/started").await.last().unwrap(),
+        "turn/started"
+    );
 
     let _: Value = f
         .client
@@ -810,14 +831,14 @@ async fn child_env_is_the_allowlist_plus_extras_with_secrets_always_scrubbed() {
     f.init().await; // the dump is written before the first frame
 
     let dumped = std::fs::read_to_string(&dump).expect("child env dump");
-    let keys: Vec<&str> = dumped
-        .lines()
-        .filter_map(|l| l.split('=').next())
-        .collect();
+    let keys: Vec<&str> = dumped.lines().filter_map(|l| l.split('=').next()).collect();
 
     assert!(keys.contains(&"PATH"), "PATH is in the allowlist");
     assert!(keys.contains(&"HOME"), "HOME is in the allowlist");
-    assert!(keys.contains(&"A2A_TEST_MARKER"), "extra pairs pass through");
+    assert!(
+        keys.contains(&"A2A_TEST_MARKER"),
+        "extra pairs pass through"
+    );
     for scrubbed in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "DEPOT_TOKEN"] {
         assert!(
             !keys.contains(&scrubbed),
@@ -935,7 +956,9 @@ async fn adapter_initialize_opts_out_of_the_delta_stream_and_the_voice_channel()
     let root = root();
     let f = Fake::start(root.path(), "happy", &[]).await;
 
-    let info = adapter::initialize(&f.client, RPC).await.expect("initialize");
+    let info = adapter::initialize(&f.client, RPC)
+        .await
+        .expect("initialize");
     assert!(
         info.user_agent.starts_with("fake-app-server/"),
         "got {}",
@@ -1277,7 +1300,10 @@ async fn the_adapter_ref_clones_and_drives_turn_start_and_interrupt() {
         worker_dir: &wd,
         output_schema: None,
     };
-    let open = adapter_ref.turn_start(&spec, RPC).await.expect("turn/start");
+    let open = adapter_ref
+        .turn_start(&spec, RPC)
+        .await
+        .expect("turn/start");
     assert_eq!(
         notes_until_of(&mut incoming, "turn/started")
             .await
@@ -1390,7 +1416,10 @@ fn handshake_probe_times_out_and_kills_the_child() {
 
 #[test]
 fn handshake_probe_reports_a_missing_binary_rather_than_panicking() {
-    let err = adapter::handshake_probe(Path::new("/definitely/not/a/binary"), Duration::from_secs(2))
-        .expect_err("there is no such binary");
+    let err = adapter::handshake_probe(
+        Path::new("/definitely/not/a/binary"),
+        Duration::from_secs(2),
+    )
+    .expect_err("there is no such binary");
     assert_eq!(err, RpcError::ChildDied);
 }

@@ -1,7 +1,7 @@
 use a2a::home::A2aHome;
 use a2a::mesh::keys::{
-    fleet_init, gateway_identity, mint_ulid, sign_token, verify_token, RootSet, TestClock,
-    TokenClaims, SKEW_TOLERANCE_SECS,
+    ensure_gateway_token, fleet_init, gateway_identity, gateway_public_key_fingerprint, mint_ulid,
+    sign_token, verify_token, RootSet, TestClock, TokenClaims, SKEW_TOLERANCE_SECS,
 };
 use chrono::{TimeZone, Utc};
 use std::fs;
@@ -37,7 +37,9 @@ fn fleet_and_gateway_material_have_stable_ids_modes_and_fingerprint() {
         "{}",
         fleet.fleet_id
     );
-    assert!(fleet.fleet_id["fleet-".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(fleet.fleet_id["fleet-".len()..]
+        .chars()
+        .all(|c| c.is_ascii_hexdigit()));
 
     let gw = gateway_identity(&home, false).unwrap();
     let again = gateway_identity(&home, false).unwrap();
@@ -45,7 +47,10 @@ fn fleet_and_gateway_material_have_stable_ids_modes_and_fingerprint() {
     assert_eq!(gw.cert_fpr, again.cert_fpr);
     assert!(gw.gateway_id.starts_with("gw-"), "{}", gw.gateway_id);
     assert_eq!(gw.cert_fpr.len(), 64);
-    assert!(gw.cert_fpr.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(gw
+        .cert_fpr
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     assert_eq!(gw.cert_fpr(), gw.cert_fpr);
 
     let fresh = gateway_identity(&home, true).unwrap();
@@ -83,6 +88,41 @@ fn sign_verify_roundtrip_and_root_rotation_accepts_current_or_next() {
 }
 
 #[test]
+fn self_enrollment_token_is_minted_once_from_existing_fleet_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    let root = fleet_init(&home).unwrap();
+    let gateway = gateway_identity(&home, false).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+    assert!(ensure_gateway_token(&home, &clock).unwrap());
+    let token_path = tmp.path().join("mesh/gateway/gw.token");
+    assert_eq!(mode(&token_path), 0o600);
+    let token = fs::read_to_string(&token_path).unwrap();
+    let verified = verify_token(token.trim(), &RootSet::load(&home).unwrap(), &clock).unwrap();
+    assert_eq!(verified.fleet_id, root.fleet_id);
+    assert_eq!(verified.gateway_id, gateway.gateway_id);
+    assert_eq!(verified.exp - verified.issued_at, 90 * 24 * 60 * 60);
+    assert_eq!(gateway_public_key_fingerprint(&home).unwrap().len(), 64);
+
+    let before = fs::read_to_string(&token_path).unwrap();
+    assert!(!ensure_gateway_token(&home, &clock).unwrap());
+    assert_eq!(fs::read_to_string(&token_path).unwrap(), before);
+}
+
+#[test]
+fn self_enrollment_without_root_key_returns_gateway_not_enrolled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    gateway_identity(&home, false).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+    let err = ensure_gateway_token(&home, &clock).unwrap_err();
+    assert_eq!(err.code, "GATEWAY_NOT_ENROLLED");
+    assert!(err.remedy.unwrap().contains("a2a mesh fleet init"));
+}
+
+#[test]
 fn clock_skew_boundaries_are_injected_and_expired_error_names_both_timestamps() {
     let tmp = tempfile::tempdir().unwrap();
     let home = home_in(&tmp);
@@ -92,17 +132,28 @@ fn clock_skew_boundaries_are_injected_and_expired_error_names_both_timestamps() 
     let now = 1_700_000_000;
     let token = sign_token(&claims(now + 10, now - 10), &home).unwrap();
 
-    let ahead_ok = TestClock::new(Utc.timestamp_opt(now + 10 + SKEW_TOLERANCE_SECS - 1, 0).unwrap());
+    let ahead_ok = TestClock::new(
+        Utc.timestamp_opt(now + 10 + SKEW_TOLERANCE_SECS - 1, 0)
+            .unwrap(),
+    );
     verify_token(&token, &roots, &ahead_ok).unwrap();
-    let behind_ok =
-        TestClock::new(Utc.timestamp_opt(now - 10 - SKEW_TOLERANCE_SECS + 1, 0).unwrap());
+    let behind_ok = TestClock::new(
+        Utc.timestamp_opt(now - 10 - SKEW_TOLERANCE_SECS + 1, 0)
+            .unwrap(),
+    );
     verify_token(&token, &roots, &behind_ok).unwrap();
 
-    let ahead_bad =
-        TestClock::new(Utc.timestamp_opt(now + 10 + SKEW_TOLERANCE_SECS + 1, 0).unwrap());
+    let ahead_bad = TestClock::new(
+        Utc.timestamp_opt(now + 10 + SKEW_TOLERANCE_SECS + 1, 0)
+            .unwrap(),
+    );
     let err = verify_token(&token, &roots, &ahead_bad).unwrap_err();
     assert_eq!(err.code, "TOKEN_EXPIRED");
-    assert!(err.message.contains(&(now + 10).to_string()), "{}", err.message);
+    assert!(
+        err.message.contains(&(now + 10).to_string()),
+        "{}",
+        err.message
+    );
     assert!(
         err.message
             .contains(&(now + 10 + SKEW_TOLERANCE_SECS + 1).to_string()),
@@ -111,8 +162,10 @@ fn clock_skew_boundaries_are_injected_and_expired_error_names_both_timestamps() 
     );
 
     let future_token = sign_token(&claims(now + 10, now + 10), &home).unwrap();
-    let behind_bad =
-        TestClock::new(Utc.timestamp_opt(now + 10 - SKEW_TOLERANCE_SECS - 1, 0).unwrap());
+    let behind_bad = TestClock::new(
+        Utc.timestamp_opt(now + 10 - SKEW_TOLERANCE_SECS - 1, 0)
+            .unwrap(),
+    );
     let err = verify_token(&future_token, &roots, &behind_bad).unwrap_err();
     assert_eq!(err.code, "TOKEN_NOT_YET_VALID");
 }
@@ -143,10 +196,13 @@ fn forced_errors_do_not_leak_private_key_material() {
         sign_token(&claims(1_700_001_000, 1_699_999_000), &home).unwrap_err()
     ));
     corpus.push(format!("{:?}", gateway_identity(&home, false).unwrap_err()));
-    corpus.push(format!("{:?}", TokenClaims {
-        pubkey_b64: "public".to_string(),
-        ..claims(1, 0)
-    }));
+    corpus.push(format!(
+        "{:?}",
+        TokenClaims {
+            pubkey_b64: "public".to_string(),
+            ..claims(1, 0)
+        }
+    ));
 
     for entry in corpus {
         assert!(!entry.contains(secret), "{entry}");

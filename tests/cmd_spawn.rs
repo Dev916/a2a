@@ -5,9 +5,11 @@ use common::*;
 #[test]
 fn spawn_general_creates_worker_and_runs() {
     let (home, _tmp, id) = spawn_with(&[]);
-    assert!(regex::Regex::new(r"^general-[0-9]{4}t[0-9]{4}-[a-z2-7]{4}$")
-        .unwrap()
-        .is_match(&id));
+    assert!(
+        regex::Regex::new(r"^general-[0-9]{4}t[0-9]{4}-[a-z2-7]{4}$")
+            .unwrap()
+            .is_match(&id)
+    );
     let wdir = home.join("workers").join(&id);
     for f in ["brief.md", "prompt.md", "state.json", "events.jsonl"] {
         assert!(wdir.join(f).exists(), "{f}");
@@ -36,7 +38,9 @@ fn cwd_outside_allowed_roots_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let brief = write_brief(tmp.path(), "x");
     let out = a2a(&tmp.path().join("home"), &tmp.path().join("only-here"))
-        .args(["--json", "spawn", "--lane", "general", "--cwd", "/tmp", "--brief"])
+        .args([
+            "--json", "spawn", "--lane", "general", "--cwd", "/tmp", "--brief",
+        ])
         .arg(&brief)
         .assert()
         .code(9);
@@ -131,14 +135,28 @@ fn brief_transport_and_elevation_gates() {
     // never the static exit 9, which is now only for a transport string this
     // build could never offer at all.
     a2a(&home, tmp.path())
-        .args(["spawn", "--lane", "general", "--transport", "app-server", "--cwd"])
+        .args([
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "app-server",
+            "--cwd",
+        ])
         .arg(tmp.path())
         .arg("--brief")
         .arg(&no_ac)
         .assert()
         .code(7);
     a2a(&home, tmp.path())
-        .args(["spawn", "--lane", "general", "--transport", "carrier-pigeon", "--cwd"])
+        .args([
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "carrier-pigeon",
+            "--cwd",
+        ])
         .arg(tmp.path())
         .arg("--brief")
         .arg(&no_ac)
@@ -219,7 +237,11 @@ fn the_impl_lane_materializes_the_shipped_schema_and_records_its_source() {
     let brief = brief_with(tmp.path(), "");
 
     let out = spawn_schema(&home, tmp.path(), "impl", &work, &brief, &[]);
-    assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let id = v["data"]["id"].as_str().unwrap().to_string();
 
@@ -237,11 +259,18 @@ fn the_impl_lane_materializes_the_shipped_schema_and_records_its_source() {
 
     let snap = read_snapshot(&home, &id);
     assert_eq!(snap["schema_path"], serde_json::json!(path), "{snap}");
-    assert_eq!(snap["schema_source"], serde_json::json!("lane-default"), "{snap}");
+    assert_eq!(
+        snap["schema_source"],
+        serde_json::json!("lane-default"),
+        "{snap}"
+    );
 
     // Lossless: the label lives in GENESIS, so it survives a rebuild from zero.
     wait_dead(&home, &id, 30);
-    a2a(&home, tmp.path()).args(["status", &id]).output().unwrap();
+    a2a(&home, tmp.path())
+        .args(["status", &id])
+        .output()
+        .unwrap();
     std::fs::remove_file(home.join("workers").join(&id).join("state.json")).unwrap();
     a2a(&home, tmp.path())
         .args(["--json", "status", &id])
@@ -271,7 +300,11 @@ fn a_briefs_result_schema_is_resolved_beside_the_brief() {
     let brief = brief_with(tmp.path(), "result_schema: ./task.schema.json\n");
 
     let out = spawn_schema(&home, tmp.path(), "impl", &work, &brief, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let id = v["data"]["id"].as_str().unwrap().to_string();
 
@@ -330,7 +363,11 @@ fn the_flag_outranks_the_brief_and_general_has_no_default() {
         &brief,
         &["--schema", flagged.to_str().unwrap()],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let id = v["data"]["id"].as_str().unwrap().to_string();
     assert_eq!(
@@ -345,7 +382,11 @@ fn the_flag_outranks_the_brief_and_general_has_no_default() {
     // The general lane: no flag, no brief key, no default.
     let plain = write_brief(&work, "freeform\n");
     let out = spawn_schema(&home, tmp.path(), "general", &work, &plain, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let snap = read_snapshot(&home, v["data"]["id"].as_str().unwrap());
     assert_eq!(snap["schema_path"], serde_json::Value::Null, "{snap}");

@@ -117,7 +117,13 @@ fn reconcile_locked(
     let snap = match load_snapshot(dir) {
         Ok(s) => s,
         Err(SnapshotError::Missing) | Err(SnapshotError::Corrupt) => {
-            let rebuilt = fold::recover(dir, LivenessInput { process_alive: true }, now)?;
+            let rebuilt = fold::recover(
+                dir,
+                LivenessInput {
+                    process_alive: true,
+                },
+                now,
+            )?;
             if rebuilt.transport == Transport::AppServer {
                 return reconcile_app_server(home, dir, rebuilt, now);
             }
@@ -557,14 +563,16 @@ fn ingest(
 /// (`session.created`, `session_configured`, `thread.started`).
 fn extract_session(raw: &Value) -> Option<SessionIds> {
     let nested = ["session", "msg", "thread"];
-    let id = pick_str(raw, &["session_id", "sessionId", "thread_id", "threadId", "id"]).or_else(
-        || {
-            nested
-                .iter()
-                .filter_map(|k| raw.get(k))
-                .find_map(|v| pick_str(v, &["session_id", "thread_id", "id"]))
-        },
-    )?;
+    let id = pick_str(
+        raw,
+        &["session_id", "sessionId", "thread_id", "threadId", "id"],
+    )
+    .or_else(|| {
+        nested
+            .iter()
+            .filter_map(|k| raw.get(k))
+            .find_map(|v| pick_str(v, &["session_id", "thread_id", "id"]))
+    })?;
     let rollout_path = pick_str(raw, &["rollout_path", "rollout"]).or_else(|| {
         nested
             .iter()
@@ -813,8 +821,8 @@ fn schema_gate(dir: &Path, schema_path: &Path) -> Result<Gate, AppError> {
             )
         }
     };
-    let text = std::fs::read_to_string(dir.join(RESULT_MD))
-        .map_err(|e| io_err("reading result.md", e))?;
+    let text =
+        std::fs::read_to_string(dir.join(RESULT_MD)).map_err(|e| io_err("reading result.md", e))?;
     let parsed = match serde_json::from_str::<Value>(&text) {
         Ok(v) => v,
         // The serde message names a position, never content — the result text
@@ -845,7 +853,10 @@ fn schema_gate(dir: &Path, schema_path: &Path) -> Result<Gate, AppError> {
         if !missing.is_empty() {
             return violation(
                 dir,
-                format!("result.md is missing required key(s): {}", missing.join(", ")),
+                format!(
+                    "result.md is missing required key(s): {}",
+                    missing.join(", ")
+                ),
             );
         }
     }
@@ -1011,9 +1022,7 @@ pub fn arm_deadline(snap: &mut WorkerSnapshot, cfg: &Config) {
     snap.deadline_at = match snap.state {
         WorkerState::Spawned => Some(from + Delta::seconds(lane.start_timeout_secs as i64)),
         WorkerState::Running => Some(from + Delta::seconds(lane.task_timeout_secs as i64)),
-        WorkerState::AwaitingInput => {
-            Some(from + Delta::seconds(lane.blocked_timeout_secs as i64))
-        }
+        WorkerState::AwaitingInput => Some(from + Delta::seconds(lane.blocked_timeout_secs as i64)),
         _ => None,
     };
 }
@@ -1248,8 +1257,8 @@ mod tests {
         // Turn 1: no result, one unanswered question → parked, blocked.
         let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
         assert!(has_question);
-        let mut snap = conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), false, has_question)
-            .unwrap();
+        let mut snap =
+            conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), false, has_question).unwrap();
         assert_eq!(snap.state, WorkerState::AwaitingInput);
         assert_eq!(snap.state_reason, Some(StateReason::Blocked));
 
@@ -1261,9 +1270,16 @@ mod tests {
         std::fs::write(dir.join(RESULT_MD), b"the answer\n").unwrap();
         let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
         assert!(!has_question, "seq 1 was answered by delivery watermark 1");
-        let snap =
-            conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), has_result(dir), has_question)
-                .unwrap();
+        let snap = conclude_turn(
+            &mut log,
+            dir,
+            snap,
+            &cfg,
+            Utc::now(),
+            has_result(dir),
+            has_question,
+        )
+        .unwrap();
         assert_eq!(snap.state, WorkerState::Done);
         assert!(snap.extra.get("fold_rejections").is_none());
     }
@@ -1281,7 +1297,10 @@ mod tests {
 
         let snap = conclude_turn(&mut log, dir, snap, &cfg, Utc::now(), true, false).unwrap();
         assert_eq!(snap.state, WorkerState::Failed);
-        assert_eq!(snap.failure_class, Some(crate::fsm::FailureClass::SchemaViolation));
+        assert_eq!(
+            snap.failure_class,
+            Some(crate::fsm::FailureClass::SchemaViolation)
+        );
         assert!(dir.join(RESULT_RAW).exists(), "the raw text is preserved");
         // `done` was never reached, so no `result.json` was ever published.
         assert!(!dir.join(RESULT_JSON).exists());
@@ -1306,7 +1325,10 @@ mod tests {
             .iter()
             .map(|e| e.kind)
             .collect();
-        assert_eq!(kinds, vec![EventKind::ResultWritten, EventKind::StateChange]);
+        assert_eq!(
+            kinds,
+            vec![EventKind::ResultWritten, EventKind::StateChange]
+        );
         assert!(dir.join(RESULT_JSON).exists());
     }
 
@@ -1334,7 +1356,10 @@ mod tests {
         assert!(!has_pending_delivery(tmp.path(), &snap), "empty queue");
         crate::inbox::queue_message(tmp.path(), "o", crate::inbox::MsgKind::Answer, "B").unwrap();
         snap.session_id = None;
-        assert!(!has_pending_delivery(tmp.path(), &snap), "nothing to resume");
+        assert!(
+            !has_pending_delivery(tmp.path(), &snap),
+            "nothing to resume"
+        );
     }
 
     #[test]

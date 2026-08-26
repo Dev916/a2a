@@ -50,7 +50,10 @@ pub const DISABLE_ENV: &str = "A2A_BROKER_DISABLE";
 /// a shell leaves behind when a variable is cleared badly.
 pub fn disabled() -> bool {
     match std::env::var(DISABLE_ENV) {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no"
+        ),
         Err(_) => false,
     }
 }
@@ -137,9 +140,13 @@ pub enum TailUpdate {
     Event(Box<TailEvent>),
     /// The subscription fell behind and was cut. `last_seq` is the last
     /// envelope that actually arrived — the cursor to re-read from.
-    Lagged { last_seq: u64 },
+    Lagged {
+        last_seq: u64,
+    },
     /// The daemon is shutting down and said so.
-    BrokerShutdown { grace_secs: u64 },
+    BrokerShutdown {
+        grace_secs: u64,
+    },
     /// The connection ended without a farewell.
     Closed,
     /// Nothing arrived inside the timeout.
@@ -294,14 +301,14 @@ fn handshake(stream: UnixStream, home: &Path) -> Result<Handshake, AppError> {
     let frame = client.read(home)?;
     match frame.ty {
         FrameType::Hello => {
-            client.peer = serde_json::from_value(frame.body).map_err(|e| {
-                unavailable(home, format!("the broker's hello is unreadable: {e}"))
-            })?;
+            client.peer = serde_json::from_value(frame.body)
+                .map_err(|e| unavailable(home, format!("the broker's hello is unreadable: {e}")))?;
             Ok(Handshake::Ready(client))
         }
         FrameType::Err => {
-            let error = WireError::from_value(&frame.body)
-                .unwrap_or_else(|| WireError::from_app(&unavailable(home, "the broker refused us")));
+            let error = WireError::from_value(&frame.body).unwrap_or_else(|| {
+                WireError::from_app(&unavailable(home, "the broker refused us"))
+            });
             if error.code == wire::ERR_VERSION_SKEW {
                 client.skewed = true;
                 client.peer = wire::Hello {
@@ -424,9 +431,9 @@ impl BrokerClient {
             Ok(Incoming::Frame(frame)) => Ok(classify(&frame)?.unwrap_or(TailUpdate::Idle)),
             Ok(Incoming::Eof) => Ok(TailUpdate::Closed),
             Ok(Incoming::TooLarge) => Err(internal("the broker sent an oversized frame")),
-            Ok(Incoming::Malformed(detail)) => {
-                Err(internal(format!("unreadable frame from the broker: {detail}")))
-            }
+            Ok(Incoming::Malformed(detail)) => Err(internal(format!(
+                "unreadable frame from the broker: {detail}"
+            ))),
             Err(e) if would_block(&e) => Ok(TailUpdate::Idle),
             Err(e) => Err(AppError::new(
                 wire::ERR_BROKER_UNAVAILABLE,
@@ -457,7 +464,12 @@ impl BrokerClient {
     fn wire_error(&self, frame: &Frame) -> AppError {
         WireError::from_value(&frame.body)
             .map(|e| e.to_app())
-            .unwrap_or_else(|| internal(format!("the broker sent an unreadable error: {}", frame.body)))
+            .unwrap_or_else(|| {
+                internal(format!(
+                    "the broker sent an unreadable error: {}",
+                    frame.body
+                ))
+            })
     }
 
     fn write(&mut self, frame: &Frame) -> Result<(), AppError> {
@@ -479,9 +491,9 @@ impl BrokerClient {
             Ok(Incoming::Frame(frame)) => Ok(*frame),
             Ok(Incoming::Eof) => Err(unavailable(home, "the broker closed the connection")),
             Ok(Incoming::TooLarge) => Err(internal("the broker sent an oversized frame")),
-            Ok(Incoming::Malformed(detail)) => {
-                Err(internal(format!("unreadable frame from the broker: {detail}")))
-            }
+            Ok(Incoming::Malformed(detail)) => Err(internal(format!(
+                "unreadable frame from the broker: {detail}"
+            ))),
             Err(e) => Err(unavailable(home, format!("reading: {e}"))),
         }
     }
@@ -513,7 +525,10 @@ fn classify(frame: &Frame) -> Result<Option<TailUpdate>, AppError> {
         }
         FrameType::Err => {
             let err = WireError::from_value(&frame.body).ok_or_else(|| {
-                internal(format!("the broker sent an unreadable error: {}", frame.body))
+                internal(format!(
+                    "the broker sent an unreadable error: {}",
+                    frame.body
+                ))
             })?;
             if err.code == wire::ERR_LAGGED {
                 return Ok(Some(TailUpdate::Lagged {
@@ -773,7 +788,10 @@ mod tests {
     #[test]
     fn a_subscriber_tells_an_envelope_a_lag_and_a_farewell_apart() {
         let envelope = crate::events::Envelope::synthetic(crate::events::EventKind::TurnStarted);
-        let event = Frame::event(9, json!({"worker": "impl-0817t1200-aaaa", "envelope": envelope}));
+        let event = Frame::event(
+            9,
+            json!({"worker": "impl-0817t1200-aaaa", "envelope": envelope}),
+        );
         match classify(&event).unwrap() {
             Some(TailUpdate::Event(e)) => assert_eq!(e.worker, "impl-0817t1200-aaaa"),
             other => panic!("expected an envelope, got {other:?}"),
@@ -829,6 +847,9 @@ mod tests {
         };
         assert_eq!(err.exit, ExitCode::BrokerUnavailable);
         assert_eq!(err.code, wire::ERR_BROKER_UNAVAILABLE);
-        assert!(err.remedy.is_some(), "an unreachable broker names a way out");
+        assert!(
+            err.remedy.is_some(),
+            "an unreachable broker names a way out"
+        );
     }
 }

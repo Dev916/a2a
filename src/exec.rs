@@ -615,7 +615,10 @@ fn run_shim(worker_dir: &Path, epoch: u32, prompt_file: &Path, argv: &[String]) 
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     // Written while the lock is still held, so any observer that sees Dead also
     // sees the sentinel.
-    let _ = write_atomic(&worker_dir.join("exit_code"), format!("{code}\n").as_bytes());
+    let _ = write_atomic(
+        &worker_dir.join("exit_code"),
+        format!("{code}\n").as_bytes(),
+    );
     0
 }
 

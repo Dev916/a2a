@@ -234,7 +234,12 @@ pub struct IdleWatch {
 }
 
 impl IdleWatch {
-    pub fn new(core: CoreHandle, home: impl Into<PathBuf>, timeout: Duration, liveness: Liveness) -> IdleWatch {
+    pub fn new(
+        core: CoreHandle,
+        home: impl Into<PathBuf>,
+        timeout: Duration,
+        liveness: Liveness,
+    ) -> IdleWatch {
         IdleWatch {
             core,
             home: home.into(),
@@ -323,7 +328,12 @@ pub struct TeardownReport {
 /// Returns once the daemon owns nothing but its files; unlinking those is the
 /// caller's job, because the lock must be released *after* them and the lock
 /// lives outside the runtime.
-pub async fn teardown(home: &Path, core: CoreHandle, sd: &Shutdown, cause: &Cause) -> TeardownReport {
+pub async fn teardown(
+    home: &Path,
+    core: CoreHandle,
+    sd: &Shutdown,
+    cause: &Cause,
+) -> TeardownReport {
     let mut report = TeardownReport {
         cause: cause.as_str().to_string(),
         ..TeardownReport::default()
@@ -350,7 +360,12 @@ pub async fn teardown(home: &Path, core: CoreHandle, sd: &Shutdown, cause: &Caus
         json!({"orphaned": drained.orphaned, "stopped": drained.stopped,
                "flushed_in_time": drained.actors_finished}),
     );
-    record_phase(home, PHASE_CHILD_STOPPED, cause, json!({"child": drained.child}));
+    record_phase(
+        home,
+        PHASE_CHILD_STOPPED,
+        cause,
+        json!({"child": drained.child}),
+    );
 
     // 3. Cancel the root — every worker holds a child token of it — and wait
     //    for the tracker, bounded.
@@ -403,7 +418,10 @@ mod tests {
         let sd = Shutdown::rooted(root.clone());
         sd.accepting().cancel();
         assert!(sd.accepting().is_cancelled());
-        assert!(!root.is_cancelled(), "closing the door is not stopping the house");
+        assert!(
+            !root.is_cancelled(),
+            "closing the door is not stopping the house"
+        );
 
         let sd2 = Shutdown::rooted(CancellationToken::new());
         let door = sd2.accepting();

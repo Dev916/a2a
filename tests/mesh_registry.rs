@@ -1,6 +1,6 @@
 use a2a::mesh::registry::{
-    registry_plan, staleness, FileRegistry, GatewayRow, Registry, RegistryStaleness,
-    REGISTRY_SCHEMA_VERSION,
+    open_registry, read_registry_env, registry_plan, staleness, write_registry_env, FileRegistry,
+    GatewayRow, Registry, RegistryHandle, RegistryStaleness, REGISTRY_SCHEMA_VERSION,
 };
 use assert_cmd::Command;
 use chrono::{TimeZone, Utc};
@@ -42,8 +42,14 @@ async fn file_registry_implements_lifecycle_and_skips_revoked_rows() {
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     let t1 = Utc.timestamp_opt(1_700_000_030, 0).unwrap();
 
-    registry.upsert_self(row("fleet-a", "gw-a", t0.timestamp())).await.unwrap();
-    registry.upsert_self(row("fleet-a", "gw-b", t0.timestamp())).await.unwrap();
+    registry
+        .upsert_self(row("fleet-a", "gw-a", t0.timestamp()))
+        .await
+        .unwrap();
+    registry
+        .upsert_self(row("fleet-a", "gw-b", t0.timestamp()))
+        .await
+        .unwrap();
     registry.heartbeat("fleet-a", "gw-a", t1).await.unwrap();
     registry.retire_self("fleet-a", "gw-a", t1).await.unwrap();
     registry.revoke("fleet-a", "gw-b", t1).await.unwrap();
@@ -53,7 +59,10 @@ async fn file_registry_implements_lifecycle_and_skips_revoked_rows() {
     assert_eq!(rows[0].gateway_id, "gw-a");
     assert_eq!(rows[0].last_heartbeat, t1);
     assert_eq!(rows[0].endpoint_url, None);
-    assert_eq!(registry.schema_version().await.unwrap(), REGISTRY_SCHEMA_VERSION);
+    assert_eq!(
+        registry.schema_version().await.unwrap(),
+        REGISTRY_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -93,6 +102,30 @@ fn pg_url_and_options_are_pinned_without_connecting() {
 }
 
 #[test]
+fn shared_registry_env_helpers_preserve_cli_file_registry_behavior() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = a2a::home::A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
+    let registry_dir = tmp.path().join("registry");
+    let url = format!("file://{}", registry_dir.display());
+
+    write_registry_env(&home, &url).unwrap();
+    let env_file = home.root().join("mesh/fleet/registry.env");
+    assert_eq!(
+        fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(read_registry_env(&home).unwrap(), url);
+    assert!(matches!(
+        open_registry(&url).unwrap(),
+        RegistryHandle::File(_)
+    ));
+    assert!(matches!(
+        open_registry(&format!("file:{}", registry_dir.display())).unwrap(),
+        RegistryHandle::File(_)
+    ));
+}
+
+#[test]
 fn pg_source_keeps_ddl_out_of_client_and_bounds_gucs_to_local_transactions() {
     let source = fs::read_to_string("src/mesh/registry.rs").unwrap();
     assert!(!source.contains("CREATE TABLE"), "{source}");
@@ -120,19 +153,30 @@ fn fleet_cli_init_ls_and_revoke_are_hermetic_with_file_registry() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["command"], "mesh fleet init");
-    assert!(v["data"]["fleet_id"].as_str().unwrap().starts_with("fleet-"));
+    assert!(v["data"]["fleet_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("fleet-"));
     assert_eq!(v["data"]["root_fingerprint"].as_str().unwrap().len(), 64);
     assert!(v["data"].get("registry").is_none());
 
     let env_file = home.join("mesh/fleet/registry.env");
-    assert_eq!(fs::metadata(&env_file).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(fs::read_to_string(&env_file).unwrap(), format!("{registry_url}\n"));
+    assert_eq!(
+        fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::read_to_string(&env_file).unwrap(),
+        format!("{registry_url}\n")
+    );
 
     let reg = FileRegistry::new(&registry_dir);
     let fleet_id = v["data"]["fleet_id"].as_str().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        reg.upsert_self(row(fleet_id, "gw-a", 1_700_000_000)).await.unwrap();
+        reg.upsert_self(row(fleet_id, "gw-a", 1_700_000_000))
+            .await
+            .unwrap();
     });
 
     let out = a2a(&home)

@@ -46,8 +46,7 @@ use tempfile::TempDir;
 /// therefore pin this shape — and
 /// [`a_plain_text_result_fails_the_shipped_default_schema`] pins the other
 /// direction, which is what makes the default wiring observably live.
-const DEVLOOP_RESULT: &str =
-    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+const DEVLOOP_RESULT: &str = r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
 
 /// The brief's one verify command: toolchain-free, and its whole effect is a
 /// file in the working directory — so "it ran, and it ran THERE" is observable
@@ -170,8 +169,17 @@ impl World {
     }
 
     /// `a2a --json verify <id> [extra…]` -> (exit code, envelope, stderr).
-    fn verify(&self, mut cmd: assert_cmd::Command, id: &str, extra: &[&str]) -> (i32, Value, String) {
-        let out = cmd.args(["--json", "verify", id]).args(extra).output().unwrap();
+    fn verify(
+        &self,
+        mut cmd: assert_cmd::Command,
+        id: &str,
+        extra: &[&str],
+    ) -> (i32, Value, String) {
+        let out = cmd
+            .args(["--json", "verify", id])
+            .args(extra)
+            .output()
+            .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|_| panic!("one JSON envelope: {:?}", out.stdout));
         (
@@ -210,10 +218,7 @@ fn spawn_impl(w: &World, mut cmd: assert_cmd::Command) -> (String, Value) {
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("one envelope");
     let data = v["data"].clone();
-    (
-        data["id"].as_str().expect("an id").to_string(),
-        data,
-    )
+    (data["id"].as_str().expect("an id").to_string(), data)
 }
 
 fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
@@ -236,14 +241,26 @@ fn assert_worktree_payload(w: &World, id: &str, data: &Value) {
     let wt = w.worktree(id);
     let branch = format!("a2a/impl/{id}");
     assert_eq!(data["worktree"]["path"], serde_json::json!(wt), "{data}");
-    assert_eq!(data["worktree"]["branch"], serde_json::json!(branch), "{data}");
-    assert_eq!(data["worktree"]["repo"], serde_json::json!(w.repo), "{data}");
+    assert_eq!(
+        data["worktree"]["branch"],
+        serde_json::json!(branch),
+        "{data}"
+    );
+    assert_eq!(
+        data["worktree"]["repo"],
+        serde_json::json!(w.repo),
+        "{data}"
+    );
     assert_eq!(
         data["worktree"]["base_ref"],
         serde_json::json!(w.head),
         "the branch is cut from the repo's HEAD: {data}"
     );
-    assert_eq!(data["cwd"], serde_json::json!(wt), "the cwd IS the worktree");
+    assert_eq!(
+        data["cwd"],
+        serde_json::json!(wt),
+        "the cwd IS the worktree"
+    );
 }
 
 // ===========================================================================
@@ -271,8 +288,14 @@ fn the_exec_leg_runs_in_its_worktree_verifies_it_and_gc_reclaims_it() {
     let branch = format!("a2a/impl/{id}");
 
     // --- 2. it is a real, registered worktree of the parent repo
-    assert!(wt.join("src/lib.rs").is_file(), "the base commit is checked out");
-    assert!(wt.join(".git").is_file(), "a linked worktree's .git is a FILE");
+    assert!(
+        wt.join("src/lib.rs").is_file(),
+        "the base commit is checked out"
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree's .git is a FILE"
+    );
     let listed = git_ok(&w.repo, &["worktree", "list", "--porcelain"]);
     assert!(listed.contains(wt.to_str().unwrap()), "{listed}");
     assert!(
@@ -287,7 +310,10 @@ fn the_exec_leg_runs_in_its_worktree_verifies_it_and_gc_reclaims_it() {
     // --- 3. info/exclude exactly once, .gitignore never
     let exclude = std::fs::read_to_string(w.repo.join(".git/info/exclude")).unwrap();
     assert_eq!(
-        exclude.lines().filter(|l| *l == wt.to_str().unwrap()).count(),
+        exclude
+            .lines()
+            .filter(|l| *l == wt.to_str().unwrap())
+            .count(),
         1,
         "the worktree path is excluded exactly once: {exclude}"
     );
@@ -309,7 +335,9 @@ fn the_exec_leg_runs_in_its_worktree_verifies_it_and_gc_reclaims_it() {
     //     BECAUSE its result satisfied the impl lane's shipped default schema,
     //     and the schema it was judged by is its OWN copy.
     let snap = read_snapshot(&w.home, &id);
-    let schema_path = snap["schema_path"].as_str().expect("an impl worker is schema-gated");
+    let schema_path = snap["schema_path"]
+        .as_str()
+        .expect("an impl worker is schema-gated");
     assert!(
         schema_path.ends_with("result-schema.json"),
         "the worker is judged by a file inside its own directory: {schema_path}"
@@ -343,7 +371,10 @@ fn the_exec_leg_runs_in_its_worktree_verifies_it_and_gc_reclaims_it() {
     assert_eq!(a["ok"], true, "{a}");
     assert_eq!(a["workspace"], serde_json::json!(wt), "{a}");
     let c = &a["commands"][0];
-    assert_eq!(c["command"], VERIFY_CMD, "the BRIEF's command, verbatim: {a}");
+    assert_eq!(
+        c["command"], VERIFY_CMD,
+        "the BRIEF's command, verbatim: {a}"
+    );
     assert_eq!(c["exit_code"], 0, "{a}");
     assert_eq!(c["ran_by"], "a2a-verify", "{a}");
     let hash = c["stdout_sha256"].as_str().expect("a hash");
@@ -365,9 +396,21 @@ fn the_exec_leg_runs_in_its_worktree_verifies_it_and_gc_reclaims_it() {
     // --- 7. lossless genesis: state.json is a derived checkpoint
     std::fs::remove_file(w.worker_dir(&id).join("state.json")).unwrap();
     let rebuilt = w.status(w.cli(), &id);
-    assert_eq!(rebuilt["worktree"]["path"], serde_json::json!(wt), "{rebuilt}");
-    assert_eq!(rebuilt["worktree"]["branch"], serde_json::json!(branch), "{rebuilt}");
-    assert_eq!(rebuilt["worktree"]["base_ref"], serde_json::json!(w.head), "{rebuilt}");
+    assert_eq!(
+        rebuilt["worktree"]["path"],
+        serde_json::json!(wt),
+        "{rebuilt}"
+    );
+    assert_eq!(
+        rebuilt["worktree"]["branch"],
+        serde_json::json!(branch),
+        "{rebuilt}"
+    );
+    assert_eq!(
+        rebuilt["worktree"]["base_ref"],
+        serde_json::json!(w.head),
+        "{rebuilt}"
+    );
     assert_eq!(rebuilt["base_ref"], serde_json::json!(w.head), "{rebuilt}");
 
     // --- 8. gc refuses while the tree is dirty, and cleans with --force
@@ -404,7 +447,8 @@ fn the_exec_leg_runs_in_its_worktree_verifies_it_and_gc_reclaims_it() {
         "a2a NEVER deletes a branch — the branch IS the deliverable"
     );
     let index = std::fs::read_to_string(w.home.join("index.jsonl")).unwrap();
-    let last: Value = serde_json::from_str(index.lines().next_back().expect("a tombstone")).unwrap();
+    let last: Value =
+        serde_json::from_str(index.lines().next_back().expect("a tombstone")).unwrap();
     assert_eq!(last["id"], id.as_str(), "{last}");
     assert_eq!(last["worktree_branch"], branch.as_str(), "{last}");
 }
@@ -494,7 +538,11 @@ fn the_app_server_leg_spawns_into_the_same_worktree_and_verifies_identically() {
         let d = w.status(w.broker_cli(), &id);
         (d["state"] == "done").then_some(d)
     });
-    assert_eq!(status["worktree"]["path"], serde_json::json!(wt), "{status}");
+    assert_eq!(
+        status["worktree"]["path"],
+        serde_json::json!(wt),
+        "{status}"
+    );
 
     // --- 4. the verification matches the exec leg's, field-wise
     let (code, env, _stderr) = w.verify(w.broker_cli(), &id, &[]);
@@ -512,7 +560,13 @@ fn the_app_server_leg_spawns_into_the_same_worktree_and_verifies_identically() {
     );
     assert_eq!(a.len(), b.len(), "the same brief, the same command list");
     for (x, y) in a.iter().zip(b) {
-        for key in ["command", "exit_code", "timed_out", "stdout_sha256", "ran_by"] {
+        for key in [
+            "command",
+            "exit_code",
+            "timed_out",
+            "stdout_sha256",
+            "ran_by",
+        ] {
             assert_eq!(x[key], y[key], "commands[].{key} differs across transports");
         }
         // The two that necessarily vary: type-checked on both sides, compared
@@ -555,11 +609,7 @@ fn an_untracked_workflow_refuses_the_verification_until_it_is_forced() {
     assert_eq!(w.status(w.cli(), &id)["state"], "done");
 
     std::fs::create_dir_all(wt.join(".github/workflows")).unwrap();
-    std::fs::write(
-        wt.join(".github/workflows/ci.yml"),
-        "on: push\njobs: {}\n",
-    )
-    .unwrap();
+    std::fs::write(wt.join(".github/workflows/ci.yml"), "on: push\njobs: {}\n").unwrap();
 
     let (code, env, _stderr) = w.verify(w.cli(), &id, &[]);
     assert_eq!(code, 9, "a static precondition: {env}");

@@ -9,6 +9,7 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_NGROK_API: &str = "http://127.0.0.1:4040";
@@ -99,10 +100,7 @@ impl NgrokExposure<HttpNgrokApi> {
 
 impl<A> NgrokExposure<A> {
     pub fn with_api(listen_port: u64, api: A) -> Self {
-        Self {
-            listen_port,
-            api,
-        }
+        Self { listen_port, api }
     }
 
     pub fn api(&self) -> &A {
@@ -120,7 +118,11 @@ impl<A: NgrokApi> Exposure for NgrokExposure<A> {
         {
             return tunnel.to_wss_url().map(Some);
         }
-        self.api.start_tunnel(self.listen_port).await?.to_wss_url().map(Some)
+        self.api
+            .start_tunnel(self.listen_port)
+            .await?
+            .to_wss_url()
+            .map(Some)
     }
 }
 
@@ -218,8 +220,37 @@ where
     E: Exposure,
     C: Clock + ?Sized,
 {
+    run_exposure_loop_with_events(
+        registry,
+        exposure,
+        publisher,
+        heartbeat_interval,
+        clock,
+        token,
+        None,
+    )
+    .await
+}
+
+pub async fn run_exposure_loop_with_events<R, E, C>(
+    registry: &R,
+    exposure: &E,
+    publisher: &mut ExposurePublisher,
+    heartbeat_interval: Duration,
+    clock: &C,
+    token: CancellationToken,
+    events: Option<mpsc::Sender<ExposureTick>>,
+) -> Result<(), AppError>
+where
+    R: Registry,
+    E: Exposure,
+    C: Clock + ?Sized,
+{
     loop {
-        publisher.tick(registry, exposure, clock.now()).await?;
+        let tick = publisher.tick(registry, exposure, clock.now()).await?;
+        if let Some(tx) = &events {
+            let _ = tx.send(tick).await;
+        }
         tokio::select! {
             _ = token.cancelled() => return Ok(()),
             _ = tokio::time::sleep(jittered_heartbeat(heartbeat_interval)) => {}

@@ -16,7 +16,7 @@
 
 mod common;
 
-use a2a::events::{EventClass, EventKind, Envelope, Transport};
+use a2a::events::{Envelope, EventClass, EventKind, Transport};
 use a2a::fold::{self, LivenessInput};
 use a2a::store::{self, EventLog, EVENTS_FILE, EVENTS_ROTATED_FILE};
 use serde_json::{json, Value};
@@ -62,8 +62,10 @@ fn history(id: &str, cwd: &Path, filler: usize) -> Vec<Envelope> {
             "schema_path": "/tmp/schema.json",
             "created_at": "2026-08-19T00:00:00Z",
         })),
-        lifecycle(json!({"fsm": "ProcessStarted", "pid": 4242, "start_witness": "w-1",
-                         "thread_id": "thread-of-record"})),
+        lifecycle(
+            json!({"fsm": "ProcessStarted", "pid": 4242, "start_witness": "w-1",
+                         "thread_id": "thread-of-record"}),
+        ),
         lifecycle(json!({"fsm": "SessionIdentified", "session_id": "sess-1"})),
     ];
     // The bulk: trace rows big enough that a modest cap is crossed exactly once.
@@ -136,8 +138,22 @@ fn a_rotated_log_and_an_unrotated_one_rebuild_the_same_worker() {
     }
 
     let now = chrono::Utc::now();
-    let snap_a = fold::recover(&dir_a, LivenessInput { process_alive: true }, now).unwrap();
-    let snap_b = fold::recover(&dir_b, LivenessInput { process_alive: true }, now).unwrap();
+    let snap_a = fold::recover(
+        &dir_a,
+        LivenessInput {
+            process_alive: true,
+        },
+        now,
+    )
+    .unwrap();
+    let snap_b = fold::recover(
+        &dir_b,
+        LivenessInput {
+            process_alive: true,
+        },
+        now,
+    )
+    .unwrap();
 
     let all_a = store::read_events(&dir_a, 0).unwrap();
     let markers: Vec<&Envelope> = all_a
@@ -302,7 +318,15 @@ fn an_app_server_flood_rotates_once_and_every_reader_spans_the_split() {
     let mut cmd = a2a_appserver(
         &home,
         tmp.path(),
-        &["--json", "spawn", "--lane", "general", "--transport", "app-server", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "app-server",
+            "--cwd",
+        ],
     );
     cmd.arg(&work)
         .arg("--brief")
@@ -362,7 +386,14 @@ fn an_app_server_flood_rotates_once_and_every_reader_spans_the_split() {
     let (code, stdout, stderr) = run(a2a_appserver(
         &home,
         tmp.path(),
-        &["--json", "tail", &id, "--raw", "--since", &since.to_string()],
+        &[
+            "--json",
+            "tail",
+            &id,
+            "--raw",
+            "--since",
+            &since.to_string(),
+        ],
     ));
     assert_eq!(code, 0, "tail --since: {stderr}");
     let after: Vec<u64> = json_of(&stdout)["data"]["events"]
@@ -373,7 +404,10 @@ fn an_app_server_flood_rotates_once_and_every_reader_spans_the_split() {
         .collect();
     assert_eq!(
         after,
-        seqs.iter().copied().filter(|s| *s > since).collect::<Vec<_>>(),
+        seqs.iter()
+            .copied()
+            .filter(|s| *s > since)
+            .collect::<Vec<_>>(),
         "--since crosses the file boundary like it was never there"
     );
 
@@ -436,7 +470,11 @@ fn an_exec_worker_rotates_through_reconcile_and_stays_readable() {
         .assert()
         .success();
     let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(v["data"]["transport"], json!("exec"), "no broker, no socket");
+    assert_eq!(
+        v["data"]["transport"],
+        json!("exec"),
+        "no broker, no socket"
+    );
     let id = v["data"]["id"].as_str().unwrap().to_string();
 
     // `wait` is what drives `reconcile`, which is the capped writer here.
@@ -453,7 +491,11 @@ fn an_exec_worker_rotates_through_reconcile_and_stays_readable() {
     );
     let markers = marker_in(&dir);
     assert!(!markers.is_empty(), "and said so");
-    assert_eq!(markers[0].transport, Transport::Exec, "the trigger's transport");
+    assert_eq!(
+        markers[0].transport,
+        Transport::Exec,
+        "the trigger's transport"
+    );
 
     let out = common::a2a(&home, tmp.path())
         .args(["--json", "tail", &id, "--raw"])

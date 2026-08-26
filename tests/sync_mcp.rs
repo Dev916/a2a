@@ -349,7 +349,10 @@ fn a_blocked_stdio_detail_names_the_env_keys_and_the_migration() {
     assert!(detail.contains("CONFLUENCE_API_TOKEN"), "{detail}");
     assert!(detail.contains("JIRA_API_TOKEN"), "{detail}");
     assert!(!detail.contains("CONFLUENCE_USERNAME"), "{detail}");
-    assert!(detail.contains("a2a sync mcp --migrate-untrack"), "{detail}");
+    assert!(
+        detail.contains("a2a sync mcp --migrate-untrack"),
+        "{detail}"
+    );
     assert_eq!(class.disposition(), Disposition::SkippedSecret);
 }
 
@@ -373,7 +376,10 @@ fn the_untranslatable_remedy_is_pasteable_toml_with_masked_values() {
         remedy.contains("url = \"https://services.leadconnectorhq.com/mcp/\""),
         "a url is not a credential and a remedy without it is useless: {remedy}"
     );
-    assert!(remedy.contains("bearer_token_env_var = \"A2A_MCP_GHL_TOKEN\""), "{remedy}");
+    assert!(
+        remedy.contains("bearer_token_env_var = \"A2A_MCP_GHL_TOKEN\""),
+        "{remedy}"
+    );
     assert!(
         remedy.contains("locationId = \"[REDACTED:20]\""),
         "the value is masked, the length survives: {remedy}"
@@ -442,7 +448,10 @@ fn no_fixture_value_survives_into_any_report_line() {
         }
     }
     for value in values.iter().filter(|v| v.len() >= 8) {
-        assert!(!printed.contains(value.as_str()), "leaked {value} in report");
+        assert!(
+            !printed.contains(value.as_str()),
+            "leaked {value} in report"
+        );
     }
     assert!(
         printed.contains("[REDACTED:"),
@@ -520,7 +529,13 @@ fn every_disposition_variant_has_a_producer() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&dest).unwrap();
     std::fs::write(src.join("README.md"), "not a skill\n").unwrap();
-    for name in ["new-skill", "docusign", "curated", "owned-drifted", "owned-same"] {
+    for name in [
+        "new-skill",
+        "docusign",
+        "curated",
+        "owned-drifted",
+        "owned-same",
+    ] {
         let dir = src.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -730,7 +745,11 @@ impl World {
         let mut v: Value =
             serde_json::from_str(&std::fs::read_to_string(self.source_json()).unwrap()).unwrap();
         f(&mut v);
-        std::fs::write(self.source_json(), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        std::fs::write(
+            self.source_json(),
+            serde_json::to_string_pretty(&v).unwrap(),
+        )
+        .unwrap();
     }
 
     fn cmd(&self) -> assert_cmd::Command {
@@ -886,7 +905,8 @@ fn has(haystack: &str, needle: &str) -> bool {
 /// the raw JSON with the classifier's own rule — so a newly added fixture
 /// secret is automatically covered by all three sweeps below.
 fn fixture_secrets(name: &str) -> Vec<String> {
-    let raw: Value = serde_json::from_str(&std::fs::read_to_string(fixture(name)).unwrap()).unwrap();
+    let raw: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture(name)).unwrap()).unwrap();
     let mut out = Vec::new();
     for (_, server) in raw["mcpServers"].as_object().unwrap() {
         for group in ["headers", "env"] {
@@ -894,7 +914,9 @@ fn fixture_secrets(name: &str) -> Vec<String> {
                 continue;
             };
             for (key, value) in map {
-                let Some(value) = value.as_str() else { continue };
+                let Some(value) = value.as_str() else {
+                    continue;
+                };
                 let secret = key.eq_ignore_ascii_case("authorization")
                     || a2a::redact::is_secret_key(&key.replace('-', "_"))
                     || !a2a::redact::scan_text(value).is_empty();
@@ -966,7 +988,10 @@ fn the_first_apply_renders_every_writable_shape_and_leaves_the_rest_byte_identic
     // stdio: command, args, env — each omitted when empty.
     let codegraph = table("codegraph");
     assert!(has(&codegraph, r#"command = "codegraph""#), "{codegraph}");
-    assert!(has(&codegraph, r#"args = ["serve", "--mcp"]"#), "{codegraph}");
+    assert!(
+        has(&codegraph, r#"args = ["serve", "--mcp"]"#),
+        "{codegraph}"
+    );
     assert!(
         !codegraph.contains("env"),
         "an empty env is omitted, not written as an empty table: {codegraph}"
@@ -1086,7 +1111,10 @@ fn an_untracked_target_writes_the_stdio_literals_and_still_never_reports_them() 
 
     let reported = reported(&data(&out));
     for name in ["atlassian", "google-workspace", "telegram"] {
-        assert_eq!(reported[name], "synced", "{name} is writable when untracked");
+        assert_eq!(
+            reported[name], "synced",
+            "{name} is writable when untracked"
+        );
     }
     let config = w.config_text();
     assert!(
@@ -1145,13 +1173,19 @@ fn allowlisted_headers_render_http_headers_and_env_http_headers() {
         "{ghl}"
     );
     assert!(
-        has(&ghl, r#"http_headers = { locationId = "FAKEloc000000000fake" }"#),
+        has(
+            &ghl,
+            r#"http_headers = { locationId = "FAKEloc000000000fake" }"#
+        ),
         "an opaque non-credential header is a literal: {ghl}"
     );
 
     let hf = tables["[mcp_servers.headerful]"].clone();
     assert!(
-        has(&hf, r#"http_headers = { locationId = "FAKEloc111111111fake" }"#),
+        has(
+            &hf,
+            r#"http_headers = { locationId = "FAKEloc111111111fake" }"#
+        ),
         "{hf}"
     );
     assert!(
@@ -1191,9 +1225,9 @@ fn a_successful_validation_reports_transport_and_auth_from_a_temp_copy() {
         if disposition != "synced" {
             continue;
         }
-        let (transport, auth) = validated
-            .get(&name)
-            .unwrap_or_else(|| panic!("{name} was written but codex did not list it: {validated:?}"));
+        let (transport, auth) = validated.get(&name).unwrap_or_else(|| {
+            panic!("{name} was written but codex did not list it: {validated:?}")
+        });
         let stdio = ["XcodeBuildMCP", "codegraph"].contains(&name.as_str());
         let bearer = ["Neon", "linear"].contains(&name.as_str());
         assert_eq!(
@@ -1203,7 +1237,11 @@ fn a_successful_validation_reports_transport_and_auth_from_a_temp_copy() {
         );
         assert_eq!(
             auth,
-            if bearer { "bearer_token" } else { "unsupported" },
+            if bearer {
+                "bearer_token"
+            } else {
+                "unsupported"
+            },
             "{name}"
         );
     }
@@ -1268,7 +1306,10 @@ fn a_rejected_render_never_touches_the_real_config() {
 #[test]
 fn a_validator_that_answers_nonsense_warns_and_the_write_proceeds() {
     let w = World::new();
-    let out = w.run_with(&[("STUB_CODEX_MCP_GARBAGE", "1")], &["--json", "sync", "mcp"]);
+    let out = w.run_with(
+        &[("STUB_CODEX_MCP_GARBAGE", "1")],
+        &["--json", "sync", "mcp"],
+    );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let data = data(&out);
     assert!(data["validated"].is_null(), "{}", data);
@@ -1324,7 +1365,10 @@ fn a_validator_that_hangs_is_killed_at_the_budget_and_the_write_proceeds() {
     );
     let w = World::new();
     let started = Instant::now();
-    let out = w.run_with(&[("STUB_CODEX_MCP_SLEEP", "30")], &["--json", "sync", "mcp"]);
+    let out = w.run_with(
+        &[("STUB_CODEX_MCP_SLEEP", "30")],
+        &["--json", "sync", "mcp"],
+    );
     let elapsed = started.elapsed();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(
@@ -1406,7 +1450,8 @@ fn drift_is_content_based_not_formatting_based() {
     assert_eq!(reported(&third)["Neon"], "refused-dest-drift");
     assert_eq!(third["counts"]["refused"], 1);
     assert!(
-        w.config_text().contains(r#"bearer_token_env_var = "MY_OWN_TOKEN""#),
+        w.config_text()
+            .contains(r#"bearer_token_env_var = "MY_OWN_TOKEN""#),
         "the human's edit is left exactly where it is"
     );
     assert!(
@@ -1509,7 +1554,10 @@ fn a_write_with_a_live_broker_warns_and_a_run_that_wrote_nothing_does_not() {
     let socket = a2a::broker::sockserv::socket_path(&w.home);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
-        assert!(Instant::now() < deadline, "the broker never bound its socket");
+        assert!(
+            Instant::now() < deadline,
+            "the broker never bound its socket"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -1548,10 +1596,6 @@ fn a_write_without_a_broker_reports_no_staleness() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(data(&out)["counts"]["synced"], 6);
     assert_eq!(data(&out)["broker_config_stale"], false);
-    assert!(
-        !stderr(&out).contains("broker restart"),
-        "{}",
-        stderr(&out)
-    );
+    assert!(!stderr(&out).contains("broker restart"), "{}", stderr(&out));
     assert!(!a2a::broker::sockserv::socket_path(&w.home).exists());
 }

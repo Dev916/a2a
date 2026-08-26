@@ -5,8 +5,8 @@ use clap::Parser;
 
 fn main() {
     let cli = Cli::parse(); // clap exits 2 on usage errors
-    // The shim is not a user-facing command: it never emits an envelope, and it
-    // owns the process until the codex child it supervises is done.
+                            // The shim is not a user-facing command: it never emits an envelope, and it
+                            // owns the process until the codex child it supervises is done.
     if let Cmd::ExecShim {
         worker_dir,
         epoch,
@@ -188,11 +188,7 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::kill::run(&home, id, *force, cli.global.json, cli.global.quiet)
         }
-        Cmd::Resume {
-            id,
-            message,
-            force,
-        } => {
+        Cmd::Resume { id, message, force } => {
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             a2a::commands::resume::run(
                 &home,
@@ -230,8 +226,7 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;
-                a2a::commands::config_show::run(&home, *origin, cli.global.quiet)
-                    .map(Outcome::from)
+                a2a::commands::config_show::run(&home, *origin, cli.global.quiet).map(Outcome::from)
             }
         },
         Cmd::Broker { cmd } => {

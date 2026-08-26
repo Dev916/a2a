@@ -322,8 +322,16 @@ impl Snapshot {
             ));
         }
         for (name, after, prior) in [
-            ("config.toml content", &self.config_hash, &before.config_hash),
-            ("skills tree content", &self.skills_hash, &before.skills_hash),
+            (
+                "config.toml content",
+                &self.config_hash,
+                &before.config_hash,
+            ),
+            (
+                "skills tree content",
+                &self.skills_hash,
+                &before.skills_hash,
+            ),
         ] {
             if after != prior {
                 moved.push(format!("{name}: {prior} -> {after}"));
@@ -650,7 +658,10 @@ fn live_dry_runs_read_the_real_machine_and_write_nothing() {
     // Every value a report DID print is masked, and the mask carries a length
     // and nothing else.
     let printed = live.transcript.borrow().join("");
-    let masks: Vec<&str> = printed.match_indices("[REDACTED:").map(|(_, m)| m).collect();
+    let masks: Vec<&str> = printed
+        .match_indices("[REDACTED:")
+        .map(|(_, m)| m)
+        .collect();
     assert!(
         !masks.is_empty(),
         "no value was reported at all — the mask assertion would prove nothing"

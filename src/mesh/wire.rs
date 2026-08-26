@@ -8,7 +8,9 @@ use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, ServerConfig, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as TlsError, ServerConfig, SignatureScheme,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Once};
@@ -39,15 +41,37 @@ pub struct OriginWant {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
-    Challenge { nonce: String },
-    Hello { token: String, nonce_sig: String },
-    Feed { origin: String, entries: Vec<FeedEntry> },
-    Note { note: Note },
-    Presence { peers: Vec<Presence> },
-    Digest { origins: Vec<OriginDigest> },
-    Want { origins: Vec<OriginWant> },
-    Ack { ref_id: String, outcome: String },
-    Err { code: String, detail: String },
+    Challenge {
+        nonce: String,
+    },
+    Hello {
+        token: String,
+        nonce_sig: String,
+    },
+    Feed {
+        origin: String,
+        entries: Vec<FeedEntry>,
+    },
+    Note {
+        note: Note,
+    },
+    Presence {
+        peers: Vec<Presence>,
+    },
+    Digest {
+        origins: Vec<OriginDigest>,
+    },
+    Want {
+        origins: Vec<OriginWant>,
+    },
+    Ack {
+        ref_id: String,
+        outcome: String,
+    },
+    Err {
+        code: String,
+        detail: String,
+    },
 }
 
 impl Frame {
@@ -66,7 +90,10 @@ impl Frame {
             return Err(AppError::new(
                 "WIRE_FRAME_TOO_LARGE",
                 ExitCode::Precondition,
-                format!("frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes", line.len()),
+                format!(
+                    "frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes",
+                    line.len()
+                ),
             ));
         }
         Ok(line)
@@ -77,7 +104,10 @@ impl Frame {
             return Err(AppError::new(
                 "WIRE_FRAME_TOO_LARGE",
                 ExitCode::Precondition,
-                format!("frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes", line.len()),
+                format!(
+                    "frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes",
+                    line.len()
+                ),
             ));
         }
         let value: serde_json::Value = serde_json::from_str(line.trim_end()).map_err(data_err)?;
@@ -165,11 +195,18 @@ where
                         return Err(AppError::new(
                             "WIRE_FRAME_TOO_LARGE",
                             ExitCode::Precondition,
-                            format!("frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes", bytes.len()),
+                            format!(
+                                "frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes",
+                                bytes.len()
+                            ),
                         ));
                     }
                     let text = String::from_utf8(bytes).map_err(|_| {
-                        AppError::new("WIRE_FRAME_INVALID", ExitCode::Precondition, "frame is not utf-8")
+                        AppError::new(
+                            "WIRE_FRAME_INVALID",
+                            ExitCode::Precondition,
+                            "frame is not utf-8",
+                        )
                     })?;
                     if let Some(frame) = Frame::from_ndjson(&text)? {
                         return Ok(Some(frame));
@@ -250,11 +287,18 @@ where
                         return Err(AppError::new(
                             "WIRE_FRAME_TOO_LARGE",
                             ExitCode::Precondition,
-                            format!("frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes", bytes.len()),
+                            format!(
+                                "frame is {} bytes, exceeding cap {MAX_FRAME_BYTES} bytes",
+                                bytes.len()
+                            ),
                         ));
                     }
                     let text = String::from_utf8(bytes).map_err(|_| {
-                        AppError::new("WIRE_FRAME_INVALID", ExitCode::Precondition, "frame is not utf-8")
+                        AppError::new(
+                            "WIRE_FRAME_INVALID",
+                            ExitCode::Precondition,
+                            "frame is not utf-8",
+                        )
                     })?;
                     if let Some(frame) = Frame::from_ndjson(&text)? {
                         return Ok(Some(frame));
@@ -315,12 +359,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     install_rustls_provider();
-    let config = ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(tls_config_err)?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedSpkiVerifier::new(expected_cert_fpr)?))
-        .with_no_client_auth();
+    let config =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(tls_config_err)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedSpkiVerifier::new(expected_cert_fpr)?))
+            .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from("pinned.invalid")
         .map_err(|e| AppError::new("TLS_SERVER_NAME", ExitCode::Internal, e.to_string()))?;
@@ -351,12 +396,13 @@ where
     install_rustls_provider();
     let cert = CertificateDer::from(tls.cert_der);
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(tls.key_der));
-    let config = ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(tls_config_err)?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .map_err(tls_config_err)?;
+    let config =
+        ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(tls_config_err)?
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .map_err(tls_config_err)?;
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let tls = acceptor.accept(stream).await.map_err(tls_connect_err)?;
     let ws = accept_async(tls).await.map_err(ws_err)?;
@@ -380,9 +426,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let nonce = nonce();
-    side.send(&Frame::Challenge { nonce: nonce.clone() }).await?;
+    side.send(&Frame::Challenge {
+        nonce: nonce.clone(),
+    })
+    .await?;
     let peer = read_hello(side, roots, clock, &nonce).await?;
-    let Frame::Challenge { nonce: peer_nonce } = expect_frame(side.recv().await?, "challenge")? else {
+    let Frame::Challenge { nonce: peer_nonce } = expect_frame(side.recv().await?, "challenge")?
+    else {
         return Err(unexpected_frame("challenge"));
     };
     side.send(&hello_frame(identity, &peer_nonce)).await?;
@@ -398,12 +448,16 @@ pub async fn handshake_dialer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Frame::Challenge { nonce: peer_nonce } = expect_frame(side.recv().await?, "challenge")? else {
+    let Frame::Challenge { nonce: peer_nonce } = expect_frame(side.recv().await?, "challenge")?
+    else {
         return Err(unexpected_frame("challenge"));
     };
     side.send(&hello_frame(identity, &peer_nonce)).await?;
     let local_nonce = nonce();
-    side.send(&Frame::Challenge { nonce: local_nonce.clone() }).await?;
+    side.send(&Frame::Challenge {
+        nonce: local_nonce.clone(),
+    })
+    .await?;
     read_hello(side, roots, clock, &local_nonce).await
 }
 
@@ -417,16 +471,21 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match expect_frame(side.recv().await?, "hello")? {
-        Frame::Hello { token, nonce_sig } => match verify_hello(&token, &nonce_sig, roots, clock, nonce) {
-            Ok(claims) => Ok(claims),
-            Err(err) => {
-                let _ = side
-                    .send(&Frame::Err { code: err.code.to_string(), detail: err.message.clone() })
-                    .await;
-                let _ = side.close().await;
-                Err(err)
+        Frame::Hello { token, nonce_sig } => {
+            match verify_hello(&token, &nonce_sig, roots, clock, nonce) {
+                Ok(claims) => Ok(claims),
+                Err(err) => {
+                    let _ = side
+                        .send(&Frame::Err {
+                            code: err.code.to_string(),
+                            detail: err.message.clone(),
+                        })
+                        .await;
+                    let _ = side.close().await;
+                    Err(err)
+                }
             }
-        },
+        }
         Frame::Err { code, detail } => Err(AppError::new(
             "WIRE_PEER_ERR",
             ExitCode::Precondition,
@@ -445,19 +504,54 @@ fn verify_hello(
 ) -> Result<TokenClaims, AppError> {
     let claims = verify_token(token, roots, clock)?;
     let pubkey_bytes: [u8; 32] = b64_decode(&claims.pubkey_b64)
-        .map_err(|_| AppError::new("NONCE_SIG_INVALID", ExitCode::Precondition, "token public key is invalid"))?
+        .map_err(|_| {
+            AppError::new(
+                "NONCE_SIG_INVALID",
+                ExitCode::Precondition,
+                "token public key is invalid",
+            )
+        })?
         .try_into()
-        .map_err(|_| AppError::new("NONCE_SIG_INVALID", ExitCode::Precondition, "token public key length is invalid"))?;
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
-        .map_err(|_| AppError::new("NONCE_SIG_INVALID", ExitCode::Precondition, "token public key is invalid"))?;
+        .map_err(|_| {
+            AppError::new(
+                "NONCE_SIG_INVALID",
+                ExitCode::Precondition,
+                "token public key length is invalid",
+            )
+        })?;
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| {
+        AppError::new(
+            "NONCE_SIG_INVALID",
+            ExitCode::Precondition,
+            "token public key is invalid",
+        )
+    })?;
     let sig_bytes: [u8; 64] = b64_decode(nonce_sig)
-        .map_err(|_| AppError::new("NONCE_SIG_INVALID", ExitCode::Precondition, "nonce signature is not base64"))?
+        .map_err(|_| {
+            AppError::new(
+                "NONCE_SIG_INVALID",
+                ExitCode::Precondition,
+                "nonce signature is not base64",
+            )
+        })?
         .try_into()
-        .map_err(|_| AppError::new("NONCE_SIG_INVALID", ExitCode::Precondition, "nonce signature length is invalid"))?;
+        .map_err(|_| {
+            AppError::new(
+                "NONCE_SIG_INVALID",
+                ExitCode::Precondition,
+                "nonce signature length is invalid",
+            )
+        })?;
     let signature = Signature::from_bytes(&sig_bytes);
     verifying_key
         .verify(nonce.as_bytes(), &signature)
-        .map_err(|_| AppError::new("NONCE_SIG_INVALID", ExitCode::Precondition, "nonce signature does not match token public key"))?;
+        .map_err(|_| {
+            AppError::new(
+                "NONCE_SIG_INVALID",
+                ExitCode::Precondition,
+                "nonce signature does not match token public key",
+            )
+        })?;
     Ok(claims)
 }
 
@@ -553,17 +647,37 @@ fn is_known_kind(kind: &str) -> bool {
 
 fn parse_wss_url(url: &str) -> Result<Endpoint, AppError> {
     let rest = url.strip_prefix("wss://").ok_or_else(|| {
-        AppError::new("WIRE_URL_INVALID", ExitCode::Precondition, "wire URL must start with wss://")
+        AppError::new(
+            "WIRE_URL_INVALID",
+            ExitCode::Precondition,
+            "wire URL must start with wss://",
+        )
     })?;
     let (authority, path) = rest.split_once('/').map_or((rest, "/"), |(a, p)| (a, p));
-    let path = if path == "/" { "/".to_string() } else { format!("/{path}") };
+    let path = if path == "/" {
+        "/".to_string()
+    } else {
+        format!("/{path}")
+    };
     let (host, port) = authority.rsplit_once(':').ok_or_else(|| {
-        AppError::new("WIRE_URL_INVALID", ExitCode::Precondition, "wire URL must include an explicit port")
+        AppError::new(
+            "WIRE_URL_INVALID",
+            ExitCode::Precondition,
+            "wire URL must include an explicit port",
+        )
     })?;
     let port = port.parse::<u16>().map_err(|_| {
-        AppError::new("WIRE_URL_INVALID", ExitCode::Precondition, "wire URL port is invalid")
+        AppError::new(
+            "WIRE_URL_INVALID",
+            ExitCode::Precondition,
+            "wire URL port is invalid",
+        )
     })?;
-    Ok(Endpoint { host: host.to_string(), port, path })
+    Ok(Endpoint {
+        host: host.to_string(),
+        port,
+        path,
+    })
 }
 
 struct Endpoint {
@@ -591,7 +705,11 @@ fn tls_config_err(e: TlsError) -> AppError {
 fn tls_connect_err(e: std::io::Error) -> AppError {
     let msg = e.to_string();
     if msg.contains("TLS_CERT_PIN_MISMATCH") {
-        AppError::new("TLS_CERT_PIN_MISMATCH", ExitCode::Precondition, "server certificate SPKI fingerprint did not match pin")
+        AppError::new(
+            "TLS_CERT_PIN_MISMATCH",
+            ExitCode::Precondition,
+            "server certificate SPKI fingerprint did not match pin",
+        )
     } else {
         AppError::new("TLS", ExitCode::BrokerUnavailable, msg)
     }

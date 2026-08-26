@@ -411,7 +411,9 @@ pub struct ThreadStartedNotification {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum UserInput {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -719,9 +721,10 @@ mod tests {
         assert_eq!(n.thread_id(), Some("01a010ee-c244-7341-9948-1dc7303e753b"));
 
         // ... and broker-scoped notifications have none at all.
-        let n: RpcNotification =
-            serde_json::from_str(r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{}}}"#)
-                .unwrap();
+        let n: RpcNotification = serde_json::from_str(
+            r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{}}}"#,
+        )
+        .unwrap();
         assert_eq!(n.thread_id(), None);
     }
 
@@ -737,8 +740,7 @@ mod tests {
         assert!(init.codex_home.is_absolute());
         // The handshake carries no protocol version — hence the schema canary.
         assert!(
-            !init.extra.contains_key("version")
-                && !init.extra.contains_key("protocolVersion"),
+            !init.extra.contains_key("version") && !init.extra.contains_key("protocolVersion"),
             "unexpected version field appeared: {:?}",
             init.extra
         );
@@ -806,7 +808,8 @@ mod tests {
                 .unwrap();
         assert_eq!(item.kind, ThreadItemKind::Unknown);
 
-        let status: TurnStatus = serde_json::from_value(serde_json::json!("pausedForLunch")).unwrap();
+        let status: TurnStatus =
+            serde_json::from_value(serde_json::json!("pausedForLunch")).unwrap();
         assert_eq!(status, TurnStatus::Unknown);
         assert!(!status.is_terminal() || status == TurnStatus::Unknown);
 
@@ -907,7 +910,11 @@ mod tests {
         for (wire, typed) in cases {
             let got: SandboxPolicy = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(got, typed, "deserialize {wire}");
-            assert_eq!(serde_json::to_value(&typed).unwrap(), wire, "serialize back");
+            assert_eq!(
+                serde_json::to_value(&typed).unwrap(),
+                wire,
+                "serialize back"
+            );
         }
     }
 
@@ -937,7 +944,10 @@ mod tests {
             "exclude_slash_tmp",
             "exclude_tmpdir_env_var",
         ] {
-            assert!(v.get(snake).is_none(), "decoy snake_case key {snake} leaked");
+            assert!(
+                v.get(snake).is_none(),
+                "decoy snake_case key {snake} leaked"
+            );
         }
     }
 
@@ -1069,16 +1079,34 @@ mod tests {
     #[test]
     fn server_request_methods_map_one_to_one_onto_snapshot_responses() {
         let table = [
-            ("account/chatgptAuthTokens/refresh", "ChatgptAuthTokensRefreshResponse.json"),
+            (
+                "account/chatgptAuthTokens/refresh",
+                "ChatgptAuthTokensRefreshResponse.json",
+            ),
             ("applyPatchApproval", "ApplyPatchApprovalResponse.json"),
             ("attestation/generate", "AttestationGenerateResponse.json"),
             ("execCommandApproval", "ExecCommandApprovalResponse.json"),
-            ("item/commandExecution/requestApproval", "CommandExecutionRequestApprovalResponse.json"),
-            ("item/fileChange/requestApproval", "FileChangeRequestApprovalResponse.json"),
-            ("item/permissions/requestApproval", "PermissionsRequestApprovalResponse.json"),
+            (
+                "item/commandExecution/requestApproval",
+                "CommandExecutionRequestApprovalResponse.json",
+            ),
+            (
+                "item/fileChange/requestApproval",
+                "FileChangeRequestApprovalResponse.json",
+            ),
+            (
+                "item/permissions/requestApproval",
+                "PermissionsRequestApprovalResponse.json",
+            ),
             ("item/tool/call", "DynamicToolCallResponse.json"),
-            ("item/tool/requestUserInput", "ToolRequestUserInputResponse.json"),
-            ("mcpServer/elicitation/request", "McpServerElicitationRequestResponse.json"),
+            (
+                "item/tool/requestUserInput",
+                "ToolRequestUserInputResponse.json",
+            ),
+            (
+                "mcpServer/elicitation/request",
+                "McpServerElicitationRequestResponse.json",
+            ),
         ];
         let covered: Vec<&str> = table.iter().map(|(m, _)| *m).collect();
         assert_eq!(covered, SERVER_REQUEST_METHODS.to_vec());
@@ -1132,6 +1160,9 @@ mod tests {
             !prod.contains(">=0.140"),
             "version range must be read from config::DEFAULT_CODEX_VERSION_RANGE"
         );
-        assert_eq!(crate::config::DEFAULT_CODEX_VERSION_RANGE, ">=0.140, <0.150");
+        assert_eq!(
+            crate::config::DEFAULT_CODEX_VERSION_RANGE,
+            ">=0.140, <0.150"
+        );
     }
 }

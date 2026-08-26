@@ -64,7 +64,9 @@ pub fn run(
     // already over" (spec §4.8).
     owner::guard(&id, snap.owner.as_deref(), force)?;
     if snap.state.is_terminal() {
-        return Ok(Outcome::from(already_terminal(&id, &snap, json_mode, quiet)));
+        return Ok(Outcome::from(already_terminal(
+            &id, &snap, json_mode, quiet,
+        )));
     }
 
     // An app-server worker is the broker's to stop, because only the broker can
@@ -85,7 +87,9 @@ pub fn run(
     // and this lock. Re-checking here keeps the short-circuit BEFORE `step()`
     // in that race too, so a kill never logs a rejected transition.
     if snap.state.is_terminal() {
-        return Ok(Outcome::from(already_terminal(&id, &snap, json_mode, quiet)));
+        return Ok(Outcome::from(already_terminal(
+            &id, &snap, json_mode, quiet,
+        )));
     }
 
     let transition =
@@ -200,12 +204,7 @@ fn signal(snap: &WorkerSnapshot) -> Result<&'static str, AppError> {
     })
 }
 
-fn already_terminal(
-    id: &str,
-    snap: &WorkerSnapshot,
-    json_mode: bool,
-    quiet: bool,
-) -> Value {
+fn already_terminal(id: &str, snap: &WorkerSnapshot, json_mode: bool, quiet: bool) -> Value {
     if !quiet {
         eprintln!(
             "a2a: {id}: already {} — nothing to kill",

@@ -57,7 +57,9 @@ fn template_prints_the_scaffold_and_creates_nothing() {
         );
         let workers = home.join("workers");
         assert_eq!(
-            std::fs::read_dir(&workers).map(Iterator::count).unwrap_or(0),
+            std::fs::read_dir(&workers)
+                .map(Iterator::count)
+                .unwrap_or(0),
             0,
             "{lane}: --template created a worker"
         );
@@ -76,7 +78,11 @@ fn every_scaffold_passes_its_own_lanes_brief_gate() {
     for lane in Lane::ALL {
         let text = templates::brief_scaffold(lane);
         let parsed = brief::parse(text).unwrap_or_else(|e| panic!("{lane}: {e}"));
-        assert_eq!(parsed.lane, Some(lane), "{lane}: front matter names its lane");
+        assert_eq!(
+            parsed.lane,
+            Some(lane),
+            "{lane}: front matter names its lane"
+        );
         brief::validate(&parsed, lane)
             .unwrap_or_else(|missing| panic!("{lane}: missing {missing:?}"));
 
@@ -101,7 +107,10 @@ fn every_scaffold_passes_its_own_lanes_brief_gate() {
         assert_eq!(parsed.max_turns, None, "{lane}: max_turns is unset");
         assert!(text.contains("result_schema:"), "{lane}: key is present");
         assert!(text.contains("max_turns:"), "{lane}: key is present");
-        assert!(!parsed.body.trim().is_empty(), "{lane}: the body is a brief");
+        assert!(
+            !parsed.body.trim().is_empty(),
+            "{lane}: the body is a brief"
+        );
     }
 }
 
@@ -188,7 +197,11 @@ fn a_review_spawn_gets_the_findings_schema_by_default() {
     let id = v["data"]["id"].as_str().unwrap().to_string();
 
     let snap = read_snapshot(&home, &id);
-    assert_eq!(snap["schema_source"], serde_json::json!("lane-default"), "{snap}");
+    assert_eq!(
+        snap["schema_source"],
+        serde_json::json!("lane-default"),
+        "{snap}"
+    );
     let path = std::path::PathBuf::from(snap["schema_path"].as_str().expect("a schema path"));
     let body = std::fs::read_to_string(&path).expect("the worker carries its own copy");
     assert_eq!(body, templates::REVIEW_FINDINGS_SCHEMA);
@@ -264,14 +277,22 @@ fn the_usage_errors_survive_the_optional_lane_and_brief() {
         .args(["spawn", "--lane", "general"])
         .output()
         .unwrap();
-    assert_eq!(lane_only.status.code(), Some(2), "--brief is still required");
+    assert_eq!(
+        lane_only.status.code(),
+        Some(2),
+        "--brief is still required"
+    );
 
     let brief_only = a2a(&home, tmp.path())
         .args(["spawn", "--brief"])
         .arg(&brief)
         .output()
         .unwrap();
-    assert_eq!(brief_only.status.code(), Some(2), "--lane is still required");
+    assert_eq!(
+        brief_only.status.code(),
+        Some(2),
+        "--lane is still required"
+    );
 
     for conflicting in [
         vec!["spawn", "--template", "impl", "--lane", "impl"],

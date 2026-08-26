@@ -606,7 +606,10 @@ fn probe_broker(home: &Path) -> BrokerProbe {
         },
         Ok(Some(Handshake::Ready(client))) => {
             let health = BrokerHealth::read(home).map(Box::new);
-            let pid = health.as_ref().map(|h| h.pid).or_else(|| read_pidfile(home));
+            let pid = health
+                .as_ref()
+                .map(|h| h.pid)
+                .or_else(|| read_pidfile(home));
             BrokerProbe::Up {
                 peer: client.peer.clone(),
                 health,
@@ -735,7 +738,10 @@ fn auth_mode(ctx: &Ctx) -> Check {
     let exported = std::env::var_os(API_KEY_ENV).is_some_and(|v| !v.is_empty());
     auth_mode_verdict(
         exported,
-        ctx.codex_home.as_deref().map(|h| h.join(AUTH_JSON)).as_deref(),
+        ctx.codex_home
+            .as_deref()
+            .map(|h| h.join(AUTH_JSON))
+            .as_deref(),
     )
 }
 
@@ -808,11 +814,7 @@ fn context_canon_verdict(claude_md: Option<&str>, cwd: &Path) -> Check {
     if text.lines().any(|l| l.trim() == AGENTS_IMPORT) {
         return Check::ok(
             "context_canon",
-            format!(
-                "{} in {} imports {AGENTS_IMPORT}",
-                CLAUDE_MD,
-                cwd.display()
-            ),
+            format!("{} in {} imports {AGENTS_IMPORT}", CLAUDE_MD, cwd.display()),
         );
     }
     Check::warn(
@@ -859,13 +861,19 @@ fn codex_config_secrets_verdict(
     let Some(path) = path else {
         return Check::ok(
             "codex_config_secrets",
-            format!("no {} under the codex home — nothing to check", mcp::TARGET_FILE),
+            format!(
+                "no {} under the codex home — nothing to check",
+                mcp::TARGET_FILE
+            ),
         );
     };
     let count = secret_lines.len();
     if !tracked {
         let detail = if count == 0 {
-            format!("{} carries no secret shape and git does not track it", path.display())
+            format!(
+                "{} carries no secret shape and git does not track it",
+                path.display()
+            )
         } else {
             format!(
                 "{count} secret-shaped line(s) in {}, which git does not track",
@@ -877,7 +885,10 @@ fn codex_config_secrets_verdict(
     if count == 0 {
         return Check::ok(
             "codex_config_secrets",
-            format!("{} is tracked by git and carries no secret shape", path.display()),
+            format!(
+                "{} is tracked by git and carries no secret shape",
+                path.display()
+            ),
         );
     }
     Check::fail(
@@ -1343,7 +1354,11 @@ mod tests {
         let down = broker_verdict(BrokerProbe::Down {
             startable: Ok(PathBuf::from("/usr/local/bin/a2a")),
         });
-        assert_eq!(down.status, Status::Ok, "start-on-demand is the normal state");
+        assert_eq!(
+            down.status,
+            Status::Ok,
+            "start-on-demand is the normal state"
+        );
         assert!(down.detail.contains("not running"));
 
         let unstartable = broker_verdict(BrokerProbe::Down {
@@ -1385,7 +1400,15 @@ mod tests {
         assert_eq!(unreachable.status, Status::Warn);
 
         // A broker is never a `fail`: exec still spawns workers without one.
-        for c in [disabled, down, unstartable, up, degraded, skewed, unreachable] {
+        for c in [
+            disabled,
+            down,
+            unstartable,
+            up,
+            degraded,
+            skewed,
+            unreachable,
+        ] {
             assert_ne!(c.status, Status::Fail, "{}", c.detail);
         }
     }
@@ -1405,7 +1428,10 @@ mod tests {
         assert!(!up.detail.contains(", )"), "{}", up.detail);
         assert_eq!(
             up.detail,
-            format!("broker up (protocol v{}, binary unknown)", wire::PROTOCOL_VERSION)
+            format!(
+                "broker up (protocol v{}, binary unknown)",
+                wire::PROTOCOL_VERSION
+            )
         );
     }
 
@@ -1418,7 +1444,10 @@ mod tests {
 
         let none = context_canon_verdict(None, cwd);
         assert_eq!(none.status, Status::Ok);
-        assert_eq!(none.detail, "no CLAUDE.md in /work/proj — nothing to migrate");
+        assert_eq!(
+            none.detail,
+            "no CLAUDE.md in /work/proj — nothing to migrate"
+        );
 
         for body in [
             "@AGENTS.md\n\n# Project\n",
@@ -1458,8 +1487,14 @@ mod tests {
         let path = Path::new("/home/mike/.codex/config.toml");
 
         // No file (or no codex home at all) is nothing to check.
-        assert_eq!(codex_config_secrets_verdict(None, false, &[]).status, Status::Ok);
-        assert_eq!(codex_config_secrets_verdict(None, true, &[23]).status, Status::Ok);
+        assert_eq!(
+            codex_config_secrets_verdict(None, false, &[]).status,
+            Status::Ok
+        );
+        assert_eq!(
+            codex_config_secrets_verdict(None, true, &[23]).status,
+            Status::Ok
+        );
 
         // Not a work tree / not tracked, with secrets: the DESIRED end state.
         let private = codex_config_secrets_verdict(Some(path), false, &[23, 41]);
@@ -1482,7 +1517,11 @@ mod tests {
         let published = codex_config_secrets_verdict(Some(path), true, &[23, 41]);
         assert_eq!(published.status, Status::Fail);
         assert!(published.detail.contains("/home/mike/.codex/config.toml"));
-        assert!(published.detail.contains("lines 23, 41"), "{}", published.detail);
+        assert!(
+            published.detail.contains("lines 23, 41"),
+            "{}",
+            published.detail
+        );
         assert_eq!(
             published.remedy.as_deref(),
             Some(crate::sync::mcp::MIGRATE_REMEDY)
@@ -1507,9 +1546,19 @@ mod tests {
         let corrupt = sync_state_verdict(Some(Err(
             "/home/mike/.a2a/sync-manifest.json: expected value at line 1 column 1",
         )));
-        assert_eq!(corrupt.status, Status::Warn, "a broken ledger is not a spawn blocker");
-        assert!(corrupt.detail.contains("/home/mike/.a2a/sync-manifest.json"));
-        assert!(corrupt.detail.contains("expected value"), "{}", corrupt.detail);
+        assert_eq!(
+            corrupt.status,
+            Status::Warn,
+            "a broken ledger is not a spawn blocker"
+        );
+        assert!(corrupt
+            .detail
+            .contains("/home/mike/.a2a/sync-manifest.json"));
+        assert!(
+            corrupt.detail.contains("expected value"),
+            "{}",
+            corrupt.detail
+        );
         assert_eq!(
             corrupt.remedy.as_deref(),
             Some(crate::sync::manifest::CORRUPT_REMEDY),
@@ -1547,10 +1596,23 @@ mod tests {
             ..DriftSummary::default()
         };
         let cases = [
-            DriftSummary { drifted: 2, missing_dest: 1, ..base.clone() },
-            DriftSummary { missing_dest: 1, ..base.clone() },
-            DriftSummary { orphaned_source: 1, ..base.clone() },
-            DriftSummary { ignore_block_uncovered: true, ..base.clone() },
+            DriftSummary {
+                drifted: 2,
+                missing_dest: 1,
+                ..base.clone()
+            },
+            DriftSummary {
+                missing_dest: 1,
+                ..base.clone()
+            },
+            DriftSummary {
+                orphaned_source: 1,
+                ..base.clone()
+            },
+            DriftSummary {
+                ignore_block_uncovered: true,
+                ..base.clone()
+            },
         ];
         for summary in &cases {
             let c = sync_state_verdict(Some(Ok(summary)));

@@ -74,7 +74,10 @@ async fn neon_registry_own_row_lifecycle_and_pooler_statement_cache_probe() {
     );
 
     let registry = PgRegistry::connect_lazy(&registry_url, 30).unwrap();
-    assert_eq!(registry.schema_version().await.unwrap(), REGISTRY_SCHEMA_VERSION);
+    assert_eq!(
+        registry.schema_version().await.unwrap(),
+        REGISTRY_SCHEMA_VERSION
+    );
 
     let now = Utc::now();
     let fleet_id = format!("fleet-live-{}", ulid::Ulid::new());

@@ -111,7 +111,11 @@ pub fn run(home: &A2aHome, foreground: bool, quiet: bool) -> Result<Outcome, App
         Ok((data, cause)) => (Ok(data), cause),
         Err(e) => (Err(e), Cause::Internal("the daemon could not start".into())),
     };
-    if data.as_ref().map(|d| d["started"] == json!(true)).unwrap_or(true) {
+    if data
+        .as_ref()
+        .map(|d| d["started"] == json!(true))
+        .unwrap_or(true)
+    {
         let _ = std::fs::remove_file(sockserv::socket_path(&root));
         shutdown::record_phase(&root, shutdown::PHASE_SOCKET_UNLINKED, &cause, json!({}));
     }
@@ -297,8 +301,13 @@ fn daemonize(home: &Path) -> Result<(), AppError> {
         .map_err(|e| daemon_error(format!("ignoring SIGHUP: {e}")))?;
     leave()?;
 
-    for (fd, source) in [(0, devnull.as_raw_fd()), (1, log.as_raw_fd()), (2, log.as_raw_fd())] {
-        nix::unistd::dup2(source, fd).map_err(|e| daemon_error(format!("dup2 onto fd {fd}: {e}")))?;
+    for (fd, source) in [
+        (0, devnull.as_raw_fd()),
+        (1, log.as_raw_fd()),
+        (2, log.as_raw_fd()),
+    ] {
+        nix::unistd::dup2(source, fd)
+            .map_err(|e| daemon_error(format!("dup2 onto fd {fd}: {e}")))?;
     }
     Ok(())
 }
@@ -452,11 +461,7 @@ pub fn call(home: &A2aHome, op: &str, params: Option<&str>) -> Result<Outcome, A
 }
 
 fn io_error(path: &Path, e: std::io::Error) -> AppError {
-    AppError::new(
-        "IO",
-        ExitCode::Internal,
-        format!("{}: {e}", path.display()),
-    )
+    AppError::new("IO", ExitCode::Internal, format!("{}: {e}", path.display()))
 }
 
 fn daemon_error(detail: String) -> AppError {
@@ -480,7 +485,9 @@ mod tests {
         let home = tmp.path();
         assert!(lock_is_free(home), "an empty home is unowned");
 
-        let first = acquire_lock(home).unwrap().expect("the first acquirer wins");
+        let first = acquire_lock(home)
+            .unwrap()
+            .expect("the first acquirer wins");
         assert!(
             acquire_lock(home).unwrap().is_none(),
             "the second acquirer is refused rather than failed"

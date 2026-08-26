@@ -54,10 +54,7 @@ fn walk(root: &Path) -> Vec<String> {
             } else {
                 format!("{prefix}/{name}")
             };
-            let is_dir = entry
-                .metadata()
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
             out.push(rel.clone());
             if is_dir {
                 rec(&entry.path(), &rel, out);
@@ -170,7 +167,10 @@ fn check_exits_nine_and_names_each_drifted_artifact() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     for rel in [ARTIFACTS[0], ARTIFACTS[1]] {
-        assert!(drifted.contains(&rel.to_string()), "{rel} missing from {drifted:?}");
+        assert!(
+            drifted.contains(&rel.to_string()),
+            "{rel} missing from {drifted:?}"
+        );
         assert!(msg.contains(rel), "message does not name {rel}: {msg}");
     }
     assert!(
@@ -242,7 +242,11 @@ fn every_pinned_section_appears_in_id_order_in_both_codex_artifacts() {
     use a2a::commands::gen_skills::{parse_sections, REQUIRED_SECTIONS, WORKER_PROTOCOL_SRC};
     let sections = parse_sections(WORKER_PROTOCOL_SRC).expect("the source parses");
     let ids: Vec<&str> = sections.iter().map(|s| s.id).collect();
-    assert_eq!(ids, REQUIRED_SECTIONS.to_vec(), "source section order is pinned");
+    assert_eq!(
+        ids,
+        REQUIRED_SECTIONS.to_vec(),
+        "source section order is pinned"
+    );
 
     let out = render_into_tempdir();
     for rel in [ARTIFACTS[0], ARTIFACTS[1]] {
@@ -348,7 +352,11 @@ fn the_orchestrate_source_carries_exactly_the_pinned_sections_in_order() {
     use a2a::commands::gen_skills::{parse_sections, ORCHESTRATE_SECTIONS, ORCHESTRATE_SRC};
     let sections = parse_sections(ORCHESTRATE_SRC).expect("the source parses");
     let ids: Vec<&str> = sections.iter().map(|s| s.id).collect();
-    assert_eq!(ids, ORCHESTRATE_SECTIONS.to_vec(), "section order is pinned");
+    assert_eq!(
+        ids,
+        ORCHESTRATE_SECTIONS.to_vec(),
+        "section order is pinned"
+    );
 
     let out = render_into_tempdir();
     let body = read(out.path(), ARTIFACTS[2]);
@@ -357,7 +365,11 @@ fn the_orchestrate_source_carries_exactly_the_pinned_sections_in_order() {
         let at = body
             .find(s.body.trim())
             .unwrap_or_else(|| panic!("the artifact is missing section `{}`", s.id));
-        assert!(at >= last, "the artifact renders `{}` out of id order", s.id);
+        assert!(
+            at >= last,
+            "the artifact renders `{}` out of id order",
+            s.id
+        );
         last = at;
     }
     assert!(
@@ -467,5 +479,8 @@ fn gen_skills_writes_only_under_out_and_never_installs() {
     rendered.sort();
     let mut expected: Vec<String> = ARTIFACTS.iter().map(|s| s.to_string()).collect();
     expected.sort();
-    assert_eq!(rendered, expected, "--out holds exactly the three artifacts");
+    assert_eq!(
+        rendered, expected,
+        "--out holds exactly the three artifacts"
+    );
 }

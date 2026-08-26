@@ -281,7 +281,9 @@ pub fn load_snapshot(worker_dir: &Path) -> Result<WorkerSnapshot, SnapshotError>
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| SnapshotError::Corrupt)?;
     match value.get("schema_version").and_then(|v| v.as_u64()) {
-        Some(v) if v as u32 > SNAPSHOT_SCHEMA_VERSION => return Err(SnapshotError::TooNew(v as u32)),
+        Some(v) if v as u32 > SNAPSHOT_SCHEMA_VERSION => {
+            return Err(SnapshotError::TooNew(v as u32))
+        }
         Some(_) => {}
         None => return Err(SnapshotError::Corrupt),
     }
@@ -345,7 +347,10 @@ mod tests {
             .insert("from_the_future".into(), serde_json::json!({"a": 1}));
         save_snapshot(tmp.path(), &s).unwrap();
         let back = load_snapshot(tmp.path()).unwrap();
-        assert_eq!(back.extra.get("from_the_future"), Some(&serde_json::json!({"a": 1})));
+        assert_eq!(
+            back.extra.get("from_the_future"),
+            Some(&serde_json::json!({"a": 1}))
+        );
         assert_eq!(back.lane, Lane::Review);
     }
 

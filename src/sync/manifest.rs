@@ -330,7 +330,11 @@ pub fn hash_path(p: &Path) -> std::io::Result<String> {
 
 /// Every file under `dir`, as `(relative path, absolute path)`. Directories
 /// contribute nothing of their own — an empty directory is not content.
-fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+fn collect_files(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<(String, PathBuf)>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -515,10 +519,14 @@ mod tests {
 
         assert!(m.owns(Kind::Skill, "default", "techniques").is_some());
         assert!(
-            m.owns(Kind::Skill, "claude-revenium", "techniques").is_none(),
+            m.owns(Kind::Skill, "claude-revenium", "techniques")
+                .is_none(),
             "ownership is per (kind, account, name), not per name"
         );
-        assert_eq!(m.owner_account(Kind::Mcp, "linear"), Some("claude-revenium"));
+        assert_eq!(
+            m.owner_account(Kind::Mcp, "linear"),
+            Some("claude-revenium")
+        );
         assert_eq!(m.owner_account(Kind::Skill, "linear"), None);
         assert_eq!(m.owner_account(Kind::Mcp, "techniques"), None);
 
@@ -536,7 +544,11 @@ mod tests {
         let copy = tmp.path().join("techniques");
         copy_tree(&fixture_skill(), &copy);
         let source = hash_path(&fixture_skill()).unwrap();
-        assert_eq!(hash_path(&copy).unwrap(), source, "a fresh copy is unchanged");
+        assert_eq!(
+            hash_path(&copy).unwrap(),
+            source,
+            "a fresh copy is unchanged"
+        );
 
         // Mode is not content.
         use std::os::unix::fs::PermissionsExt;
@@ -624,7 +636,10 @@ mod tests {
         assert_eq!(clean.entries, 1);
         assert_eq!(clean.orphaned_source, 0, "mcp entries contribute 0, always");
         assert_eq!((clean.drifted, clean.missing_dest), (0, 0));
-        assert!(!clean.ignore_block_uncovered, "no skill dirs, nothing to cover");
+        assert!(
+            !clean.ignore_block_uncovered,
+            "no skill dirs, nothing to cover"
+        );
         assert_eq!(clean.kinds_affected, Vec::<Kind>::new());
         assert!(clean.last_synced_at.is_some());
 
@@ -686,7 +701,10 @@ mod tests {
         assert_eq!(s.entries, 4);
         assert_eq!(s.drifted, 1, "only the edited destination");
         assert_eq!(s.missing_dest, 1, "only the destination that is not there");
-        assert_eq!(s.orphaned_source, 1, "only the entry whose source went away");
+        assert_eq!(
+            s.orphaned_source, 1,
+            "only the entry whose source went away"
+        );
         assert_eq!(s.kinds_affected, vec![Kind::Skill]);
     }
 

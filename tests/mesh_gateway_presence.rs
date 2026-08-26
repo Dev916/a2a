@@ -51,7 +51,11 @@ fn write_presence(home: &Path, peer: &str, days_old: i64, home_gateway: Option<&
     if let Some(gateway) = home_gateway {
         value["home_gateway"] = json!(gateway);
     }
-    fs::write(dir.join("presence.json"), serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    fs::write(
+        dir.join("presence.json"),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
 }
 
 fn registry_row(gateway_id: &str, last_heartbeat: chrono::DateTime<Utc>) -> GatewayRow {
@@ -113,7 +117,10 @@ fn presence_is_layer1_compatible_and_tuple_lww_counter_beats_clock_skew() {
     incoming.status = Some("newer despite backward clock".to_string());
     assert!(presence_wire::merge_presence(&home, incoming, "gw-a").unwrap());
     let merged = a2a::mesh::presence::load(&home, &peer).unwrap().unwrap();
-    assert_eq!(merged.status.as_deref(), Some("newer despite backward clock"));
+    assert_eq!(
+        merged.status.as_deref(),
+        Some("newer despite backward clock")
+    );
     assert_eq!(merged.presence_seq, 8);
 
     let mut stale_by_counter = merged.clone();
@@ -143,7 +150,9 @@ fn local_presence_changes_persist_counter_and_gossip_frame_sets_home_gateway() {
     write_presence(tmp.path(), &peer.to_string(), 0, None);
 
     let first = presence_wire::record_local_change(&home, &peer, now, "gw-a").unwrap();
-    let second = presence_wire::record_local_change(&home, &peer, now + Duration::seconds(1), "gw-a").unwrap();
+    let second =
+        presence_wire::record_local_change(&home, &peer, now + Duration::seconds(1), "gw-a")
+            .unwrap();
     assert_eq!(first.presence_seq, 2);
     assert_eq!(second.presence_seq, 3);
     assert_eq!(second.home_gateway.as_deref(), Some("gw-a"));
@@ -229,12 +238,7 @@ fn gc_keeps_remote_homed_peer_until_home_gateway_is_registry_retired_then_archiv
         now - Duration::minutes(1),
     )
     .unwrap();
-    presence_wire::refresh_registry_cache(
-        &a2a_home,
-        &[registry_row("gw-c", now)],
-        now,
-    )
-    .unwrap();
+    presence_wire::refresh_registry_cache(&a2a_home, &[registry_row("gw-c", now)], now).unwrap();
 
     let mut cursors = CursorStore::load_or_rebuild(&a2a_home).unwrap();
     cursors.apply_advance(a2a::mesh::gateway::replicate::CursorAdvance::new("gw-b", 4));
@@ -253,24 +257,38 @@ fn gc_keeps_remote_homed_peer_until_home_gateway_is_registry_retired_then_archiv
     let value: Value = serde_json::from_slice(&out).unwrap();
     let removed = value["data"]["mesh"]["removed"].as_array().unwrap();
     assert!(
-        removed.iter().any(|peer| peer == "claude:11111111-1111-4111-8111-111111111111"),
+        removed
+            .iter()
+            .any(|peer| peer == "claude:11111111-1111-4111-8111-111111111111"),
         "{value}"
     );
     assert!(
-        removed.iter().any(|peer| peer == "codex:22222222-2222-4222-8222-222222222222"),
+        removed
+            .iter()
+            .any(|peer| peer == "codex:22222222-2222-4222-8222-222222222222"),
         "{value}"
     );
     assert!(
-        !removed.iter().any(|peer| peer == "codex:33333333-3333-4333-8333-333333333333"),
+        !removed
+            .iter()
+            .any(|peer| peer == "codex:33333333-3333-4333-8333-333333333333"),
         "{value}"
     );
     assert!(!home.join("mesh").join("outbound").join("gw-b").exists());
-    let retired_dir = home.join("mesh").join("outbound").join("retired").join("gw-b");
+    let retired_dir = home
+        .join("mesh")
+        .join("outbound")
+        .join("retired")
+        .join("gw-b");
     assert_eq!(fs::read_dir(retired_dir).unwrap().count(), 2);
 
-    let cursor_text = fs::read_to_string(home.join("mesh").join("gateway").join("cursors.json")).unwrap();
+    let cursor_text =
+        fs::read_to_string(home.join("mesh").join("gateway").join("cursors.json")).unwrap();
     let cursor_json: Value = serde_json::from_str(&cursor_text).unwrap();
-    assert!(cursor_json["origins"].get("gw-b").is_none(), "{cursor_json}");
+    assert!(
+        cursor_json["origins"].get("gw-b").is_none(),
+        "{cursor_json}"
+    );
     assert_eq!(cursor_json["origins"]["gw-c"]["last_seq"], 9);
 
     let log = fs::read_to_string(home.join("mesh").join("gateway").join("gateway.jsonl")).unwrap();

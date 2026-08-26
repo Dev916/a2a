@@ -185,7 +185,9 @@ impl CursorStore {
             });
         }
         for cursor in store.origins.values_mut() {
-            cursor.last_seq = cursor.last_seq.max(cursor.compacted_before_seq.saturating_sub(1));
+            cursor.last_seq = cursor
+                .last_seq
+                .max(cursor.compacted_before_seq.saturating_sub(1));
         }
         Ok(store)
     }
@@ -273,7 +275,12 @@ impl FeedReorderBuffers {
         }
     }
 
-    fn insert(&mut self, origin: &str, origin_seq: u64, entry: FeedEntry) -> (bool, Option<ReorderEviction>) {
+    fn insert(
+        &mut self,
+        origin: &str,
+        origin_seq: u64,
+        entry: FeedEntry,
+    ) -> (bool, Option<ReorderEviction>) {
         let pending = self.origins.entry(origin.to_string()).or_default();
         if pending.contains_key(&origin_seq) {
             return (false, None);
@@ -282,7 +289,11 @@ impl FeedReorderBuffers {
         if pending.len() <= self.cap_per_origin {
             return (true, None);
         }
-        let evicted_seq = pending.keys().next().copied().expect("pending is non-empty");
+        let evicted_seq = pending
+            .keys()
+            .next()
+            .copied()
+            .expect("pending is non-empty");
         pending.remove(&evicted_seq);
         (
             true,
@@ -354,7 +365,11 @@ impl AntiEntropyCycle {
                 .get(&remote.origin)
                 .map(|d| remote.max_seq.saturating_sub(d.max_seq) as i64)
                 .unwrap_or(remote.max_seq as i64);
-            if lag > 0 && old_lag > 0 && self.drift_after_cycles <= 1 && self.sustained_lag.num_seconds() >= 0 {
+            if lag > 0
+                && old_lag > 0
+                && self.drift_after_cycles <= 1
+                && self.sustained_lag.num_seconds() >= 0
+            {
                 drift.push(DriftEvent {
                     kind: "drift",
                     origin: remote.origin,
@@ -685,7 +700,8 @@ pub fn compact_feed(
         });
     }
     let cutoff = now - retain;
-    let rows = store::read_json_named(&root, "feed", 0).map_err(|e| io_err("reading feed.jsonl", e))?;
+    let rows =
+        store::read_json_named(&root, "feed", 0).map_err(|e| io_err("reading feed.jsonl", e))?;
     let mut kept = Vec::new();
     let mut compacted_before = BTreeMap::<String, u64>::new();
     let mut removed = 0usize;
@@ -700,7 +716,8 @@ pub fn compact_feed(
         let entry = match serde_json::from_value::<FeedEntry>(value.clone()) {
             Ok(entry) => entry,
             Err(_) => {
-                max_kept_seq = max_kept_seq.max(value.get("seq").and_then(Value::as_u64).unwrap_or(0));
+                max_kept_seq =
+                    max_kept_seq.max(value.get("seq").and_then(Value::as_u64).unwrap_or(0));
                 kept.push(value);
                 continue;
             }
@@ -793,7 +810,8 @@ fn scan_origin_sequences(home: &A2aHome) -> Result<BTreeMap<String, BTreeSet<u64
     if !root.exists() {
         return Ok(BTreeMap::new());
     }
-    let rows = store::read_json_named(&root, "feed", 0).map_err(|e| io_err("reading feed.jsonl", e))?;
+    let rows =
+        store::read_json_named(&root, "feed", 0).map_err(|e| io_err("reading feed.jsonl", e))?;
     let mut out = BTreeMap::<String, BTreeSet<u64>>::new();
     for value in rows {
         if feed::is_feed_bookkeeping(&value) {
@@ -844,7 +862,8 @@ fn write_feed_window(root: &std::path::Path, rows: &[Value]) -> Result<(), AppEr
         serde_json::to_writer(&mut bytes, row).map_err(data_err)?;
         bytes.push(b'\n');
     }
-    store::write_atomic(&root.join("feed.jsonl"), &bytes).map_err(|e| io_err("writing feed.jsonl", e))
+    store::write_atomic(&root.join("feed.jsonl"), &bytes)
+        .map_err(|e| io_err("writing feed.jsonl", e))
 }
 
 fn cursor_path(home: &A2aHome) -> PathBuf {

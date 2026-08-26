@@ -112,12 +112,7 @@ fn transport_name(t: Transport) -> String {
 
 /// stdout stays machine-readable: the full record under `--json`, the resulting
 /// state otherwise (the same spelling `a2a status` prints).
-fn payload(
-    id: &str,
-    snap: &crate::state::WorkerSnapshot,
-    noop: bool,
-    json_mode: bool,
-) -> Value {
+fn payload(id: &str, snap: &crate::state::WorkerSnapshot, noop: bool, json_mode: bool) -> Value {
     if json_mode {
         json!({
             "id": id,

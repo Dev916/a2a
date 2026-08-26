@@ -164,7 +164,11 @@ fn a_zero_budget_trips_on_the_first_turn() {
     let id = spawned.data()["id"].as_str().unwrap().to_string();
 
     let failed = until_state(&home, &id, "failed");
-    assert_eq!(failed["failure_class"], json!("budget_exhausted"), "{failed}");
+    assert_eq!(
+        failed["failure_class"],
+        json!("budget_exhausted"),
+        "{failed}"
+    );
     assert_eq!(failed["turns_this_epoch"], json!(1), "{failed}");
     assert_eq!(failed["max_turns"], json!(0), "{failed}");
     assert_no_fold_rejections(&failed);
@@ -189,7 +193,11 @@ fn a_zero_budget_trips_on_the_first_turn() {
         &scratch,
         "status",
     );
-    assert_eq!(status.code, 4, "a failed worker is exit 4: {}", status.stderr);
+    assert_eq!(
+        status.code, 4,
+        "a failed worker is exit 4: {}",
+        status.stderr
+    );
     assert_eq!(
         status.data()["failure_class"],
         json!("budget_exhausted"),
@@ -253,7 +261,11 @@ fn the_budget_counts_turns_across_a_park() {
     assert_eq!(sent.code, 0, "send: {}", sent.stderr);
 
     let failed = until_state(&home, &id, "failed");
-    assert_eq!(failed["failure_class"], json!("budget_exhausted"), "{failed}");
+    assert_eq!(
+        failed["failure_class"],
+        json!("budget_exhausted"),
+        "{failed}"
+    );
     assert_eq!(
         failed["turns_this_epoch"],
         json!(2),
@@ -339,7 +351,11 @@ fn a_brief_may_only_lower_the_budget_and_genesis_survives_a_rebuild() {
     assert!(before.code == 0 || before.code == 4, "{}", before.stderr);
     let snap = snap_of(&home, &id).expect("a snapshot");
     assert_eq!(snap["max_turns"], json!(40));
-    assert_eq!(snap["turns_this_epoch"], json!(1), "one turn, counted: {snap}");
+    assert_eq!(
+        snap["turns_this_epoch"],
+        json!(1),
+        "one turn, counted: {snap}"
+    );
 
     // Rebuild-lossless: the checkpoint is derived, so losing it costs a replay
     // and nothing else. The BUDGET is what genesis carries and therefore what

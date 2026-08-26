@@ -478,7 +478,8 @@ mod tests {
             .append(true)
             .open(tmp.path().join("events.jsonl"))
             .unwrap();
-        f.write_all(br#"{"schema_version":1,"seq":3,"ts":"20"#).unwrap();
+        f.write_all(br#"{"schema_version":1,"seq":3,"ts":"20"#)
+            .unwrap();
         assert_eq!(last_event_ts(tmp.path()), Some(expected));
     }
 
@@ -503,10 +504,7 @@ mod tests {
             lines[1]
         );
         // ...and without the flag the projection is exactly the Phase-1 one.
-        let plain = render_table(
-            &[row("general-0814t1300-aaaa", "done", Some(240))],
-            false,
-        );
+        let plain = render_table(&[row("general-0814t1300-aaaa", "done", Some(240))], false);
         assert!(plain.ends_with("done  4m  -"), "{plain}");
     }
 

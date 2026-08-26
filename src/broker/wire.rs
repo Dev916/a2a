@@ -432,7 +432,11 @@ where
         let (done, consumed) = {
             let available = reader.fill_buf().await?;
             if available.is_empty() {
-                return Ok(if acc.is_empty() { Incoming::Eof } else { acc.finish() });
+                return Ok(if acc.is_empty() {
+                    Incoming::Eof
+                } else {
+                    acc.finish()
+                });
             }
             match available.iter().position(|b| *b == b'\n') {
                 Some(i) => {
@@ -461,7 +465,11 @@ pub fn read_frame_sync<R: io::BufRead>(reader: &mut R) -> io::Result<Incoming> {
         let (done, consumed) = {
             let available = reader.fill_buf()?;
             if available.is_empty() {
-                return Ok(if acc.is_empty() { Incoming::Eof } else { acc.finish() });
+                return Ok(if acc.is_empty() {
+                    Incoming::Eof
+                } else {
+                    acc.finish()
+                });
             }
             match available.iter().position(|b| *b == b'\n') {
                 Some(i) => {
@@ -577,7 +585,10 @@ mod tests {
             .to_app();
         assert_eq!(back.code, "QUEUE_FULL");
         assert_eq!(back.exit, ExitCode::Precondition);
-        assert_eq!(back.data, Some(json!({"retry_after_secs": 30, "queue_cap": 32})));
+        assert_eq!(
+            back.data,
+            Some(json!({"retry_after_secs": 30, "queue_cap": 32}))
+        );
         // An error with nothing structured to say carries no key at all.
         let plain = AppError::new("NO_SUCH_WORKER", ExitCode::NoSuchWorker, "who?");
         assert_eq!(WireError::from_app(&plain).get(WireError::DATA_KEY), None);

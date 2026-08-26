@@ -225,7 +225,10 @@ pub fn plan(
 
         // `metadata` follows symlinks, which is the whole point: a symlinked
         // skill is planned as an ordinary directory and copied as contents.
-        if !std::fs::metadata(&source).map(|m| m.is_dir()).unwrap_or(false) {
+        if !std::fs::metadata(&source)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             push(Disposition::SkippedNotASkill, "not a directory");
             continue;
         }
@@ -281,7 +284,10 @@ fn plan_removals(listed: &[String], manifest: &Manifest, account: &str, plan: &m
         if entry.account != account {
             continue;
         }
-        let Some(name) = entry.dest_path.file_name().map(|n| n.to_string_lossy().into_owned())
+        let Some(name) = entry
+            .dest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
         else {
             continue;
         };
@@ -515,10 +521,21 @@ mod tests {
         );
         let mut sorted = SEED_SIDE_EFFECTING;
         sorted.sort_unstable();
-        assert_eq!(sorted, SEED_SIDE_EFFECTING, "kept sorted so a reader can scan it");
+        assert_eq!(
+            sorted, SEED_SIDE_EFFECTING,
+            "kept sorted so a reader can scan it"
+        );
         assert_eq!(
             SIDE_EFFECT_VOCABULARY,
-            ["credential", "send", "post", "deploy", "password", "token", "aws"]
+            [
+                "credential",
+                "send",
+                "post",
+                "deploy",
+                "password",
+                "token",
+                "aws"
+            ]
         );
     }
 
@@ -594,7 +611,10 @@ mod tests {
             },
             "the directory name is scanned too"
         );
-        assert_eq!(classify("techniques", Some(&clean), &[]), Classification::ReadOnly);
+        assert_eq!(
+            classify("techniques", Some(&clean), &[]),
+            Classification::ReadOnly
+        );
     }
 
     /// The allowlist is the one way past a refusal, and it is per-name.
@@ -717,7 +737,10 @@ mod tests {
     fn block_covers_is_true_only_for_one_well_formed_complete_block() {
         let two = dirs(&["a", "b"]);
         assert!(!block_covers("*.log\n", &two), "absent");
-        assert!(block_covers(&managed_block(&two), &two), "present and complete");
+        assert!(
+            block_covers(&managed_block(&two), &two),
+            "present and complete"
+        );
         assert!(
             !block_covers(&managed_block(&dirs(&["a"])), &two),
             "present but missing one dir"
@@ -786,7 +809,11 @@ mod tests {
         // Idempotence, for every one of those inputs.
         for input in ["", "*.log\n.env\n", &appended, &surrounded, &doubled] {
             let once = rewrite_block(input, &two);
-            assert_eq!(rewrite_block(&once, &two), once, "not idempotent for {input:?}");
+            assert_eq!(
+                rewrite_block(&once, &two),
+                once,
+                "not idempotent for {input:?}"
+            );
         }
     }
 }

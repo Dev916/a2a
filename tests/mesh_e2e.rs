@@ -70,7 +70,11 @@ fn note_files(home: &Path, provider: &str, session: &str) -> Vec<PathBuf> {
         Ok(entries) => entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".note.json")))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".note.json"))
+            })
             .collect(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => panic!("reading note inbox: {e}"),
@@ -103,7 +107,11 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
         entries.sort_by_key(|e| e.path());
         for entry in entries {
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             let ty = entry.file_type().unwrap();
             if ty.is_dir() {
                 out.insert(format!("{rel}/"), Vec::new());
@@ -133,7 +141,10 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 }
 
 fn read_snapshot(home: &Path, worker_id: &str) -> Value {
-    serde_json::from_str(&fs::read_to_string(home.join("workers").join(worker_id).join("state.json")).unwrap()).unwrap()
+    serde_json::from_str(
+        &fs::read_to_string(home.join("workers").join(worker_id).join("state.json")).unwrap(),
+    )
+    .unwrap()
 }
 
 fn peer_presence(home: &Path, provider: &str, session: &str) -> PathBuf {
@@ -157,7 +168,9 @@ fn row_for<'a>(rows: &'a [Value], peer: &str) -> &'a Value {
 }
 
 fn spawn_exec_worker(home: &Path, allowed: &Path, work: &Path, note_to_a: &str) -> String {
-    let note = json!({"to": format!("claude:{A}"), "text": note_to_a, "refs": {"worker": ["stub"]}}).to_string();
+    let note =
+        json!({"to": format!("claude:{A}"), "text": note_to_a, "refs": {"worker": ["stub"]}})
+            .to_string();
     let brief = common::write_brief(allowed, "write a mesh note back to A\n");
     let out = cli(home, allowed)
         .env("STUB_SLEEP", "2")
@@ -261,7 +274,13 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0]["text"], "B note to A by prefix");
     assert!(note_files(&home, "claude", A).is_empty());
-    assert!(home.join("mesh/peers").join(format!("claude-{A}/inbox/read")).read_dir().unwrap().next().is_some());
+    assert!(home
+        .join("mesh/peers")
+        .join(format!("claude-{A}/inbox/read"))
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_some());
 
     let worker_id = spawn_exec_worker(&home, tmp.path(), &work, "W outbox note to A");
     wait_for("worker session", || {
@@ -273,7 +292,14 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
         (snap["session_id"] == W_SESSION).then_some(())
     });
     cli(&home, tmp.path())
-        .args(["mesh", "register", "--provider", "codex", "--session", W_SESSION])
+        .args([
+            "mesh",
+            "register",
+            "--provider",
+            "codex",
+            "--session",
+            W_SESSION,
+        ])
         .assert()
         .success();
     note(&home, tmp.path(), A, &worker_id, "A note to W by worker id");
@@ -281,7 +307,9 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
         let files = worker_inbox_files(&home, &worker_id);
         (files.len() == 1).then_some(files)
     });
-    assert!(fs::read_to_string(&queued[0]).unwrap().contains("A note to W by worker id"));
+    assert!(fs::read_to_string(&queued[0])
+        .unwrap()
+        .contains("A note to W by worker id"));
     assert_eq!(note_files(&home, "codex", W_SESSION).len(), 1);
 
     let out = cli(&home, tmp.path())
@@ -302,7 +330,11 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
         .success();
     let block = inject(&home, tmp.path(), A);
     assert!(block.contains("W outbox note to A"), "{block}");
-    assert!(home.join("workers").join(&worker_id).join("outbox/1.note.routed.json").exists());
+    assert!(home
+        .join("workers")
+        .join(&worker_id)
+        .join("outbox/1.note.routed.json")
+        .exists());
     common::wait_dead(&home, &worker_id, 10);
     cli(&home, tmp.path())
         .args(["--json", "status", &worker_id])
@@ -312,7 +344,10 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
     let before = snapshot_tree(&home);
     for (subcommand, args) in [
         ("post", vec!["mesh", "post", "--session", A, SECRET]),
-        ("note", vec!["mesh", "note", "--session", A, &format!("claude:{B}"), "-"]),
+        (
+            "note",
+            vec!["mesh", "note", "--session", A, &format!("claude:{B}"), "-"],
+        ),
         ("status", vec!["mesh", "status", "--session", A, SECRET]),
     ] {
         let mut cmd = cli(&home, tmp.path());
@@ -322,9 +357,16 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
         }
         let out = cmd.assert().code(9);
         let v = data(out.get_output().stdout.as_slice());
-        assert_eq!(v["error"]["code"], format!("SECRET_IN_{}", subcommand.to_ascii_uppercase()));
+        assert_eq!(
+            v["error"]["code"],
+            format!("SECRET_IN_{}", subcommand.to_ascii_uppercase())
+        );
         assert!(!v.to_string().contains(SECRET), "{v}");
-        assert_eq!(snapshot_tree(&home), before, "{subcommand} wrote after refusing a secret");
+        assert_eq!(
+            snapshot_tree(&home),
+            before,
+            "{subcommand} wrote after refusing a secret"
+        );
     }
 
     cli(&home, tmp.path())
@@ -338,7 +380,10 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
         .success();
     let rows = array(out.get_output().stdout.as_slice());
     assert_eq!(row_for(&rows, &format!("claude:{B}"))["label"], "retired");
-    assert_eq!(row_for(&rows, &format!("codex:{W_SESSION}"))["label"], "stale");
+    assert_eq!(
+        row_for(&rows, &format!("codex:{W_SESSION}"))["label"],
+        "stale"
+    );
 
     let out = cli(&home, tmp.path())
         .args(["--json", "gc"])
@@ -347,10 +392,16 @@ fn hermetic_mesh_exec_e2e_cursors_notes_worker_refusals_roster_and_gc() {
     let v = data(out.get_output().stdout.as_slice());
     let removed = v["mesh"]["removed"].as_array().unwrap();
     assert!(removed.contains(&json!(format!("claude:{B}"))), "{v}");
-    assert!(removed.contains(&json!(format!("codex:{W_SESSION}"))), "{v}");
+    assert!(
+        removed.contains(&json!(format!("codex:{W_SESSION}"))),
+        "{v}"
+    );
     assert!(home.join("mesh/peers").join(format!("claude-{A}")).is_dir());
     assert!(!home.join("mesh/peers").join(format!("claude-{B}")).exists());
-    assert!(!home.join("mesh/peers").join(format!("codex-{W_SESSION}")).exists());
+    assert!(!home
+        .join("mesh/peers")
+        .join(format!("codex-{W_SESSION}"))
+        .exists());
 }
 
 #[test]
@@ -366,7 +417,9 @@ fn broker_transport_routes_worker_originated_note_into_claude_inject() {
             .args(["mesh", "register", "--session", A])
             .assert()
             .success();
-        let note = json!({"to": format!("claude:{A}"), "text": "broker W outbox note to A", "refs": {}}).to_string();
+        let note =
+            json!({"to": format!("claude:{A}"), "text": "broker W outbox note to A", "refs": {}})
+                .to_string();
         let brief = common::write_brief(tmp.path(), "write a broker mesh note\n");
         let out = StdCommand::new(assert_cmd::cargo::cargo_bin("a2a"))
             .arg("--home")
@@ -394,7 +447,10 @@ fn broker_transport_routes_worker_originated_note_into_claude_inject() {
         );
         let d = data_str(&String::from_utf8(out.stdout).unwrap());
         if d["transport"] != "app-server" {
-            eprintln!("skipping app-server e2e assertion: transport was {}", d["transport"]);
+            eprintln!(
+                "skipping app-server e2e assertion: transport was {}",
+                d["transport"]
+            );
             return;
         }
         let worker_id = d["id"].as_str().unwrap().to_string();
@@ -403,7 +459,11 @@ fn broker_transport_routes_worker_originated_note_into_claude_inject() {
             let block = inject(&home, tmp.path(), A);
             block.contains("broker W outbox note to A").then_some(block)
         });
-        assert!(home.join("workers").join(&worker_id).join("outbox/1.note.routed.json").exists());
+        assert!(home
+            .join("workers")
+            .join(&worker_id)
+            .join("outbox/1.note.routed.json")
+            .exists());
         let broker_log = fs::read_to_string(home.join("broker.jsonl")).unwrap_or_default();
         assert!(broker_log.contains("mesh_note_routed"), "{broker_log}");
     }
@@ -419,11 +479,17 @@ fn worker_originated_broker_route_can_target_codex_send_inbox() {
     fs::create_dir_all(&fake_state).unwrap();
     let target_worker = "general-0824t2201-targ";
     let target_session = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-    seed_worker(&home, target_worker, target_session, WorkerState::AwaitingInput);
+    seed_worker(
+        &home,
+        target_worker,
+        target_session,
+        WorkerState::AwaitingInput,
+    );
 
     {
         let _guard = BrokerGuard::new(&home);
-        let note = json!({"to": target_worker, "text": "broker note to codex worker", "refs": {}}).to_string();
+        let note = json!({"to": target_worker, "text": "broker note to codex worker", "refs": {}})
+            .to_string();
         let brief = common::write_brief(tmp.path(), "write a broker mesh note to codex\n");
         let out = StdCommand::new(assert_cmd::cargo::cargo_bin("a2a"))
             .arg("--home")
@@ -451,7 +517,10 @@ fn worker_originated_broker_route_can_target_codex_send_inbox() {
         );
         let d = data_str(&String::from_utf8(out.stdout).unwrap());
         if d["transport"] != "app-server" {
-            eprintln!("skipping app-server codex-target assertion: transport was {}", d["transport"]);
+            eprintln!(
+                "skipping app-server codex-target assertion: transport was {}",
+                d["transport"]
+            );
             return;
         }
         wait_for("broker note to target worker inbox", || {

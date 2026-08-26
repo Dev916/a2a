@@ -63,7 +63,13 @@ const REGISTRY_CAPACITY: usize = 256;
 /// **child and to workers**, never to the broker daemon itself, which needs its
 /// own `A2A_*` configuration to function.
 pub const CHILD_ENV_ALLOWLIST: [&str; 7] = [
-    "PATH", "HOME", "USER", "TERM", "LANG", "TMPDIR", "CODEX_HOME",
+    "PATH",
+    "HOME",
+    "USER",
+    "TERM",
+    "LANG",
+    "TMPDIR",
+    "CODEX_HOME",
 ];
 
 /// Names that are stripped from the child environment even when a caller passes
@@ -251,7 +257,12 @@ impl Client {
         let params = serde_json::to_value(params).map_err(|e| RpcError::Decode(e.to_string()))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        if self.registry.send(Registry::Register(id, tx)).await.is_err() {
+        if self
+            .registry
+            .send(Registry::Register(id, tx))
+            .await
+            .is_err()
+        {
             return Err(RpcError::ChildDied);
         }
         let mut line = serde_json::to_vec(&RpcRequest::new(id, method, params))
@@ -307,9 +318,10 @@ impl Client {
         };
         let mut line = serde_json::to_vec(&frame)?;
         line.push(b'\n');
-        self.writer.send(line).await.map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "app-server stdin is closed")
-        })
+        self.writer
+            .send(line)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "app-server stdin is closed"))
     }
 }
 
@@ -374,7 +386,10 @@ fn classify(line: &str) -> Frame {
         (true, Some(id)) => Frame::ServerRequest(ServerRequestFrame {
             id,
             method: value["method"].as_str().unwrap_or_default().to_string(),
-            params: value.get("params").cloned().unwrap_or(serde_json::Value::Null),
+            params: value
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         }),
         (true, None) => match serde_json::from_value::<RpcNotification>(value) {
             Ok(n) => Frame::Notification(n),

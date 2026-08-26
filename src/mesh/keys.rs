@@ -18,12 +18,12 @@ use ulid::Ulid;
 
 pub const SKEW_TOLERANCE_SECS: i64 = 300;
 
-const ROOT_KEY: &str = "root.key";
+pub const ROOT_KEY: &str = "root.key";
 const ROOT_KEY_NEXT: &str = "root.key.next";
 const ROOT_PUB: &str = "root.pub";
 const ROOT_PUB_NEXT: &str = "root.pub.next";
 const GW_KEY: &str = "gw.key";
-const GW_TOKEN: &str = "token";
+pub const GW_TOKEN: &str = "gw.token";
 const TLS_CERT: &str = "gw.crt";
 const TLS_KEY: &str = "gw.tls.key";
 const TLS_FPR: &str = "gw.cert.fpr";
@@ -229,6 +229,68 @@ pub fn gateway_identity(home: &A2aHome, fresh: bool) -> Result<GatewayIdentity, 
     })
 }
 
+pub fn fleet_id(home: &A2aHome) -> Result<String, AppError> {
+    let dir = fleet_dir(home)?;
+    let key_path = dir.join(ROOT_KEY);
+    if key_path.exists() {
+        return Ok(read_root_key(&key_path)?.fleet_id);
+    }
+    read_root_pub(&dir.join(ROOT_PUB)).map(|root| root.fleet_id)
+}
+
+pub fn gateway_public_key_b64(home: &A2aHome) -> Result<String, AppError> {
+    let gateway = read_gateway_key(&gateway_dir(home)?.join(GW_KEY))?;
+    let signing = signing_key_from_b64(&gateway.secret_b64).map_err(|_| {
+        AppError::new(
+            "GATEWAY_KEY_INVALID",
+            ExitCode::Precondition,
+            "gateway key file is invalid",
+        )
+    })?;
+    Ok(b64_encode(&signing.verifying_key().to_bytes()))
+}
+
+pub fn gateway_public_key_fingerprint(home: &A2aHome) -> Result<String, AppError> {
+    let pubkey_b64 = gateway_public_key_b64(home)?;
+    let pubkey = b64_decode(&pubkey_b64).map_err(|_| {
+        AppError::new(
+            "GATEWAY_KEY_INVALID",
+            ExitCode::Precondition,
+            "gateway key file is invalid",
+        )
+    })?;
+    Ok(hex(&Sha256::digest(pubkey)))
+}
+
+pub fn ensure_gateway_token(home: &A2aHome, clock: &dyn Clock) -> Result<bool, AppError> {
+    let token_path = gateway_dir(home)?.join(GW_TOKEN);
+    if token_path.exists() {
+        return Ok(false);
+    }
+    let root_key_path = fleet_dir(home)?.join(ROOT_KEY);
+    if !root_key_path.exists() {
+        return Err(AppError::new(
+            "GATEWAY_NOT_ENROLLED",
+            ExitCode::Precondition,
+            "gateway enrollment token is missing and this home has no fleet root key",
+        )
+        .remedy("run `a2a mesh fleet init` on the root machine or install a token minted for this gateway"));
+    }
+
+    let identity = gateway_identity(home, false)?;
+    let issued_at = clock.now().timestamp();
+    let claims = TokenClaims {
+        fleet_id: String::new(),
+        gateway_id: identity.gateway_id,
+        pubkey_b64: gateway_public_key_b64(home)?,
+        issued_at,
+        exp: issued_at + 90 * 24 * 60 * 60,
+    };
+    let token = sign_token(&claims, home)?;
+    write_string_0600(&token_path, &(token + "\n"))?;
+    Ok(true)
+}
+
 pub fn sign_token(claims: &TokenClaims, home: &A2aHome) -> Result<String, AppError> {
     let root = fleet_init(home)?;
     let mut claims = claims.clone();
@@ -309,7 +371,9 @@ pub fn verify_token(
         }
     }
     if !verified {
-        return Err(token_invalid("signature does not verify against trusted roots"));
+        return Err(token_invalid(
+            "signature does not verify against trusted roots",
+        ));
     }
 
     check_claim_clock(&claims, clock.now().timestamp())?;
@@ -377,7 +441,10 @@ fn check_claim_clock(claims: &TokenClaims, now: i64) -> Result<(), AppError> {
         return Err(AppError::new(
             "TOKEN_NOT_YET_VALID",
             ExitCode::Precondition,
-            format!("token not yet valid: issued_at={} now={now}", claims.issued_at),
+            format!(
+                "token not yet valid: issued_at={} now={now}",
+                claims.issued_at
+            ),
         ));
     }
     Ok(())
@@ -576,7 +643,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn b64_encode(bytes: &[u8]) -> String {

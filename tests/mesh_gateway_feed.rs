@@ -72,7 +72,9 @@ fn entry(origin: &str, origin_seq: u64, text: &str) -> FeedEntry {
         origin: Some(origin.to_string()),
         origin_seq: Some(origin_seq),
         from: "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
-        ts: Utc.timestamp_opt(1_700_000_000 + origin_seq as i64, 0).unwrap(),
+        ts: Utc
+            .timestamp_opt(1_700_000_000 + origin_seq as i64, 0)
+            .unwrap(),
         text: text.to_string(),
         refs: json!({}),
         extra: serde_json::Map::new(),
@@ -146,18 +148,28 @@ fn remote_ingress_appends_before_advancing_and_rebuilds_or_repairs_cursors_by_sc
     let cfg = cfg_for(&home);
     let mut cursors = CursorStore::load_or_rebuild(&home).unwrap();
 
-    let accepted =
-        replicate::append_remote_entry(&home, &cfg, &mut cursors, "gw-remote", entry("gw-remote", 1, "one"))
-            .unwrap();
+    let accepted = replicate::append_remote_entry(
+        &home,
+        &cfg,
+        &mut cursors,
+        "gw-remote",
+        entry("gw-remote", 1, "one"),
+    )
+    .unwrap();
     assert_eq!(accepted, IngestDecision::Accepted { local_seq: 1 });
     assert_eq!(cursors.last_seq("gw-remote"), 1);
     cursors.persist(&home).unwrap();
     let feed = fs::read_to_string(tmp.path().join("mesh").join("feed.jsonl")).unwrap();
     assert!(feed.contains(r#""origin":"gw-remote""#), "{feed}");
 
-    let replay =
-        replicate::append_remote_entry(&home, &cfg, &mut cursors, "gw-remote", entry("gw-remote", 1, "again"))
-            .unwrap();
+    let replay = replicate::append_remote_entry(
+        &home,
+        &cfg,
+        &mut cursors,
+        "gw-remote",
+        entry("gw-remote", 1, "again"),
+    )
+    .unwrap();
     assert_eq!(replay, IngestDecision::Duplicate);
     assert_eq!(a2a::mesh::feed::read(&home, 0).unwrap().len(), 1);
 
@@ -218,8 +230,14 @@ fn supervisor_cursor_advances_never_regress_and_compaction_watermarks_reject_old
     let mut stale = CursorStore::load_or_rebuild(&home).unwrap();
     stale.set_compacted_before_seq("gw-origin", 3);
     assert_eq!(
-        replicate::append_remote_entry(&home, &cfg, &mut stale, "gw-origin", entry("gw-origin", 2, "trimmed"))
-            .unwrap(),
+        replicate::append_remote_entry(
+            &home,
+            &cfg,
+            &mut stale,
+            "gw-origin",
+            entry("gw-origin", 2, "trimmed")
+        )
+        .unwrap(),
         IngestDecision::Compacted { from_seq: 3 }
     );
     assert_eq!(
@@ -288,7 +306,10 @@ fn loopback_feed_replication_pushes_local_deltas_with_attribution() {
     )
     .unwrap();
     assert_eq!(replay, 0);
-    assert_eq!(a2a::mesh::feed::read(&home_at(&home_b), 0).unwrap().len(), 1);
+    assert_eq!(
+        a2a::mesh::feed::read(&home_at(&home_b), 0).unwrap().len(),
+        1
+    );
 }
 
 #[test]
@@ -348,7 +369,10 @@ fn want_catchup_buffers_gaps_and_streams_contiguous_ranges_oldest_first() {
         &mut receiver_cursors,
         &mut reorder,
         "gw-origin",
-        vec![entry("gw-origin", 1, "entry 1"), entry("gw-origin", 2, "entry 2")],
+        vec![
+            entry("gw-origin", 1, "entry 1"),
+            entry("gw-origin", 2, "entry 2"),
+        ],
     )
     .unwrap();
     assert_eq!(filled_gap.accepted, 3);
@@ -376,7 +400,10 @@ fn reorder_buffer_cap_eviction_is_reported() {
         &mut cursors,
         &mut reorder,
         "gw-origin",
-        vec![entry("gw-origin", 3, "entry 3"), entry("gw-origin", 4, "entry 4")],
+        vec![
+            entry("gw-origin", 3, "entry 3"),
+            entry("gw-origin", 4, "entry 4"),
+        ],
     )
     .unwrap();
     assert_eq!(report.accepted, 0);
@@ -397,10 +424,22 @@ fn transitive_relay_pushes_every_origin_verbatim_in_both_directions() {
     let mut b_cursors = CursorStore::load_or_rebuild(&home_b).unwrap();
     let mut c_cursors = CursorStore::load_or_rebuild(&home_c).unwrap();
 
-    replicate::append_remote_entry(&home_a, &cfg, &mut a_cursors, "gw-a", entry("gw-a", 1, "from a"))
-        .unwrap();
-    replicate::append_remote_entry(&home_c, &cfg, &mut c_cursors, "gw-c", entry("gw-c", 1, "from c"))
-        .unwrap();
+    replicate::append_remote_entry(
+        &home_a,
+        &cfg,
+        &mut a_cursors,
+        "gw-a",
+        entry("gw-a", 1, "from a"),
+    )
+    .unwrap();
+    replicate::append_remote_entry(
+        &home_c,
+        &cfg,
+        &mut c_cursors,
+        "gw-c",
+        entry("gw-c", 1, "from c"),
+    )
+    .unwrap();
 
     assert_eq!(
         replicate::replicate_feed_once(&cfg, &home_a, "gw-a", &home_b, &mut b_cursors).unwrap(),
@@ -421,8 +460,12 @@ fn transitive_relay_pushes_every_origin_verbatim_in_both_directions() {
 
     let a_rows = feed_json(home_a.root(), tmp.path());
     let c_rows = feed_json(home_c.root(), tmp.path());
-    assert!(a_rows.iter().any(|row| row["origin"] == "gw-c" && row["origin_seq"] == 1));
-    assert!(c_rows.iter().any(|row| row["origin"] == "gw-a" && row["origin_seq"] == 1));
+    assert!(a_rows
+        .iter()
+        .any(|row| row["origin"] == "gw-c" && row["origin_seq"] == 1));
+    assert!(c_rows
+        .iter()
+        .any(|row| row["origin"] == "gw-a" && row["origin_seq"] == 1));
 }
 
 #[test]
@@ -466,9 +509,9 @@ fn anti_entropy_digest_repairs_mid_log_delete_and_updates_health_shape() {
             peer_origin: "gw-a",
             remote_digest: digest,
             repair_entries: replicate::entries_for_want_capped(&home_a, "gw-a", 2, &a_cursors, 16)
-            .unwrap()
-            .entries()
-            .to_vec(),
+                .unwrap()
+                .entries()
+                .to_vec(),
             now: Utc.timestamp_opt(1_700_000_010, 0).unwrap(),
         })
         .unwrap();
@@ -493,18 +536,34 @@ async fn revoked_peer_is_closed_within_two_anti_entropy_discovery_cycles() {
         .unwrap();
     let mut tracker = PeerRevocationTracker::default();
     assert!(tracker
-        .closed_after_discovery("gw-a", ["gw-b"], &registry.discover("fleet-a").await.unwrap())
+        .closed_after_discovery(
+            "gw-a",
+            ["gw-b"],
+            &registry.discover("fleet-a").await.unwrap()
+        )
         .is_empty());
 
     registry
-        .revoke("fleet-a", "gw-b", Utc.timestamp_opt(1_700_000_020, 0).unwrap())
+        .revoke(
+            "fleet-a",
+            "gw-b",
+            Utc.timestamp_opt(1_700_000_020, 0).unwrap(),
+        )
         .await
         .unwrap();
     assert!(tracker
-        .closed_after_discovery("gw-a", ["gw-b"], &registry.discover("fleet-a").await.unwrap())
+        .closed_after_discovery(
+            "gw-a",
+            ["gw-b"],
+            &registry.discover("fleet-a").await.unwrap()
+        )
         .is_empty());
     assert_eq!(
-        tracker.closed_after_discovery("gw-a", ["gw-b"], &registry.discover("fleet-a").await.unwrap()),
+        tracker.closed_after_discovery(
+            "gw-a",
+            ["gw-b"],
+            &registry.discover("fleet-a").await.unwrap()
+        ),
         vec!["gw-b".to_string()]
     );
 }

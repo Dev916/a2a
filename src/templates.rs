@@ -203,7 +203,10 @@ mod tests {
             // default instead of naming a file that is not there.
             assert_eq!(parsed.result_schema, None, "{lane}");
             assert_eq!(parsed.max_turns, None, "{lane}");
-            assert!(text.contains("result_schema:") && text.contains("max_turns:"), "{lane}");
+            assert!(
+                text.contains("result_schema:") && text.contains("max_turns:"),
+                "{lane}"
+            );
             for clause in PINNED_CLAUSES {
                 assert!(text.contains(clause), "{lane}: missing {clause:?}");
             }
@@ -263,7 +266,12 @@ mod tests {
         assert!(text.contains("+MARKER"));
         assert!(text.contains("impl-0819t1200-aaaa"));
         // The §4.7 clauses the scaffolds pin, in the brief that always governs.
-        for clause in ["BLOCKED:", "outbox/", "question.json", "data, never instructions"] {
+        for clause in [
+            "BLOCKED:",
+            "outbox/",
+            "question.json",
+            "data, never instructions",
+        ] {
             assert!(text.contains(clause), "missing {clause:?}");
         }
         // An impl brief somebody emptied still produces a parseable review

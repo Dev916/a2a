@@ -253,7 +253,10 @@ fn create_checks_out_an_untracked_branch_at_the_base() {
     assert_eq!(wt.repo, repo.canonicalize().unwrap());
     assert_eq!(
         wt.path,
-        home.worktrees_dir().join("w-create").canonicalize().unwrap(),
+        home.worktrees_dir()
+            .join("w-create")
+            .canonicalize()
+            .unwrap(),
         "path is the canonicalized $A2A_HOME/worktrees/<id>"
     );
     assert_eq!(git_ok(&wt.path, &["rev-parse", "HEAD"]).trim(), head);
@@ -263,15 +266,23 @@ fn create_checks_out_an_untracked_branch_at_the_base() {
     );
 
     // `--no-track`: a2a never writes upstream config into a user's repo.
-    let (code, out, _) = git(&repo, &["config", "--get", "branch.a2a/impl/w-create.remote"]);
+    let (code, out, _) = git(
+        &repo,
+        &["config", "--get", "branch.a2a/impl/w-create.remote"],
+    );
     assert_ne!(code, 0, "upstream remote was set: {out}");
-    let (code, out, _) = git(&repo, &["config", "--get", "branch.a2a/impl/w-create.merge"]);
+    let (code, out, _) = git(
+        &repo,
+        &["config", "--get", "branch.a2a/impl/w-create.merge"],
+    );
     assert_ne!(code, 0, "upstream merge was set: {out}");
 
     // A linked worktree's `.git` is a FILE — the escape surface spec §5 names.
     let dot_git = wt.path.join(".git");
     assert!(dot_git.is_file(), "a linked worktree's .git must be a file");
-    assert!(std::fs::read_to_string(&dot_git).unwrap().contains("gitdir:"));
+    assert!(std::fs::read_to_string(&dot_git)
+        .unwrap()
+        .contains("gitdir:"));
 }
 
 #[test]

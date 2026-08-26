@@ -27,7 +27,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 /// What an entry — in a [`Plan`] or in the manifest — is about.
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+#[derive(
+    serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Skill,
@@ -437,7 +439,11 @@ mod tests {
             .iter()
             .map(|k| counts[k].as_u64().unwrap())
             .sum();
-        assert_eq!(total as usize, all.len(), "nothing falls out of the summary");
+        assert_eq!(
+            total as usize,
+            all.len(),
+            "nothing falls out of the summary"
+        );
         assert_eq!(Plan::default().counts()["synced"], 0);
     }
 
@@ -453,7 +459,10 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(d).unwrap(), d.as_str());
         }
-        assert_eq!(Disposition::SkippedSideEffecting.to_string(), "skipped-side-effecting");
+        assert_eq!(
+            Disposition::SkippedSideEffecting.to_string(),
+            "skipped-side-effecting"
+        );
         assert_eq!(serde_json::to_value(Kind::Skill).unwrap(), "skill");
         assert_eq!(serde_json::to_value(Kind::Mcp).unwrap(), "mcp");
     }

@@ -58,8 +58,7 @@ fn fixture_repo(under: &Path) -> PathBuf {
 /// that produces a result — and the fixture's plain-text `done` fails it with
 /// `result.md is not JSON` ⇒ `failed{schema_violation}`. Every impl worker here
 /// that is expected to finish cleanly therefore pins this shape.
-const DEVLOOP_RESULT: &str =
-    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+const DEVLOOP_RESULT: &str = r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
 
 /// The impl lane's brief has to declare its acceptance criteria and how they
 /// are verified (spec §4.7).
@@ -153,10 +152,19 @@ fn the_impl_lane_defaults_to_its_own_worktree_and_codex_runs_in_it() {
     let branch = format!("a2a/impl/{}", s.id);
 
     // --json carries the same four fields `status --json` reports.
-    assert_eq!(s.data["worktree"]["path"], serde_json::json!(wt), "{}", s.data);
+    assert_eq!(
+        s.data["worktree"]["path"],
+        serde_json::json!(wt),
+        "{}",
+        s.data
+    );
     assert_eq!(s.data["worktree"]["branch"], serde_json::json!(branch));
     assert_eq!(s.data["worktree"]["repo"], serde_json::json!(repo));
-    assert_eq!(s.data["cwd"], serde_json::json!(wt), "the cwd IS the worktree");
+    assert_eq!(
+        s.data["cwd"],
+        serde_json::json!(wt),
+        "the cwd IS the worktree"
+    );
     assert!(
         s.stderr.contains(&format!("on {branch}")),
         "the human line names the branch: {}",
@@ -165,7 +173,10 @@ fn the_impl_lane_defaults_to_its_own_worktree_and_codex_runs_in_it() {
 
     // The tree is a real, checked-out worktree of the parent repo.
     assert!(wt.join("a.txt").is_file(), "the base commit is checked out");
-    assert!(wt.join(".git").is_file(), "a linked worktree's .git is a FILE");
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree's .git is a FILE"
+    );
     let listed = git_ok(&repo, &["worktree", "list", "--porcelain"]);
     assert!(listed.contains(wt.to_str().unwrap()), "{listed}");
     let base = s.data["worktree"]["base_ref"].as_str().unwrap().to_string();
@@ -186,7 +197,10 @@ fn the_impl_lane_defaults_to_its_own_worktree_and_codex_runs_in_it() {
         exclude.lines().any(|l| l == wt.to_str().unwrap()),
         "the worktree path must be excluded: {exclude}"
     );
-    assert!(!repo.join(".gitignore").exists(), ".gitignore is the human's file");
+    assert!(
+        !repo.join(".gitignore").exists(),
+        ".gitignore is the human's file"
+    );
 
     // The codex child was pointed AT the worktree (`-C` comes from `snap.cwd`).
     wait_dead(&home, &s.id, 10);
@@ -198,7 +212,11 @@ fn the_impl_lane_defaults_to_its_own_worktree_and_codex_runs_in_it() {
 
     // …and the snapshot agrees with genesis on all of it.
     let data = status_json(&home, tmp.path(), &s.id);
-    assert_eq!(data["worktree"]["branch"], serde_json::json!(branch), "{data}");
+    assert_eq!(
+        data["worktree"]["branch"],
+        serde_json::json!(branch),
+        "{data}"
+    );
     assert_eq!(data["base_ref"], serde_json::json!(base), "{data}");
     let g = genesis(&home, &s.id);
     assert_eq!(g["worktree_path"], serde_json::json!(wt), "{g}");
@@ -246,15 +264,27 @@ fn the_worktree_base_ref_and_schema_survive_losing_state_json() {
 
     let data = status_json(&home, tmp.path(), &s.id);
     assert_eq!(data["worktree"]["path"], serde_json::json!(wt), "{data}");
-    assert_eq!(data["worktree"]["branch"], serde_json::json!(branch), "{data}");
-    assert_eq!(data["worktree"]["base_ref"], serde_json::json!(base), "{data}");
+    assert_eq!(
+        data["worktree"]["branch"],
+        serde_json::json!(branch),
+        "{data}"
+    );
+    assert_eq!(
+        data["worktree"]["base_ref"],
+        serde_json::json!(base),
+        "{data}"
+    );
     assert_eq!(data["worktree"]["repo"], serde_json::json!(repo), "{data}");
     assert_eq!(data["base_ref"], serde_json::json!(base), "{data}");
 
     // ...and the rebuild PERSISTED all of it, schema_path included — the key
     // genesis has recorded since Phase 1 and the fold never read.
     let snap = read_snapshot(&home, &s.id);
-    assert_eq!(snap["worktree"]["branch"], serde_json::json!(branch), "{snap}");
+    assert_eq!(
+        snap["worktree"]["branch"],
+        serde_json::json!(branch),
+        "{snap}"
+    );
     assert_eq!(snap["base_ref"], serde_json::json!(base), "{snap}");
     // The recorded path is the worker's OWN copy of the schema, not the flag's
     // file: a worker is judged by something inside its own directory, so the
@@ -289,7 +319,14 @@ fn an_explicit_worktree_on_a_non_git_cwd_refuses_and_writes_nothing() {
     let brief = write_brief(tmp.path(), "do the thing\n");
 
     let out = a2a(&home, tmp.path())
-        .args(["--json", "spawn", "--lane", "general", "--worktree", "--cwd"])
+        .args([
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--worktree",
+            "--cwd",
+        ])
         .arg(&plain)
         .arg("--brief")
         .arg(&brief)
@@ -298,13 +335,19 @@ fn an_explicit_worktree_on_a_non_git_cwd_refuses_and_writes_nothing() {
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["error"]["code"], "WORKTREE_NOT_A_REPO", "{v}");
     assert!(
-        v["error"]["remedy"].as_str().unwrap().contains("--no-worktree"),
+        v["error"]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("--no-worktree"),
         "the remedy must name the opt-out: {v}"
     );
     // Nothing was written: the refusal is a gate, not a rollback.
     let workers = std::fs::read_dir(home.join("workers")).unwrap().count();
     assert_eq!(workers, 0, "a gate leaves no worker behind");
-    assert_eq!(std::fs::read_dir(home.join("worktrees")).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_dir(home.join("worktrees")).unwrap().count(),
+        0
+    );
 }
 
 /// A lane DEFAULT is a policy, not a request: an impl worker in a directory
@@ -336,12 +379,19 @@ fn a_lane_default_worktree_on_a_non_git_cwd_warns_and_proceeds() {
     assert!(!home.join("worktrees").join(&s.id).exists());
 
     let g = genesis(&home, &s.id);
-    assert_eq!(g["worktree_skipped"], serde_json::json!("not-a-git-repo"), "{g}");
+    assert_eq!(
+        g["worktree_skipped"],
+        serde_json::json!("not-a-git-repo"),
+        "{g}"
+    );
     assert_eq!(g.get("worktree_path"), None, "{g}");
     assert_eq!(g.get("base_ref"), None, "{g}");
 
     wait_dead(&home, &s.id, 10);
-    a2a(&home, tmp.path()).args(["status", &s.id]).assert().success();
+    a2a(&home, tmp.path())
+        .args(["status", &s.id])
+        .assert()
+        .success();
     std::fs::remove_file(home.join("workers").join(&s.id).join("state.json")).unwrap();
     let _ = status_json(&home, tmp.path(), &s.id);
     let snap = read_snapshot(&home, &s.id);
@@ -417,13 +467,29 @@ fn base_ref_chooses_the_branch_point_and_an_unknown_ref_refuses() {
         &["--base-ref", &first],
         &[],
     );
-    assert_eq!(s.data["worktree"]["base_ref"], serde_json::json!(first), "{}", s.data);
+    assert_eq!(
+        s.data["worktree"]["base_ref"],
+        serde_json::json!(first),
+        "{}",
+        s.data
+    );
     let wt = home.join("worktrees").join(&s.id);
     assert!(wt.join("a.txt").is_file());
-    assert!(!wt.join("b.txt").exists(), "the tree is cut from --base-ref");
+    assert!(
+        !wt.join("b.txt").exists(),
+        "the tree is cut from --base-ref"
+    );
 
     let out = a2a(&home, tmp.path())
-        .args(["--json", "spawn", "--lane", "impl", "--base-ref", "no/such/ref", "--cwd"])
+        .args([
+            "--json",
+            "spawn",
+            "--lane",
+            "impl",
+            "--base-ref",
+            "no/such/ref",
+            "--cwd",
+        ])
         .arg(&repo)
         .arg("--brief")
         .arg(&brief)
@@ -432,7 +498,10 @@ fn base_ref_chooses_the_branch_point_and_an_unknown_ref_refuses() {
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["error"]["code"], "WORKTREE_BASE_UNKNOWN", "{v}");
     // One worktree (the good one) and one worker: the refusal left nothing.
-    assert_eq!(std::fs::read_dir(home.join("worktrees")).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_dir(home.join("worktrees")).unwrap().count(),
+        1
+    );
     assert_eq!(std::fs::read_dir(home.join("workers")).unwrap().count(), 1);
 }
 

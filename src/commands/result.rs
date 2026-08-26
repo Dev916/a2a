@@ -51,9 +51,7 @@ fn exit_for(state: WorkerState) -> ExitCode {
         WorkerState::Failed => ExitCode::WorkerFailed,
         WorkerState::AwaitingInput | WorkerState::Escalated => ExitCode::Blocked,
         WorkerState::Orphaned => ExitCode::Orphaned,
-        WorkerState::Spawned | WorkerState::Queued | WorkerState::Running => {
-            ExitCode::NotTerminal
-        }
+        WorkerState::Spawned | WorkerState::Queued | WorkerState::Running => ExitCode::NotTerminal,
         // Written by a newer a2a: reported, never silently normalized.
         WorkerState::Unknown => ExitCode::Internal,
     }
@@ -242,7 +240,11 @@ mod tests {
             r#"{"status":"pass","note":"token xoxb-1234567890-abcdef"}"#,
         )
         .unwrap();
-        let v = payload("general-0814t1300-aaaa", &snap, find_result(tmp.path()).as_ref());
+        let v = payload(
+            "general-0814t1300-aaaa",
+            &snap,
+            find_result(tmp.path()).as_ref(),
+        );
         assert_eq!(v["result"]["status"], json!("pass"), "structure preserved");
         assert_eq!(v["format"], json!("json"));
         let note = v["result"]["note"].as_str().unwrap();

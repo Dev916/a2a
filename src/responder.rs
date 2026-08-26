@@ -187,8 +187,7 @@ pub fn respond_to(frame: &ServerRequestFrame) -> Answer {
             Disposition::Errored,
             Err((
                 NO_DENY_SHAPE,
-                "a2a holds no ChatGPT auth tokens: refresh on the server side"
-                    .to_string(),
+                "a2a holds no ChatGPT auth tokens: refresh on the server side".to_string(),
             )),
         ),
         // Unreachable in practice — `a2a` never sets `requestAttestation:true`
@@ -198,8 +197,7 @@ pub fn respond_to(frame: &ServerRequestFrame) -> Answer {
             Disposition::Errored,
             Err((
                 NO_DENY_SHAPE,
-                "a2a issues no attestation tokens (requestAttestation is never set)"
-                    .to_string(),
+                "a2a issues no attestation tokens (requestAttestation is never set)".to_string(),
             )),
         ),
 
@@ -305,7 +303,9 @@ mod tests {
     #[test]
     fn the_two_approval_families_do_not_share_a_spelling() {
         let old = answer("execCommandApproval").payload.unwrap();
-        let new = answer("item/commandExecution/requestApproval").payload.unwrap();
+        let new = answer("item/commandExecution/requestApproval")
+            .payload
+            .unwrap();
         assert_eq!(old["decision"], "denied");
         assert_eq!(new["decision"], "decline");
         assert_ne!(old, new);
@@ -342,12 +342,16 @@ mod tests {
     fn the_schema_check_rejects_the_wrong_familys_spelling() {
         let v = fidelity::validator("ExecCommandApprovalResponse.json");
         assert!(
-            v.iter_errors(&json!({"decision": "decline"})).next().is_some(),
+            v.iter_errors(&json!({"decision": "decline"}))
+                .next()
+                .is_some(),
             "ReviewDecision must not accept the item/* spelling"
         );
         let v = fidelity::validator("CommandExecutionRequestApprovalResponse.json");
         assert!(
-            v.iter_errors(&json!({"decision": "denied"})).next().is_some(),
+            v.iter_errors(&json!({"decision": "denied"}))
+                .next()
+                .is_some(),
             "the item/* family must not accept the ReviewDecision spelling"
         );
     }

@@ -49,7 +49,12 @@ impl Fix {
             .arg(&self.brief)
             .assert()
             .success();
-        json_of(&out).pointer("/data/id").unwrap().as_str().unwrap().to_string()
+        json_of(&out)
+            .pointer("/data/id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     fn kill(&self, id: &str) {
@@ -213,10 +218,17 @@ fn a_running_parent_is_refused() {
     let parent = f.spawn(Some("30"));
     assert_eq!(read_snapshot(&f.home, &parent)["state"], "running");
 
-    let out = f.cmd().args(["--json", "respawn", &parent]).assert().code(9);
+    let out = f
+        .cmd()
+        .args(["--json", "respawn", &parent])
+        .assert()
+        .code(9);
     let err = json_of(&out)["error"].clone();
     assert_eq!(err["code"], "PARENT_ACTIVE");
-    assert!(err["remedy"].as_str().unwrap().contains("a2a kill"), "{err}");
+    assert!(
+        err["remedy"].as_str().unwrap().contains("a2a kill"),
+        "{err}"
+    );
     assert_eq!(f.rows().len(), 1, "nothing was spawned");
     f.kill(&parent);
 }
@@ -258,7 +270,11 @@ fn lineage_survives_losing_state_json() {
     let f = fixture();
     let parent = f.spawn(Some("30"));
     f.kill(&parent);
-    let out = f.cmd().args(["--json", "respawn", &parent]).assert().success();
+    let out = f
+        .cmd()
+        .args(["--json", "respawn", &parent])
+        .assert()
+        .success();
     let child = json_of(&out)["data"]["id"].as_str().unwrap().to_string();
     wait_dead(&f.home, &child, 20);
     // Settle the child first, so what the rebuild below has to reproduce is a

@@ -104,7 +104,11 @@ impl PeerDamping {
         if state.drops.len() < 3 {
             return None;
         }
-        if state.cooldown_until.map(|until| until > now).unwrap_or(false) {
+        if state
+            .cooldown_until
+            .map(|until| until > now)
+            .unwrap_or(false)
+        {
             return None;
         }
         let cooldown = chrono::Duration::from_std(cooldown).unwrap_or(chrono::Duration::MAX);

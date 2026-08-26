@@ -98,7 +98,10 @@ fn the_adversarial_corpus_parses_validates_and_is_scan_clean() {
     found.sort();
     let mut expected: Vec<String> = FIXTURES.iter().map(|s| (*s).to_string()).collect();
     expected.sort();
-    assert_eq!(found, expected, "the corpus directory and FIXTURES disagree");
+    assert_eq!(
+        found, expected,
+        "the corpus directory and FIXTURES disagree"
+    );
 
     for name in FIXTURES {
         let path = dir.join(name);
@@ -117,7 +120,10 @@ fn the_adversarial_corpus_parses_validates_and_is_scan_clean() {
         );
         brief::validate(&parsed, a2a::config::Lane::General)
             .unwrap_or_else(|missing| panic!("{name}: missing {missing:?}"));
-        assert!(!parsed.body.trim().is_empty(), "{name}: the body is the prompt");
+        assert!(
+            !parsed.body.trim().is_empty(),
+            "{name}: the body is the prompt"
+        );
 
         let hits = redact::scan_text(&text);
         assert!(hits.is_empty(), "{name}: ingress scan found {hits:?}");
@@ -286,7 +292,10 @@ fn blocked_protocol_pass_rate_over_real_codex() {
     for run in 0..K {
         let (tmp, home, pid, passed, label) = one_run("unresolvable-decision.md", run);
         lines.push(format!("run {run}: {}  ({label})", verdict(passed)));
-        eprintln!("[eval] unresolvable-decision run {run}: {} — {label}", verdict(passed));
+        eprintln!(
+            "[eval] unresolvable-decision run {run}: {} — {label}",
+            verdict(passed)
+        );
         if passed {
             passes += 1;
         }
@@ -300,9 +309,16 @@ fn blocked_protocol_pass_rate_over_real_codex() {
     // The other three fixtures: recorded, never asserted. They exist so a future
     // threshold has a baseline; asserting a rate on a fixture nobody has ever
     // measured would be a coin flip dressed as a gate (recorded deferral).
-    for name in ["missing-file.md", "ambiguous-criteria.md", "compaction-forcing.md"] {
+    for name in [
+        "missing-file.md",
+        "ambiguous-criteria.md",
+        "compaction-forcing.md",
+    ] {
         let (tmp, home, pid, passed, label) = one_run(name, 0);
-        eprintln!("[eval] {name} (recorded, not asserted): {} — {label}", verdict(passed));
+        eprintln!(
+            "[eval] {name} (recorded, not asserted): {} — {label}",
+            verdict(passed)
+        );
         if let Some(p) = pid {
             pids.push(p);
         }
@@ -323,7 +339,10 @@ fn blocked_protocol_pass_rate_over_real_codex() {
     for home in &homes {
         let needle = home.to_string_lossy().into_owned();
         let left = processes_mentioning(&needle);
-        assert!(left.is_empty(), "processes still holding {needle}: {left:?}");
+        assert!(
+            left.is_empty(),
+            "processes still holding {needle}: {left:?}"
+        );
     }
 
     // Hermeticity, checked rather than claimed.
@@ -415,7 +434,13 @@ impl Drop for WorkerGuard {
             // Best effort: a panic in `drop` while already unwinding aborts the
             // process, which would destroy the diagnosis the panic carries.
             for _ in 0..600 {
-                if !self.home.join("workers").join(&self.id).join("run.lock").exists() {
+                if !self
+                    .home
+                    .join("workers")
+                    .join(&self.id)
+                    .join("run.lock")
+                    .exists()
+                {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));

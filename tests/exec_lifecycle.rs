@@ -110,7 +110,11 @@ fn resume_argv_puts_the_subcommand_after_the_exec_options() {
         .position(|a| a == "resume")
         .expect("a resume spawns the resume subcommand");
     assert_eq!(argv[at + 1], "019898f0-0000-7000-8000-000000000001");
-    assert_eq!(argv[at + 2], "-", "the prompt positional follows the session");
+    assert_eq!(
+        argv[at + 2],
+        "-",
+        "the prompt positional follows the session"
+    );
     assert_eq!(at + 3, argv.len(), "nothing follows the prompt positional");
     for option in ["-C", "-s", "--add-dir", "--output-last-message", "-m"] {
         let pos = argv
@@ -154,7 +158,10 @@ fn detached_worker_lifecycle_env_scrub_and_streams() {
     let raw = std::fs::read_to_string(exec::exec_stream_path(&w, 1)).unwrap();
     assert!(raw.contains("session.created") && raw.contains("turn.completed"));
     let dumped = std::fs::read_to_string(&envdump).unwrap();
-    assert!(!dumped.contains("OPENAI_API_KEY"), "billing-critical scrub failed");
+    assert!(
+        !dumped.contains("OPENAI_API_KEY"),
+        "billing-critical scrub failed"
+    );
 }
 
 #[test]

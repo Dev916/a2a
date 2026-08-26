@@ -55,7 +55,11 @@ mod tests {
     fn resolve_prefix_unique_ambiguous_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let home = crate::home::A2aHome::resolve(Some(tmp.path())).unwrap();
-        for id in ["impl-0814t1300-aaaa", "impl-0814t1300-aabb", "review-0814t1301-cccc"] {
+        for id in [
+            "impl-0814t1300-aaaa",
+            "impl-0814t1300-aabb",
+            "review-0814t1301-cccc",
+        ] {
             std::fs::create_dir_all(home.worker_dir(id)).unwrap();
         }
         assert_eq!(resolve(&home, "review").unwrap(), "review-0814t1301-cccc");

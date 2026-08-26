@@ -308,7 +308,10 @@ impl World {
     fn doctor(&self) -> (Value, i32) {
         let out = self.run(&["--json", "doctor"]);
         let code = out.status.code().unwrap_or_else(|| {
-            panic!("doctor did not exit within {STEP_BUDGET:?}: {}", stderr(&out))
+            panic!(
+                "doctor did not exit within {STEP_BUDGET:?}: {}",
+                stderr(&out)
+            )
         });
         (envelope(&out), code)
     }
@@ -711,7 +714,11 @@ fn the_pipeline_syncs_both_kinds_into_one_home_and_converges() {
         "a second skills run writes no content"
     );
     assert_eq!(w.gitignore_text(), ignore_block, "nor a new ignore block");
-    assert_eq!(std::fs::read(w.config()).unwrap(), config_bytes, "same bytes");
+    assert_eq!(
+        std::fs::read(w.config()).unwrap(),
+        config_bytes,
+        "same bytes"
+    );
     assert_eq!(
         std::fs::metadata(w.config()).unwrap().modified().unwrap(),
         config_mtime,
@@ -832,7 +839,14 @@ fn two_accounts_share_one_config_toml_and_the_first_owner_wins() {
     );
 
     let servers = w.dest_servers();
-    for name in ["Neon", "linear", "hq", "akiflow", "codegraph", "context-lake"] {
+    for name in [
+        "Neon",
+        "linear",
+        "hq",
+        "akiflow",
+        "codegraph",
+        "context-lake",
+    ] {
         assert!(
             servers.contains(&name.to_string()),
             "{name} survived the second account's run: {servers:?}"
@@ -887,7 +901,10 @@ fn a_second_account_leaves_the_first_accounts_skills_covered() {
             .collect::<Vec<_>>(),
         "and no parallel key set was created"
     );
-    assert_eq!(w.skills_status(), BTreeSet::from([" M .gitignore".to_string()]));
+    assert_eq!(
+        w.skills_status(),
+        BTreeSet::from([" M .gitignore".to_string()])
+    );
 
     w.assert_nothing_leaked();
     w.assert_nothing_left_running();
@@ -1004,7 +1021,10 @@ fn a_deleted_skill_and_a_deleted_server_are_both_propagated() {
     assert!(!w.dest().join("wordy").exists());
     assert!(!w.dest_servers().contains(&"hq".to_string()));
     let keys = w.manifest_keys();
-    assert!(!keys.contains(&"skill:default:wordy".to_string()), "{keys:?}");
+    assert!(
+        !keys.contains(&"skill:default:wordy".to_string()),
+        "{keys:?}"
+    );
     assert!(!keys.contains(&"mcp:claude:hq".to_string()), "{keys:?}");
     // The ignore block still names `wordy`, and that is the containment ordering
     // working as designed: the block is written BEFORE any content, off a ledger
@@ -1034,7 +1054,10 @@ fn a_deleted_skill_and_a_deleted_server_are_both_propagated() {
     assert!(w.config_text().contains("# mx exists on BOTH sides"));
 
     // And both repositories still see exactly what they saw before.
-    assert_eq!(w.skills_status(), BTreeSet::from([" M .gitignore".to_string()]));
+    assert_eq!(
+        w.skills_status(),
+        BTreeSet::from([" M .gitignore".to_string()])
+    );
     assert_eq!(
         w.codex_status(),
         BTreeSet::from(["D  config.toml".to_string(), " M .gitignore".to_string()])

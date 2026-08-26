@@ -154,7 +154,8 @@ fn spawn_owner_precedence_is_flag_then_env_then_anon() {
 
     let flagged = fx.spawn(Some("bob"), Some("alice"), &[]);
     assert_eq!(
-        fx.snapshot(&flagged)["owner"], "alice",
+        fx.snapshot(&flagged)["owner"],
+        "alice",
         "--owner outranks A2A_OWNER"
     );
 
@@ -183,7 +184,11 @@ fn the_owner_survives_losing_state_json() {
     let (code, env) = run(&fx, Some("alice"), &["--json", "status", &id]);
     assert_eq!(code, 0, "status after losing state.json: {env}");
     assert_eq!(env["data"]["owner"], "alice", "{env}");
-    assert_eq!(fx.snapshot(&id)["owner"], "alice", "the rebuild persisted it");
+    assert_eq!(
+        fx.snapshot(&id)["owner"],
+        "alice",
+        "the rebuild persisted it"
+    );
 }
 
 // ------------------------------------------------------------------------ ls
@@ -254,7 +259,10 @@ fn ls_defaults_to_own_plus_unowned_and_all_adds_the_owner_column() {
         .expect("a2a runs");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(stderr.contains("OWNER"), "header names the column: {stderr}");
+    assert!(
+        stderr.contains("OWNER"),
+        "header names the column: {stderr}"
+    );
     let bob_line = stdout
         .lines()
         .find(|l| l.starts_with(&theirs))
@@ -295,13 +303,19 @@ fn cross_owner_mutations_are_refused_with_not_owner() {
         let (code, env) = run(&fx, Some("bob"), &args);
         assert_not_owner(code, &env, "alice", "bob");
         assert_eq!(
-            fx.snapshot(&id)["state"], "done",
+            fx.snapshot(&id)["state"],
+            "done",
             "a refused {args:?} changed nothing"
         );
     }
     // The refusal is not a side effect of the message reaching disk either.
     assert!(
-        !fx.home.join("workers").join(&id).join("inbox").join("1.json").exists(),
+        !fx.home
+            .join("workers")
+            .join(&id)
+            .join("inbox")
+            .join("1.json")
+            .exists(),
         "a refused send queues nothing"
     );
 }
@@ -316,7 +330,11 @@ fn a_null_owner_worker_stays_open_to_every_caller() {
     let id = fx.spawn(Some("alice"), None, &[("STUB_SLEEP", "20")]);
     fx.unown(&id);
 
-    let (code, env) = run(&fx, Some("bob"), &["--json", "send", &id, "hi", "--queue-only"]);
+    let (code, env) = run(
+        &fx,
+        Some("bob"),
+        &["--json", "send", &id, "hi", "--queue-only"],
+    );
     assert_eq!(code, 0, "an unowned worker accepts anyone's send: {env}");
 
     let (code, env) = run(&fx, Some("carol"), &["--json", "kill", &id]);
@@ -408,7 +426,11 @@ fn gc_scopes_to_own_plus_unowned_until_all() {
         "bob's worker survived alice's gc"
     );
 
-    let (code, env) = run(&fx, Some("alice"), &["--json", "gc", "--age", "0s", "--all"]);
+    let (code, env) = run(
+        &fx,
+        Some("alice"),
+        &["--json", "gc", "--age", "0s", "--all"],
+    );
     assert_eq!(code, 0, "{env}");
     assert_eq!(env["data"]["removed"][0], theirs.as_str(), "{env}");
     assert!(!fx.home.join("workers").join(&theirs).exists());

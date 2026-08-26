@@ -49,7 +49,7 @@
 
 use crate::brokerclient::{self, BrokerClient, Handshake, TailUpdate};
 use crate::config;
-use crate::events::{EventClass, EventKind, Envelope, Transport};
+use crate::events::{Envelope, EventClass, EventKind, Transport};
 use crate::home::A2aHome;
 use crate::ids;
 use crate::output::{AppError, ExitCode, Outcome};
@@ -104,7 +104,10 @@ pub fn run(
     };
 
     if !quiet && events.is_empty() {
-        eprintln!("a2a: {id}: no events{}", since.map(|s| format!(" after seq {s}")).unwrap_or_default());
+        eprintln!(
+            "a2a: {id}: no events{}",
+            since.map(|s| format!(" after seq {s}")).unwrap_or_default()
+        );
     }
 
     if json_mode {
@@ -205,7 +208,15 @@ fn follow_run(
         printed += batch;
 
         if snap.state.is_terminal() {
-            return Ok(finish(id, &snap, cursor, printed, Stop::Terminal, json_mode, quiet));
+            return Ok(finish(
+                id,
+                &snap,
+                cursor,
+                printed,
+                Stop::Terminal,
+                json_mode,
+                quiet,
+            ));
         }
 
         // 2. The bound. Checked after a full drain, so a worker that finishes
@@ -213,7 +224,18 @@ fn follow_run(
         //    timeout.
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return settle(home, &cfg, id, dir, cursor, printed, Stop::Timeout, raw, json_mode, quiet);
+            return settle(
+                home,
+                &cfg,
+                id,
+                dir,
+                cursor,
+                printed,
+                Stop::Timeout,
+                raw,
+                json_mode,
+                quiet,
+            );
         }
 
         // 3. Wait for something to happen — the broker's subscription if this
@@ -226,7 +248,16 @@ fn follow_run(
             // the file, and dropping them would lose exactly the ones a
             // shutdown makes interesting.
             return settle(
-                home, &cfg, id, dir, cursor, printed, Stop::BrokerGone, raw, json_mode, quiet,
+                home,
+                &cfg,
+                id,
+                dir,
+                cursor,
+                printed,
+                Stop::BrokerGone,
+                raw,
+                json_mode,
+                quiet,
             );
         }
 
@@ -362,14 +393,18 @@ impl Doorbell {
         if snap.transport != Transport::AppServer || brokerclient::disabled() {
             return Doorbell::Clock;
         }
-        let Ok(Some(Handshake::Ready(mut client))) = brokerclient::try_handshake(home.root()) else {
+        let Ok(Some(Handshake::Ready(mut client))) = brokerclient::try_handshake(home.root())
+        else {
             return Doorbell::Clock;
         };
         match client.subscribe() {
             Ok(_) => Doorbell::Broker(Box::new(client)),
             Err(e) => {
                 if !quiet {
-                    eprintln!("a2a: the broker refused a tail subscription ({}); polling instead", e.code);
+                    eprintln!(
+                        "a2a: the broker refused a tail subscription ({}); polling instead",
+                        e.code
+                    );
                 }
                 Doorbell::Clock
             }
@@ -410,7 +445,10 @@ impl Doorbell {
             // not a reason to stop tailing: the file is still there.
             Err(e) => {
                 if !quiet {
-                    eprintln!("a2a: {id}: the broker tail failed ({}); polling instead", e.code);
+                    eprintln!(
+                        "a2a: {id}: the broker tail failed ({}); polling instead",
+                        e.code
+                    );
                 }
                 *self = Doorbell::Clock;
                 Ok(Wake::Again)
@@ -431,7 +469,10 @@ fn finish(
 ) -> Outcome {
     if !quiet {
         match stop {
-            Stop::Terminal => eprintln!("a2a: {id}: {} — nothing left to follow", snap.state.as_str()),
+            Stop::Terminal => eprintln!(
+                "a2a: {id}: {} — nothing left to follow",
+                snap.state.as_str()
+            ),
             Stop::Timeout => eprintln!(
                 "a2a: {id}: still {} when the follow timed out",
                 snap.state.as_str()
@@ -545,7 +586,10 @@ mod tests {
     fn both_projections_render_the_same_line_in_either_mode() {
         let mut e = Envelope::synthetic(EventKind::TurnCompleted);
         e.seq = 12;
-        assert_eq!(text_line(&e, false), format!("12 {} turn_completed", ts(&e)));
+        assert_eq!(
+            text_line(&e, false),
+            format!("12 {} turn_completed", ts(&e))
+        );
         assert_eq!(projection(&e, false)["seq"], json!(12));
         assert_eq!(projection(&e, false)["kind"], json!("turn_completed"));
         // --raw is one complete JSON object per line, both ways

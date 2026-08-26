@@ -83,7 +83,10 @@ fn assert_no_workers(home: &Path) {
     let listed: Vec<_> = std::fs::read_dir(&dir)
         .map(|d| d.filter_map(Result::ok).map(|e| e.file_name()).collect())
         .unwrap_or_default();
-    assert!(listed.is_empty(), "a refusal left workers behind: {listed:?}");
+    assert!(
+        listed.is_empty(),
+        "a refusal left workers behind: {listed:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -112,10 +115,7 @@ fn row1_no_flag_and_an_unelevated_lane_just_spawns() {
 fn row2_configured_elevation_without_permission_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    write_config(
-        &home,
-        "[lanes.general]\nsandbox = \"danger-full-access\"\n",
-    );
+    write_config(&home, "[lanes.general]\nsandbox = \"danger-full-access\"\n");
     let r = spawn(&home, tmp.path(), "general", &[], &[]);
     assert_eq!(r.code, 9, "{}", r.stderr);
     assert_eq!(r.error["code"], "ELEVATION_NOT_PERMITTED", "{}", r.error);
@@ -159,7 +159,10 @@ fn row3_the_flag_without_the_lane_permission_is_refused() {
         "{remedy}"
     );
     assert_no_workers(&home);
-    assert!(!audit_path(&home).exists(), "a refusal writes no audit line");
+    assert!(
+        !audit_path(&home).exists(),
+        "a refusal writes no audit line"
+    );
 }
 
 /// Row 4: permitted, intended — and unexplained. A blank reason is no reason.
@@ -284,7 +287,11 @@ fn every_elevated_spawn_appends_one_pinned_0600_audit_line() {
     );
     assert_eq!(first.code, 0, "{}", first.stderr);
 
-    let mode = std::fs::metadata(audit_path(&home)).unwrap().permissions().mode() & 0o777;
+    let mode = std::fs::metadata(audit_path(&home))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o600, "audit.jsonl must be owner-only");
 
     let lines = audit_lines(&home);

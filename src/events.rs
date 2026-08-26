@@ -390,7 +390,10 @@ mod tests {
             map_exec_line(&json!({"type":"agent_message","message":"hi"})),
             Some((EventClass::Lifecycle, EventKind::AgentMessage))
         );
-        assert_eq!(map_exec_line(&json!({"type":"agent_message_delta","delta":"h"})), None);
+        assert_eq!(
+            map_exec_line(&json!({"type":"agent_message_delta","delta":"h"})),
+            None
+        );
         assert_eq!(
             map_exec_line(&json!({"type":"totally_new_thing"})),
             Some((EventClass::Trace, EventKind::Unknown))
@@ -494,7 +497,11 @@ mod tests {
     fn exec_mapping_table_full_vocabulary() {
         // deltas are dropped no matter what else the type says
         for t in ["agent_message_delta", "response.output_text.delta", "delta"] {
-            assert_eq!(map_exec_line(&json!({ "type": t })), None, "{t} should drop");
+            assert_eq!(
+                map_exec_line(&json!({ "type": t })),
+                None,
+                "{t} should drop"
+            );
         }
         // session identification, all three known spellings
         for t in ["session.created", "session_configured", "thread.started"] {
@@ -635,7 +642,12 @@ mod tests {
             );
         }
         // An item type from a newer codex is a trace line, never a failure.
-        for spelling in ["reasoning", "webSearch", "contextCompaction", "brandNewThing"] {
+        for spelling in [
+            "reasoning",
+            "webSearch",
+            "contextCompaction",
+            "brandNewThing",
+        ] {
             assert_eq!(
                 map_appserver_notification(
                     "item/completed",

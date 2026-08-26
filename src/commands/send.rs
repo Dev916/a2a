@@ -101,8 +101,8 @@ pub fn run(
     // must not learn its state from an `ILLEGAL_TRANSITION` remedy, and must
     // certainly not have their message queued on the way to being refused.
     owner::guard(&id, snap.owner.as_deref(), force)?;
-    let transition = fsm::step(snap.state, snap.state_reason, &FsmEvent::Send)
-        .map_err(|rejected| {
+    let transition =
+        fsm::step(snap.state, snap.state_reason, &FsmEvent::Send).map_err(|rejected| {
             AppError::new(
                 "ILLEGAL_TRANSITION",
                 ExitCode::Precondition,
@@ -117,9 +117,9 @@ pub fn run(
     // a turn is open, as a fresh turn when one is not. `None` means there was no
     // broker to route through, and the Phase-1 path below takes over.
     if snap.transport == Transport::AppServer {
-        if let Some(outcome) =
-            send_via_broker(home, &id, &dir, &snap, message, from, kind, json_mode, quiet)?
-        {
+        if let Some(outcome) = send_via_broker(
+            home, &id, &dir, &snap, message, from, kind, json_mode, quiet,
+        )? {
             return Ok(outcome);
         }
     }
@@ -283,13 +283,7 @@ fn send_via_broker(
 /// `send_path` appears only when something was actually delivered over the live
 /// transport — an absent key means "nothing was steered", which is exactly what
 /// the exec transport and `--queue-only` mean.
-fn payload(
-    id: &str,
-    seq: u64,
-    delivered: bool,
-    send_path: Option<&str>,
-    json_mode: bool,
-) -> Value {
+fn payload(id: &str, seq: u64, delivered: bool, send_path: Option<&str>, json_mode: bool) -> Value {
     if !json_mode {
         return Value::String(seq.to_string());
     }

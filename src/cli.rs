@@ -543,11 +543,11 @@ pub enum MeshFleetCmd {
         json: bool,
     },
     /// Mark a gateway revoked in the registry
-    Revoke {
-        gateway_id: String,
-    },
+    Revoke { gateway_id: String },
     /// Mint root.pub.next and re-sign this machine's gateway token
-    #[command(after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation.")]
+    #[command(
+        after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation."
+    )]
     RotateRoot,
 }
 

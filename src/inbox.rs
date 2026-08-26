@@ -249,7 +249,9 @@ fn session_unknown() -> AppError {
         "no codex session id was ever recorded for this worker, so there is nothing to resume \
          — the message stays queued and will be delivered once a session exists",
     )
-    .remedy("check `a2a tail <id>` for a session event; a worker that never started must be re-spawned")
+    .remedy(
+        "check `a2a tail <id>` for a session event; a worker that never started must be re-spawned",
+    )
 }
 
 /// One block per message, tagged with its seq so the worker can tell a batch of

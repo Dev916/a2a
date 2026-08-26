@@ -4,8 +4,8 @@ use crate::home::{create_dir_0700, A2aHome};
 use crate::ids;
 use crate::inbox::MsgKind;
 use crate::mesh::{
-    feed, gateway::notes_wire, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider,
-    Presence, INJECT_BUDGET_BYTES, NOTE_MAX_BYTES,
+    feed, gateway::notes_wire, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId,
+    Presence, Provider, INJECT_BUDGET_BYTES, NOTE_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode};
 use crate::state::{load_snapshot, WorkerSnapshot};
@@ -116,7 +116,11 @@ pub fn unread(home: &A2aHome, id: &PeerId) -> Result<Vec<(PathBuf, Note)>, AppEr
     let mut out = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| io_err("reading peer inbox", e))?;
-        if !entry.file_type().map_err(|e| io_err("reading peer inbox", e))?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|e| io_err("reading peer inbox", e))?
+            .is_file()
+        {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -191,10 +195,18 @@ pub fn inject(
     // lost merely because it was already moved out of unread.
     presence::save_inject_cursors(home, &mut p, next_feed_seq, last_note, now)?;
 
-    Ok(Some(format_inject_block(&notes, &feed_entries, old_feed_seq)))
+    Ok(Some(format_inject_block(
+        &notes,
+        &feed_entries,
+        old_feed_seq,
+    )))
 }
 
-pub fn roster(home: &A2aHome, cfg: &Config, now: DateTime<Utc>) -> Result<Vec<RosterRow>, AppError> {
+pub fn roster(
+    home: &A2aHome,
+    cfg: &Config,
+    now: DateTime<Utc>,
+) -> Result<Vec<RosterRow>, AppError> {
     let mut rows = BTreeMap::new();
 
     for id in peer_ids(home)? {
@@ -253,7 +265,11 @@ pub fn roster(home: &A2aHome, cfg: &Config, now: DateTime<Utc>) -> Result<Vec<Ro
                 home_gateway,
                 label: presence::Label::Active,
                 status,
-                working_on: Some(format!("{}: {}", snap.lane.as_str(), brief_title(home, &worker_id, &snap))),
+                working_on: Some(format!(
+                    "{}: {}",
+                    snap.lane.as_str(),
+                    brief_title(home, &worker_id, &snap)
+                )),
                 unread_notes,
             },
         );
@@ -295,7 +311,11 @@ fn collect_inject_notes(
     };
     for entry in entries {
         let entry = entry.map_err(|e| io_err("reading peer inbox", e))?;
-        if !entry.file_type().map_err(|e| io_err("reading peer inbox", e))?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|e| io_err("reading peer inbox", e))?
+            .is_file()
+        {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -337,7 +357,11 @@ fn archive_unread_notes(home: &A2aHome, id: &PeerId, notes: &[InjectNote]) -> Re
     Ok(())
 }
 
-fn format_inject_block(notes: &[InjectNote], feed_entries: &[FeedEntry], old_feed_seq: u64) -> String {
+fn format_inject_block(
+    notes: &[InjectNote],
+    feed_entries: &[FeedEntry],
+    old_feed_seq: u64,
+) -> String {
     let mut note_items = notes
         .iter()
         .rev()
@@ -355,7 +379,12 @@ fn format_inject_block(notes: &[InjectNote], feed_entries: &[FeedEntry], old_fee
 
     while let Some(item) = note_items.first().cloned() {
         let omitted = note_items.len() + feed_items.len() - 1;
-        let candidate = inject_block(&[selected_notes.as_slice(), &[item]].concat(), &selected_feed, omitted, old_feed_seq);
+        let candidate = inject_block(
+            &[selected_notes.as_slice(), &[item]].concat(),
+            &selected_feed,
+            omitted,
+            old_feed_seq,
+        );
         if candidate.len() > limit {
             break;
         }
@@ -365,7 +394,12 @@ fn format_inject_block(notes: &[InjectNote], feed_entries: &[FeedEntry], old_fee
     if note_items.is_empty() {
         while let Some(item) = feed_items.first().cloned() {
             let omitted = feed_items.len() - 1;
-            let candidate = inject_block(&selected_notes, &[selected_feed.as_slice(), &[item]].concat(), omitted, old_feed_seq);
+            let candidate = inject_block(
+                &selected_notes,
+                &[selected_feed.as_slice(), &[item]].concat(),
+                omitted,
+                old_feed_seq,
+            );
             if candidate.len() > limit {
                 break;
             }
@@ -425,7 +459,10 @@ pub(crate) fn target_peer(target: &Target) -> &PeerId {
     }
 }
 
-pub(crate) fn target_warning(home: &A2aHome, target: &Target) -> Result<Option<&'static str>, AppError> {
+pub(crate) fn target_warning(
+    home: &A2aHome,
+    target: &Target,
+) -> Result<Option<&'static str>, AppError> {
     let peer = target_peer(target);
     let presence = presence::load(home, peer)?;
     if let Some(p) = &presence {
@@ -470,11 +507,18 @@ fn resolve_peer_prefix(home: &A2aHome, s: &str) -> Result<Option<PeerId>, AppErr
     }
 }
 
-pub(crate) fn write_note_file(home: &A2aHome, peer: &PeerId, note: &Note) -> Result<PathBuf, AppError> {
+pub(crate) fn write_note_file(
+    home: &A2aHome,
+    peer: &PeerId,
+    note: &Note,
+) -> Result<PathBuf, AppError> {
     notes_wire::write_note_file_with_id(home, peer, note)
 }
 
-fn remote_gateway_route(home: &A2aHome, peer: &PeerId) -> Result<Option<(String, String)>, AppError> {
+fn remote_gateway_route(
+    home: &A2aHome,
+    peer: &PeerId,
+) -> Result<Option<(String, String)>, AppError> {
     let Some(from_gateway) = feed::existing_gateway_id(home) else {
         return Ok(None);
     };
@@ -519,7 +563,10 @@ pub(crate) fn routable_worker(
     }
 }
 
-fn worker_for_peer(home: &A2aHome, peer: &PeerId) -> Result<Option<(String, WorkerSnapshot)>, AppError> {
+fn worker_for_peer(
+    home: &A2aHome,
+    peer: &PeerId,
+) -> Result<Option<(String, WorkerSnapshot)>, AppError> {
     for id in home
         .list_worker_ids()
         .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("listing workers: {e}")))?
@@ -545,7 +592,11 @@ fn peer_ids(home: &A2aHome) -> Result<Vec<PeerId>, AppError> {
     let mut out = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| io_err("reading mesh peers", e))?;
-        if !entry.file_type().map_err(|e| io_err("reading mesh peers", e))?.is_dir() {
+        if !entry
+            .file_type()
+            .map_err(|e| io_err("reading mesh peers", e))?
+            .is_dir()
+        {
             continue;
         }
         let Some(id) = peer_from_dir_name(&entry.file_name().to_string_lossy()) else {

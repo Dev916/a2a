@@ -1,7 +1,13 @@
 use crate::config::Config;
 use crate::home::A2aHome;
+use crate::mesh::{
+    keys::{self, Clock, SystemClock},
+    registry::{self, Registry, RegistryHandle},
+};
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, Utc};
+use expose::{Exposure, ExposureProvider, ExposurePublisher, ExposureRow};
+use futures_util::FutureExt;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -12,18 +18,18 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use futures_util::FutureExt;
 
+pub mod expose;
 pub mod link;
 pub mod notes_wire;
 pub mod presence_wire;
 pub mod replicate;
-pub mod expose;
 
 pub const GATEWAY_LOCK: &str = "gateway.lock";
 pub const GATEWAY_PID: &str = "gateway.pid";
@@ -145,7 +151,7 @@ impl GatewayHealth {
             state: "starting".to_string(),
             listen_port: cfg.mesh.gateway.listen_port,
             expose: cfg.mesh.gateway.expose.clone(),
-            endpoint_url: cfg.mesh.gateway.endpoint_url.clone(),
+            endpoint_url: None,
             loops: LoopSlot::ALL
                 .into_iter()
                 .map(|slot| (slot, LoopHealth::new(slot)))
@@ -192,16 +198,17 @@ impl GatewayLog {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct GatewayRuntimeConfig {
     outbound_retry_max_secs: u64,
     shutdown_grace_secs: u64,
     panic_slot: Option<LoopSlot>,
     stall_shutdown_slot: Option<LoopSlot>,
+    registry: Arc<GatewayRegistryRuntime>,
 }
 
 impl GatewayRuntimeConfig {
-    fn from_config(cfg: &Config) -> Self {
+    fn from_config(cfg: &Config, registry: Arc<GatewayRegistryRuntime>) -> Self {
         GatewayRuntimeConfig {
             outbound_retry_max_secs: cfg.mesh.gateway.outbound_retry_max_secs,
             shutdown_grace_secs: cfg.mesh.gateway.shutdown_grace_secs,
@@ -211,12 +218,14 @@ impl GatewayRuntimeConfig {
             stall_shutdown_slot: std::env::var("A2A_TEST_MESH_GATEWAY_STUB_STALL_SHUTDOWN")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            registry,
         }
     }
 }
 
 enum LoopEvent {
     Heartbeat(LoopSlot),
+    Endpoint(Option<String>),
 }
 
 #[derive(Debug)]
@@ -240,8 +249,14 @@ pub fn run(home: &A2aHome, cfg: &Config, quiet: bool) -> Result<Outcome, AppErro
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| AppError::new("INTERNAL", ExitCode::Internal, format!("starting gateway runtime: {e}")))?;
-    let outcome = runtime.block_on(supervise(root.clone(), cfg.clone(), quiet));
+        .map_err(|e| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("starting gateway runtime: {e}"),
+            )
+        })?;
+    let outcome = runtime.block_on(supervise(home, root.clone(), cfg.clone(), quiet));
     runtime.shutdown_timeout(Duration::from_secs(2));
 
     let _ = std::fs::remove_file(root.join(GATEWAY_PID));
@@ -284,7 +299,9 @@ pub fn status(home: &A2aHome, json_mode: bool) -> Result<Outcome, AppError> {
 pub fn stop(home: &A2aHome) -> Result<Outcome, AppError> {
     let root = gateway_root(home);
     if lock_is_free(&root) {
-        return Ok(Outcome::from(json!({"stopped": false, "already_stopped": true})));
+        return Ok(Outcome::from(
+            json!({"stopped": false, "already_stopped": true}),
+        ));
     }
     let pid = read_pidfile(&root)
         .ok()
@@ -306,7 +323,13 @@ pub fn stop(home: &A2aHome) -> Result<Outcome, AppError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .map_err(|e| AppError::new("INTERNAL", ExitCode::Internal, format!("starting stop runtime: {e}")))?;
+        .map_err(|e| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("starting stop runtime: {e}"),
+            )
+        })?;
     let released = rt.block_on(wait_for_lock_release(&root, Duration::from_secs(12)));
     if !released {
         return Err(AppError::new(
@@ -319,6 +342,7 @@ pub fn stop(home: &A2aHome) -> Result<Outcome, AppError> {
 }
 
 async fn supervise(
+    home: &A2aHome,
     root: PathBuf,
     cfg: Config,
     quiet: bool,
@@ -326,9 +350,16 @@ async fn supervise(
     let supervisor_token = CancellationToken::new();
     let tracker = TaskTracker::new();
     let log = GatewayLog::start(root.clone());
-    let runtime_cfg = GatewayRuntimeConfig::from_config(&cfg);
+    let registry_runtime = Arc::new(bootstrap_registry_runtime(home, &cfg)?);
+    let runtime_cfg = GatewayRuntimeConfig::from_config(&cfg, registry_runtime);
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| AppError::new("GATEWAY_SIGNAL", ExitCode::Internal, format!("installing SIGTERM handler: {e}")))?;
+        .map_err(|e| {
+            AppError::new(
+                "GATEWAY_SIGNAL",
+                ExitCode::Internal,
+                format!("installing SIGTERM handler: {e}"),
+            )
+        })?;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut health = GatewayHealth::initial(&cfg);
@@ -369,6 +400,10 @@ async fn supervise(
                             slot_health.heartbeats = slot_health.heartbeats.saturating_add(1);
                             slot_health.last_heartbeat = Some(Utc::now());
                         }
+                        write_health(&root, &mut health).await?;
+                    }
+                    LoopEvent::Endpoint(endpoint_url) => {
+                        health.endpoint_url = endpoint_url;
                         write_health(&root, &mut health).await?;
                     }
                 }
@@ -450,6 +485,54 @@ async fn supervise(
     Ok(outcome)
 }
 
+struct GatewayRegistryRuntime {
+    registry: RegistryHandle,
+    exposure: ExposureProvider,
+    row: ExposureRow,
+    heartbeat_interval: Duration,
+}
+
+fn bootstrap_registry_runtime(
+    home: &A2aHome,
+    cfg: &Config,
+) -> Result<GatewayRegistryRuntime, AppError> {
+    let identity = keys::gateway_identity(home, false)?;
+    keys::ensure_gateway_token(home, &SystemClock)?;
+    let registry_url = read_gateway_registry_env(home)?;
+    let registry = registry::open_registry(&registry_url)?;
+    let exposure = ExposureProvider::from_config(cfg)?;
+    Ok(GatewayRegistryRuntime {
+        registry,
+        exposure,
+        row: ExposureRow {
+            fleet_id: keys::fleet_id(home)?,
+            gateway_id: identity.gateway_id,
+            owner: gateway_owner(),
+            pubkey_fpr: keys::gateway_public_key_fingerprint(home)?,
+            cert_fpr: identity.cert_fpr,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        heartbeat_interval: Duration::from_secs(cfg.mesh.gateway.registry_heartbeat_secs),
+    })
+}
+
+fn read_gateway_registry_env(home: &A2aHome) -> Result<String, AppError> {
+    registry::read_registry_env(home).map_err(|err| {
+        if err.code == "REGISTRY_URL_REQUIRED" {
+            AppError::new("REGISTRY_UNCONFIGURED", ExitCode::Precondition, err.message)
+                .remedy("run `a2a mesh fleet init --registry -`")
+        } else {
+            err
+        }
+    })
+}
+
+fn gateway_owner() -> String {
+    std::env::var("A2A_OWNER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 async fn shutdown(
     root: PathBuf,
     log: &GatewayLog,
@@ -469,13 +552,15 @@ async fn shutdown(
         "ts": Utc::now(),
         "kind": "stop_accepting",
         "links": 0
-    })).await;
+    }))
+    .await;
     log.line(json!({
         "ts": Utc::now(),
         "kind": "link_close",
         "err": {"code": "SHUTTING_DOWN"},
         "links": 0
-    })).await;
+    }))
+    .await;
 
     token.cancel();
     tracker.close();
@@ -489,7 +574,8 @@ async fn shutdown(
             "ts": Utc::now(),
             "kind": "stopped",
             "graceful": true
-        })).await;
+        }))
+        .await;
         Ok(DaemonOutcome::Graceful(json!({
             "started": true,
             "shutdown": {"cause": "signal", "graceful": true}
@@ -503,7 +589,8 @@ async fn shutdown(
             "ts": Utc::now(),
             "kind": "drain_timeout",
             "outstanding_tasks": outstanding
-        })).await;
+        }))
+        .await;
         Ok(DaemonOutcome::NonZero(json!({
             "started": true,
             "shutdown": {
@@ -524,17 +611,161 @@ fn spawn_loop(
     cfg: GatewayRuntimeConfig,
 ) {
     let future = async move {
-        let result = AssertUnwindSafe(stub_loop(slot, token, tx, cfg))
-            .catch_unwind()
-            .await;
-        let result = match result {
-            Ok(_) => Ok(()),
-            Err(_) => Err("panicked".to_string()),
+        let result = if slot == LoopSlot::Registry {
+            AssertUnwindSafe(registry_loop(slot, token, tx, cfg))
+                .catch_unwind()
+                .await
+                .map(|result| result.map_err(|err| format!("{}: {}", err.code, err.message)))
+        } else {
+            AssertUnwindSafe(stub_loop(slot, token, tx, cfg))
+                .catch_unwind()
+                .await
+                .map(|_| Ok(()))
         };
+        let result = result.unwrap_or_else(|_| Err("panicked".to_string()));
         (slot, result)
     };
     let tracked = tracker.track_future(future);
     loops.spawn(tracked);
+}
+
+async fn registry_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    if cfg.panic_slot == Some(slot) {
+        panic!("gateway stub loop {slot} panicked by test hook");
+    }
+    let registry_runtime = Arc::clone(&cfg.registry);
+    registry_exposure_loop(
+        slot,
+        token,
+        tx,
+        RegistrySlotParams {
+            registry: &registry_runtime.registry,
+            exposure: &registry_runtime.exposure,
+            publisher: ExposurePublisher::new(registry_runtime.row.clone()),
+            heartbeat_interval: registry_runtime.heartbeat_interval,
+            clock: &SystemClock,
+            stall_shutdown_slot: cfg.stall_shutdown_slot,
+        },
+    )
+    .await
+}
+
+pub struct RegistrySlotParams<'a, R, E, C: ?Sized> {
+    pub registry: &'a R,
+    pub exposure: &'a E,
+    pub publisher: ExposurePublisher,
+    pub heartbeat_interval: Duration,
+    pub clock: &'a C,
+    pub stall_shutdown_slot: Option<LoopSlot>,
+}
+
+async fn registry_exposure_loop<R, E, C>(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    params: RegistrySlotParams<'_, R, E, C>,
+) -> Result<(), AppError>
+where
+    R: Registry,
+    E: Exposure,
+    C: Clock + ?Sized,
+{
+    let RegistrySlotParams {
+        registry,
+        exposure,
+        mut publisher,
+        heartbeat_interval,
+        clock,
+        stall_shutdown_slot,
+    } = params;
+    let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
+    let (exposure_tx, mut exposure_rx) = mpsc::channel(16);
+    let exposure_loop = expose::run_exposure_loop_with_events(
+        registry,
+        exposure,
+        &mut publisher,
+        heartbeat_interval,
+        clock,
+        token.clone(),
+        Some(exposure_tx),
+    );
+    tokio::pin!(exposure_loop);
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep(jittered_heartbeat(HEARTBEAT_INTERVAL)) => {
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            Some(tick) = exposure_rx.recv() => {
+                if tx.send(LoopEvent::Endpoint(tick.endpoint_url)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            result = &mut exposure_loop => {
+                return result;
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub async fn run_registry_slot_for_test<R, E, C>(
+    root: &Path,
+    cfg: &Config,
+    params: RegistrySlotParams<'_, R, E, C>,
+    token: CancellationToken,
+) -> Result<(), AppError>
+where
+    R: Registry,
+    E: Exposure,
+    C: Clock + ?Sized,
+{
+    let mut health = GatewayHealth::initial(cfg);
+    health.state = "running".to_string();
+    write_health(root, &mut health).await?;
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(LOG_CAPACITY);
+    let run = registry_exposure_loop(LoopSlot::Registry, token, tx, params);
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            result = &mut run => return result,
+            Some(event) = rx.recv() => {
+                match event {
+                    LoopEvent::Heartbeat(slot) => {
+                        if let Some(slot_health) = health.loops.get_mut(&slot) {
+                            slot_health.state = "running".to_string();
+                            slot_health.heartbeats = slot_health.heartbeats.saturating_add(1);
+                            slot_health.last_heartbeat = Some(Utc::now());
+                        }
+                        write_health(root, &mut health).await?;
+                    }
+                    LoopEvent::Endpoint(endpoint_url) => {
+                        health.endpoint_url = endpoint_url;
+                        write_health(root, &mut health).await?;
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn stub_loop(

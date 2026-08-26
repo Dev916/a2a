@@ -34,8 +34,14 @@ async fn discovery_orders_deduped_links_and_damped_side_still_accepts_inbound() 
     let tmp = tempfile::tempdir().unwrap();
     let registry = FileRegistry::new(tmp.path());
     registry.init_schema().unwrap();
-    registry.upsert_self(row("gw-a", Some("wss://127.0.0.1:1"))).await.unwrap();
-    registry.upsert_self(row("gw-b", Some("wss://127.0.0.1:2"))).await.unwrap();
+    registry
+        .upsert_self(row("gw-a", Some("wss://127.0.0.1:1")))
+        .await
+        .unwrap();
+    registry
+        .upsert_self(row("gw-b", Some("wss://127.0.0.1:2")))
+        .await
+        .unwrap();
     registry.upsert_self(row("gw-c", None)).await.unwrap();
     let rows = registry.discover("fleet-a").await.unwrap();
 
@@ -55,12 +61,22 @@ async fn discovery_orders_deduped_links_and_damped_side_still_accepts_inbound() 
     assert!(damping.admit("gw-b", "gw-a", LinkDirection::Inbound, now));
     assert!(!damping.admit("gw-b", "gw-a", LinkDirection::Outbound, now));
 
-    assert!(damping.record_connect_drop("gw-b", now, Duration::from_secs(1_920)).is_none());
     assert!(damping
-        .record_connect_drop("gw-b", now + chrono::Duration::seconds(60), Duration::from_secs(1_920))
+        .record_connect_drop("gw-b", now, Duration::from_secs(1_920))
+        .is_none());
+    assert!(damping
+        .record_connect_drop(
+            "gw-b",
+            now + chrono::Duration::seconds(60),
+            Duration::from_secs(1_920)
+        )
         .is_none());
     let event = damping
-        .record_connect_drop("gw-b", now + chrono::Duration::seconds(120), Duration::from_secs(1_920))
+        .record_connect_drop(
+            "gw-b",
+            now + chrono::Duration::seconds(120),
+            Duration::from_secs(1_920),
+        )
         .expect("third drop logs link_flapping");
     assert_eq!(event.kind, "link_flapping");
     assert!(!damping.can_dial("gw-b", now + chrono::Duration::seconds(121)));
@@ -81,18 +97,22 @@ async fn acceptor_and_dialer_connect_over_discovered_injected_io_endpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = FileRegistry::new(tmp.path());
     registry.init_schema().unwrap();
-    registry.upsert_self(row("gw-a", Some("wss://127.0.0.1:1"))).await.unwrap();
+    registry
+        .upsert_self(row("gw-a", Some("wss://127.0.0.1:1")))
+        .await
+        .unwrap();
 
     let tls = TlsIdentity::self_signed(vec!["localhost".to_string()]).unwrap();
     registry
-        .upsert_self(row(
-            "gw-b",
-            Some("wss://127.0.0.1:7787"),
-        ))
+        .upsert_self(row("gw-b", Some("wss://127.0.0.1:7787")))
         .await
         .unwrap();
     registry
-        .revoke("fleet-a", "gw-a", Utc.timestamp_opt(1_700_000_001, 0).unwrap())
+        .revoke(
+            "fleet-a",
+            "gw-a",
+            Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
+        )
         .await
         .unwrap();
     let mut rows = registry.discover("fleet-a").await.unwrap();
@@ -144,10 +164,13 @@ async fn liveness_pings_and_closes_after_two_missed_read_windows() {
     tokio::time::advance(Duration::from_secs(5)).await;
     assert_eq!(writer_rx.recv().await.unwrap(), LinkWriteOp::Ping(vec![]));
     tokio::time::advance(Duration::from_secs(5)).await;
-    assert_eq!(writer_rx.recv().await.unwrap(), LinkWriteOp::Close(Frame::Err {
-        code: "LIVENESS_TIMEOUT".to_string(),
-        detail: "no read activity for 10s".to_string(),
-    }));
+    assert_eq!(
+        writer_rx.recv().await.unwrap(),
+        LinkWriteOp::Close(Frame::Err {
+            code: "LIVENESS_TIMEOUT".to_string(),
+            detail: "no read activity for 10s".to_string(),
+        })
+    );
     assert_eq!(
         event_rx.recv().await.unwrap(),
         LinkRuntimeEvent::ClosedForLiveness
@@ -158,20 +181,25 @@ async fn liveness_pings_and_closes_after_two_missed_read_windows() {
 #[test]
 fn inbound_mailboxes_apply_class_specific_capacity_backpressure_and_busy() {
     let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-    let mut inbox = a2a::mesh::gateway::link::InboundMailboxes::new(
-        2,
-        Duration::from_secs(3),
-    );
+    let mut inbox = a2a::mesh::gateway::link::InboundMailboxes::new(2, Duration::from_secs(3));
 
     assert!(inbox.offer_feed(1, now).is_accepted());
     assert!(inbox.offer_note(2, now).is_accepted());
-    assert!(inbox.offer_feed(3, now + chrono::Duration::seconds(1)).is_backpressure());
+    assert!(inbox
+        .offer_feed(3, now + chrono::Duration::seconds(1))
+        .is_backpressure());
     assert_eq!(inbox.lossy_payload_drops(), 0);
     assert_eq!(inbox.drain_payloads(), vec![1, 2]);
-    assert!(inbox.offer_feed(3, now + chrono::Duration::seconds(2)).is_accepted());
-    assert!(inbox.offer_note(4, now + chrono::Duration::seconds(2)).is_accepted());
+    assert!(inbox
+        .offer_feed(3, now + chrono::Duration::seconds(2))
+        .is_accepted());
+    assert!(inbox
+        .offer_note(4, now + chrono::Duration::seconds(2))
+        .is_accepted());
     assert_eq!(
-        inbox.offer_feed(5, now + chrono::Duration::seconds(6)).err_frame(),
+        inbox
+            .offer_feed(5, now + chrono::Duration::seconds(6))
+            .err_frame(),
         Some(Frame::Err {
             code: "BUSY".to_string(),
             detail: "inbound payload mailbox remained full for 3s".to_string()
@@ -212,7 +240,11 @@ fn outbound_queue_sheds_feed_and_presence_newest_with_rate_limited_visibility() 
     assert!(!visible.queued);
     assert!(visible.log_outbound_shed);
     assert_eq!(
-        outbound.drain().into_iter().map(|v| v["seq"].as_u64().unwrap()).collect::<Vec<_>>(),
+        outbound
+            .drain()
+            .into_iter()
+            .map(|v| v["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
 
@@ -235,7 +267,8 @@ async fn link_tasks_are_owned_by_join_set_and_spawned_with_cursor_state() {
 
     assert_eq!(tasks.len(), 2);
     assert_eq!(
-        tasks.spawned_peer_states()
+        tasks
+            .spawned_peer_states()
             .into_iter()
             .map(|s| (s.peer_gateway_id, s.cursors["feed"].as_u64().unwrap()))
             .collect::<Vec<_>>(),

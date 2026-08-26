@@ -86,7 +86,11 @@ fn extract_methods(schema: &Path) -> BTreeSet<String> {
         .as_array()
         .unwrap_or_else(|| panic!("{} has no oneOf", schema.display()))
         .iter()
-        .filter_map(|v| v["properties"]["method"]["enum"][0].as_str().map(String::from))
+        .filter_map(|v| {
+            v["properties"]["method"]["enum"][0]
+                .as_str()
+                .map(String::from)
+        })
         .collect()
 }
 
@@ -176,8 +180,7 @@ fn schema_snapshot_matches_live_codex() {
     let mut drifted: Vec<String> = Vec::new();
 
     for f in BYTE_SNAPSHOT_FILES {
-        let want = std::fs::read(dir.join(f))
-            .unwrap_or_else(|e| panic!("read snapshot {f}: {e}"));
+        let want = std::fs::read(dir.join(f)).unwrap_or_else(|e| panic!("read snapshot {f}: {e}"));
         match std::fs::read(out.path().join(f)) {
             Ok(got) if got == want => {}
             Ok(_) => drifted.push(format!("{f} (bytes differ)")),

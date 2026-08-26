@@ -56,8 +56,8 @@ use crate::fold;
 use crate::fsm::{self, FsmEvent, TimeoutKind, WorkerState};
 use crate::inbox;
 use crate::output::{AppError, ExitCode};
-use crate::redact;
 use crate::reconcile;
+use crate::redact;
 use crate::rpc::RpcError;
 use crate::state::{save_snapshot, WorkerSnapshot};
 use crate::store::{self, EventLog};
@@ -269,7 +269,10 @@ pub fn build_worker_actor(
     cancel: CancellationToken,
     tracker: TaskTracker,
     log: BrokerLog,
-) -> (WorkerHandle, impl std::future::Future<Output = ()> + Send + 'static) {
+) -> (
+    WorkerHandle,
+    impl std::future::Future<Output = ()> + Send + 'static,
+) {
     let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
     let id = snap.id.clone();
     let actor = WorkerActor {
@@ -617,7 +620,8 @@ impl WorkerActor {
         // A turn only concludes from `running`: an interrupted or killed worker
         // still receives its `turn/completed`, and committing `TurnEnded` from
         // `awaiting-input` would be a rejection, not a conclusion.
-        let concludes = env.kind == EventKind::TurnCompleted && self.snap.state == WorkerState::Running;
+        let concludes =
+            env.kind == EventKind::TurnCompleted && self.snap.state == WorkerState::Running;
 
         if let Err(e) = self.append_lifecycle(&mut env).await {
             self.warn("appending a lifecycle event", &e);
@@ -736,7 +740,8 @@ impl WorkerActor {
         // it. `write_atomic` creates it 0600, which is stricter than what codex
         // leaves behind on exec.
         if let Some(text) = events::synthesize_result(&messages) {
-            if let Err(e) = store::write_atomic(&self.dir.join(reconcile::RESULT_MD), text.as_bytes())
+            if let Err(e) =
+                store::write_atomic(&self.dir.join(reconcile::RESULT_MD), text.as_bytes())
             {
                 self.warn(
                     "writing result.md",
@@ -751,8 +756,7 @@ impl WorkerActor {
                 // Both observations are taken under the lock, so nothing can
                 // land between reading them and committing what they imply.
                 let has_result = reconcile::has_result(dir);
-                let has_question =
-                    reconcile::has_unanswered_question(dir, snap.last_delivered_seq);
+                let has_question = reconcile::has_unanswered_question(dir, snap.last_delivered_seq);
                 let snap = reconcile::conclude_turn(
                     log,
                     dir,
@@ -921,7 +925,10 @@ impl WorkerActor {
                     .turn_interrupt(&thread_id, &turn_id, RPC_TIMEOUT)
                     .await
                 {
-                    self.warn("interrupting the turn before a kill", &rpc_err("turn/interrupt", e));
+                    self.warn(
+                        "interrupting the turn before a kill",
+                        &rpc_err("turn/interrupt", e),
+                    );
                 }
             }
         }
@@ -1148,7 +1155,10 @@ impl WorkerActor {
             AppError::new(
                 "CONFIG",
                 ExitCode::Precondition,
-                format!("no configuration for the `{}` lane", self.snap.lane.as_str()),
+                format!(
+                    "no configuration for the `{}` lane",
+                    self.snap.lane.as_str()
+                ),
             )
         })
     }
@@ -1167,13 +1177,23 @@ impl WorkerActor {
     }
 
     fn envelope(&self, class: EventClass, kind: EventKind, raw: Value) -> Envelope {
-        Envelope::new(self.snap.epoch, self.snap.transport, class, kind, raw, Utc::now())
+        Envelope::new(
+            self.snap.epoch,
+            self.snap.transport,
+            class,
+            kind,
+            raw,
+            Utc::now(),
+        )
     }
 
     /// The daemon's stderr is `broker.log`; a persistence failure is an
     /// operational fact, never a reason to abandon the worker.
     fn warn(&self, ctx: &str, e: &AppError) {
-        eprintln!("a2a broker: {}: {ctx}: {}: {}", self.snap.id, e.code, e.message);
+        eprintln!(
+            "a2a broker: {}: {ctx}: {}: {}",
+            self.snap.id, e.code, e.message
+        );
     }
 }
 
@@ -1266,8 +1286,7 @@ fn acknowledge_inbox(dir: &Path, snap: &WorkerSnapshot) -> Result<(u64, Vec<u64>
         return Ok((snap.last_delivered_seq, Vec::new()));
     }
     let delivered = dir.join(inbox::INBOX).join(inbox::DELIVERED);
-    crate::home::create_dir_0700(&delivered)
-        .map_err(|e| io_err("creating inbox/delivered", e))?;
+    crate::home::create_dir_0700(&delivered).map_err(|e| io_err("creating inbox/delivered", e))?;
     let mut watermark = snap.last_delivered_seq;
     let mut seqs = Vec::with_capacity(pending.len());
     for (seq, path, _) in &pending {
@@ -1561,8 +1580,7 @@ mod tests {
         let tx = handle.sender().clone();
         let pump = tokio::spawn(async move {
             while let Some(n) = incoming.notifications.recv().await {
-                let Some((class, kind)) =
-                    events::map_appserver_notification(&n.method, &n.params)
+                let Some((class, kind)) = events::map_appserver_notification(&n.method, &n.params)
                 else {
                     continue;
                 };
@@ -1697,7 +1715,9 @@ mod tests {
 
         // The thread is opened by the actor itself, so the worker is `running`
         // before anything is delivered to it.
-        let snap = h.until("the thread to start", |s| s.state == WorkerState::Running).await;
+        let snap = h
+            .until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
         assert!(snap.session_id.is_some(), "the thread id is recorded");
         assert_eq!(snap.pid, Some(h.child_pid), "the SHARED child's pid");
 
@@ -1714,14 +1734,22 @@ mod tests {
             .await
             .unwrap();
 
-        let snap = h.until("the turn to conclude", |s| s.state == WorkerState::Done).await;
+        let snap = h
+            .until("the turn to conclude", |s| s.state == WorkerState::Done)
+            .await;
         assert_no_rejections(&snap);
         assert_eq!(
             std::fs::read_to_string(h.dir.join("result.md")).unwrap(),
             "THE ANSWER",
             "the turn's final agent message IS the result on this transport"
         );
-        assert_eq!(h.settled().await, Settled { id: snap.id.clone(), state: WorkerState::Done });
+        assert_eq!(
+            h.settled().await,
+            Settled {
+                id: snap.id.clone(),
+                state: WorkerState::Done
+            }
+        );
 
         // ── the event-order pin ──────────────────────────────────────────
         let events = h.events();
@@ -1742,7 +1770,9 @@ mod tests {
             "a notification was folded before ProcessStarted"
         );
         // Every worker file the actor wrote is app-server transport.
-        assert!(events[1..].iter().all(|e| e.transport == Transport::AppServer));
+        assert!(events[1..]
+            .iter()
+            .all(|e| e.transport == Transport::AppServer));
         // The server request is recorded by method+disposition and nothing else.
         let sr = events
             .iter()
@@ -1809,17 +1839,19 @@ mod tests {
         assert_eq!(snap.last_delivered_seq, 0);
 
         // ── the answer ───────────────────────────────────────────────────
-        let seq = crate::inbox::queue_message(&h.dir, "orchestrator", MsgKind::Answer, "B").unwrap();
+        let seq =
+            crate::inbox::queue_message(&h.dir, "orchestrator", MsgKind::Answer, "B").unwrap();
         assert_eq!(seq, 1, "the answer's seq matches the question it answers");
         assert_eq!(
             h.handle.deliver("B").await.unwrap(),
             SendPath::Started,
             "the previous turn had ended, so there was nothing to steer"
         );
-        let snap = h.until("the answer to move the watermark", |s| {
-            s.last_delivered_seq == 1
-        })
-        .await;
+        let snap = h
+            .until("the answer to move the watermark", |s| {
+                s.last_delivered_seq == 1
+            })
+            .await;
         assert_eq!(snap.state, WorkerState::Running);
         // The question file is STILL on disk: it is the WATERMARK, not a
         // deletion, that marks it answered.
@@ -1839,7 +1871,9 @@ mod tests {
         )
         .await;
         let snap = h
-            .until("turn 2 to conclude", |s| s.state == WorkerState::AwaitingInput)
+            .until("turn 2 to conclude", |s| {
+                s.state == WorkerState::AwaitingInput
+            })
             .await;
         assert_eq!(
             snap.state_reason,
@@ -1863,7 +1897,11 @@ mod tests {
         )
         .await;
 
-        let snap = h.until("the answered worker to finish", |s| s.state == WorkerState::Done).await;
+        let snap = h
+            .until("the answered worker to finish", |s| {
+                s.state == WorkerState::Done
+            })
+            .await;
         assert_no_rejections(&snap);
         assert_eq!(
             std::fs::read_to_string(h.dir.join("result.md")).unwrap(),
@@ -1878,12 +1916,22 @@ mod tests {
     /// NEVER signal the child — that child is every other worker's transport.
     #[tokio::test(flavor = "multi_thread")]
     async fn kill_interrupts_the_turn_and_never_signals_the_shared_child() {
-        let mut h = start(Lane::General, WorkerState::Spawned, "hang-turn", &[], |_| {}).await;
-        h.until("the thread to start", |s| s.state == WorkerState::Running).await;
+        let mut h = start(
+            Lane::General,
+            WorkerState::Spawned,
+            "hang-turn",
+            &[],
+            |_| {},
+        )
+        .await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
         h.handle.deliver("work forever").await.unwrap();
 
         h.handle.kill().await.unwrap();
-        let snap = h.until("the kill to land", |s| s.state == WorkerState::Cancelled).await;
+        let snap = h
+            .until("the kill to land", |s| s.state == WorkerState::Cancelled)
+            .await;
         assert_no_rejections(&snap);
         assert_eq!(
             snap.failure_class, None,
@@ -1905,7 +1953,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn interrupting_a_finished_turn_is_a_noop() {
         let h = start(Lane::General, WorkerState::Spawned, "happy", &[], |_| {}).await;
-        h.until("the thread to start", |s| s.state == WorkerState::Running).await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
         assert_eq!(
             h.handle.interrupt().await.unwrap(),
             InterruptOutcome::NoopTurnAlreadyOver,
@@ -1913,7 +1962,9 @@ mod tests {
         );
 
         h.handle.deliver("do the thing").await.unwrap();
-        let snap = h.until("the turn to conclude", |s| s.state == WorkerState::Done).await;
+        let snap = h
+            .until("the turn to conclude", |s| s.state == WorkerState::Done)
+            .await;
         assert_eq!(
             h.handle.interrupt().await.unwrap(),
             InterruptOutcome::NoopTurnAlreadyOver,
@@ -1945,11 +1996,14 @@ mod tests {
             },
         )
         .await;
-        h.until("the thread to start", |s| s.state == WorkerState::Running).await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
         h.handle.deliver("ask me something").await.unwrap();
 
         let parked = h
-            .until("the worker to park", |s| s.state == WorkerState::AwaitingInput)
+            .until("the worker to park", |s| {
+                s.state == WorkerState::AwaitingInput
+            })
             .await;
         assert_eq!(parked.state_reason, Some(StateReason::Blocked));
         let deadline = parked.deadline_at.expect("the blocked deadline is armed");
@@ -1959,7 +2013,9 @@ mod tests {
         );
 
         let escalated = h
-            .until("the blocked deadline to fire", |s| s.state == WorkerState::Escalated)
+            .until("the blocked deadline to fire", |s| {
+                s.state == WorkerState::Escalated
+            })
             .await;
         assert_eq!(escalated.state_reason, Some(StateReason::BlockedTimeout));
         assert_eq!(escalated.failure_class, None);
@@ -1986,8 +2042,17 @@ mod tests {
     /// `spawn` gives when an exec fork fails.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_thread_that_never_starts_fails_never_started() {
-        let mut h = start(Lane::General, WorkerState::Spawned, "always-crash", &[], |_| {}).await;
-        let snap = h.until("the failure to land", |s| s.state == WorkerState::Failed).await;
+        let mut h = start(
+            Lane::General,
+            WorkerState::Spawned,
+            "always-crash",
+            &[],
+            |_| {},
+        )
+        .await;
+        let snap = h
+            .until("the failure to land", |s| s.state == WorkerState::Failed)
+            .await;
         assert_eq!(snap.failure_class, Some(FailureClass::NeverStarted));
         assert_no_rejections(&snap);
         assert_eq!(h.settled().await.state, WorkerState::Failed);

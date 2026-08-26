@@ -1,8 +1,10 @@
 mod common;
 
+use a2a::mesh::registry::Registry;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -60,7 +62,10 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
     let data = &v["data"];
     assert_eq!(data["mesh"]["gateway"]["listen_port"], 8899);
     assert_eq!(data["mesh"]["gateway"]["expose"], "manual");
-    assert_eq!(data["mesh"]["gateway"]["endpoint_url"], "wss://127.0.0.1:8899");
+    assert_eq!(
+        data["mesh"]["gateway"]["endpoint_url"],
+        "wss://127.0.0.1:8899"
+    );
     assert_eq!(data["mesh"]["gateway"]["registry_heartbeat_secs"], 17);
     assert_eq!(data["mesh"]["gateway"]["registry_timeout_secs"], 10);
     assert_eq!(data["mesh"]["gateway"]["replication_poll_secs"], 5);
@@ -88,6 +93,7 @@ fn gateway_status_is_exit_7_until_a_supervisor_writes_health() {
     let home = tmp.path().join("home");
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
 
     common::a2a(&home, &work)
         .args(["mesh", "gateway", "status"])
@@ -138,6 +144,7 @@ fn supervisor_escalates_panicking_loop_and_releases_lock() {
     let home = tmp.path().join("home");
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
 
     let mut child = spawn_gateway(
         &home,
@@ -155,7 +162,9 @@ fn supervisor_escalates_panicking_loop_and_releases_lock() {
     assert_eq!(health["loops"]["registry"]["restart_policy"], "one-for-one");
 
     let mut fresh = spawn_gateway(&home, &work, &[]);
-    wait_for_health_with(&home, |health| health["pid"].as_u64() == Some(fresh.id() as u64));
+    wait_for_health_with(&home, |health| {
+        health["pid"].as_u64() == Some(fresh.id() as u64)
+    });
     common::a2a(&home, &work)
         .args(["mesh", "gateway", "stop"])
         .assert()
@@ -170,6 +179,7 @@ fn shutdown_is_bounded_even_when_a_stub_refuses_to_die() {
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
     std::fs::write(
         home.join("config.toml"),
         "[mesh.gateway]\nshutdown_grace_secs = 1\n",
@@ -197,7 +207,9 @@ fn shutdown_is_bounded_even_when_a_stub_refuses_to_die() {
     assert!(log.contains(r#""outstanding_tasks":"#), "{log}");
 
     let mut fresh = spawn_gateway(&home, &work, &[]);
-    wait_for_health_with(&home, |health| health["pid"].as_u64() == Some(fresh.id() as u64));
+    wait_for_health_with(&home, |health| {
+        health["pid"].as_u64() == Some(fresh.id() as u64)
+    });
     common::a2a(&home, &work)
         .args(["mesh", "gateway", "stop"])
         .assert()
@@ -257,6 +269,90 @@ fn gateway_source_scan_pins_health_ownership_and_async_discipline() {
     assert!(select_blocks >= 2, "gateway loops are select!-driven");
 }
 
+#[test]
+fn gateway_startup_mints_identity_and_self_enrollment_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let registry_dir = tmp.path().join("registry");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &registry_dir);
+    std::fs::write(
+        home.join("config.toml"),
+        "[mesh.gateway]\nexpose = \"manual\"\nendpoint_url = \"wss://manual.example.test:7787\"\nregistry_heartbeat_secs = 1\n",
+    )
+    .unwrap();
+
+    let mut child = spawn_gateway(&home, &work, &[]);
+    let health = wait_for_health_with(&home, |health| {
+        health["endpoint_url"].as_str() == Some("wss://manual.example.test:7787")
+            && health["loops"]["registry"]["state"] == "running"
+    });
+    assert_eq!(health["loops"]["registry"]["state"], "running");
+
+    let gateway_dir = home.join("mesh").join("gateway");
+    assert!(gateway_dir.join("gw.key").exists());
+    assert!(gateway_dir.join("gw.crt").exists());
+    assert!(gateway_dir.join("gw.tls.key").exists());
+    let token = gateway_dir.join("gw.token");
+    assert!(token.exists());
+    assert_eq!(
+        std::fs::metadata(&token).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let rows = wait_for_registry_rows(&home, &registry_dir, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].endpoint_url.as_deref(),
+        Some("wss://manual.example.test:7787")
+    );
+    assert_eq!(rows[0].cert_fpr.as_ref().unwrap().len(), 64);
+    assert_eq!(rows[0].version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(rows[0].pubkey_fpr.len(), 64);
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "stop"])
+        .assert()
+        .success();
+    assert_exits(&mut child, Duration::from_secs(3));
+}
+
+#[test]
+fn gateway_startup_without_root_or_token_fails_not_enrolled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    let registry_dir = tmp.path().join("registry");
+    std::fs::create_dir_all(&work).unwrap();
+    write_registry_env_for_test(&home, &registry_dir);
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GATEWAY_NOT_ENROLLED"))
+        .stderr(predicate::str::contains("a2a mesh fleet init"));
+}
+
+#[test]
+fn gateway_startup_without_registry_env_fails_unconfigured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let resolved = a2a::home::A2aHome::resolve(Some(&home)).unwrap();
+    a2a::mesh::keys::fleet_init(&resolved).unwrap();
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("REGISTRY_UNCONFIGURED"))
+        .stderr(predicate::str::contains("a2a mesh fleet init --registry -"));
+}
+
 fn spawn_gateway(home: &std::path::Path, work: &std::path::Path, envs: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("a2a"));
     cmd.arg("--home")
@@ -272,6 +368,46 @@ fn spawn_gateway(home: &std::path::Path, work: &std::path::Path, envs: &[(&str, 
         cmd.env(k, v);
     }
     cmd.spawn().unwrap()
+}
+
+fn prepare_gateway_home(home: &std::path::Path, registry_dir: &std::path::Path) {
+    std::fs::create_dir_all(home).unwrap();
+    let resolved = a2a::home::A2aHome::resolve(Some(home)).unwrap();
+    a2a::mesh::keys::fleet_init(&resolved).unwrap();
+    write_registry_env_for_test(home, registry_dir);
+}
+
+fn write_registry_env_for_test(home: &std::path::Path, registry_dir: &std::path::Path) {
+    let fleet = home.join("mesh").join("fleet");
+    std::fs::create_dir_all(&fleet).unwrap();
+    let path = fleet.join("registry.env");
+    std::fs::write(&path, format!("file://{}\n", registry_dir.display())).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn wait_for_registry_rows(
+    home: &std::path::Path,
+    registry_dir: &std::path::Path,
+    min_rows: usize,
+) -> Vec<a2a::mesh::registry::GatewayRow> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    loop {
+        let rows = rt.block_on(async {
+            let resolved = a2a::home::A2aHome::resolve(Some(home)).unwrap();
+            let fleet_id = a2a::mesh::keys::fleet_id(&resolved).unwrap();
+            let registry = a2a::mesh::registry::FileRegistry::new(registry_dir);
+            registry.discover(&fleet_id).await.unwrap()
+        });
+        if rows.len() >= min_rows {
+            return rows;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry rows were not published"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_health(home: &std::path::Path, min_seq: u64) -> Value {

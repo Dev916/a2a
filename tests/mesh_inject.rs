@@ -1,5 +1,5 @@
-use assert_cmd::Command;
 use a2a::mesh::INJECT_BUDGET_BYTES;
+use assert_cmd::Command;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -85,7 +85,14 @@ fn post(home: &Path, session: &str, text: &str) {
 
 fn note(home: &Path, from: &str, to: &str, text: &str) {
     cli(home)
-        .args(["mesh", "note", "--session", from, &format!("claude:{to}"), "-"])
+        .args([
+            "mesh",
+            "note",
+            "--session",
+            from,
+            &format!("claude:{to}"),
+            "-",
+        ])
         .write_stdin(text)
         .assert()
         .success();
@@ -119,7 +126,11 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
         entries.sort_by_key(|e| e.path());
         for entry in entries {
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             let ty = entry.file_type().unwrap();
             if ty.is_dir() {
                 out.insert(format!("{rel}/"), Vec::new());
@@ -138,8 +149,10 @@ fn run_hook_command(home: &Path, shell_command: &str, session: &str) -> std::pro
     let bin = assert_cmd::cargo::cargo_bin("a2a");
     let bin_dir = bin.parent().unwrap();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = std::env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&old_path)))
-        .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&old_path)),
+    )
+    .unwrap();
     let mut child = StdCommand::new("zsh")
         .arg("-c")
         .arg(shell_command)
@@ -177,7 +190,10 @@ fn hooks_template_is_valid_json_and_pins_the_claude_commands() {
         hook_commands(&snippet, "UserPromptSubmit"),
         vec![USER_PROMPT_SUBMIT_COMMAND]
     );
-    assert_eq!(hook_commands(&snippet, "SessionEnd"), vec![SESSION_END_COMMAND]);
+    assert_eq!(
+        hook_commands(&snippet, "SessionEnd"),
+        vec![SESSION_END_COMMAND]
+    );
     assert_eq!(hook_timeouts(&snippet, "SessionStart"), vec![10]);
     assert_eq!(hook_timeouts(&snippet, "UserPromptSubmit"), vec![10]);
     assert_eq!(hook_timeouts(&snippet, "SessionEnd"), vec![10]);
@@ -200,7 +216,11 @@ fn hooks_template_is_valid_json_and_pins_the_claude_commands() {
 fn hooks_print_emits_the_compiled_snippet_and_never_installs() {
     let home = tempfile::tempdir().unwrap();
     fs::create_dir_all(home.path().join(".claude")).unwrap();
-    fs::write(home.path().join(".claude/settings.json"), "{\"hooks\":{}}\n").unwrap();
+    fs::write(
+        home.path().join(".claude/settings.json"),
+        "{\"hooks\":{}}\n",
+    )
+    .unwrap();
     let before = snapshot_tree(home.path());
 
     let out = Command::cargo_bin("a2a")
@@ -215,7 +235,10 @@ fn hooks_print_emits_the_compiled_snippet_and_never_installs() {
         .success();
 
     assert_eq!(out.get_output().stderr, HOOK_WARNING.as_bytes());
-    assert_eq!(out.get_output().stdout, a2a::templates::MESH_HOOKS_JSON.as_bytes());
+    assert_eq!(
+        out.get_output().stdout,
+        a2a::templates::MESH_HOOKS_JSON.as_bytes()
+    );
     assert_eq!(snapshot_tree(home.path()), before);
 }
 
@@ -298,7 +321,10 @@ fn inject_emits_pinned_marker_block_then_second_run_is_empty() {
     assert_eq!(lines.first().copied(), Some(START_MARKER));
     assert_eq!(lines.last().copied(), Some(END_MARKER));
     assert!(stdout.contains("## Notes to you"), "{stdout}");
-    assert!(stdout.contains("from claude:aaaaaaaa-2222-2222-2222-aaaaaaaaaaaa at "), "{stdout}");
+    assert!(
+        stdout.contains("from claude:aaaaaaaa-2222-2222-2222-aaaaaaaaaaaa at "),
+        "{stdout}"
+    );
     assert!(stdout.contains("second note"), "{stdout}");
     assert!(stdout.contains("first note\nsecond line"), "{stdout}");
     assert!(stdout.find("second note").unwrap() < stdout.find("first note").unwrap());
@@ -336,7 +362,11 @@ fn non_empty_inject_json_wraps_the_block_for_tooling() {
         .assert()
         .success();
     let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    let payload = if v.get("data").is_some() { &v["data"] } else { &v };
+    let payload = if v.get("data").is_some() {
+        &v["data"]
+    } else {
+        &v
+    };
     let block = payload["block"].as_str().unwrap();
     assert!(block.starts_with(START_MARKER), "{block}");
     assert!(block.ends_with(END_MARKER), "{block}");
@@ -357,7 +387,12 @@ fn oversized_backlog_is_bounded_trailered_and_advances_cursors() {
         post(tmp.path(), alice, &format!("feed {i} {}", "f".repeat(450)));
     }
     for i in 0..8 {
-        note(tmp.path(), alice, bob, &format!("note {i} {}", "n".repeat(900)));
+        note(
+            tmp.path(),
+            alice,
+            bob,
+            &format!("note {i} {}", "n".repeat(900)),
+        );
     }
 
     let out = cli(tmp.path())

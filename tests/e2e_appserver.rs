@@ -294,10 +294,7 @@ fn broker_happy_pipeline_spawn_wait_status_result_tail_gc() {
     let guard = common::BrokerGuard::new(&env.home);
     let brief = env.brief("summarize the repository\n");
 
-    let mut cmd = broker_cli(
-        &env,
-        &["--json", "spawn", "--lane", "general", "--cwd"],
-    );
+    let mut cmd = broker_cli(&env, &["--json", "spawn", "--lane", "general", "--cwd"]);
     cmd.arg(&env.work)
         .arg("--brief")
         .arg(&brief)
@@ -306,7 +303,8 @@ fn broker_happy_pipeline_spawn_wait_status_result_tail_gc() {
     assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
     let d = spawned.data();
     assert_eq!(
-        d["transport"], json!("app-server"),
+        d["transport"],
+        json!("app-server"),
         "`--transport auto` with a reachable broker is the live transport: {d}"
     );
     let id = d["id"].as_str().expect("an id").to_string();
@@ -329,9 +327,13 @@ fn broker_happy_pipeline_spawn_wait_status_result_tail_gc() {
     assert_eq!(status.code, 0, "status: {}", status.stderr);
     let s = status.data();
     assert_eq!(s["state"], json!("done"), "{s}");
-    let thread_id = s["thread_id"].as_str().expect("a thread of record").to_string();
+    let thread_id = s["thread_id"]
+        .as_str()
+        .expect("a thread of record")
+        .to_string();
     assert_eq!(
-        s["session_id"], json!(thread_id),
+        s["session_id"],
+        json!(thread_id),
         "thread.id IS the session id on this transport: {s}"
     );
     assert!(
@@ -347,7 +349,8 @@ fn broker_happy_pipeline_spawn_wait_status_result_tail_gc() {
     );
     assert_eq!(result.code, 0, "result: {}", result.stderr);
     assert_eq!(
-        result.data()["result"], json!("A2A-APPSERVER-OK"),
+        result.data()["result"],
+        json!("A2A-APPSERVER-OK"),
         "the final agent message IS the result on this transport"
     );
 
@@ -377,10 +380,12 @@ fn broker_happy_pipeline_spawn_wait_status_result_tail_gc() {
         "a reclaimed worker's directory is gone"
     );
     let index = std::fs::read_to_string(env.home.join("index.jsonl")).unwrap();
-    let tombstone: Value = serde_json::from_str(index.lines().next().expect("one tombstone")).unwrap();
+    let tombstone: Value =
+        serde_json::from_str(index.lines().next().expect("one tombstone")).unwrap();
     assert_eq!(tombstone["id"], json!(id.as_str()), "{tombstone}");
     assert_eq!(
-        tombstone["session_id"], json!(thread_id.as_str()),
+        tombstone["session_id"],
+        json!(thread_id.as_str()),
         "the tombstone is the last place the thread id exists — losing it would \
          strand the conversation on the codex side: {tombstone}"
     );
@@ -449,7 +454,11 @@ fn exec_fallback_pipeline_is_green_and_speaks_the_same_vocabulary() {
         result.stdout
     );
 
-    let tailed = run(exec_cli(&env, &["--json", "tail", &id]), &env.scratch, "tail");
+    let tailed = run(
+        exec_cli(&env, &["--json", "tail", &id]),
+        &env.scratch,
+        "tail",
+    );
     assert_eq!(tailed.code, 0, "tail: {}", tailed.stderr);
     assert_eq!(
         tail_vocabulary(&tailed),
@@ -518,7 +527,8 @@ fn broker_blocked_pipeline_parks_then_the_answer_converges_it() {
     assert_eq!(sent.code, 0, "send: {}", sent.stderr);
     assert_eq!(sent.data()["delivered"], json!(true), "{}", sent.stdout);
     assert_eq!(
-        sent.data()["send_path"], json!("started"),
+        sent.data()["send_path"],
+        json!("started"),
         "off a turn boundary there is nothing to steer: {}",
         sent.stdout
     );
@@ -539,7 +549,8 @@ fn broker_blocked_pipeline_parks_then_the_answer_converges_it() {
     );
     assert_eq!(result.code, 0, "result: {}", result.stderr);
     assert_eq!(
-        result.data()["result"], json!("A2A-ANSWERED-B"),
+        result.data()["result"],
+        json!("A2A-ANSWERED-B"),
         "an answered worker's result is the answer turn's own message"
     );
 
@@ -605,7 +616,9 @@ fn a_kill_dash_nine_broker_is_recovered_by_the_next_one() {
         nix::sys::signal::Signal::SIGKILL,
     )
     .unwrap();
-    until("the broker to be gone", || (!alive(broker_pid)).then_some(()));
+    until("the broker to be gone", || {
+        (!alive(broker_pid)).then_some(())
+    });
 
     // A crashed daemon leaves its address behind and nothing removes it here:
     // the next `broker run` must unlink it after a failed connect, and `status`
@@ -625,12 +638,21 @@ fn a_kill_dash_nine_broker_is_recovered_by_the_next_one() {
         "a live worker with no broker is orphaned: {}",
         orphan.stderr
     );
-    assert_eq!(orphan.data()["state"], json!("orphaned"), "{}", orphan.stdout);
+    assert_eq!(
+        orphan.data()["state"],
+        json!("orphaned"),
+        "{}",
+        orphan.stdout
+    );
 
     // The next daemon. No `FAKE_SCENARIO`, so this generation's model answers
     // instead of hanging — the same conversation, resumed, with a server that
     // now finishes what it is asked.
-    let restarted = run(broker_cli(&env, &["broker", "run"]), &env.scratch, "restart");
+    let restarted = run(
+        broker_cli(&env, &["broker", "run"]),
+        &env.scratch,
+        "restart",
+    );
     assert_eq!(restarted.code, 0, "broker run: {}", restarted.stderr);
     let new_pid = wait_for_broker(&env.home, Some(broker_pid));
     assert_ne!(new_pid, broker_pid, "a new daemon, not the corpse");
@@ -643,13 +665,15 @@ fn a_kill_dash_nine_broker_is_recovered_by_the_next_one() {
     assert_eq!(status.code, 0, "broker status: {}", status.stderr);
     let reconciled = status.data()["reconciled"].clone();
     assert_eq!(
-        reconciled["adopted"], json!([id.as_str()]),
+        reconciled["adopted"],
+        json!([id.as_str()]),
         "the orphan is adopted by the next daemon: {reconciled}"
     );
     // Scoped stray check: the ONE child this test's first daemon owned, named by
     // the pid its own worker recorded — never a scan for other people's fakes.
     assert_eq!(
-        reconciled["reaped"][0]["pid"], json!(child_pid),
+        reconciled["reaped"][0]["pid"],
+        json!(child_pid),
         "the reap names the previous instance's child: {reconciled}"
     );
     assert!(!alive(child_pid), "the previous app-server child is gone");
@@ -658,11 +682,13 @@ fn a_kill_dash_nine_broker_is_recovered_by_the_next_one() {
     // assertion: the worker is BACK IN `running`, under the new daemon.
     let readopted = until_state(&env.home, &id, "running");
     assert_eq!(
-        readopted["session_id"], json!(thread_id.as_str()),
+        readopted["session_id"],
+        json!(thread_id.as_str()),
         "the thread survived the crash: {readopted}"
     );
     assert_eq!(
-        readopted["epoch"], json!(2),
+        readopted["epoch"],
+        json!(2),
         "a resume is a new epoch on an old conversation: {readopted}"
     );
     assert!(
@@ -697,7 +723,9 @@ fn a_kill_dash_nine_broker_is_recovered_by_the_next_one() {
     );
     assert_eq!(result.code, 0, "result: {}", result.stderr);
     assert!(
-        result.data()["result"].as_str().is_some_and(|r| !r.is_empty()),
+        result.data()["result"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
         "a recovered worker produces a real result: {}",
         result.stdout
     );
@@ -777,7 +805,10 @@ fn real_codex_bin() -> PathBuf {
         .output()
         .expect("sh runs");
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(!path.is_empty(), "no `codex` on PATH — the gated smoke needs one");
+    assert!(
+        !path.is_empty(),
+        "no `codex` on PATH — the gated smoke needs one"
+    );
     PathBuf::from(path)
 }
 
@@ -916,11 +947,7 @@ fn real_codex_smoke_then_cross_transport_resume() {
         &env.scratch,
         "real-wait",
     );
-    assert_eq!(
-        waited.code, 0,
-        "wait: {} (worker {id})",
-        waited.stderr
-    );
+    assert_eq!(waited.code, 0, "wait: {} (worker {id})", waited.stderr);
 
     let status = run(
         real_cli(&env, &["--json", "status", &id]),
@@ -956,7 +983,10 @@ fn real_codex_smoke_then_cross_transport_resume() {
         "real-result",
     );
     assert_eq!(result.code, 0, "result: {}", result.stderr);
-    let text = result.data()["result"].as_str().unwrap_or_default().to_string();
+    let text = result.data()["result"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     eprintln!("app-server result: {text:?}");
     assert!(
         text.contains("A2A-P2-OK"),
@@ -1005,14 +1035,16 @@ fn real_codex_smoke_then_cross_transport_resume() {
     // `contains("tool")`-ing; the same normalization is applied here.
     assert!(
         evs.iter()
-            .any(|e| e["kind"] == "agent_message" && norm(&e["raw"]["item"]["type"]) == "agentmessage"),
+            .any(|e| e["kind"] == "agent_message"
+                && norm(&e["raw"]["item"]["type"]) == "agentmessage"),
         "no `item/completed{{item.type:agentMessage}}` reached the fold — \
          map_appserver_notification has drifted"
     );
     // `turn/completed` = `{threadId, turn}` with `TurnStatus`.
     assert!(
         evs.iter()
-            .any(|e| e["kind"] == "turn_completed" && e["raw"]["turn"]["status"] == json!("completed")),
+            .any(|e| e["kind"] == "turn_completed"
+                && e["raw"]["turn"]["status"] == json!("completed")),
         "no `turn/completed{{turn.status:completed}}` reached the fold — \
          map_appserver_notification has drifted"
     );
@@ -1073,7 +1105,10 @@ fn real_codex_smoke_then_cross_transport_resume() {
         "real-xt-result",
     );
     assert_eq!(result.code, 0, "result after resume: {}", result.stderr);
-    let text = result.data()["result"].as_str().unwrap_or_default().to_string();
+    let text = result.data()["result"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     eprintln!("cross-transport result: {text:?}");
     assert!(
         text.contains("A2A-XT-OK"),
@@ -1092,9 +1127,11 @@ fn real_codex_smoke_then_cross_transport_resume() {
         "the resumed epoch is a `codex exec` run with its own stream"
     );
     assert!(
-        events_of(&env.home, &id).iter().any(|e| e["epoch"] == json!(2)
-            && e["transport"] == json!("exec")
-            && e["kind"] == json!("agent_message")),
+        events_of(&env.home, &id)
+            .iter()
+            .any(|e| e["epoch"] == json!(2)
+                && e["transport"] == json!("exec")
+                && e["kind"] == json!("agent_message")),
         "the resumed worker's own words must arrive on the EXEC transport"
     );
 
@@ -1147,16 +1184,12 @@ fn real_codex_interrupt_parks_the_worker_as_interrupted() {
     // in the WAL is that fact, and waiting for it is what makes the three
     // attempts below about the model's timing rather than about the daemon's
     // startup.
-    until_within(
-        Duration::from_secs(180),
-        "a real turn to be open",
-        || {
-            events_of(&env.home, &id)
-                .iter()
-                .any(|e| e["kind"] == json!("turn_started"))
-                .then_some(())
-        },
-    );
+    until_within(Duration::from_secs(180), "a real turn to be open", || {
+        events_of(&env.home, &id)
+            .iter()
+            .any(|e| e["kind"] == json!("turn_started"))
+            .then_some(())
+    });
 
     let mut parked = None;
     for attempt in 1..=3 {
@@ -1212,7 +1245,10 @@ fn real_codex_interrupt_parks_the_worker_as_interrupted() {
     );
     // `a2a wait --until blocked` is how an orchestrator learns about it.
     let blocked = run(
-        real_cli(&env, &["wait", &id, "--until", "blocked", "--timeout", "30s"]),
+        real_cli(
+            &env,
+            &["wait", &id, "--until", "blocked", "--timeout", "30s"],
+        ),
         &env.scratch,
         "int-wait",
     );

@@ -1,7 +1,7 @@
-use assert_cmd::Command;
 use a2a::events::Transport;
 use a2a::fsm::WorkerState;
 use a2a::state::WorkerSnapshot;
+use assert_cmd::Command;
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -104,7 +104,12 @@ fn post_auto_registers_scans_before_cap_and_records_refs() {
         ])
         .assert()
         .success();
-    assert_eq!(String::from_utf8(out.get_output().stdout.clone()).unwrap().trim(), "1");
+    assert_eq!(
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .trim(),
+        "1"
+    );
 
     let entries = feed_json(tmp.path(), None);
     assert_eq!(entries.len(), 1);
@@ -121,7 +126,10 @@ fn post_auto_registers_scans_before_cap_and_records_refs() {
         .join(format!("claude-{session}"))
         .join("presence.json");
     assert!(presence.exists(), "posting auto-registers the caller");
-    assert_eq!(fs::metadata(&presence).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&presence).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
     let out = cli(tmp.path())
         .args(["--json", "mesh", "post", "--session", session, &secret])
@@ -207,7 +215,9 @@ fn feed_rotation_keeps_post_seqs_gapless_and_since_returns_the_new_generation() 
     assert!(root.join("feed.jsonl.1").exists(), "feed rotated");
     let live = fs::read_to_string(root.join("feed.jsonl")).unwrap();
     assert_eq!(
-        live.lines().filter(|line| line.contains("events_rotated")).count(),
+        live.lines()
+            .filter(|line| line.contains("events_rotated"))
+            .count(),
         1,
         "the fresh generation has exactly one rotation marker"
     );
@@ -273,15 +283,29 @@ fn note_to_peer_lands_private_fifo_and_inbox_consume_archives_it() {
         .assert()
         .success();
     cli(tmp.path())
-        .args(["mesh", "note", "--session", alice, &format!("claude:{bob}"), "-"])
+        .args([
+            "mesh",
+            "note",
+            "--session",
+            alice,
+            &format!("claude:{bob}"),
+            "-",
+        ])
         .write_stdin("hello bob\nsecond line")
         .assert()
         .success();
 
     let files = note_files(tmp.path(), "claude", bob);
     assert_eq!(files.len(), 1);
-    assert!(files[0].file_name().unwrap().to_string_lossy().starts_with("000001-"));
-    assert_eq!(fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(files[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("000001-"));
+    assert_eq!(
+        fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let note: Value = serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(note["from"], format!("claude:{alice}"));
     assert_eq!(note["to"], format!("claude:{bob}"));
@@ -319,7 +343,10 @@ fn note_to_peer_lands_private_fifo_and_inbox_consume_archives_it() {
         .unwrap(),
     )
     .unwrap();
-    assert!(presence["cursors"]["inbox"].as_str().unwrap().starts_with("000001-"));
+    assert!(presence["cursors"]["inbox"]
+        .as_str()
+        .unwrap()
+        .starts_with("000001-"));
 }
 
 #[test]
@@ -383,7 +410,11 @@ fn note_gates_scan_before_forgiving_cap_and_name_the_cap() {
     let too_big_secret = tmp.path().join("secret.txt");
     fs::write(
         &too_big_secret,
-        format!("ghp_{}\n{}", "a".repeat(40), "x".repeat(a2a::mesh::NOTE_MAX_BYTES + 1)),
+        format!(
+            "ghp_{}\n{}",
+            "a".repeat(40),
+            "x".repeat(a2a::mesh::NOTE_MAX_BYTES + 1)
+        ),
     )
     .unwrap();
     let out = cli(tmp.path())
@@ -496,7 +527,14 @@ fn note_to_retired_unknown_or_terminal_peer_warns_but_succeeds() {
         .success();
 
     let out = cli(tmp.path())
-        .args(["mesh", "note", "--session", alice, &format!("claude:{retired}"), "-"])
+        .args([
+            "mesh",
+            "note",
+            "--session",
+            alice,
+            &format!("claude:{retired}"),
+            "-",
+        ])
         .write_stdin("retired note")
         .assert()
         .success();
@@ -505,7 +543,14 @@ fn note_to_retired_unknown_or_terminal_peer_warns_but_succeeds() {
 
     let unknown = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
     let out = cli(tmp.path())
-        .args(["mesh", "note", "--session", alice, &format!("claude:{unknown}"), "-"])
+        .args([
+            "mesh",
+            "note",
+            "--session",
+            alice,
+            &format!("claude:{unknown}"),
+            "-",
+        ])
         .write_stdin("unknown note")
         .assert()
         .success();
@@ -538,14 +583,26 @@ fn roster_unions_presence_with_live_workers_and_unread_counts() {
         .assert()
         .success();
     cli(tmp.path())
-        .args(["mesh", "note", "--session", claude, &format!("claude:{claude}"), "-"])
+        .args([
+            "mesh",
+            "note",
+            "--session",
+            claude,
+            &format!("claude:{claude}"),
+            "-",
+        ])
         .write_stdin("self note")
         .assert()
         .success();
 
     let worker_id = "general-0824t2052-dddd";
     let codex_session = "99999999-5555-5555-5555-999999999999";
-    seed_worker(tmp.path(), worker_id, Some(codex_session), WorkerState::Running);
+    seed_worker(
+        tmp.path(),
+        worker_id,
+        Some(codex_session),
+        WorkerState::Running,
+    );
 
     let pending_id = "impl-0824t2052-eeee";
     seed_worker(tmp.path(), pending_id, None, WorkerState::Queued);
@@ -570,7 +627,13 @@ fn roster_unions_presence_with_live_workers_and_unread_counts() {
         .unwrap();
     assert_eq!(codex_row["provider"], "codex");
     assert_eq!(codex_row["worker_id"], worker_id);
-    assert!(codex_row["working_on"].as_str().unwrap().contains("general:"), "{codex_row}");
+    assert!(
+        codex_row["working_on"]
+            .as_str()
+            .unwrap()
+            .contains("general:"),
+        "{codex_row}"
+    );
     assert_eq!(codex_row["label"], "active");
 
     let pending = rows

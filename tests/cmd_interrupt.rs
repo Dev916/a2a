@@ -120,7 +120,10 @@ fn until_turn_started(home: &Path, allowed: &Path, scratch: &Path, id: &str) {
         if tailed.code != 0 {
             return None;
         }
-        let events = tailed.data()["events"].as_array().cloned().unwrap_or_default();
+        let events = tailed.data()["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         events
             .iter()
             .any(|e| e["kind"] == json!("turn_started"))
@@ -149,7 +152,15 @@ fn spawn_app_server(
     let mut cmd = a2a(
         home,
         allowed,
-        &["--json", "spawn", "--lane", "general", "--transport", "app-server", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "app-server",
+            "--cwd",
+        ],
     );
     cmd.arg(cwd)
         .arg("--brief")
@@ -185,7 +196,11 @@ fn interrupt_ends_a_live_turn_and_parks_the_worker_awaiting_input() {
     );
     assert_eq!(out.code, 0, "interrupt exits 0: {}", out.stderr);
     let d = out.data();
-    assert_eq!(d["noop"], json!(false), "a live turn was really interrupted: {d}");
+    assert_eq!(
+        d["noop"],
+        json!(false),
+        "a live turn was really interrupted: {d}"
+    );
     assert_eq!(d["state"], json!("awaiting-input"), "{d}");
 
     let parked = until_state(&home, &id, "awaiting-input");
@@ -196,7 +211,10 @@ fn interrupt_ends_a_live_turn_and_parks_the_worker_awaiting_input() {
         kinds_of(&home, &id)
     );
     assert!(
-        snap_of(&home, &id).unwrap().get("fold_rejections").is_none(),
+        snap_of(&home, &id)
+            .unwrap()
+            .get("fold_rejections")
+            .is_none(),
         "the interrupt commit is a legal row"
     );
 
@@ -225,7 +243,11 @@ fn interrupt_after_the_turn_is_over_is_a_zero_exit_noop() {
         &scratch,
         "interrupt",
     );
-    assert_eq!(out.code, 0, "a finished turn is not an error: {}", out.stderr);
+    assert_eq!(
+        out.code, 0,
+        "a finished turn is not an error: {}",
+        out.stderr
+    );
     let d = out.data();
     assert_eq!(d["noop"], json!(true), "{d}");
     assert_eq!(d["state"], json!("done"), "the worker is untouched: {d}");
@@ -259,7 +281,15 @@ fn interrupt_on_an_exec_worker_is_a_static_precondition() {
     let mut cmd = a2a(
         &home,
         tmp.path(),
-        &["--json", "spawn", "--lane", "general", "--transport", "exec", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "exec",
+            "--cwd",
+        ],
     );
     cmd.arg(&work)
         .arg("--brief")

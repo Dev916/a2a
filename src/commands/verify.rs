@@ -413,7 +413,9 @@ pub fn run(
             ExitCode::Precondition,
             format!("cannot read {}: {e}", brief_path.display()),
         )
-        .remedy("verify runs the brief's commands, so a worker without its brief cannot be verified")
+        .remedy(
+            "verify runs the brief's commands, so a worker without its brief cannot be verified",
+        )
     })?;
     if brief::sha256_hex(&brief_text) != snap.brief_sha {
         return Err(AppError::new(
@@ -424,7 +426,9 @@ pub fn run(
                 id
             ),
         )
-        .remedy("the brief is immutable after spawn; a2a will not run commands from an edited brief")
+        .remedy(
+            "the brief is immutable after spawn; a2a will not run commands from an edited brief",
+        )
         .data(json!({"id": id, "expected": snap.brief_sha})));
     }
     let parsed = brief::parse(&brief_text).map_err(|e| {
@@ -956,7 +960,10 @@ mod tests {
                 ran_by: RAN_BY,
             },
         ];
-        assert_eq!(plain_lines(&runs), "0 1234ms cargo test\n- 1000ms sleep 300");
+        assert_eq!(
+            plain_lines(&runs),
+            "0 1234ms cargo test\n- 1000ms sleep 300"
+        );
     }
 
     #[test]

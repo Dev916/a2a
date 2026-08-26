@@ -138,7 +138,10 @@ pub enum McpClass {
     BlockedTrackedSecrets { env_keys: Vec<String> },
     /// Refused: `reason` says why, `headers` names the headers involved (empty
     /// when the refusal is about the server's shape rather than its headers).
-    Untranslatable { reason: String, headers: Vec<String> },
+    Untranslatable {
+        reason: String,
+        headers: Vec<String>,
+    },
     /// The destination already has this table and the ledger does not own it.
     Unowned,
 }
@@ -215,10 +218,10 @@ pub fn source_path(claude_config_dir: &Path) -> PathBuf {
 /// would mean deciding what to write into somebody's home directory on the
 /// strength of half a file.
 pub fn read_source(claude_json: &Path) -> Result<Vec<SourceServer>, AppError> {
-    let text = match std::fs::read_to_string(claude_json) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::new(
+    let text =
+        match std::fs::read_to_string(claude_json) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(AppError::new(
                 "SYNC_CLAUDE_CONFIG_MISSING",
                 ExitCode::Precondition,
                 format!("{}: {e}", claude_json.display()),
@@ -226,10 +229,9 @@ pub fn read_source(claude_json: &Path) -> Result<Vec<SourceServer>, AppError> {
             .remedy(
                 "point --claude-config-dir (or [sync] claude_config_dir) at the directory that \
                  holds .claude.json",
-            ))
-        }
-        Err(e) => return Err(unreadable(claude_json, e)),
-    };
+            )),
+            Err(e) => return Err(unreadable(claude_json, e)),
+        };
     // Only the error's *shape* is reported, never a fragment of the file:
     // `serde_json` names a line and a column, which is all an operator needs
     // and all a 200 KB config of somebody else's secrets may contribute.
@@ -1461,7 +1463,10 @@ mod tests {
     #[test]
     fn classification_follows_the_pinned_order() {
         let allow: Vec<String> = vec![];
-        let bearer = http("neon", &[("Authorization", "Bearer aaaaaaaaaaaaaaaaaaaaaa")]);
+        let bearer = http(
+            "neon",
+            &[("Authorization", "Bearer aaaaaaaaaaaaaaaaaaaaaa")],
+        );
         assert_eq!(
             classify(&bearer, false, false, true, &allow),
             McpClass::BearerIndirect {
@@ -1486,7 +1491,13 @@ mod tests {
             McpClass::SecretFree
         );
         assert_eq!(
-            classify(&stdio("mx", &[("MX_MODE", "local")]), false, false, true, &allow),
+            classify(
+                &stdio("mx", &[("MX_MODE", "local")]),
+                false,
+                false,
+                true,
+                &allow
+            ),
             McpClass::SecretFree,
             "an innocent env value is writable even into a tracked file"
         );
@@ -1596,8 +1607,15 @@ mod tests {
             bearer_env_var("google-workspace"),
             "A2A_MCP_GOOGLE_WORKSPACE_TOKEN"
         );
-        assert_eq!(bearer_env_var("a..b"), "A2A_MCP_A_B_TOKEN", "a RUN collapses");
-        assert_eq!(header_env_var("ghl", "locationId"), "A2A_MCP_GHL_LOCATIONID");
+        assert_eq!(
+            bearer_env_var("a..b"),
+            "A2A_MCP_A_B_TOKEN",
+            "a RUN collapses"
+        );
+        assert_eq!(
+            header_env_var("ghl", "locationId"),
+            "A2A_MCP_GHL_LOCATIONID"
+        );
         assert_eq!(header_env_var("ghl", "X-Api-Key"), "A2A_MCP_GHL_X_API_KEY");
     }
 
@@ -1656,7 +1674,10 @@ mod tests {
         }
         .detail();
         assert!(detail.contains("http_headers locationId"), "{detail}");
-        assert!(detail.contains("X-Api-Key -> $A2A_MCP_GHL_X_API_KEY"), "{detail}");
+        assert!(
+            detail.contains("X-Api-Key -> $A2A_MCP_GHL_X_API_KEY"),
+            "{detail}"
+        );
     }
 
     /// Dispositions are the vocabulary every report and every AC quotes, so the
@@ -1703,7 +1724,10 @@ mod tests {
             !target_is_tracked(&repo),
             "a plain directory is not a repository"
         );
-        assert!(!target_is_tracked(&tmp.path().join("nope")), "nor is nothing");
+        assert!(
+            !target_is_tracked(&tmp.path().join("nope")),
+            "nor is nothing"
+        );
 
         let nowhere = tmp.path().join("no-such-gitconfig");
         let git = |args: &[&str]| {
@@ -1750,12 +1774,14 @@ mod tests {
     #[test]
     fn the_destination_hash_is_content_not_formatting() {
         let doc = |text: &str| text.parse::<DocumentMut>().expect("the fixture parses");
-        let plain = doc("[mcp_servers.neon]\nurl = \"https://x/mcp\"\nbearer_token_env_var = \"V\"\n");
+        let plain =
+            doc("[mcp_servers.neon]\nurl = \"https://x/mcp\"\nbearer_token_env_var = \"V\"\n");
         let fussed = doc(
             "# a human's note\n[mcp_servers.neon]\nbearer_token_env_var   =   \"V\"   # why\n\n\
              url = 'https://x/mcp'\n",
         );
-        let changed = doc("[mcp_servers.neon]\nurl = \"https://y/mcp\"\nbearer_token_env_var = \"V\"\n");
+        let changed =
+            doc("[mcp_servers.neon]\nurl = \"https://y/mcp\"\nbearer_token_env_var = \"V\"\n");
 
         let hash = |d: &DocumentMut| dest_hash(d, "neon").expect("the table is there");
         assert_eq!(
@@ -1769,7 +1795,9 @@ mod tests {
         // The same projection whichever shape the destination uses, so a table
         // a human wrote inline is not reported as drift the moment a2a adopts
         // it.
-        let inline_form = doc("[mcp_servers]\nneon = { url = \"https://x/mcp\", bearer_token_env_var = \"V\" }\n");
+        let inline_form = doc(
+            "[mcp_servers]\nneon = { url = \"https://x/mcp\", bearer_token_env_var = \"V\" }\n",
+        );
         assert_eq!(hash(&inline_form), hash(&plain));
         assert_eq!(
             canonical_table_hash(
@@ -1831,7 +1859,11 @@ mod tests {
         let SourceTransport::Stdio { args, env, .. } = &servers[1].transport else {
             panic!("b is stdio");
         };
-        assert_eq!(args, &["x", "8080"], "a non-string arg is rendered, not lost");
+        assert_eq!(
+            args,
+            &["x", "8080"],
+            "a non-string arg is rendered, not lost"
+        );
         assert_eq!(env["PORT"], "8080");
         assert_eq!(servers[3].transport, SourceTransport::Unknown);
         assert!(

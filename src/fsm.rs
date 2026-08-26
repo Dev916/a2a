@@ -99,26 +99,42 @@ pub enum FailureClass {
 pub enum FsmEvent {
     /// Genesis ONLY — the fold applies it to create a worker (Task 9);
     /// `step` rejects it from every state.
-    Spawn { id: String },
+    Spawn {
+        id: String,
+    },
     /// queued → spawned (Phase 2 admission; Phase 1 never enters queued).
     Admit,
-    ProcessStarted { pid: u32, start_witness: String },
+    ProcessStarted {
+        pid: u32,
+        start_witness: String,
+    },
     /// running → running (records the codex session/rollout ids).
     SessionIdentified {
         session_id: String,
         rollout_path: Option<String>,
     },
-    TurnEnded { has_result: bool, has_question: bool },
-    ResultInvalid { detail: String },
-    ProcessExited { code: Option<i32> },
+    TurnEnded {
+        has_result: bool,
+        has_question: bool,
+    },
+    ResultInvalid {
+        detail: String,
+    },
+    ProcessExited {
+        code: Option<i32>,
+    },
     /// Emitted by reconcile: a resumed process died before its first turn.
     SessionMissing,
-    Timeout { kind: TimeoutKind },
+    Timeout {
+        kind: TimeoutKind,
+    },
     Interrupt,
     Kill,
     OrphanDetected,
     /// Non-running (including terminal) → running, epoch+1.
-    Resume { answer_queued: bool },
+    Resume {
+        answer_queued: bool,
+    },
     Send,
 }
 

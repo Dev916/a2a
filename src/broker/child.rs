@@ -523,7 +523,10 @@ mod tests {
             assert!(low < nominal && nominal < high, "band brackets the nominal");
             for _ in 0..64 {
                 let d = p.backoff(attempt);
-                assert!(d >= low && d <= high, "attempt {attempt}: {d:?} outside the band");
+                assert!(
+                    d >= low && d <= high,
+                    "attempt {attempt}: {d:?} outside the band"
+                );
             }
         }
         // ... and it is actually random: two draws in a row being identical is
@@ -547,7 +550,11 @@ mod tests {
         loop {
             let n = budget.record(Instant::now());
             if budget.exceeded() {
-                assert_eq!(n, policy.max_restarts + 1, "the 4th is the one that latches");
+                assert_eq!(
+                    n,
+                    policy.max_restarts + 1,
+                    "the 4th is the one that latches"
+                );
                 break;
             }
             attempts += 1;
@@ -569,7 +576,11 @@ mod tests {
         let policy = RestartPolicy::default();
         let mut budget = RestartBudget::new(policy);
         for _ in 0..10 {
-            assert_eq!(budget.record(Instant::now()), 1, "each is alone in its window");
+            assert_eq!(
+                budget.record(Instant::now()),
+                1,
+                "each is alone in its window"
+            );
             assert!(!budget.exceeded());
             tokio::time::sleep(policy.window + Duration::from_secs(1)).await;
         }
@@ -627,10 +638,16 @@ mod tests {
         // The default is a claim about production, so it is asserted directly.
         assert_eq!(DEFAULT_PROBE_MS, 30_000);
         assert_eq!(PROBE_METHOD, "thread/loaded/list");
-        assert_eq!(DEFAULT_REPROMOTION_MS, 300_000, "spec §4.2: a 5-minute probe");
+        assert_eq!(
+            DEFAULT_REPROMOTION_MS, 300_000,
+            "spec §4.2: a 5-minute probe"
+        );
         // Parsing, without touching the process environment (which is shared by
         // every test in this binary).
-        assert_eq!(interval_from_env("A2A_TEST_NOT_SET_ANYWHERE", 1234), Duration::from_millis(1234));
+        assert_eq!(
+            interval_from_env("A2A_TEST_NOT_SET_ANYWHERE", 1234),
+            Duration::from_millis(1234)
+        );
     }
 
     // -- env forwarding ------------------------------------------------------
@@ -664,20 +681,29 @@ mod tests {
             ..at_start.clone()
         };
         let detail = at_start.drift_from(&upgraded).expect("an upgrade is drift");
-        assert!(detail.contains("0.140.0") && detail.contains("0.147.0"), "{detail}");
+        assert!(
+            detail.contains("0.140.0") && detail.contains("0.147.0"),
+            "{detail}"
+        );
 
         let moved = CodexIdentity {
             path: PathBuf::from("/opt/codex"),
             ..at_start.clone()
         };
-        assert!(at_start.drift_from(&moved).is_some(), "a moved binary is drift");
+        assert!(
+            at_start.drift_from(&moved).is_some(),
+            "a moved binary is drift"
+        );
 
         let unknown = CodexIdentity {
             path: at_start.path.clone(),
             version: None,
         };
         assert_eq!(unknown.drift_from(&unknown.clone()), None);
-        assert!(unknown.drift_from(&at_start).is_some(), "unknown → known is drift");
+        assert!(
+            unknown.drift_from(&at_start).is_some(),
+            "unknown → known is drift"
+        );
     }
 
     /// A binary that answers `--version` is read (first non-empty line); one
@@ -687,7 +713,10 @@ mod tests {
         let id = CodexIdentity::resolve(Path::new("/bin/echo"), &[]);
         assert_eq!(id.path, PathBuf::from("/bin/echo"));
         let version = id.version.expect("echo answers something");
-        assert!(!version.is_empty() && !version.contains('\n'), "{version:?}");
+        assert!(
+            !version.is_empty() && !version.contains('\n'),
+            "{version:?}"
+        );
         assert_eq!(
             CodexIdentity::resolve(Path::new("/definitely/not/a/binary"), &[]).version,
             None

@@ -237,7 +237,11 @@ impl World {
     /// Steer a `hang-turn` worker so its turn completes with `FAKE_MESSAGE`.
     fn finish(&self, id: &str, tag: &str) {
         self.until_state(id, "running");
-        let ran = run(self.cli(&["--json", "send", id, "finish up"]), &self.scratch, tag);
+        let ran = run(
+            self.cli(&["--json", "send", id, "finish up"]),
+            &self.scratch,
+            tag,
+        );
         assert_eq!(ran.code, 0, "send {id}: {} {}", ran.stdout, ran.stderr);
     }
 
@@ -248,14 +252,22 @@ impl World {
         let ran = run(self.cli(&["broker", "run"]), &self.scratch, "broker-run");
         assert_eq!(ran.code, 0, "broker run: {} {}", ran.stdout, ran.stderr);
         until("the daemon to answer `broker status`", || {
-            let ran = run(self.cli(&["--json", "broker", "status"]), &self.scratch, "status-up");
+            let ran = run(
+                self.cli(&["--json", "broker", "status"]),
+                &self.scratch,
+                "status-up",
+            );
             (ran.code == 0).then_some(())
         });
     }
 
     /// One `broker status --json` sample. `None` once the daemon is gone.
     fn status_now(&self, tag: &str) -> Option<Value> {
-        let ran = run(self.cli(&["--json", "broker", "status"]), &self.scratch, tag);
+        let ran = run(
+            self.cli(&["--json", "broker", "status"]),
+            &self.scratch,
+            tag,
+        );
         (ran.code == 0).then(|| ran.data())
     }
 
@@ -297,7 +309,9 @@ fn assert_line_shape(line: &Value) {
     }
     assert_eq!(line["kind"], json!("state_change"), "{line}");
     assert!(
-        line["ts"].as_str().is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+        line["ts"]
+            .as_str()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
         "`ts` is rfc3339: {line}"
     );
     assert!(
@@ -308,9 +322,14 @@ fn assert_line_shape(line: &Value) {
         line["event"].as_str().is_some_and(|s| !s.is_empty()),
         "`event` is a non-empty string: {line}"
     );
-    assert!(line["epoch"].as_u64().is_some(), "`epoch` is a number: {line}");
+    assert!(
+        line["epoch"].as_u64().is_some(),
+        "`epoch` is a number: {line}"
+    );
     for key in ["from", "to"] {
-        let s = line[key].as_str().unwrap_or_else(|| panic!("`{key}` is a string: {line}"));
+        let s = line[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{key}` is a string: {line}"));
         assert!(
             STATES.contains(&s),
             "`{key}` is a WorkerState::as_str() spelling, got {s:?}: {line}"
@@ -373,7 +392,10 @@ fn broker_jsonl_carries_one_state_change_line_per_transition() {
     // starts where genesis put the worker, and no line is a self-loop.
     assert_eq!(lines[0]["from"], json!("spawned"), "{lines:?}");
     for pair in lines.windows(2) {
-        assert_eq!(pair[1]["from"], pair[0]["to"], "the chain is contiguous: {lines:?}");
+        assert_eq!(
+            pair[1]["from"], pair[0]["to"],
+            "the chain is contiguous: {lines:?}"
+        );
     }
     for line in &lines {
         assert_ne!(line["from"], line["to"], "no line for a self-loop: {line}");
@@ -431,7 +453,9 @@ fn the_core_writes_the_two_transitions_the_actor_never_sees() {
     assert_eq!(killed.code, 0, "kill: {} {}", killed.stdout, killed.stderr);
     w.until_state(&third, "cancelled");
     let cancel = until("the queued worker's cancel line", || {
-        w.transitions(&third).into_iter().find(|l| l["to"] == json!("cancelled"))
+        w.transitions(&third)
+            .into_iter()
+            .find(|l| l["to"] == json!("cancelled"))
     });
     assert_line_shape(&cancel);
     assert_eq!(cancel["from"], json!("queued"), "{cancel}");
@@ -555,7 +579,11 @@ fn a_fleet_of_four_survives_a_cap_of_two_and_broker_jsonl_tells_the_story() {
                 let w = &w;
                 scope.spawn(move || {
                     let mut cmd = w.cli(&["--json", "spawn", "--lane"]);
-                    cmd.arg(lane).arg("--cwd").arg(cwd).arg("--brief").arg(brief);
+                    cmd.arg(lane)
+                        .arg("--cwd")
+                        .arg(cwd)
+                        .arg("--brief")
+                        .arg(brief);
                     if *tag == "w1" {
                         cmd.env("A2A_LANES_GENERAL_MAX_TURNS", "0");
                     } else if *tag == "w2" {
@@ -617,7 +645,10 @@ fn a_fleet_of_four_survives_a_cap_of_two_and_broker_jsonl_tells_the_story() {
     // --- final states: exactly one failed{budget_exhausted}, the rest done.
     let rows = w.rows();
     assert_eq!(rows.len(), 4, "four workers, no more: {rows:?}");
-    let failed: Vec<&Value> = rows.iter().filter(|r| r["state"] == json!("failed")).collect();
+    let failed: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["state"] == json!("failed"))
+        .collect();
     assert_eq!(failed.len(), 1, "exactly one failure: {rows:?}");
     assert_eq!(failed[0]["id"], json!(w1), "{rows:?}");
     assert_eq!(
@@ -637,11 +668,17 @@ fn a_fleet_of_four_survives_a_cap_of_two_and_broker_jsonl_tells_the_story() {
     //     JSON" is asserted by reading it at all.
     let mut queued_born = 0usize;
     for id in [&w1, &w2, &w3, &rid] {
-        let lines = until(&format!("worker {id}'s transitions to reach its final state"), || {
-            let lines = w.transitions(id);
-            let final_state = w.snap(id).map(|s| s["state"].clone())?;
-            lines.last().filter(|l| l["to"] == final_state).map(|_| lines.clone())
-        });
+        let lines = until(
+            &format!("worker {id}'s transitions to reach its final state"),
+            || {
+                let lines = w.transitions(id);
+                let final_state = w.snap(id).map(|s| s["state"].clone())?;
+                lines
+                    .last()
+                    .filter(|l| l["to"] == final_state)
+                    .map(|_| lines.clone())
+            },
+        );
         for line in &lines {
             assert_line_shape(line);
             assert_ne!(line["from"], line["to"], "no line for a self-loop: {line}");
@@ -684,7 +721,10 @@ fn a_fleet_of_four_survives_a_cap_of_two_and_broker_jsonl_tells_the_story() {
     if let Some(pid) = child_pid {
         let left = command_of(pid);
         assert!(
-            !left.as_deref().unwrap_or_default().contains("fake-app-server"),
+            !left
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fake-app-server"),
             "the daemon's app-server child outlived it: pid {pid} is {left:?}"
         );
     }
@@ -747,12 +787,37 @@ fn assert_phase5_keys_default() {
     }
 
     // ...and the values behind them are the documented defaults.
-    assert_eq!(data["admission"]["breaker_failures"], json!(5), "{}", ran.stdout);
-    assert_eq!(data["admission"]["breaker_window_secs"], json!(300), "{}", ran.stdout);
-    assert_eq!(data["admission"]["max_attempts"], json!(3), "{}", ran.stdout);
-    assert_eq!(data["broker"]["events_max_bytes"], json!(10_485_760), "{}", ran.stdout);
+    assert_eq!(
+        data["admission"]["breaker_failures"],
+        json!(5),
+        "{}",
+        ran.stdout
+    );
+    assert_eq!(
+        data["admission"]["breaker_window_secs"],
+        json!(300),
+        "{}",
+        ran.stdout
+    );
+    assert_eq!(
+        data["admission"]["max_attempts"],
+        json!(3),
+        "{}",
+        ran.stdout
+    );
+    assert_eq!(
+        data["broker"]["events_max_bytes"],
+        json!(10_485_760),
+        "{}",
+        ran.stdout
+    );
     for lane in ["impl", "review", "research", "general"] {
-        assert_eq!(data["lanes"][lane]["auto_review"], json!(false), "{}", ran.stdout);
+        assert_eq!(
+            data["lanes"][lane]["auto_review"],
+            json!(false),
+            "{}",
+            ran.stdout
+        );
         assert!(
             data["lanes"][lane]["max_turns"].as_u64().is_some(),
             "lanes.{lane}.max_turns is a number: {}",

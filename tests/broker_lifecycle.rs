@@ -296,9 +296,7 @@ fn until_blocking(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
 fn requests_after_last_initialize(transcript: &[Value], method: &str) -> Vec<Value> {
     let last_init = transcript
         .iter()
-        .rposition(|rec| {
-            rec["dir"] == "in" && rec["frame"]["method"] == "initialize"
-        })
+        .rposition(|rec| rec["dir"] == "in" && rec["frame"]["method"] == "initialize")
         .unwrap_or(0);
     transcript[last_init..]
         .iter()
@@ -322,7 +320,10 @@ async fn a_worker_registered_with_the_core_is_demuxed_all_the_way_to_done() {
     let snap = h.core.spawn_worker(&dir).await.unwrap();
     assert_eq!(snap.state, WorkerState::Spawned, "registered as spawned");
     let running = h.until_state(&id, WorkerState::Running).await;
-    let thread_id = running.session_id.clone().expect("the actor opened a thread");
+    let thread_id = running
+        .session_id
+        .clone()
+        .expect("the actor opened a thread");
 
     assert_eq!(
         h.core.send(&id, "do the thing").await.unwrap(),
@@ -410,7 +411,10 @@ async fn broker_scoped_and_unroutable_frames_are_recorded_not_dropped() {
             "configWarning"
         ]
     );
-    assert_eq!(health.notices[0].params["rateLimits"]["primary"]["usedPercent"], json!(12.5));
+    assert_eq!(
+        health.notices[0].params["rateLimits"]["primary"]["usedPercent"],
+        json!(12.5)
+    );
     assert_eq!(health.generation, 1);
     assert_eq!(health.degraded, None);
     assert!(health.child_pid.is_some());
@@ -418,7 +422,10 @@ async fn broker_scoped_and_unroutable_frames_are_recorded_not_dropped() {
     let lines = h
         .until("broker.jsonl to carry both kinds", || async {
             let lines = h.broker_jsonl();
-            let scoped = lines.iter().filter(|l| l["kind"] == "broker_scoped").count();
+            let scoped = lines
+                .iter()
+                .filter(|l| l["kind"] == "broker_scoped")
+                .count();
             let unroutable = lines.iter().any(|l| l["kind"] == "unroutable");
             (scoped == 3 && unroutable).then_some(lines)
         })
@@ -437,7 +444,12 @@ async fn broker_scoped_and_unroutable_frames_are_recorded_not_dropped() {
 /// `broker.jsonl`. Either way it is ANSWERED: a dropped one is a permanent hang.
 #[tokio::test(flavor = "multi_thread")]
 async fn server_requests_are_answered_and_logged_where_they_belong() {
-    let h = Harness::start("server-request", &[("FAKE_MESSAGE", "APPROVED?")], Harness::quick()).await;
+    let h = Harness::start(
+        "server-request",
+        &[("FAKE_MESSAGE", "APPROVED?")],
+        Harness::quick(),
+    )
+    .await;
     let (id, dir) = h.seed_worker(Lane::General);
     h.core.spawn_worker(&dir).await.unwrap();
     h.until_state(&id, WorkerState::Running).await;
@@ -496,11 +508,22 @@ async fn server_requests_are_answered_and_logged_where_they_belong() {
 /// `AdapterRef` would be writing into a dead process's stdin.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_survives_its_transport_dying_mid_turn() {
-    let h = Harness::start("crash-mid-turn", &[("FAKE_MESSAGE", "AFTER")], Harness::quick()).await;
+    let h = Harness::start(
+        "crash-mid-turn",
+        &[("FAKE_MESSAGE", "AFTER")],
+        Harness::quick(),
+    )
+    .await;
     let (id, dir) = h.seed_worker(Lane::General);
     h.core.spawn_worker(&dir).await.unwrap();
     let running = h.until_state(&id, WorkerState::Running).await;
-    let first_pid = h.core.idle().await.unwrap().child_pid.expect("a live child");
+    let first_pid = h
+        .core
+        .idle()
+        .await
+        .unwrap()
+        .child_pid
+        .expect("a live child");
     assert_eq!(running.pid, Some(first_pid), "the SHARED child's pid");
 
     // The turn starts, and the child dies inside it.
@@ -521,7 +544,11 @@ async fn a_worker_survives_its_transport_dying_mid_turn() {
     // The snapshot followed the pid, so a later kill aims at the right process.
     let snap = h
         .until("the snapshot to follow the new child", || async {
-            h.core.status(&id).await.ok().filter(|s| s.pid == Some(second_pid))
+            h.core
+                .status(&id)
+                .await
+                .ok()
+                .filter(|s| s.pid == Some(second_pid))
         })
         .await;
     assert_eq!(snap.state, WorkerState::Running, "the worker never failed");
@@ -556,7 +583,10 @@ async fn a_worker_survives_its_transport_dying_mid_turn() {
     let turns = requests_after_last_initialize(&transcript, "turn/start");
     let post_restart = turns.last().expect("a turn started after the restart");
     assert_eq!(post_restart["approvalPolicy"], json!("never"));
-    assert_eq!(post_restart["sandboxPolicy"]["type"], json!("workspaceWrite"));
+    assert_eq!(
+        post_restart["sandboxPolicy"]["type"],
+        json!("workspaceWrite")
+    );
     assert!(
         post_restart["sandboxPolicy"]["writableRoots"]
             .as_array()
@@ -572,7 +602,12 @@ async fn a_worker_survives_its_transport_dying_mid_turn() {
 /// has to notice — and re-`send` through — is an outage that lost a message.
 #[tokio::test(flavor = "multi_thread")]
 async fn work_queued_while_the_transport_was_down_is_re_delivered() {
-    let h = Harness::start("crash-mid-turn", &[("FAKE_MESSAGE", "RESUMED")], Harness::quick()).await;
+    let h = Harness::start(
+        "crash-mid-turn",
+        &[("FAKE_MESSAGE", "RESUMED")],
+        Harness::quick(),
+    )
+    .await;
     let (id, dir) = h.seed_worker(Lane::General);
     h.core.spawn_worker(&dir).await.unwrap();
     h.until_state(&id, WorkerState::Running).await;
@@ -645,7 +680,10 @@ async fn a_child_that_always_dies_latches_degraded_after_three_restarts() {
     let elapsed = started.elapsed();
 
     assert_eq!(health.degraded.as_deref(), Some("exec"));
-    assert_eq!(health.restarts, 3, "spec §4.2: three restarts, then degrade");
+    assert_eq!(
+        health.restarts, 3,
+        "spec §4.2: three restarts, then degrade"
+    );
     assert!(health.degraded_since.is_some());
     assert!(
         health
@@ -656,7 +694,9 @@ async fn a_child_that_always_dies_latches_degraded_after_three_restarts() {
         health.degraded_reason
     );
     // ... and it will try again, rather than staying degraded forever.
-    let next = health.next_promotion_probe_at.expect("a re-promotion probe is scheduled");
+    let next = health
+        .next_promotion_probe_at
+        .expect("a re-promotion probe is scheduled");
     assert!(next > Utc::now(), "the probe is in the future");
 
     // The backoff is real: 500ms + 1s + 2s nominal, jittered ±25%.
@@ -691,7 +731,13 @@ async fn a_wedged_child_is_declared_dead_by_the_liveness_probe() {
         },
     )
     .await;
-    let first_pid = h.core.idle().await.unwrap().child_pid.expect("a live child");
+    let first_pid = h
+        .core
+        .idle()
+        .await
+        .unwrap()
+        .child_pid
+        .expect("a live child");
 
     let idle = h
         .until("the probe to notice a wedged child", || async {
@@ -723,7 +769,13 @@ async fn a_worker_whose_thread_cannot_be_resumed_is_orphaned() {
 
     // Kill the child out from under the broker: a real death, not a simulated
     // one, so the whole supervision path runs.
-    let pid = h.core.idle().await.unwrap().child_pid.expect("a live child");
+    let pid = h
+        .core
+        .idle()
+        .await
+        .unwrap()
+        .child_pid
+        .expect("a live child");
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGKILL,
@@ -830,7 +882,10 @@ async fn the_broker_socket_is_0600_and_the_handshake_is_one_frame_shape() {
 
     assert_eq!(hello["v"], json!(1), "every frame carries the wire version");
     assert_eq!(hello["type"], json!("hello"));
-    assert_eq!(hello["body"]["protocol_version"], json!(wire::protocol_version()));
+    assert_eq!(
+        hello["body"]["protocol_version"],
+        json!(wire::protocol_version())
+    );
     assert_eq!(hello["body"]["binary_version"], json!(wire::BINARY_VERSION));
 
     assert_eq!(listed["type"], json!("resp"));
@@ -869,7 +924,10 @@ async fn a_frame_over_the_cap_is_refused_with_a_typed_error_and_the_connection_c
         json!(wire::MAX_FRAME_BYTES),
         "the error names the cap it hit"
     );
-    assert!(after.is_none(), "the connection is closed, not merely scolded");
+    assert!(
+        after.is_none(),
+        "the connection is closed, not merely scolded"
+    );
     h.stop().await;
 }
 
@@ -905,9 +963,15 @@ async fn a_skewed_hello_is_refused_with_the_live_worker_count_and_can_only_drain
         json!(1),
         "the count is the whole point: a live worker forbids the respawn"
     );
-    assert_eq!(err["body"]["broker_protocol_version"], json!(wire::protocol_version()));
+    assert_eq!(
+        err["body"]["broker_protocol_version"],
+        json!(wire::protocol_version())
+    );
     assert_eq!(err["body"]["client_protocol_version"], json!(skewed));
-    assert_eq!(err["body"]["broker_binary_version"], json!(wire::BINARY_VERSION));
+    assert_eq!(
+        err["body"]["broker_binary_version"],
+        json!(wire::BINARY_VERSION)
+    );
     assert_eq!(err["body"]["client_binary_version"], json!("0.0.1"));
     assert_eq!(err["body"]["exit"], json!(7));
 
@@ -936,7 +1000,9 @@ async fn one_subscription_per_connection_streams_a_workers_envelopes() {
     let worker = id.clone();
     let (second, path, kinds) = tokio::task::spawn_blocking(move || {
         let mut client = brokerclient::connect(&home).expect("the sync client handshakes");
-        client.subscribe().expect("the first subscription is accepted");
+        client
+            .subscribe()
+            .expect("the first subscription is accepted");
         let second = client.subscribe().expect_err("the second is not");
 
         let path = client
@@ -948,7 +1014,10 @@ async fn one_subscription_per_connection_streams_a_workers_envelopes() {
         while std::time::Instant::now() < deadline {
             match client.next_event(Duration::from_millis(500)).unwrap() {
                 Some(event) => {
-                    assert_eq!(event.worker, worker, "events name the worker they belong to");
+                    assert_eq!(
+                        event.worker, worker,
+                        "events name the worker they belong to"
+                    );
                     kinds.push(format!("{:?}", event.envelope.kind));
                     if event.envelope.kind == EventKind::TurnCompleted {
                         break;
@@ -1060,7 +1129,11 @@ fn a_version_skew_with_no_live_workers_drains_and_respawns_the_broker() {
     )
     .unwrap();
 
-    assert_eq!(out["ok"], json!(true), "the respawn made the call work: {out}");
+    assert_eq!(
+        out["ok"],
+        json!(true),
+        "the respawn made the call work: {out}"
+    );
     assert_eq!(
         out["data"]["protocol_version"],
         json!(42),
@@ -1231,7 +1304,8 @@ fn sigterm_orphans_live_workers_tells_tails_and_leaves_nothing_behind() {
     // Both workers have a live turn before anything is signalled: orphaning a
     // worker that never started would prove nothing.
     until_blocking("both workers to be running", 20, || {
-        ids.iter().all(|id| state_of(&home, id).as_deref() == Some("running"))
+        ids.iter()
+            .all(|id| state_of(&home, id).as_deref() == Some("running"))
     });
 
     // A tail, on a raw connection, collecting until the far end goes away.
@@ -1367,7 +1441,12 @@ fn a_worker_awaiting_input_keeps_an_idle_broker_alive() {
     });
 
     broker_call(&home, tmp.path(), "spawn", json!({"dir": dir}));
-    broker_call(&home, tmp.path(), "send", json!({"id": id, "text": "which one?"}));
+    broker_call(
+        &home,
+        tmp.path(),
+        "send",
+        json!({"id": id, "text": "which one?"}),
+    );
     broker_call(&home, tmp.path(), "interrupt", json!({"id": id}));
     until_blocking("the worker to reach awaiting-input", 20, || {
         state_of(&home, &id).as_deref() == Some("awaiting-input")

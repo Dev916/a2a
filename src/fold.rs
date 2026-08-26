@@ -626,7 +626,10 @@ mod tests {
                 "session_identified",
             ),
             (json!({"fsm":"TurnEnded"}), "turn_ended"),
-            (json!({"fsm":"ResultInvalid","detail":"d"}), "result_invalid"),
+            (
+                json!({"fsm":"ResultInvalid","detail":"d"}),
+                "result_invalid",
+            ),
             (json!({"fsm":"ProcessExited","code":1}), "process_exited"),
             (json!({"fsm":"SessionMissing"}), "session_missing"),
             (json!({"fsm":"Timeout","kind":"blocked"}), "timeout"),
@@ -649,7 +652,10 @@ mod tests {
         // `send` to a spawned worker is a rejection, not a panic and not an error
         let after = fold(snap, &[ev(json!({"fsm":"Send"}), 1, 1)], Utc::now());
         assert_eq!(after.state, WorkerState::Spawned);
-        assert_eq!(after.last_applied_seq, 1, "a rejected event still consumes its seq");
+        assert_eq!(
+            after.last_applied_seq, 1,
+            "a rejected event still consumes its seq"
+        );
         let rejections = after.extra["fold_rejections"].as_array().unwrap();
         assert_eq!(rejections.len(), 1);
         assert_eq!(rejections[0]["event"], json!("send"));
@@ -803,7 +809,11 @@ mod tests {
                 turn1,
                 turn2,
                 // The worker has to be terminal for `Resume` to be legal.
-                ev(json!({"fsm":"ProcessStarted","pid":1,"start_witness":"w"}), 1, 4),
+                ev(
+                    json!({"fsm":"ProcessStarted","pid":1,"start_witness":"w"}),
+                    1,
+                    4,
+                ),
                 ev(json!({"fsm":"ProcessExited","code":0}), 1, 5),
                 ev(json!({"fsm":"Resume","answer_queued":false}), 1, 6),
             ],
@@ -854,7 +864,10 @@ mod tests {
             Utc::now(),
         );
         let wt = after.worktree.clone().expect("all four keys present");
-        assert_eq!(wt.path, std::path::Path::new("/home/worktrees/impl-0817t1200-aaaa"));
+        assert_eq!(
+            wt.path,
+            std::path::Path::new("/home/worktrees/impl-0817t1200-aaaa")
+        );
         assert_eq!(wt.branch, "a2a/impl/impl-0817t1200-aaaa");
         assert_eq!(wt.base_ref, base);
         assert_eq!(wt.repo, std::path::Path::new("/repo"));
@@ -905,11 +918,17 @@ mod tests {
                 "worktree_repo",
             ] {
                 if k != missing {
-                    keys.insert(k.to_string(), json!(if k == "worktree_base_ref" { base } else { "x" }));
+                    keys.insert(
+                        k.to_string(),
+                        json!(if k == "worktree_base_ref" { base } else { "x" }),
+                    );
                 }
             }
             let partial = seeded(serde_json::Value::Object(keys));
-            assert_eq!(partial.worktree, None, "missing {missing} must not build a worktree");
+            assert_eq!(
+                partial.worktree, None,
+                "missing {missing} must not build a worktree"
+            );
         }
 
         // ...and when the worktree keys are complete but `base_ref` is absent,
@@ -956,7 +975,10 @@ mod tests {
         assert_eq!(folded(genesis(Some(true)), &[]).state, WorkerState::Queued);
         // Absent and explicitly-false are the same worker: the Phase-1 shape.
         assert_eq!(folded(genesis(None), &[]).state, WorkerState::Spawned);
-        assert_eq!(folded(genesis(Some(false)), &[]).state, WorkerState::Spawned);
+        assert_eq!(
+            folded(genesis(Some(false)), &[]).state,
+            WorkerState::Spawned
+        );
 
         // Admission, then the ordinary start flow — no rejections anywhere.
         let admitted = folded(
@@ -1006,7 +1028,10 @@ mod tests {
         );
         assert_eq!(after.thread_id.as_deref(), Some("thread-7"));
         assert_eq!(after.session_id.as_deref(), Some("thread-7"));
-        assert_eq!(after.extra["resolved_sandbox"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            after.extra["resolved_sandbox"]["type"],
+            json!("workspaceWrite")
+        );
         assert!(after.extra.get("fold_rejections").is_none());
     }
 
@@ -1122,7 +1147,10 @@ mod tests {
         );
         let snap =
             append_envelope_and_fold(&mut log, dir, snap, &mut lifecycle, Utc::now()).unwrap();
-        assert_eq!(lifecycle.seq, 1, "the caller's envelope is stamped in place");
+        assert_eq!(
+            lifecycle.seq, 1,
+            "the caller's envelope is stamped in place"
+        );
         assert_eq!(snap.state, WorkerState::Running);
         assert_eq!(snap.pid, Some(31337));
         assert_eq!(snap.last_applied_seq, 1);
@@ -1139,7 +1167,11 @@ mod tests {
         );
         let snap = append_envelope_and_fold(&mut log, dir, snap, &mut trace, Utc::now()).unwrap();
         assert_eq!(trace.seq, 2);
-        assert_eq!(snap.state, WorkerState::Running, "trace never drives the FSM");
+        assert_eq!(
+            snap.state,
+            WorkerState::Running,
+            "trace never drives the FSM"
+        );
         assert_eq!(snap.last_applied_seq, 2);
         assert!(snap.extra.get("fold_rejections").is_none());
 
@@ -1179,8 +1211,14 @@ mod tests {
             br#"{"schema_version":99}"#,
         )
         .unwrap();
-        let err = recover(tmp.path(), LivenessInput { process_alive: true }, Utc::now())
-            .expect_err("a newer snapshot must not be mutated");
+        let err = recover(
+            tmp.path(),
+            LivenessInput {
+                process_alive: true,
+            },
+            Utc::now(),
+        )
+        .expect_err("a newer snapshot must not be mutated");
         assert_eq!(err.code, "SCHEMA_TOO_NEW");
         assert_eq!(err.exit, ExitCode::Precondition);
     }
@@ -1204,7 +1242,14 @@ mod tests {
         snap.state = WorkerState::Spawned;
         snap.last_applied_seq = 0;
         save_snapshot(dir, &snap).unwrap();
-        let r = recover(dir, LivenessInput { process_alive: true }, Utc::now()).unwrap();
+        let r = recover(
+            dir,
+            LivenessInput {
+                process_alive: true,
+            },
+            Utc::now(),
+        )
+        .unwrap();
         assert_eq!(r.state, WorkerState::Running);
         assert_eq!(r.last_applied_seq, 1);
     }

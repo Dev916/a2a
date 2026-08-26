@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::home::A2aHome;
 use crate::inbox::{self, MsgKind};
-use crate::mesh::{notes, scan_or_refuse, NOTE_MAX_BYTES, PeerId};
+use crate::mesh::{notes, scan_or_refuse, PeerId, NOTE_MAX_BYTES};
 use crate::output::{AppError, ExitCode};
 use crate::state::WorkerSnapshot;
 use serde::Deserialize;
@@ -67,14 +67,8 @@ pub fn has_unrouted_note(worker_dir: &Path) -> bool {
         return false;
     };
     entries.flatten().any(|entry| {
-        entry
-            .file_type()
-            .map(|ty| ty.is_file())
-            .unwrap_or(false)
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".note.json")
+        entry.file_type().map(|ty| ty.is_file()).unwrap_or(false)
+            && entry.file_name().to_string_lossy().ends_with(".note.json")
     })
 }
 
@@ -141,7 +135,10 @@ fn gate_text(text: &str) -> Result<(), AppError> {
 
 fn mark(path: &Path, fate: &str) -> io::Result<()> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "note path has no file name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "note path has no file name",
+        ));
     };
     let next = if let Some(prefix) = name.strip_suffix(".note.json") {
         format!("{prefix}.note.{fate}.json")

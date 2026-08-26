@@ -3,7 +3,8 @@ use a2a::mesh::gateway::expose::{
     NgrokExposure, NgrokTunnel, NgrokTunnelConfig, NgrokTunnels, NoneExposure,
 };
 use a2a::mesh::gateway::link::{accept_once_io, dial_gateway_io};
-use a2a::mesh::keys::Clock;
+use a2a::mesh::gateway::{gateway_root, run_registry_slot_for_test, RegistrySlotParams};
+use a2a::mesh::keys::{self, Clock, SystemClock};
 use a2a::mesh::registry::{FileRegistry, Registry};
 use a2a::mesh::wire::TlsIdentity;
 use a2a::output::ExitCode;
@@ -33,7 +34,10 @@ async fn ngrok_tcp_exposure_reuses_starts_and_maps_agent_urls_to_wss() {
         ngrok.current_url().await.unwrap(),
         Some("wss://1.tcp.ngrok.test:19001".to_string())
     );
-    assert_eq!(ngrok.api_requests(), vec!["GET /api/tunnels", "POST /api/tunnels"]);
+    assert_eq!(
+        ngrok.api_requests(),
+        vec!["GET /api/tunnels", "POST /api/tunnels"]
+    );
 
     let fake = FakeNgrok::new(vec![NgrokTunnels {
         tunnels: vec![NgrokTunnel {
@@ -83,31 +87,61 @@ async fn changed_exposure_reupserts_file_registry_row_with_cert_fingerprint() {
     let mut publisher = ExposurePublisher::new(row);
 
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-    assert!(publisher.tick(&registry, &exposure, t0).await.unwrap().upserted);
+    assert!(
+        publisher
+            .tick(&registry, &exposure, t0)
+            .await
+            .unwrap()
+            .upserted
+    );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0].endpoint_url.as_deref(),
+        registry.discover("fleet-a").await.unwrap()[0]
+            .endpoint_url
+            .as_deref(),
         Some("wss://old.example.test:10000")
     );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0].cert_fpr.as_deref(),
+        registry.discover("fleet-a").await.unwrap()[0]
+            .cert_fpr
+            .as_deref(),
         Some("cert-a")
     );
 
     let t1 = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
     let same = publisher.tick(&registry, &exposure, t1).await.unwrap();
     assert!(!same.upserted);
-    assert_eq!(registry.discover("fleet-a").await.unwrap()[0].last_heartbeat, t1);
+    assert_eq!(
+        registry.discover("fleet-a").await.unwrap()[0].last_heartbeat,
+        t1
+    );
 
     let t2 = Utc.timestamp_opt(1_700_000_002, 0).unwrap();
-    assert!(publisher.tick(&registry, &exposure, t2).await.unwrap().upserted);
+    assert!(
+        publisher
+            .tick(&registry, &exposure, t2)
+            .await
+            .unwrap()
+            .upserted
+    );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0].endpoint_url.as_deref(),
+        registry.discover("fleet-a").await.unwrap()[0]
+            .endpoint_url
+            .as_deref(),
         Some("wss://new.example.test:10001")
     );
 
     let t3 = Utc.timestamp_opt(1_700_000_003, 0).unwrap();
-    assert!(publisher.tick(&registry, &exposure, t3).await.unwrap().upserted);
-    assert_eq!(registry.discover("fleet-a").await.unwrap()[0].endpoint_url, None);
+    assert!(
+        publisher
+            .tick(&registry, &exposure, t3)
+            .await
+            .unwrap()
+            .upserted
+    );
+    assert_eq!(
+        registry.discover("fleet-a").await.unwrap()[0].endpoint_url,
+        None
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -153,6 +187,92 @@ async fn exposure_loop_rechecks_on_heartbeat_interval_and_reupserts_rotated_url(
     token.cancel();
     tokio::time::advance(Duration::from_secs(11)).await;
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn real_registry_slot_with_fake_ngrok_publishes_row_and_health_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = a2a::home::A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
+    keys::fleet_init(&home).unwrap();
+    let identity = keys::gateway_identity(&home, false).unwrap();
+    keys::ensure_gateway_token(&home, &SystemClock).unwrap();
+
+    let registry = FileRegistry::new(tmp.path().join("registry"));
+    registry.init_schema().unwrap();
+    let ngrok =
+        NgrokExposure::with_api(7787, FakeNgrok::new(vec![NgrokTunnels { tunnels: vec![] }]));
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let fleet_id = keys::fleet_id(&home).unwrap();
+    let pubkey_fpr = keys::gateway_public_key_fingerprint(&home).unwrap();
+    let row = ExposureRow {
+        fleet_id: fleet_id.clone(),
+        gateway_id: identity.gateway_id.clone(),
+        owner: "test-owner".to_string(),
+        pubkey_fpr: pubkey_fpr.clone(),
+        cert_fpr: identity.cert_fpr.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let token = CancellationToken::new();
+    let root = gateway_root(&home);
+    let run = run_registry_slot_for_test(
+        &root,
+        &cfg,
+        RegistrySlotParams {
+            registry: &registry,
+            exposure: &ngrok,
+            publisher: ExposurePublisher::new(row),
+            heartbeat_interval: Duration::from_secs(60),
+            clock: &SystemClock,
+            stall_shutdown_slot: None,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+    let mut published = false;
+    for _ in 0..100 {
+        tokio::select! {
+            result = &mut run => panic!("registry slot exited before publish: {:?}", result),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                let rows = registry.discover(&fleet_id).await.unwrap();
+                let health_endpoint = std::fs::read_to_string(home.root().join("mesh/gateway-health.json"))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|health| health["endpoint_url"].as_str().map(str::to_string));
+                if rows
+                    .first()
+                    .map(|row| row.endpoint_url.as_deref() == Some("wss://1.tcp.ngrok.test:19001"))
+                    .unwrap_or(false)
+                    && health_endpoint.as_deref() == Some("wss://1.tcp.ngrok.test:19001")
+                {
+                    published = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        published,
+        "registry slot did not publish row and health endpoint"
+    );
+    let rows = registry.discover(&fleet_id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].gateway_id, identity.gateway_id);
+    assert_eq!(
+        rows[0].endpoint_url.as_deref(),
+        Some("wss://1.tcp.ngrok.test:19001")
+    );
+    assert_eq!(
+        rows[0].cert_fpr.as_deref(),
+        Some(identity.cert_fpr.as_str())
+    );
+    assert_eq!(rows[0].pubkey_fpr, pubkey_fpr);
+    assert_eq!(rows[0].version, env!("CARGO_PKG_VERSION"));
+
+    token.cancel();
+    tokio::select! {
+        result = &mut run => result.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("registry slot did not stop after cancellation"),
+    }
 }
 
 #[tokio::test]
@@ -252,8 +372,16 @@ impl Clock for StepClock {
 }
 
 async fn wait_for_row(registry: &FileRegistry, expected_url: Option<&str>) {
-    for _ in 0..10 {
-        let rows = registry.discover("fleet-a").await.unwrap();
+    wait_for_row_in_fleet(registry, "fleet-a", expected_url).await;
+}
+
+async fn wait_for_row_in_fleet(
+    registry: &FileRegistry,
+    fleet_id: &str,
+    expected_url: Option<&str>,
+) {
+    for _ in 0..100 {
+        let rows = registry.discover(fleet_id).await.unwrap();
         if rows
             .first()
             .map(|row| row.endpoint_url.as_deref() == expected_url)
@@ -261,12 +389,12 @@ async fn wait_for_row(registry: &FileRegistry, expected_url: Option<&str>) {
         {
             return;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!(
         "registry did not publish expected url {:?}: {:?}",
         expected_url,
-        registry.discover("fleet-a").await.unwrap()
+        registry.discover(fleet_id).await.unwrap()
     );
 }
 
@@ -296,7 +424,10 @@ impl FakeNgrok {
 
 impl NgrokApi for FakeNgrok {
     async fn tunnels(&self) -> Result<NgrokTunnels, a2a::output::AppError> {
-        self.requests.lock().unwrap().push("GET /api/tunnels".to_string());
+        self.requests
+            .lock()
+            .unwrap()
+            .push("GET /api/tunnels".to_string());
         Ok(self
             .gets
             .lock()
@@ -306,7 +437,10 @@ impl NgrokApi for FakeNgrok {
     }
 
     async fn start_tunnel(&self, listen_port: u64) -> Result<NgrokTunnel, a2a::output::AppError> {
-        self.requests.lock().unwrap().push("POST /api/tunnels".to_string());
+        self.requests
+            .lock()
+            .unwrap()
+            .push("POST /api/tunnels".to_string());
         assert_eq!(listen_port, 7787);
         Ok(NgrokTunnel {
             proto: Some("tcp".to_string()),

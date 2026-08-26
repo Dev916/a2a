@@ -107,7 +107,10 @@ pub fn deliver_spooled_once<R: Rng + ?Sized>(
     now: DateTime<Utc>,
     rng: &mut R,
 ) -> Result<SpoolPassReport, AppError> {
-    let NoteDeliveryTarget::Gateway { to_gateway, home: receiver } = target;
+    let NoteDeliveryTarget::Gateway {
+        to_gateway,
+        home: receiver,
+    } = target;
     let dir = outbound_dir(sender, to_gateway);
     let mut report = SpoolPassReport::default();
     let mut paths = note_paths(&dir)?;
@@ -210,7 +213,11 @@ pub fn handle_ack(
     }
 }
 
-pub fn receive_note(home: &A2aHome, _cfg: &Config, envelope: &SpooledNote) -> Result<NoteAck, AppError> {
+pub fn receive_note(
+    home: &A2aHome,
+    _cfg: &Config,
+    envelope: &SpooledNote,
+) -> Result<NoteAck, AppError> {
     let Some(note_id) = envelope.note.note_id.as_deref().filter(|s| !s.is_empty()) else {
         log_note_action(
             home,
@@ -330,7 +337,11 @@ fn schedule_retry<R: Rng + ?Sized>(
     write_envelope_atomic(path, envelope)
 }
 
-pub fn jittered_retry_backoff<R: Rng + ?Sized>(attempt: u32, cap: Duration, rng: &mut R) -> Duration {
+pub fn jittered_retry_backoff<R: Rng + ?Sized>(
+    attempt: u32,
+    cap: Duration,
+    rng: &mut R,
+) -> Duration {
     let base_ms = 1_000u128;
     let factor = 2u128.saturating_pow(attempt.saturating_sub(1).min(32));
     let cap_ms = cap.as_millis().max(1);
@@ -360,7 +371,8 @@ fn remember_delivered(home: &A2aHome, origin: &str, note_id: &str) -> Result<(),
     if let Some(parent) = path.parent() {
         create_dir_0700(parent).map_err(|e| io_err("creating note dedup dir", e))?;
     }
-    let bytes = serde_json::to_vec_pretty(&dedup).map_err(|e| data_err("serializing note dedup", e))?;
+    let bytes =
+        serde_json::to_vec_pretty(&dedup).map_err(|e| data_err("serializing note dedup", e))?;
     crate::store::write_atomic(&path, &bytes).map_err(|e| io_err("writing note dedup", e))
 }
 
@@ -375,9 +387,13 @@ fn load_dedup(home: &A2aHome) -> Result<DedupFile, AppError> {
 fn archive(home: &A2aHome, path: &Path, bucket: &str, gateway: &str) -> Result<(), AppError> {
     let dir = outbound_root(home).join(bucket).join(gateway);
     create_dir_0700(&dir).map_err(|e| io_err("creating note archive", e))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| AppError::new("NOTE_SPOOL", ExitCode::Internal, "spooled note path has no filename"))?;
+    let name = path.file_name().ok_or_else(|| {
+        AppError::new(
+            "NOTE_SPOOL",
+            ExitCode::Internal,
+            "spooled note path has no filename",
+        )
+    })?;
     let dest = dir.join(name);
     if dest.exists() {
         fs::remove_file(path).map_err(|e| io_err("removing duplicate archived note", e))?;
@@ -396,7 +412,11 @@ fn note_paths(dir: &Path) -> Result<Vec<PathBuf>, AppError> {
     let mut out = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| io_err("reading outbound notes", e))?;
-        if !entry.file_type().map_err(|e| io_err("reading outbound notes", e))?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|e| io_err("reading outbound notes", e))?
+            .is_file()
+        {
             continue;
         }
         if entry.file_name().to_string_lossy().ends_with(".note.json") {
@@ -421,15 +441,19 @@ fn find_spooled_by_trace(
 }
 
 fn write_envelope_new(path: &Path, envelope: &SpooledNote) -> Result<(), AppError> {
-    let bytes = serde_json::to_vec_pretty(envelope).map_err(|e| data_err("serializing spooled note", e))?;
+    let bytes =
+        serde_json::to_vec_pretty(envelope).map_err(|e| data_err("serializing spooled note", e))?;
     let mut f = write_new_0600(path).map_err(|e| io_err("writing spooled note", e))?;
-    f.write_all(&bytes).map_err(|e| io_err("writing spooled note", e))?;
-    f.write_all(b"\n").map_err(|e| io_err("writing spooled note", e))?;
+    f.write_all(&bytes)
+        .map_err(|e| io_err("writing spooled note", e))?;
+    f.write_all(b"\n")
+        .map_err(|e| io_err("writing spooled note", e))?;
     f.sync_all().map_err(|e| io_err("syncing spooled note", e))
 }
 
 fn write_envelope_atomic(path: &Path, envelope: &SpooledNote) -> Result<(), AppError> {
-    let bytes = serde_json::to_vec_pretty(envelope).map_err(|e| data_err("serializing spooled note", e))?;
+    let bytes =
+        serde_json::to_vec_pretty(envelope).map_err(|e| data_err("serializing spooled note", e))?;
     crate::store::write_atomic(path, &bytes).map_err(|e| io_err("writing spooled note", e))
 }
 

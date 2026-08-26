@@ -37,10 +37,7 @@ fn write_gateway_key(home: &Path, gateway_id: &str) {
 
 fn write_presence(home: &Path, peer: &str, home_gateway: Option<&str>) {
     let id = PeerId::parse(peer).unwrap();
-    let dir = home
-        .join("mesh")
-        .join("peers")
-        .join(id.dir_name());
+    let dir = home.join("mesh").join("peers").join(id.dir_name());
     fs::create_dir_all(&dir).unwrap();
     let mut value = json!({
         "peer": peer,
@@ -57,7 +54,11 @@ fn write_presence(home: &Path, peer: &str, home_gateway: Option<&str>) {
     if let Some(gateway) = home_gateway {
         value["home_gateway"] = json!(gateway);
     }
-    fs::write(dir.join("presence.json"), serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    fs::write(
+        dir.join("presence.json"),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
 }
 
 fn note(from: &str, to: &str, text: &str, note_id: &str) -> Note {
@@ -84,7 +85,12 @@ fn note_files(home: &Path, peer: &str) -> Vec<PathBuf> {
         Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
-    files.retain(|p| p.file_name().unwrap().to_string_lossy().ends_with(".note.json"));
+    files.retain(|p| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".note.json")
+    });
     files.sort();
     files
 }
@@ -94,7 +100,12 @@ fn json_files(dir: &Path) -> Vec<PathBuf> {
         Ok(entries) => entries.flatten().map(|e| e.path()).collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
-    files.retain(|p| p.file_name().unwrap().to_string_lossy().ends_with(".note.json"));
+    files.retain(|p| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".note.json")
+    });
     files.sort();
     files
 }
@@ -138,7 +149,11 @@ fn note_id_is_flatten_tolerant_and_local_notes_mint_one() {
     assert_eq!(note_id.len(), 26);
     ulid::Ulid::from_string(note_id).expect("note_id is a ULID");
     assert!(
-        files[0].file_name().unwrap().to_string_lossy().contains(note_id),
+        files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(note_id),
         "note_id is embedded in inbox filename"
     );
 }
@@ -175,7 +190,10 @@ fn remote_cli_note_spools_instead_of_touching_remote_homed_inbox() {
     let value: Value = serde_json::from_slice(&fs::read(&queued[0]).unwrap()).unwrap();
     assert_eq!(value["from_gateway"], "gw-a");
     assert_eq!(value["to_gateway"], "gw-b");
-    assert_eq!(value["to_peer"], "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    assert_eq!(
+        value["to_peer"],
+        "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    );
     assert_eq!(value["trace_id"], value["note"]["note_id"]);
 }
 
@@ -226,7 +244,18 @@ fn redelivery_after_swallowed_ack_writes_exactly_one_inbox_file() {
     assert_eq!(report.delivered, 1);
     assert_eq!(report.duplicates, 1);
     assert_eq!(note_files(receiver.root(), target).len(), 1);
-    assert!(json_files(&sender.root().join("mesh").join("outbound").join("sent").join("gw-b")).len() == 1);
+    assert!(
+        json_files(
+            &sender
+                .root()
+                .join("mesh")
+                .join("outbound")
+                .join("sent")
+                .join("gw-b")
+        )
+        .len()
+            == 1
+    );
 }
 
 #[test]
@@ -265,18 +294,52 @@ fn ingress_refusal_archives_immediately_and_logs_same_trace_id_on_both_gateways(
     )
     .unwrap();
     assert_eq!(report.rejected, 1);
-    assert!(json_files(&sender.root().join("mesh").join("outbound").join("rejected").join("gw-b")).len() == 1);
+    assert!(
+        json_files(
+            &sender
+                .root()
+                .join("mesh")
+                .join("outbound")
+                .join("rejected")
+                .join("gw-b")
+        )
+        .len()
+            == 1
+    );
 
-    let sender_log = fs::read_to_string(sender.root().join("mesh").join("gateway").join("gateway.jsonl")).unwrap();
-    let receiver_log = fs::read_to_string(receiver.root().join("mesh").join("gateway").join("gateway.jsonl")).unwrap();
+    let sender_log = fs::read_to_string(
+        sender
+            .root()
+            .join("mesh")
+            .join("gateway")
+            .join("gateway.jsonl"),
+    )
+    .unwrap();
+    let receiver_log = fs::read_to_string(
+        receiver
+            .root()
+            .join("mesh")
+            .join("gateway")
+            .join("gateway.jsonl"),
+    )
+    .unwrap();
     for log in [&sender_log, &receiver_log] {
         assert!(log.contains(trace_id), "{log}");
         assert!(log.contains(r#""from_gateway":"gw-a""#), "{log}");
         assert!(log.contains(r#""to_gateway":"gw-b""#), "{log}");
-        assert!(log.contains(r#""to_peer":"codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb""#), "{log}");
+        assert!(
+            log.contains(r#""to_peer":"codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb""#),
+            "{log}"
+        );
     }
-    assert!(sender_log.contains(r#""action":"rejected""#), "{sender_log}");
-    assert!(receiver_log.contains(r#""action":"ingress_refused""#), "{receiver_log}");
+    assert!(
+        sender_log.contains(r#""action":"rejected""#),
+        "{sender_log}"
+    );
+    assert!(
+        receiver_log.contains(r#""action":"ingress_refused""#),
+        "{receiver_log}"
+    );
 }
 
 #[test]
@@ -315,10 +378,13 @@ fn offline_target_holds_and_restart_pass_resumes_with_capped_full_jitter_retry()
     )
     .unwrap();
     assert_eq!(offline.retrying, 1);
-    let held_path = json_files(&sender.root().join("mesh").join("outbound").join("gw-b"))[0].clone();
+    let held_path =
+        json_files(&sender.root().join("mesh").join("outbound").join("gw-b"))[0].clone();
     let held = notes_wire::read_spooled(&held_path).unwrap();
     assert_eq!(held.attempts, 1);
-    let retry_at = held.next_attempt_after.expect("offline pass schedules retry");
+    let retry_at = held
+        .next_attempt_after
+        .expect("offline pass schedules retry");
     assert!(retry_at <= Utc.timestamp_opt(1_700_000_010, 0).unwrap());
 
     let resumed = deliver_spooled_once(
@@ -333,7 +399,14 @@ fn offline_target_holds_and_restart_pass_resumes_with_capped_full_jitter_retry()
     )
     .unwrap();
     assert_eq!(resumed.delivered, 1);
-    assert_eq!(note_files(receiver.root(), "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").len(), 1);
+    assert_eq!(
+        note_files(
+            receiver.root(),
+            "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+        .len(),
+        1
+    );
 }
 
 #[test]
@@ -361,7 +434,15 @@ fn token_expired_ack_archives_immediately_without_retry() {
     assert!(notes_wire::handle_ack(&sender, "gw-b", trace_id, "TOKEN_EXPIRED").unwrap());
     assert!(json_files(&sender.root().join("mesh").join("outbound").join("gw-b")).is_empty());
     assert_eq!(
-        json_files(&sender.root().join("mesh").join("outbound").join("rejected").join("gw-b")).len(),
+        json_files(
+            &sender
+                .root()
+                .join("mesh")
+                .join("outbound")
+                .join("rejected")
+                .join("gw-b")
+        )
+        .len(),
         1
     );
 }

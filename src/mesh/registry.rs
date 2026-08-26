@@ -1,9 +1,12 @@
+use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Acquire, PgPool, Row};
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,8 +100,13 @@ impl FileRegistry {
     }
 
     fn ensure_root(&self) -> Result<(), AppError> {
-        crate::home::create_dir_0700(&self.root)
-            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("creating file registry: {e}")))
+        crate::home::create_dir_0700(&self.root).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("creating file registry: {e}"),
+            )
+        })
     }
 
     fn read_rows(&self) -> Result<Vec<GatewayRow>, AppError> {
@@ -108,7 +116,11 @@ impl FileRegistry {
             return Ok(Vec::new());
         }
         let bytes = fs::read(&path).map_err(|e| {
-            AppError::new("IO", ExitCode::Internal, format!("reading file registry: {e}"))
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading file registry: {e}"),
+            )
         })?;
         serde_json::from_slice(&bytes).map_err(|e| {
             AppError::new(
@@ -123,8 +135,13 @@ impl FileRegistry {
         self.ensure_root()?;
         let bytes = serde_json::to_vec_pretty(rows)
             .map_err(|e| AppError::new("SERIALIZE", ExitCode::Internal, e.to_string()))?;
-        crate::store::write_atomic(&self.rows_path(), &bytes)
-            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing file registry: {e}")))
+        crate::store::write_atomic(&self.rows_path(), &bytes).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("writing file registry: {e}"),
+            )
+        })
     }
 }
 
@@ -205,6 +222,145 @@ pub struct PgRegistry {
     first_acquire: AtomicBool,
 }
 
+pub enum RegistryHandle {
+    File(FileRegistry),
+    Pg(PgRegistry),
+}
+
+impl RegistryHandle {
+    pub async fn apply_migration(&self, sql: &str) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.init_schema(),
+            RegistryHandle::Pg(registry) => registry.apply_migration(sql).await,
+        }
+    }
+}
+
+impl Registry for RegistryHandle {
+    async fn upsert_self(&self, row: GatewayRow) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.upsert_self(row).await,
+            RegistryHandle::Pg(registry) => registry.upsert_self(row).await,
+        }
+    }
+
+    async fn heartbeat(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
+            RegistryHandle::Pg(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
+        }
+    }
+
+    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.discover(fleet_id).await,
+            RegistryHandle::Pg(registry) => registry.discover(fleet_id).await,
+        }
+    }
+
+    async fn retire_self(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
+            RegistryHandle::Pg(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
+        }
+    }
+
+    async fn revoke(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+            RegistryHandle::Pg(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+        }
+    }
+
+    async fn schema_version(&self) -> Result<i32, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.schema_version().await,
+            RegistryHandle::Pg(registry) => registry.schema_version().await,
+        }
+    }
+}
+
+pub fn open_registry(url: &str) -> Result<RegistryHandle, AppError> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return Ok(RegistryHandle::File(FileRegistry::new(Path::new(path))));
+    }
+    if let Some(path) = url.strip_prefix("file:") {
+        return Ok(RegistryHandle::File(FileRegistry::new(Path::new(path))));
+    }
+    PgRegistry::connect_lazy(url, DEFAULT_REGISTRY_TIMEOUT_SECS).map(RegistryHandle::Pg)
+}
+
+pub fn registry_env_path(home: &A2aHome) -> PathBuf {
+    home.root().join("mesh").join("fleet").join("registry.env")
+}
+
+pub fn write_registry_env(home: &A2aHome, url: &str) -> Result<(), AppError> {
+    let path = registry_env_path(home);
+    if let Some(parent) = path.parent() {
+        create_dir_0700(parent).map_err(|e| {
+            AppError::new("IO", ExitCode::Internal, format!("creating fleet dir: {e}"))
+        })?;
+    }
+    let mut f = write_new_0600(&path).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("writing registry env: {e}"),
+        )
+    })?;
+    f.write_all(format!("{url}\n").as_bytes()).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("writing registry env: {e}"),
+        )
+    })?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("setting registry env mode: {e}"),
+        )
+    })
+}
+
+pub fn read_registry_env(home: &A2aHome) -> Result<String, AppError> {
+    let path = registry_env_path(home);
+    let text = fs::read_to_string(&path).map_err(|e| {
+        AppError::new(
+            "REGISTRY_URL_REQUIRED",
+            ExitCode::Precondition,
+            format!("reading registry env: {e}"),
+        )
+        .remedy("run `a2a mesh fleet init --registry -`")
+    })?;
+    let url = text.trim();
+    if url.is_empty() {
+        return Err(AppError::new(
+            "REGISTRY_URL_REQUIRED",
+            ExitCode::Precondition,
+            "registry env is empty",
+        )
+        .remedy("run `a2a mesh fleet init --registry -`"));
+    }
+    Ok(url.to_string())
+}
+
 impl PgRegistry {
     pub fn connect_lazy(url: &str, timeout_secs: u64) -> Result<Self, AppError> {
         let plan = registry_plan(url)?;
@@ -237,7 +393,10 @@ impl PgRegistry {
         tokio::time::timeout(timeout, async move {
             let mut tx = conn.begin().await.map_err(registry_unreachable)?;
             set_local_statement_timeout(&mut tx, timeout).await?;
-            sqlx::query(sql).execute(&mut *tx).await.map_err(registry_unreachable)?;
+            sqlx::query(sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(registry_unreachable)?;
             tx.commit().await.map_err(registry_unreachable)
         })
         .await
@@ -436,11 +595,15 @@ impl Registry for PgRegistry {
         tokio::time::timeout(timeout, async move {
             let mut tx = conn.begin().await.map_err(registry_unreachable)?;
             set_local_statement_timeout(&mut tx, timeout).await?;
-            let row = sqlx::query("SELECT COALESCE(MAX(schema_version), 0) AS schema_version FROM mesh_gateways")
-                .fetch_one(&mut *tx)
-                .await
+            let row = sqlx::query(
+                "SELECT COALESCE(MAX(schema_version), 0) AS schema_version FROM mesh_gateways",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(registry_unreachable)?;
+            let version = row
+                .try_get("schema_version")
                 .map_err(registry_unreachable)?;
-            let version = row.try_get("schema_version").map_err(registry_unreachable)?;
             tx.commit().await.map_err(registry_unreachable)?;
             Ok(version)
         })
@@ -520,9 +683,13 @@ fn pg_row(row: sqlx::postgres::PgRow) -> Result<GatewayRow, AppError> {
         cert_fpr: row.try_get("cert_fpr").map_err(registry_unreachable)?,
         version: row.try_get("version").map_err(registry_unreachable)?,
         created_at: row.try_get("created_at").map_err(registry_unreachable)?,
-        last_heartbeat: row.try_get("last_heartbeat").map_err(registry_unreachable)?,
+        last_heartbeat: row
+            .try_get("last_heartbeat")
+            .map_err(registry_unreachable)?,
         revoked_at: row.try_get("revoked_at").map_err(registry_unreachable)?,
-        schema_version: row.try_get("schema_version").map_err(registry_unreachable)?,
+        schema_version: row
+            .try_get("schema_version")
+            .map_err(registry_unreachable)?,
     })
 }
 
@@ -537,8 +704,14 @@ fn query_param(url: &str, name: &str) -> Option<String> {
 
 fn authority_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://")?.1;
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
-    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     if host_port.starts_with('[') {
         return host_port
             .split_once(']')

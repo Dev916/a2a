@@ -778,7 +778,11 @@ mod tests {
             v.get("writableRoots").is_none(),
             "thread/start has no writableRoots — confinement is per-turn"
         );
-        fidelity::assert_valid(&v, "v2/ThreadStartParams.json", "adapter thread/start params");
+        fidelity::assert_valid(
+            &v,
+            "v2/ThreadStartParams.json",
+            "adapter thread/start params",
+        );
     }
 
     #[test]
@@ -807,11 +811,8 @@ mod tests {
 
     #[test]
     fn an_outbox_only_turn_may_write_to_its_outbox_and_nowhere_else() {
-        let policy = turn_sandbox_policy(
-            &lane_cfg(SandboxMode::OutboxOnly, false),
-            &cwd(),
-            &worker(),
-        );
+        let policy =
+            turn_sandbox_policy(&lane_cfg(SandboxMode::OutboxOnly, false), &cwd(), &worker());
         assert_eq!(
             policy,
             SandboxPolicy::WorkspaceWrite {
@@ -840,14 +841,19 @@ mod tests {
             }
         );
         assert_eq!(
-            turn_sandbox_policy(&lane_cfg(SandboxMode::DangerFullAccess, false), &cwd(), &worker()),
+            turn_sandbox_policy(
+                &lane_cfg(SandboxMode::DangerFullAccess, false),
+                &cwd(),
+                &worker()
+            ),
             SandboxPolicy::DangerFullAccess
         );
     }
 
     #[test]
     fn the_per_turn_policy_uses_the_camel_case_wire_names_not_the_decoy() {
-        let policy = turn_sandbox_policy(&lane_cfg(SandboxMode::OutboxOnly, false), &cwd(), &worker());
+        let policy =
+            turn_sandbox_policy(&lane_cfg(SandboxMode::OutboxOnly, false), &cwd(), &worker());
         let v = serde_json::to_value(&policy).unwrap();
         assert_eq!(v["type"], "workspaceWrite");
         assert!(v.get("writableRoots").is_some());
@@ -871,7 +877,10 @@ mod tests {
         };
         let v = serde_json::to_value(turn_start_params(&spec)).unwrap();
         assert_eq!(v["threadId"], "thread-1");
-        assert_eq!(v["input"], json!([{"type": "text", "text": "do the thing"}]));
+        assert_eq!(
+            v["input"],
+            json!([{"type": "text", "text": "do the thing"}])
+        );
         assert_eq!(v["effort"], "medium");
         assert_eq!(v["approvalPolicy"], "never");
         assert_eq!(v["outputSchema"], schema);

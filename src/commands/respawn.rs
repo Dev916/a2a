@@ -142,9 +142,7 @@ fn next_attempt(id: &str, parent: &WorkerSnapshot, max_attempts: u64) -> Result<
                  brief is not a retry, it is a loop"
             ),
         )
-        .remedy(
-            "fix the brief — three identical retries is the poison-brief signature (spec §4.9)",
-        )
+        .remedy("fix the brief — three identical retries is the poison-brief signature (spec §4.9)")
         .data(json!({
             "parent_id": id,
             "attempt": attempt,
@@ -161,11 +159,7 @@ fn next_attempt(id: &str, parent: &WorkerSnapshot, max_attempts: u64) -> Result<
 /// resolve itself, and the worktree flags are left unset so the lane's own
 /// default decides — a retry of an impl worker should get its own tree, not the
 /// dead one's.
-fn inherited_args(
-    parent: &WorkerSnapshot,
-    parent_dir: &Path,
-    brief: Option<&Path>,
-) -> SpawnArgs {
+fn inherited_args(parent: &WorkerSnapshot, parent_dir: &Path, brief: Option<&Path>) -> SpawnArgs {
     SpawnArgs {
         lane: Some(parent.lane),
         cwd: inherited_cwd(parent),
@@ -260,7 +254,10 @@ mod tests {
     #[test]
     fn the_chain_counts_from_one_and_stops_at_the_ceiling() {
         let id = "general-0814t1300-aaaa";
-        assert_eq!(next_attempt(id, &snap(WorkerState::Done, None), 3).unwrap(), 2);
+        assert_eq!(
+            next_attempt(id, &snap(WorkerState::Done, None), 3).unwrap(),
+            2
+        );
         assert_eq!(
             next_attempt(id, &snap(WorkerState::Done, Some(1)), 3).unwrap(),
             2
@@ -269,8 +266,7 @@ mod tests {
             next_attempt(id, &snap(WorkerState::Done, Some(2)), 3).unwrap(),
             3
         );
-        let err = next_attempt(id, &snap(WorkerState::Done, Some(3)), 3)
-            .expect_err("next = 4 > 3");
+        let err = next_attempt(id, &snap(WorkerState::Done, Some(3)), 3).expect_err("next = 4 > 3");
         assert_eq!(err.code, "ATTEMPTS_EXHAUSTED");
         assert_eq!(err.exit, ExitCode::Precondition);
         assert_eq!(
@@ -338,7 +334,11 @@ mod tests {
         // The lane's own worktree default decides, so a retry gets its own tree.
         assert!(!args.worktree && !args.no_worktree);
 
-        let replaced = inherited_args(&parent, Path::new("/w/parent"), Some(Path::new("/x/new.md")));
+        let replaced = inherited_args(
+            &parent,
+            Path::new("/w/parent"),
+            Some(Path::new("/x/new.md")),
+        );
         assert_eq!(replaced.brief, Some(PathBuf::from("/x/new.md")));
     }
 }

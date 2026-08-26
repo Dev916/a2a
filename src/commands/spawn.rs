@@ -325,7 +325,9 @@ pub fn run_with_lineage(
     // slot and cannot be queued: its process is its own, and counting it
     // against a cap the broker cannot release is deferred to Phase 3.
     if args.no_queue && matches!(selected, Selected::Exec { .. }) {
-        warn("--no-queue has no effect on the exec transport: there is no admission queue to refuse");
+        warn(
+            "--no-queue has no effect on the exec transport: there is no admission queue to refuse",
+        );
     }
 
     // The turn budget (spec §4.9). The lane owns the ceiling; the brief may only
@@ -337,7 +339,10 @@ pub fn run_with_lineage(
     }
 
     let model = args.model.clone().unwrap_or_else(|| lane_cfg.model.clone());
-    let effort = args.effort.clone().unwrap_or_else(|| lane_cfg.effort.clone());
+    let effort = args
+        .effort
+        .clone()
+        .unwrap_or_else(|| lane_cfg.effort.clone());
     let brief_sha = brief::sha256_hex(&brief_text);
     let owner = owner::resolve(args.owner.as_deref());
     let now = Utc::now();
@@ -496,7 +501,12 @@ pub fn run_with_lineage(
         Err(e) => {
             // Still pre-genesis: this id never became a worker, so the dir AND
             // the half-made tree go with it.
-            discard_pre_genesis(home, &wdir, &id, worktree.as_ref().map(|w| w.repo.as_path()));
+            discard_pre_genesis(
+                home,
+                &wdir,
+                &id,
+                worktree.as_ref().map(|w| w.repo.as_path()),
+            );
             return Err(e);
         }
     };
@@ -624,8 +634,7 @@ pub fn run_with_lineage(
     let started = Utc::now();
     // The task deadline is armed the moment the process is observed running;
     // `reconcile` (Task 13) is what later fires it.
-    snap.deadline_at =
-        Some(started + chrono::Duration::seconds(lane_cfg.task_timeout_secs as i64));
+    snap.deadline_at = Some(started + chrono::Duration::seconds(lane_cfg.task_timeout_secs as i64));
     let snap = append_and_fold(
         &mut log,
         &wdir,
@@ -1461,9 +1470,14 @@ fn resolve_cwd(
         return Err(AppError::new(
             "CWD_NOT_ALLOWED",
             ExitCode::Precondition,
-            format!("--cwd {} is not under an allowed root ({listed})", canon.display()),
+            format!(
+                "--cwd {} is not under an allowed root ({listed})",
+                canon.display()
+            ),
         )
-        .remedy("add the root to `allowed_roots` in $A2A_HOME/config.toml (or A2A_ALLOWED_ROOTS)"));
+        .remedy(
+            "add the root to `allowed_roots` in $A2A_HOME/config.toml (or A2A_ALLOWED_ROOTS)",
+        ));
     }
     Ok(CwdPlan::Fixed(canon))
 }
@@ -1574,11 +1588,7 @@ fn tombstone_ids(home: &A2aHome) -> Vec<String> {
     };
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|v| {
-            v.get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|v| v.get("id").and_then(Value::as_str).map(str::to_string))
         .collect()
 }
 
@@ -1635,7 +1645,10 @@ fn stage_context(wdir: &Path, files: &[PathBuf]) -> Result<(), AppError> {
             return Err(AppError::new(
                 "SECRET_FILE_REFUSED",
                 ExitCode::Precondition,
-                format!("--context {}: matches the secret-file rule `{rule}`", src.display()),
+                format!(
+                    "--context {}: matches the secret-file rule `{rule}`",
+                    src.display()
+                ),
             )
             .remedy("stage a redacted copy under a different name, or drop the file"));
         }
@@ -1839,7 +1852,10 @@ mod tests {
         let env: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
         assert_eq!(env["raw"]["auto_review_of"], "impl-0819t1200-aaaa");
         assert_eq!(env["raw"]["queued"], true);
-        assert!(env["raw"].get("parent_id").is_none(), "a review is not a retry");
+        assert!(
+            env["raw"].get("parent_id").is_none(),
+            "a review is not a retry"
+        );
         assert!(env["raw"].get("attempt").is_none());
         // ...and the fold puts the marker where `ls --json` reads it.
         assert_eq!(
@@ -1990,7 +2006,10 @@ mod tests {
     #[test]
     fn the_shipped_impl_schema_pins_the_devloop_result_shape() {
         let v: Value = serde_json::from_str(IMPL_RESULT_SCHEMA).expect("the template is JSON");
-        assert_eq!(v["$schema"], json!("https://json-schema.org/draft/2020-12/schema"));
+        assert_eq!(
+            v["$schema"],
+            json!("https://json-schema.org/draft/2020-12/schema")
+        );
         assert_eq!(v["type"], json!("object"));
         assert_eq!(v["additionalProperties"], json!(false));
         let required: Vec<&str> = v["required"]
@@ -2040,7 +2059,10 @@ mod tests {
         // Every required key is described; `additionalProperties: false` would
         // otherwise reject a key the schema itself asks for.
         for key in &required {
-            assert!(props.get(key).is_some(), "`{key}` is required but undescribed");
+            assert!(
+                props.get(key).is_some(),
+                "`{key}` is required but undescribed"
+            );
         }
     }
 
@@ -2143,7 +2165,8 @@ mod tests {
         // The message names the RESOLVED path, since that is the one the
         // operator has to go and look at.
         assert!(
-            err.message.contains(&tmp.path().join("no-such.json").display().to_string()),
+            err.message
+                .contains(&tmp.path().join("no-such.json").display().to_string()),
             "{}",
             err.message
         );

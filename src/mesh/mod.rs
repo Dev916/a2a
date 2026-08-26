@@ -152,7 +152,10 @@ pub fn scan_or_refuse(text: &str, code: &'static str) -> Result<(), AppError> {
         return Err(AppError::new(
             code,
             ExitCode::Precondition,
-            format!("text refused by secret scan: line {} ({})", hit.line, hit.rule),
+            format!(
+                "text refused by secret scan: line {} ({})",
+                hit.line, hit.rule
+            ),
         ));
     }
     Ok(())
@@ -173,10 +176,10 @@ fn invalid_peer_id(message: impl Into<String>) -> AppError {
     AppError::new("PEER_ID_INVALID", ExitCode::Precondition, message)
 }
 
-pub mod presence;
 pub mod feed;
-pub mod notes;
-pub mod routing;
-pub mod registry;
-pub mod wire;
 pub mod gateway;
+pub mod notes;
+pub mod presence;
+pub mod registry;
+pub mod routing;
+pub mod wire;

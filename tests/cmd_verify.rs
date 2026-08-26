@@ -260,8 +260,7 @@ fn brief_text(verify_cmds: &[&str], files_in_scope: &[&str]) -> String {
 
 /// A devloop-shaped result (`templates/impl-result.schema.json`) — what an impl
 /// worker has to write now that the lane ships a default schema.
-const DEVLOOP_RESULT: &str =
-    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+const DEVLOOP_RESULT: &str = r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
 
 /// Spawn one worker and settle it, so every later `reconcile` is a no-op and
 /// the events-differential assertion has a stable baseline.
@@ -314,7 +313,10 @@ fn spawn_fixture(lane: &str, in_a_repo: bool, verify_cmds: &[&str], scope: &[&st
 }
 
 fn status_json(home: &Path, allowed: &Path, id: &str) -> Value {
-    let out = a2a(home, allowed).args(["--json", "status", id]).output().unwrap();
+    let out = a2a(home, allowed)
+        .args(["--json", "status", id])
+        .output()
+        .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).expect("one envelope");
     v["data"].clone()
 }
@@ -343,10 +345,7 @@ fn verify_run(w: &Worker, extra: &[&str]) -> (i32, Value, String) {
 }
 
 fn artifact_path(w: &Worker) -> PathBuf {
-    w.home
-        .join("workers")
-        .join(&w.id)
-        .join("verification.json")
+    w.home.join("workers").join(&w.id).join("verification.json")
 }
 
 fn artifact(w: &Worker) -> Value {
@@ -451,14 +450,21 @@ fn a_green_run_writes_the_pinned_artifact_and_contributes_no_transition() {
         "\"ok\"",
     ]
     .iter()
-    .map(|k| text.find(k).unwrap_or_else(|| panic!("{k} in the artifact")))
+    .map(|k| {
+        text.find(k)
+            .unwrap_or_else(|| panic!("{k} in the artifact"))
+    })
     .collect();
     assert!(
         order.windows(2).all(|p| p[0] < p[1]),
         "verification.json keys are in declaration order: {order:?}"
     );
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(artifact_path(&w)).unwrap().permissions().mode() & 0o777;
+    let mode = std::fs::metadata(artifact_path(&w))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o600, "the artifact is 0600");
 }
 
@@ -488,7 +494,10 @@ fn the_plain_rendering_is_one_line_per_command() {
 fn a_failing_command_does_not_stop_the_rest_and_exits_four() {
     let w = spawn_fixture("impl", true, &["exit 3", "echo second"], &[]);
     let (code, env, _stderr) = verify_run(&w, &[]);
-    assert_eq!(code, 4, "a verify run whose commands failed is a WORKER failure");
+    assert_eq!(
+        code, 4,
+        "a verify run whose commands failed is a WORKER failure"
+    );
     assert_eq!(env["ok"], true, "the COMMAND succeeded; the worker did not");
     let a = artifact(&w);
     assert_eq!(a["ok"], false);
@@ -577,7 +586,10 @@ fn an_edited_brief_is_refused() {
     let text = std::fs::read_to_string(&brief).unwrap();
     std::fs::write(
         &brief,
-        text.replace("echo hello", "echo hello; touch /tmp/a2a-should-never-exist"),
+        text.replace(
+            "echo hello",
+            "echo hello; touch /tmp/a2a-should-never-exist",
+        ),
     )
     .unwrap();
 
@@ -711,9 +723,21 @@ fn the_two_transports_verify_identically_field_wise() {
     let app_run = artifact(&w);
 
     assert_eq!(exec_code, app_code);
-    for key in ["schema_version", "id", "ran_by", "workspace", "base_ref", "forced",
-                "exec_bearing", "scope", "ok"] {
-        assert_eq!(exec_run[key], app_run[key], "{key} differs across transports");
+    for key in [
+        "schema_version",
+        "id",
+        "ran_by",
+        "workspace",
+        "base_ref",
+        "forced",
+        "exec_bearing",
+        "scope",
+        "ok",
+    ] {
+        assert_eq!(
+            exec_run[key], app_run[key],
+            "{key} differs across transports"
+        );
     }
     let (a, b) = (
         exec_run["commands"].as_array().unwrap(),
@@ -721,7 +745,13 @@ fn the_two_transports_verify_identically_field_wise() {
     );
     assert_eq!(a.len(), b.len());
     for (x, y) in a.iter().zip(b) {
-        for key in ["command", "exit_code", "timed_out", "stdout_sha256", "ran_by"] {
+        for key in [
+            "command",
+            "exit_code",
+            "timed_out",
+            "stdout_sha256",
+            "ran_by",
+        ] {
             assert_eq!(x[key], y[key], "commands[].{key} differs across transports");
         }
         // The two that necessarily vary: type-checked on both sides, compared

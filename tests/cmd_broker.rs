@@ -250,14 +250,30 @@ fn broker_run_detaches_holds_the_singleton_and_a_second_run_exits_zero() {
 
     // A stale socket from a crashed predecessor: unlinked only because the
     // connect to it fails.
-    run(a2a(&home, tmp.path(), &["config", "show"]), &scratch, "layout");
+    run(
+        a2a(&home, tmp.path(), &["config", "show"]),
+        &scratch,
+        "layout",
+    );
     std::fs::write(socket(&home), b"not a socket").unwrap();
 
-    let first = run(a2a(&home, tmp.path(), &["broker", "run"]), &scratch, "first");
-    assert_eq!(first.code, 0, "the launching process exits: {}", first.stderr);
+    let first = run(
+        a2a(&home, tmp.path(), &["broker", "run"]),
+        &scratch,
+        "first",
+    );
+    assert_eq!(
+        first.code, 0,
+        "the launching process exits: {}",
+        first.stderr
+    );
     let pid = wait_for_broker(&home);
 
-    assert_eq!(mode_of(&home.join("broker.pid")), 0o600, "the pidfile is 0600");
+    assert_eq!(
+        mode_of(&home.join("broker.pid")),
+        0o600,
+        "the pidfile is 0600"
+    );
     assert!(alive(pid), "the pidfile names a live process");
     until("the daemon to be reparented to init", || {
         (ps_field(pid, "ppid")?.trim() == "1").then_some(())
@@ -282,8 +298,15 @@ fn broker_run_detaches_holds_the_singleton_and_a_second_run_exits_zero() {
     assert!(alive(pid), "SIGHUP is ignored");
 
     // ... and the singleton holds: contention is a message and an exit 0.
-    let second = run(a2a(&home, tmp.path(), &["broker", "run"]), &scratch, "second");
-    assert_eq!(second.code, 0, "a second `broker run` is a no-op, not a failure");
+    let second = run(
+        a2a(&home, tmp.path(), &["broker", "run"]),
+        &scratch,
+        "second",
+    );
+    assert_eq!(
+        second.code, 0,
+        "a second `broker run` is a no-op, not a failure"
+    );
     assert!(
         second.stderr.contains("a2a: broker already running"),
         "the second run says so on stderr: {:?}",
@@ -402,7 +425,10 @@ fn a_foreground_run_stays_attached_and_is_itself_the_daemon() {
     );
     assert_eq!(stopped.code, 0);
     let ran = finish(child, &scratch, "fg");
-    assert_eq!(ran.code, 0, "an attached daemon exits 0 on `broker shutdown`");
+    assert_eq!(
+        ran.code, 0,
+        "an attached daemon exits 0 on `broker shutdown`"
+    );
     assert!(
         ran.stdout.contains("\"started\": true"),
         "an attached daemon reports on ITS OWN stdout: {:?}",
@@ -469,13 +495,21 @@ fn broker_status_reports_the_daemon_and_status_broker_is_an_alias() {
     assert_eq!(up.code, 0);
     let d = up.data();
     assert_eq!(d["running"], json!(true));
-    assert_eq!(d["pid"], json!(pid), "the broker's own pid, matching broker.pid");
+    assert_eq!(
+        d["pid"],
+        json!(pid),
+        "the broker's own pid, matching broker.pid"
+    );
     assert_eq!(d["transport"], json!("app-server"), "transport mode: {d}");
     assert!(d["uptime_secs"].is_u64(), "uptime: {d}");
     assert!(d["child_pid"].is_u64(), "the app-server child's pid: {d}");
     assert_eq!(d["restarts"], json!(0), "restart count: {d}");
     assert_eq!(d["workers"], json!(0), "worker count: {d}");
-    assert_eq!(d["clients"], json!(1), "client count — the asker itself: {d}");
+    assert_eq!(
+        d["clients"],
+        json!(1),
+        "client count — the asker itself: {d}"
+    );
 
     let alias = run(
         a2a(&home, tmp.path(), &["--json", "status", "--broker"]),
@@ -503,7 +537,10 @@ fn broker_status_reports_the_daemon_and_status_broker_is_an_alias() {
         &scratch,
         "neither",
     );
-    assert_eq!(neither.code, 2, "`status` with no id and no --broker is usage");
+    assert_eq!(
+        neither.code, 2,
+        "`status` with no id and no --broker is usage"
+    );
 
     drop(guard);
     common::assert_no_broker_left(&home);
@@ -527,10 +564,14 @@ fn broker_restart_replaces_the_daemon_with_exactly_one_successor() {
         "restart",
     );
     assert_eq!(restarted.code, 0, "restart: {}", restarted.stderr);
-    let second = restarted.data()["pid"].as_u64().expect("the new daemon's pid") as u32;
+    let second = restarted.data()["pid"]
+        .as_u64()
+        .expect("the new daemon's pid") as u32;
 
     assert_ne!(second, first, "a restart is a new process");
-    until("the retired daemon to exit", || (!alive(first)).then_some(()));
+    until("the retired daemon to exit", || {
+        (!alive(first)).then_some(())
+    });
     assert_eq!(read_pidfile(&home), Some(second), "the pidfile followed");
     until("exactly one broker process after a restart", || {
         (common::broker_processes(&home).len() == 1).then_some(())
@@ -560,7 +601,11 @@ fn startup_reconciliation_reaps_the_previous_child_before_it_adopts() {
     std::fs::create_dir_all(&work).unwrap();
     let guard = common::BrokerGuard::new(&home);
     // The home layout, as `a2a` would leave it.
-    run(a2a(&home, tmp.path(), &["config", "show"]), &scratch, "layout");
+    run(
+        a2a(&home, tmp.path(), &["config", "show"]),
+        &scratch,
+        "layout",
+    );
 
     let (mut previous, old_child, witness) = stand_in_child();
     let (mut untouched, exec_pid, exec_witness) = stand_in_child();
@@ -605,9 +650,10 @@ fn startup_reconciliation_reaps_the_previous_child_before_it_adopts() {
     run(a2a(&home, tmp.path(), &["broker", "run"]), &scratch, "run");
     wait_for_broker(&home);
 
-    until("the previous instance's app-server child to be reaped", || {
-        previous.try_wait().unwrap().map(|_| ())
-    });
+    until(
+        "the previous instance's app-server child to be reaped",
+        || previous.try_wait().unwrap().map(|_| ()),
+    );
     assert!(
         untouched.try_wait().unwrap().is_none(),
         "an exec worker's process is NOT the broker's to kill"
@@ -622,7 +668,8 @@ fn startup_reconciliation_reaps_the_previous_child_before_it_adopts() {
     let r = status.data()["reconciled"].clone();
 
     assert_eq!(
-        r["reaped"][0]["pid"], json!(old_child),
+        r["reaped"][0]["pid"],
+        json!(old_child),
         "the reap names the child it killed: {r}"
     );
     assert_eq!(r["reaped"][0]["outcome"], json!("killed"), "{r}");
@@ -695,7 +742,10 @@ fn startup_reconciliation_reaps_the_previous_child_before_it_adopts() {
         let snap = a2a::state::load_snapshot(&orphaned).unwrap();
         (snap.state == WorkerState::Running).then_some(snap)
     });
-    assert_eq!(revived.epoch, 2, "a resume is a new epoch on an old conversation");
+    assert_eq!(
+        revived.epoch, 2,
+        "a resume is a new epoch on an old conversation"
+    );
     assert_eq!(
         std::fs::read(exec_dir.join("state.json")).unwrap(),
         exec_before,
@@ -751,7 +801,11 @@ fn the_child_environment_is_scrubbed_while_the_daemon_keeps_its_own() {
             .map(|(_, v)| v.clone())
     };
 
-    assert_eq!(get("OPENAI_API_KEY"), None, "the scrub list wins: {child_env:?}");
+    assert_eq!(
+        get("OPENAI_API_KEY"),
+        None,
+        "the scrub list wins: {child_env:?}"
+    );
     assert_eq!(get("DEPOT_TOKEN"), None, "the scrub list wins");
     assert!(
         !child_env.iter().any(|(k, _)| k.starts_with("AWS_")),
@@ -763,7 +817,11 @@ fn the_child_environment_is_scrubbed_while_the_daemon_keeps_its_own() {
         "the allowlist keeps CODEX_HOME"
     );
     assert!(get("PATH").is_some(), "the allowlist keeps PATH");
-    assert_eq!(get("A2A_ALLOWED_ROOTS"), None, "the daemon's own config does not travel");
+    assert_eq!(
+        get("A2A_ALLOWED_ROOTS"),
+        None,
+        "the daemon's own config does not travel"
+    );
 
     // ... and the daemon itself kept what the allowlist would have stripped.
     let status = run(
@@ -953,7 +1011,10 @@ fn select_blocks(code: &str) -> Vec<(usize, String)> {
             }
             i += 1;
         }
-        out.push((line, chars[block_start..=i.min(chars.len() - 1)].iter().collect()));
+        out.push((
+            line,
+            chars[block_start..=i.min(chars.len() - 1)].iter().collect(),
+        ));
         at = start + "select!".len();
     }
     out
@@ -1219,7 +1280,11 @@ fn spawn_auto_selects_the_app_server_and_the_worker_runs_to_done() {
     let spawned = run(cmd, &scratch, "spawn");
     assert_eq!(spawned.code, 0, "spawn: {}", spawned.stderr);
     let d = spawned.data();
-    assert_eq!(d["transport"], json!("app-server"), "auto chose the broker: {d}");
+    assert_eq!(
+        d["transport"],
+        json!("app-server"),
+        "auto chose the broker: {d}"
+    );
     let id = d["id"].as_str().expect("an id").to_string();
 
     // The daemon came up because the CLI needed it — nobody ran `broker run`.
@@ -1230,17 +1295,25 @@ fn spawn_auto_selects_the_app_server_and_the_worker_runs_to_done() {
 
     let done = until_state(&home, &id, "done");
     assert_eq!(done["transport"], json!("app-server"));
-    assert_eq!(done["requested_transport"], json!("app-server"),
-               "requested = the resolved transport when none was named: {done}");
+    assert_eq!(
+        done["requested_transport"],
+        json!("app-server"),
+        "requested = the resolved transport when none was named: {done}"
+    );
     assert_eq!(done["transport_selection"], json!("auto"), "{done}");
     assert_eq!(done["owner"], json!("test-owner"), "{done}");
-    let thread_id = done["thread_id"].as_str().expect("a thread of record").to_string();
+    let thread_id = done["thread_id"]
+        .as_str()
+        .expect("a thread of record")
+        .to_string();
     assert_eq!(
-        done["session_id"], json!(thread_id),
+        done["session_id"],
+        json!(thread_id),
         "thread.id IS the session id on 0.140.0: {done}"
     );
     assert_eq!(
-        done["resolved_sandbox"]["type"], json!("workspaceWrite"),
+        done["resolved_sandbox"]["type"],
+        json!("workspaceWrite"),
         "the sandbox the server resolved is recorded: {done}"
     );
     assert!(
@@ -1255,7 +1328,8 @@ fn spawn_auto_selects_the_app_server_and_the_worker_runs_to_done() {
     );
     assert_eq!(result.code, 0);
     assert_eq!(
-        result.data()["result"], json!("THE ANSWER"),
+        result.data()["result"],
+        json!("THE ANSWER"),
         "the final agent message IS the result on this transport"
     );
 
@@ -1266,11 +1340,23 @@ fn spawn_auto_selects_the_app_server_and_the_worker_runs_to_done() {
         &scratch,
         "rebuilt",
     );
-    assert_eq!(rebuilt.code, 0, "status after losing state.json: {}", rebuilt.stderr);
+    assert_eq!(
+        rebuilt.code, 0,
+        "status after losing state.json: {}",
+        rebuilt.stderr
+    );
     let r = rebuilt.data();
     assert_eq!(r["state"], json!("done"), "{r}");
-    assert_eq!(r["owner"], json!("test-owner"), "owner survives a rebuild: {r}");
-    assert_eq!(r["thread_id"], json!(thread_id), "thread_id survives a rebuild: {r}");
+    assert_eq!(
+        r["owner"],
+        json!("test-owner"),
+        "owner survives a rebuild: {r}"
+    );
+    assert_eq!(
+        r["thread_id"],
+        json!(thread_id),
+        "thread_id survives a rebuild: {r}"
+    );
 
     drop(guard);
     common::assert_no_broker_left(&home);
@@ -1327,7 +1413,8 @@ fn spawn_auto_stays_on_exec_when_the_broker_is_disabled_even_with_one_running() 
         "list",
     );
     assert_eq!(
-        list.data()["workers"], json!([]),
+        list.data()["workers"],
+        json!([]),
         "a disabled spawn does not register with the running broker"
     );
 
@@ -1360,7 +1447,10 @@ fn a_blocked_app_server_worker_parks_awaiting_input_and_the_cli_reconcile_is_rea
     let parked = until_state(&home, &id, "awaiting-input");
     assert_eq!(parked["state_reason"], json!("blocked"), "{parked}");
     assert!(
-        home.join("workers").join(&id).join("outbox/1.question.json").exists(),
+        home.join("workers")
+            .join(&id)
+            .join("outbox/1.question.json")
+            .exists(),
         "the worker asked its question through the outbox"
     );
 
@@ -1380,7 +1470,11 @@ fn a_blocked_app_server_worker_parks_awaiting_input_and_the_cli_reconcile_is_rea
         &scratch,
         "status",
     );
-    assert_eq!(status.code, 5, "status of a parked worker: {}", status.stderr);
+    assert_eq!(
+        status.code, 5,
+        "status of a parked worker: {}",
+        status.stderr
+    );
     assert_eq!(
         std::fs::read(&state_file).unwrap(),
         before,
@@ -1417,7 +1511,11 @@ fn the_broker_revalidates_the_wire_cwd_against_its_own_allowed_roots() {
         json!({"dir": ghost, "cwd": elsewhere, "lane": "general"}),
     );
     assert_eq!(refused["type"], json!("err"), "{refused}");
-    assert_eq!(refused["body"]["code"], json!("CWD_NOT_ALLOWED"), "{refused}");
+    assert_eq!(
+        refused["body"]["code"],
+        json!("CWD_NOT_ALLOWED"),
+        "{refused}"
+    );
     assert_eq!(refused["body"]["exit"], json!(9), "{refused}");
     assert!(!ghost.exists(), "a refused spawn creates nothing");
 
@@ -1429,8 +1527,15 @@ fn the_broker_revalidates_the_wire_cwd_against_its_own_allowed_roots() {
         "spawn",
         json!({"dir": research, "cwd": allowed, "lane": "research"}),
     );
-    assert_eq!(refused["body"]["code"], json!("CWD_NOT_ALLOWED"), "{refused}");
-    assert!(!research.exists(), "a refused research spawn creates nothing");
+    assert_eq!(
+        refused["body"]["code"],
+        json!("CWD_NOT_ALLOWED"),
+        "{refused}"
+    );
+    assert!(
+        !research.exists(),
+        "a refused research spawn creates nothing"
+    );
 
     drop(guard);
     common::assert_no_broker_left(&home);
@@ -1466,7 +1571,11 @@ fn a_broker_that_will_not_start_degrades_auto_to_exec_and_hard_fails_explicit_ap
         .env("A2A_BROKER_BIN", &dud)
         .env("A2A_CODEX_BIN", common::stub_path());
     let spawned = run(cmd, &scratch, "auto");
-    assert_eq!(spawned.code, 0, "auto degrades rather than failing: {}", spawned.stderr);
+    assert_eq!(
+        spawned.code, 0,
+        "auto degrades rather than failing: {}",
+        spawned.stderr
+    );
     let id = spawned.data()["id"].as_str().unwrap().to_string();
     assert_eq!(spawned.data()["transport"], json!("exec"));
 
@@ -1479,14 +1588,37 @@ fn a_broker_that_will_not_start_degrades_auto_to_exec_and_hard_fails_explicit_ap
         .into_iter()
         .filter(|e| e["kind"] == json!("transport_degraded"))
         .collect();
-    assert_eq!(degraded.len(), 1, "the degradation is an event: {:?}", kinds_of(&home, &id));
-    assert_eq!(degraded[0]["raw"]["requested"], json!("app-server"), "{}", degraded[0]);
-    assert_eq!(degraded[0]["raw"]["selected"], json!("exec"), "{}", degraded[0]);
+    assert_eq!(
+        degraded.len(),
+        1,
+        "the degradation is an event: {:?}",
+        kinds_of(&home, &id)
+    );
+    assert_eq!(
+        degraded[0]["raw"]["requested"],
+        json!("app-server"),
+        "{}",
+        degraded[0]
+    );
+    assert_eq!(
+        degraded[0]["raw"]["selected"],
+        json!("exec"),
+        "{}",
+        degraded[0]
+    );
 
     let mut cmd = a2a(
         &home,
         tmp.path(),
-        &["--json", "spawn", "--lane", "general", "--transport", "app-server", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "app-server",
+            "--cwd",
+        ],
     );
     cmd.arg(&work)
         .arg("--brief")
@@ -1494,16 +1626,30 @@ fn a_broker_that_will_not_start_degrades_auto_to_exec_and_hard_fails_explicit_ap
         .env("A2A_BROKER_BIN", &dud)
         .env("A2A_CODEX_BIN", common::stub_path());
     let hard = run(cmd, &scratch, "explicit");
-    assert_eq!(hard.code, 7, "explicit app-server is a reachability failure: {}", hard.stderr);
     assert_eq!(
-        hard.json()["error"]["code"], json!("BROKER_UNAVAILABLE"),
-        "{}", hard.stdout
+        hard.code, 7,
+        "explicit app-server is a reachability failure: {}",
+        hard.stderr
+    );
+    assert_eq!(
+        hard.json()["error"]["code"],
+        json!("BROKER_UNAVAILABLE"),
+        "{}",
+        hard.stdout
     );
     // An unknown transport is the one that stays a static precondition.
     let mut cmd = a2a(
         &home,
         tmp.path(),
-        &["--json", "spawn", "--lane", "general", "--transport", "carrier-pigeon", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "carrier-pigeon",
+            "--cwd",
+        ],
     );
     cmd.arg(&work).arg("--brief").arg(&brief);
     let unknown = run(cmd, &scratch, "unknown");
@@ -1572,15 +1718,25 @@ fn a_codex_binary_that_drifted_under_the_broker_refuses_new_spawns() {
         .env("A2A_CODEX_BIN", &wrapper)
         .env("A2A_TEST_VERSION_FILE", &version_file);
     let drifted = run(cmd, &scratch, "drift");
-    assert_ne!(drifted.code, 0, "a drifted codex refuses the spawn: {}", drifted.stdout);
+    assert_ne!(
+        drifted.code, 0,
+        "a drifted codex refuses the spawn: {}",
+        drifted.stdout
+    );
     let err = drifted.json()["error"].clone();
     assert_eq!(err["code"], json!("CODEX_DRIFT"), "{err}");
     assert!(
-        err["remedy"].as_str().unwrap_or_default().contains("a2a broker restart"),
+        err["remedy"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a2a broker restart"),
         "the refusal names the way out: {err}"
     );
     assert!(
-        err["message"].as_str().unwrap_or_default().contains("0.147.0"),
+        err["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("0.147.0"),
         "the refusal names what it found: {err}"
     );
 
@@ -1637,7 +1793,9 @@ fn a_dead_broker_orphans_its_workers_and_kill_never_signals_the_shared_child() {
         nix::sys::signal::Signal::SIGKILL,
     )
     .unwrap();
-    until("the broker to be gone", || (!alive(broker_pid)).then_some(()));
+    until("the broker to be gone", || {
+        (!alive(broker_pid)).then_some(())
+    });
     // A crashed daemon leaves its address behind; nobody else will remove it.
     let _ = std::fs::remove_file(socket(&home));
 
@@ -1645,7 +1803,8 @@ fn a_dead_broker_orphans_its_workers_and_kill_never_signals_the_shared_child() {
     // dead broker used to own — a `kill` that signalled it would be the bug.
     let (mut stand_in, pid, witness) = stand_in_child();
     let state_file = home.join("workers").join(&id).join("state.json");
-    let mut snap: Value = serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+    let mut snap: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
     snap["pid"] = json!(pid);
     snap["pid_start_witness"] = json!(witness);
     a2a::store::write_atomic(&state_file, snap.to_string().as_bytes()).unwrap();
@@ -1655,30 +1814,49 @@ fn a_dead_broker_orphans_its_workers_and_kill_never_signals_the_shared_child() {
         &scratch,
         "orphan",
     );
-    assert_eq!(status.code, 10, "a live worker with no broker is orphaned: {}", status.stderr);
+    assert_eq!(
+        status.code, 10,
+        "a live worker with no broker is orphaned: {}",
+        status.stderr
+    );
     assert_eq!(status.data()["state"], json!("orphaned"));
     assert!(
-        snap_of(&home, &id).unwrap().get("fold_rejections").is_none(),
+        snap_of(&home, &id)
+            .unwrap()
+            .get("fold_rejections")
+            .is_none(),
         "the orphan commit is a legal row"
     );
 
     let never = run(
-        a2a(&home, tmp.path(), &["--json", "status", "general-0817t1210-neve"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["--json", "status", "general-0817t1210-neve"],
+        ),
         &scratch,
         "never",
     );
-    assert_eq!(never.code, 4, "a spawned worker whose broker died never started");
+    assert_eq!(
+        never.code, 4,
+        "a spawned worker whose broker died never started"
+    );
     assert_eq!(never.data()["state"], json!("failed"));
     assert_eq!(never.data()["failure_class"], json!("never_started"));
 
     let queued = run(
-        a2a(&home, tmp.path(), &["--json", "status", "general-0817t1211-queu"]),
+        a2a(
+            &home,
+            tmp.path(),
+            &["--json", "status", "general-0817t1211-queu"],
+        ),
         &scratch,
         "queued",
     );
     assert_eq!(queued.code, 0);
     assert_eq!(
-        queued.data()["state"], json!("queued"),
+        queued.data()["state"],
+        json!("queued"),
         "a queued worker is left for the next broker to re-enqueue"
     );
 
@@ -1690,7 +1868,8 @@ fn a_dead_broker_orphans_its_workers_and_kill_never_signals_the_shared_child() {
     assert_eq!(killed.code, 0, "kill: {}", killed.stderr);
     assert_eq!(killed.data()["state"], json!("cancelled"));
     assert_eq!(
-        killed.data()["signal"], json!("no_signal"),
+        killed.data()["signal"],
+        json!("no_signal"),
         "the app-server child is every worker's — kill routes through the broker, never a signal"
     );
     assert!(
@@ -1750,14 +1929,32 @@ fn send_steers_a_running_app_server_worker_mid_turn() {
     assert_eq!(sent.code, 0, "send: {}", sent.stderr);
     let d = sent.data();
     assert_eq!(d["queued"], json!(true), "{d}");
-    assert_eq!(d["delivered"], json!(true), "a live turn takes the message now: {d}");
-    assert_eq!(d["send_path"], json!("steered"), "mid-turn is the steer path: {d}");
+    assert_eq!(
+        d["delivered"],
+        json!(true),
+        "a live turn takes the message now: {d}"
+    );
+    assert_eq!(
+        d["send_path"],
+        json!("steered"),
+        "mid-turn is the steer path: {d}"
+    );
 
     // The event is the durable half of the same claim.
     let deliveries = deliveries_of(&home, &id);
     assert_eq!(deliveries.len(), 1, "one delivery: {deliveries:?}");
-    assert_eq!(deliveries[0]["raw"]["send_path"], json!("steered"), "{}", deliveries[0]);
-    assert_eq!(deliveries[0]["raw"]["seqs"], json!([1]), "{}", deliveries[0]);
+    assert_eq!(
+        deliveries[0]["raw"]["send_path"],
+        json!("steered"),
+        "{}",
+        deliveries[0]
+    );
+    assert_eq!(
+        deliveries[0]["raw"]["seqs"],
+        json!([1]),
+        "{}",
+        deliveries[0]
+    );
     assert_eq!(inbox_files(&home, &id), 0, "the message was acknowledged");
     assert_eq!(delivered_files(&home, &id), 1);
 
@@ -1803,13 +2000,19 @@ fn send_to_a_parked_app_server_worker_starts_the_answer_turn() {
     let d = sent.data();
     assert_eq!(d["delivered"], json!(true), "{d}");
     assert_eq!(
-        d["send_path"], json!("started"),
+        d["send_path"],
+        json!("started"),
         "no open turn means a new one, not a steer: {d}"
     );
 
     let deliveries = deliveries_of(&home, &id);
     assert_eq!(deliveries.len(), 1, "{deliveries:?}");
-    assert_eq!(deliveries[0]["raw"]["send_path"], json!("started"), "{}", deliveries[0]);
+    assert_eq!(
+        deliveries[0]["raw"]["send_path"],
+        json!("started"),
+        "{}",
+        deliveries[0]
+    );
     assert_eq!(inbox_files(&home, &id), 0, "the answer was acknowledged");
 
     drop(guard);
@@ -1838,7 +2041,15 @@ fn send_to_a_running_exec_worker_keeps_the_phase_one_queue_path() {
     let mut cmd = a2a(
         &home,
         tmp.path(),
-        &["--json", "spawn", "--lane", "general", "--transport", "exec", "--cwd"],
+        &[
+            "--json",
+            "spawn",
+            "--lane",
+            "general",
+            "--transport",
+            "exec",
+            "--cwd",
+        ],
     );
     cmd.arg(&work)
         .arg("--brief")
@@ -1851,21 +2062,30 @@ fn send_to_a_running_exec_worker_keeps_the_phase_one_queue_path() {
     let id = spawned.data()["id"].as_str().unwrap().to_string();
     until_state(&home, &id, "running");
 
-    let mut cmd = a2a(&home, tmp.path(), &["--json", "send", &id, "fyi: keep going"]);
+    let mut cmd = a2a(
+        &home,
+        tmp.path(),
+        &["--json", "send", &id, "fyi: keep going"],
+    );
     cmd.env("A2A_CODEX_BIN", common::stub_path());
     let sent = run(cmd, &scratch, "send");
     assert_eq!(sent.code, 0, "send: {}", sent.stderr);
     let d = sent.data();
     assert_eq!(d["queued"], json!(true), "{d}");
     assert_eq!(
-        d["delivered"], json!(false),
+        d["delivered"],
+        json!(false),
         "exec has no way into a live turn: the message waits for the boundary: {d}"
     );
     assert!(
         d.get("send_path").is_none(),
         "nothing was steered, so nothing claims a steer path: {d}"
     );
-    assert_eq!(inbox_files(&home, &id), 1, "the message is queued, not delivered");
+    assert_eq!(
+        inbox_files(&home, &id),
+        1,
+        "the message is queued, not delivered"
+    );
     assert!(
         deliveries_of(&home, &id).is_empty(),
         "no delivery was recorded: {:?}",
@@ -1878,8 +2098,10 @@ fn send_to_a_running_exec_worker_keeps_the_phase_one_queue_path() {
         "list",
     );
     assert_eq!(
-        list.data()["workers"], json!([]),
-        "an exec worker is not the broker's: {}", list.stdout
+        list.data()["workers"],
+        json!([]),
+        "an exec worker is not the broker's: {}",
+        list.stdout
     );
 
     drop(guard);
@@ -1916,22 +2138,40 @@ fn queue_only_stays_a_pure_enqueue_and_the_next_send_carries_the_backlog() {
 
     for (tag, text) in [("q1", "part one"), ("q2", "part two")] {
         let queued = run(
-            a2a(&home, tmp.path(), &["--json", "send", &id, text, "--queue-only"]),
+            a2a(
+                &home,
+                tmp.path(),
+                &["--json", "send", &id, text, "--queue-only"],
+            ),
             &scratch,
             tag,
         );
         assert_eq!(queued.code, 0, "{tag}: {}", queued.stderr);
-        assert_eq!(queued.data()["delivered"], json!(false), "{}", queued.stdout);
-        assert!(queued.data().get("send_path").is_none(), "{}", queued.stdout);
+        assert_eq!(
+            queued.data()["delivered"],
+            json!(false),
+            "{}",
+            queued.stdout
+        );
+        assert!(
+            queued.data().get("send_path").is_none(),
+            "{}",
+            queued.stdout
+        );
     }
-    assert_eq!(inbox_files(&home, &id), 2, "two staged messages, nothing delivered");
+    assert_eq!(
+        inbox_files(&home, &id),
+        2,
+        "two staged messages, nothing delivered"
+    );
     assert!(
         deliveries_of(&home, &id).is_empty(),
         "--queue-only delivers nothing: {:?}",
         kinds_of(&home, &id)
     );
     assert_eq!(
-        snap_of(&home, &id).unwrap()["state"], json!("running"),
+        snap_of(&home, &id).unwrap()["state"],
+        json!("running"),
         "a staged message does not end the turn"
     );
 
@@ -1941,13 +2181,24 @@ fn queue_only_stays_a_pure_enqueue_and_the_next_send_carries_the_backlog() {
         "send",
     );
     assert_eq!(sent.code, 0, "send: {}", sent.stderr);
-    assert_eq!(sent.data()["send_path"], json!("steered"), "{}", sent.stdout);
+    assert_eq!(
+        sent.data()["send_path"],
+        json!("steered"),
+        "{}",
+        sent.stdout
+    );
 
     let deliveries = deliveries_of(&home, &id);
-    assert_eq!(deliveries.len(), 1, "one delivery carried all three: {deliveries:?}");
     assert_eq!(
-        deliveries[0]["raw"]["seqs"], json!([1, 2, 3]),
-        "the backlog travels in seq order: {}", deliveries[0]
+        deliveries.len(),
+        1,
+        "one delivery carried all three: {deliveries:?}"
+    );
+    assert_eq!(
+        deliveries[0]["raw"]["seqs"],
+        json!([1, 2, 3]),
+        "the backlog travels in seq order: {}",
+        deliveries[0]
     );
     assert_eq!(inbox_files(&home, &id), 0);
     assert_eq!(delivered_files(&home, &id), 3);

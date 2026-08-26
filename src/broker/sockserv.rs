@@ -93,11 +93,7 @@ pub fn bind(home: &Path) -> Result<Option<UnixListener>, AppError> {
 }
 
 fn io_error(path: &Path, e: std::io::Error) -> AppError {
-    AppError::new(
-        "IO",
-        ExitCode::Internal,
-        format!("{}: {e}", path.display()),
-    )
+    AppError::new("IO", ExitCode::Internal, format!("{}: {e}", path.display()))
 }
 
 /// Everything a connection needs that is not the connection itself.
@@ -139,7 +135,11 @@ pub struct ServeCtx {
 }
 
 impl ServeCtx {
-    pub fn new(home: impl Into<PathBuf>, core: CoreHandle, shutdown: CancellationToken) -> ServeCtx {
+    pub fn new(
+        home: impl Into<PathBuf>,
+        core: CoreHandle,
+        shutdown: CancellationToken,
+    ) -> ServeCtx {
         ServeCtx {
             home: home.into(),
             core,
@@ -189,7 +189,11 @@ impl ServeCtx {
         self.shutdown.cancel();
     }
 
-    pub fn with_config(mut self, codex_bin: Option<PathBuf>, allowed_roots: Vec<PathBuf>) -> ServeCtx {
+    pub fn with_config(
+        mut self,
+        codex_bin: Option<PathBuf>,
+        allowed_roots: Vec<PathBuf>,
+    ) -> ServeCtx {
         self.codex_bin = codex_bin;
         self.allowed_roots = allowed_roots;
         self
@@ -472,7 +476,9 @@ async fn request_loop(
             }
             match ctx.core.subscribe().await {
                 Ok(rx) => {
-                    let _ = out.send(Frame::resp(frame.id, json!({"subscribed": true}))).await;
+                    let _ = out
+                        .send(Frame::resp(frame.id, json!({"subscribed": true})))
+                        .await;
                     // Counted once per CONNECTION, not once per subscribe: the
                     // decrement below is also once, and a resubscribing tail
                     // must not leave the idle timer believing in a watcher that
@@ -488,7 +494,9 @@ async fn request_loop(
                     )));
                 }
                 Err(e) => {
-                    let _ = out.send(Frame::err(frame.id, WireError::from_app(&e))).await;
+                    let _ = out
+                        .send(Frame::err(frame.id, WireError::from_app(&e)))
+                        .await;
                 }
             }
             continue;
@@ -637,12 +645,7 @@ pub async fn pump_subscription(
 
 /// The op table. Every entry is a [`CoreHandle`] call or a fact about the
 /// daemon; nothing here touches a worker directory directly.
-async fn dispatch(
-    op: &str,
-    body: &Value,
-    _conn: u64,
-    ctx: &ServeCtx,
-) -> Result<Value, WireError> {
+async fn dispatch(op: &str, body: &Value, _conn: u64, ctx: &ServeCtx) -> Result<Value, WireError> {
     match op {
         "info" => Ok(info(ctx).await),
         "list" => {
@@ -876,7 +879,10 @@ mod tests {
     /// that cannot.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_finished_subscription_may_be_replaced_but_a_live_one_may_not() {
-        assert!(may_subscribe(None), "a connection with no tail may open one");
+        assert!(
+            may_subscribe(None),
+            "a connection with no tail may open one"
+        );
 
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
         let live = tokio::spawn(async move {

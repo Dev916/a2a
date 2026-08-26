@@ -198,7 +198,10 @@ fn a_codex_home_mismatch_is_the_one_new_failure() {
     assert_eq!(code, 9, "a real mismatch is fatal");
     assert_eq!(check(&v, "codex_home_match")["status"], "fail");
     let d = detail(&v, "codex_home_match");
-    assert!(d.contains("server-home") && d.contains("configured-home"), "{d}");
+    assert!(
+        d.contains("server-home") && d.contains("configured-home"),
+        "{d}"
+    );
 }
 
 /// An exported `OPENAI_API_KEY` is the billing hazard spec §4.2 names: the
@@ -287,7 +290,10 @@ fn a_running_broker_is_reported_up() {
     assert_eq!(check(&v, "broker_status")["status"], "ok");
     let d = detail(&v, "broker_status");
     assert!(d.contains("up"), "{d}");
-    assert!(d.contains("protocol"), "the skew fact is reported up front: {d}");
+    assert!(
+        d.contains("protocol"),
+        "the skew fact is reported up front: {d}"
+    );
     // A live daemon is always nameable: the health file is written by a task
     // and may still be in flight, but the pidfile predates the listener.
     let pid = std::fs::read_to_string(home.join("broker.pid")).unwrap();
@@ -300,7 +306,10 @@ fn a_running_broker_is_reported_up() {
 fn wait_for_socket(home: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !home.join("broker.sock").exists() {
-        assert!(Instant::now() < deadline, "the broker never bound its socket");
+        assert!(
+            Instant::now() < deadline,
+            "the broker never bound its socket"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -547,7 +556,10 @@ fn a_drifted_manifest_entry_warns_in_sync_state() {
     assert_eq!(check(&v, "sync_state")["status"], "warn");
     let d = detail(&v, "sync_state");
     assert!(d.contains("1 drifted"), "{d}");
-    assert!(d.contains("0 missing"), "the counts are named, not summed: {d}");
+    assert!(
+        d.contains("0 missing"),
+        "the counts are named, not summed: {d}"
+    );
     assert_eq!(check(&v, "sync_state")["remedy"], "a2a sync skills");
 }
 

@@ -1,7 +1,7 @@
 // tests/cmd_gc.rs
 mod common;
-use common::*;
 use chrono::{Duration as ChronoDuration, Utc};
+use common::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,12 +11,24 @@ use tempfile::TempDir;
 fn dry_run_lists_but_deletes_nothing_and_age_zero_reaps_with_tombstone() {
     let (home, tmp, id) = spawn_with(&[]);
     wait_dead(&home, &id, 10);
-    a2a(&home, tmp.path()).args(["status", &id]).assert().code(0);
-    let out = a2a(&home, tmp.path()).args(["--json", "gc", "--dry-run"]).assert().success();
+    a2a(&home, tmp.path())
+        .args(["status", &id])
+        .assert()
+        .code(0);
+    let out = a2a(&home, tmp.path())
+        .args(["--json", "gc", "--dry-run"])
+        .assert()
+        .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["data"]["reclaimable"][0]["id"], id.as_str());
-    assert!(home.join("workers").join(&id).exists(), "dry-run must not delete");
-    a2a(&home, tmp.path()).args(["gc", "--age", "0s"]).assert().success();
+    assert!(
+        home.join("workers").join(&id).exists(),
+        "dry-run must not delete"
+    );
+    a2a(&home, tmp.path())
+        .args(["gc", "--age", "0s"])
+        .assert()
+        .success();
     assert!(!home.join("workers").join(&id).exists());
     let index = std::fs::read_to_string(home.join("index.jsonl")).unwrap();
     let t: serde_json::Value = serde_json::from_str(index.lines().next().unwrap()).unwrap();
@@ -27,11 +39,20 @@ fn dry_run_lists_but_deletes_nothing_and_age_zero_reaps_with_tombstone() {
 #[test]
 fn non_terminal_workers_are_never_removed() {
     let (home, tmp, id) = spawn_with(&[("STUB_SLEEP", "20")]);
-    a2a(&home, tmp.path()).args(["gc", "--age", "0s"]).assert().success();
-    assert!(home.join("workers").join(&id).exists(), "running worker must survive gc");
+    a2a(&home, tmp.path())
+        .args(["gc", "--age", "0s"])
+        .assert()
+        .success();
+    assert!(
+        home.join("workers").join(&id).exists(),
+        "running worker must survive gc"
+    );
     // `--force` widens the WORKTREE rule and nothing else: a worker somebody
     // can still act on stays, flag or no flag.
-    a2a(&home, tmp.path()).args(["gc", "--age", "0s", "--force"]).assert().success();
+    a2a(&home, tmp.path())
+        .args(["gc", "--age", "0s", "--force"])
+        .assert()
+        .success();
     assert!(
         home.join("workers").join(&id).exists(),
         "--force must not reach a non-terminal worker"
@@ -45,14 +66,23 @@ fn invalid_names_and_symlinks_are_skipped_victims_survive() {
     let workers = home.join("workers");
     std::fs::create_dir_all(workers.join("..evil")).unwrap();
     std::fs::create_dir_all(workers.join("not-an-id")).unwrap();
-    let victim = tmp.path().join("victim"); std::fs::create_dir_all(&victim).unwrap();
+    let victim = tmp.path().join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
     std::fs::write(victim.join("precious.txt"), "keep me").unwrap();
     std::os::unix::fs::symlink(&victim, workers.join("evil-link")).unwrap();
-    let out = a2a(&home, tmp.path()).args(["gc", "--age", "0s"]).assert().success();
+    let out = a2a(&home, tmp.path())
+        .args(["gc", "--age", "0s"])
+        .assert()
+        .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
-    assert!(stderr.contains("..evil") && stderr.contains("not-an-id") && stderr.contains("evil-link"));
+    assert!(
+        stderr.contains("..evil") && stderr.contains("not-an-id") && stderr.contains("evil-link")
+    );
     assert!(workers.join("..evil").exists() && workers.join("not-an-id").exists());
-    assert!(victim.join("precious.txt").exists(), "symlink target must survive");
+    assert!(
+        victim.join("precious.txt").exists(),
+        "symlink target must survive"
+    );
 }
 
 #[test]
@@ -62,8 +92,11 @@ fn codex_home_is_never_touched() {
     let codex_home = tmp.path().join("codex-home");
     std::fs::create_dir_all(codex_home.join("sessions")).unwrap();
     std::fs::write(codex_home.join("sessions/sentinel"), "x").unwrap();
-    a2a(&home, tmp.path()).env("CODEX_HOME", &codex_home)
-        .args(["gc", "--age", "0s"]).assert().success();
+    a2a(&home, tmp.path())
+        .env("CODEX_HOME", &codex_home)
+        .args(["gc", "--age", "0s"])
+        .assert()
+        .success();
     assert!(codex_home.join("sessions/sentinel").exists());
 }
 
@@ -118,8 +151,7 @@ struct WtWorker {
 
 /// A devloop-shaped result (`templates/impl-result.schema.json`) — what an impl
 /// worker has to write now that the lane ships a default schema.
-const DEVLOOP_RESULT: &str =
-    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
+const DEVLOOP_RESULT: &str = r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
 
 /// Spawn an impl-lane worker into a fresh repo (`seed` writes anything extra
 /// the base commit should carry), wait for it to die, and settle it so gc's
@@ -163,8 +195,19 @@ fn spawn_worktree_worker(seed: impl FnOnce(&Path)) -> WtWorker {
             .unwrap_or_else(|| panic!("an impl worker gets a worktree: {snap}")),
     );
     let branch = snap["worktree"]["branch"].as_str().unwrap().to_string();
-    assert!(wt.is_dir(), "the worktree is a real directory: {}", wt.display());
-    WtWorker { tmp, home, repo, id, wt, branch }
+    assert!(
+        wt.is_dir(),
+        "the worktree is a real directory: {}",
+        wt.display()
+    );
+    WtWorker {
+        tmp,
+        home,
+        repo,
+        id,
+        wt,
+        branch,
+    }
 }
 
 /// `a2a --json gc <extra…>` → the `data` payload.
@@ -218,13 +261,19 @@ fn a_dirty_worktree_is_kept_until_force_and_the_branch_survives() {
         w.home.join("workers").join(&w.id).exists(),
         "a refusal deletes nothing — not the worker dir"
     );
-    assert!(w.wt.join("scratch.txt").exists(), "…and not the work in the tree");
+    assert!(
+        w.wt.join("scratch.txt").exists(),
+        "…and not the work in the tree"
+    );
     assert!(tombstones(&w).is_empty(), "…and not even a tombstone");
 
     let data = gc_json(&w, &["--age", "0s", "--force"]);
     assert_eq!(data["removed"][0], w.id.as_str(), "{data}");
     assert!(!w.home.join("workers").join(&w.id).exists());
-    assert!(!w.wt.exists(), "the worktree directory goes with the worker");
+    assert!(
+        !w.wt.exists(),
+        "the worktree directory goes with the worker"
+    );
     assert!(
         a2a_branches(&w).contains(&w.branch),
         "a2a NEVER deletes a branch: {}",
@@ -267,7 +316,10 @@ fn an_unmerged_worktree_is_kept_until_force_and_the_commits_survive() {
         )
     );
     assert!(w.home.join("workers").join(&w.id).exists());
-    assert!(w.wt.exists(), "a clean-but-ahead tree is still not gc's to take");
+    assert!(
+        w.wt.exists(),
+        "a clean-but-ahead tree is still not gc's to take"
+    );
 
     let data = gc_json(&w, &["--age", "0s", "--force"]);
     assert_eq!(data["removed"][0], w.id.as_str(), "{data}");
@@ -291,7 +343,11 @@ fn a_clean_worktree_is_sized_reported_and_reclaimed_without_force() {
     let data = gc_json(&w, &["--dry-run", "--age", "0s"]);
     let row = &data["reclaimable"][0];
     assert_eq!(row["id"], w.id.as_str(), "{data}");
-    assert_eq!(row["worktree"]["path"], w.wt.to_string_lossy().as_ref(), "{row}");
+    assert_eq!(
+        row["worktree"]["path"],
+        w.wt.to_string_lossy().as_ref(),
+        "{row}"
+    );
     assert_eq!(row["worktree"]["branch"], w.branch.as_str(), "{row}");
     assert_eq!(row["worktree"]["ahead"], 0, "{row}");
     assert_eq!(row["worktree"]["dirty_count"], 0, "{row}");
@@ -381,7 +437,10 @@ fn a_worktree_removal_failure_keeps_the_worker_directory_and_the_tombstone() {
 
     let data = &v["data"];
     assert_eq!(data["skipped"][0]["entry"], w.id.as_str(), "{data}");
-    assert_eq!(data["skipped"][0]["reason"], "worktree remove failed", "{data}");
+    assert_eq!(
+        data["skipped"][0]["reason"], "worktree remove failed",
+        "{data}"
+    );
     assert!(data["removed"].as_array().unwrap().is_empty(), "{data}");
     assert!(
         w.home.join("workers").join(&w.id).exists(),
@@ -448,7 +507,8 @@ fn mesh_reclaimed_peers(data: &Value) -> Vec<String> {
 }
 
 #[test]
-fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_ancient_stale_peers() {
+fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_ancient_stale_peers()
+{
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let active = "11111111-1111-4111-8111-111111111111";
@@ -490,10 +550,7 @@ fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_an
     let data = &v["data"];
     assert_eq!(
         mesh_reclaimed_peers(data),
-        vec![
-            format!("claude:{retired}"),
-            format!("claude:{stale_old}"),
-        ],
+        vec![format!("claude:{retired}"), format!("claude:{stale_old}"),],
         "{data}"
     );
     let retired_row = data["mesh"]["reclaimable"]
@@ -504,10 +561,13 @@ fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_an
         .unwrap();
     assert!(retired_row["bytes"].as_u64().unwrap() > 0, "{retired_row}");
     assert_eq!(retired_row["unread_notes"], 2, "{retired_row}");
-    assert_eq!(retired_row["notes_preview"].as_array().unwrap().len(), 2, "{retired_row}");
     assert_eq!(
-        retired_row["notes_preview"][0]["first_line"],
-        "plain first line",
+        retired_row["notes_preview"].as_array().unwrap().len(),
+        2,
+        "{retired_row}"
+    );
+    assert_eq!(
+        retired_row["notes_preview"][0]["first_line"], "plain first line",
         "{retired_row}"
     );
     assert!(
@@ -518,12 +578,23 @@ fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_an
         "{retired_row}"
     );
     assert!(
-        !retired_row.to_string().contains("sk-abc123456789012345678901"),
+        !retired_row
+            .to_string()
+            .contains("sk-abc123456789012345678901"),
         "preview leaked a secret: {retired_row}"
     );
-    assert!(mesh_peer_dir(&home, active).is_dir(), "dry-run keeps active peer");
-    assert!(mesh_peer_dir(&home, retired).is_dir(), "dry-run keeps retired peer");
-    assert!(mesh_peer_dir(&home, stale_old).is_dir(), "dry-run keeps stale peer");
+    assert!(
+        mesh_peer_dir(&home, active).is_dir(),
+        "dry-run keeps active peer"
+    );
+    assert!(
+        mesh_peer_dir(&home, retired).is_dir(),
+        "dry-run keeps retired peer"
+    );
+    assert!(
+        mesh_peer_dir(&home, stale_old).is_dir(),
+        "dry-run keeps stale peer"
+    );
     assert!(
         mesh_peer_dir(&home, stale_under_gc).is_dir(),
         "dry-run keeps stale-under-gc-threshold peer"
@@ -554,13 +625,22 @@ fn gc_dry_run_surfaces_mesh_unread_notes_and_live_gc_reclaims_only_retired_or_an
         serde_json::json!([format!("claude:{retired}"), format!("claude:{stale_old}")]),
         "{v}"
     );
-    assert!(mesh_peer_dir(&home, active).is_dir(), "active peer survives gc");
+    assert!(
+        mesh_peer_dir(&home, active).is_dir(),
+        "active peer survives gc"
+    );
     assert!(
         mesh_peer_dir(&home, stale_under_gc).is_dir(),
         "stale-under-threshold peer survives gc"
     );
-    assert!(!mesh_peer_dir(&home, retired).exists(), "retired peer removed");
-    assert!(!mesh_peer_dir(&home, stale_old).exists(), "ancient stale peer removed");
+    assert!(
+        !mesh_peer_dir(&home, retired).exists(),
+        "retired peer removed"
+    );
+    assert!(
+        !mesh_peer_dir(&home, stale_old).exists(),
+        "ancient stale peer removed"
+    );
     assert!(feed.exists(), "gc never touches the shared feed");
     assert_eq!(std::fs::read_to_string(&feed).unwrap(), feed_before);
 }

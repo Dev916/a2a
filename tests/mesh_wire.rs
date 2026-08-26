@@ -1,10 +1,10 @@
 use a2a::home::A2aHome;
 use a2a::mesh::keys::{fleet_init, sign_token, RootSet, TestClock, TokenClaims};
-use a2a::mesh::{FeedEntry, Note, Presence};
 use a2a::mesh::wire::{
     accept_pinned_io, connect_pinned_io, handshake_acceptor, handshake_dialer, test_link, Frame,
     HandshakeIdentity, OriginDigest, OriginWant, TlsIdentity, MAX_FRAME_BYTES,
 };
+use a2a::mesh::{FeedEntry, Note, Presence};
 use chrono::{TimeZone, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
@@ -121,8 +121,13 @@ async fn frame_codec_is_tagged_forgiving_and_continues_after_unknown_kind() {
 #[tokio::test]
 async fn frame_enum_roundtrips_all_spec_kinds() {
     let frames = vec![
-        Frame::Challenge { nonce: "n".to_string() },
-        Frame::Hello { token: "t".to_string(), nonce_sig: "s".to_string() },
+        Frame::Challenge {
+            nonce: "n".to_string(),
+        },
+        Frame::Hello {
+            token: "t".to_string(),
+            nonce_sig: "s".to_string(),
+        },
         Frame::Feed {
             origin: "gw-a".to_string(),
             entries: vec![FeedEntry {
@@ -150,18 +155,34 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
                 retired: false,
                 presence_seq: 0,
                 home_gateway: None,
-                cursors: a2a::mesh::Cursors { feed_seq: 0, inbox: None },
+                cursors: a2a::mesh::Cursors {
+                    feed_seq: 0,
+                    inbox: None,
+                },
                 extra: serde_json::Map::new(),
             }],
         },
         Frame::Digest {
-            origins: vec![OriginDigest { origin: "gw-a".to_string(), max_seq: 7, count: 3 }],
+            origins: vec![OriginDigest {
+                origin: "gw-a".to_string(),
+                max_seq: 7,
+                count: 3,
+            }],
         },
         Frame::Want {
-            origins: vec![OriginWant { origin: "gw-a".to_string(), from_seq: 4 }],
+            origins: vec![OriginWant {
+                origin: "gw-a".to_string(),
+                from_seq: 4,
+            }],
         },
-        Frame::Ack { ref_id: "r".to_string(), outcome: "ok".to_string() },
-        Frame::Err { code: "NOPE".to_string(), detail: "detail".to_string() },
+        Frame::Ack {
+            ref_id: "r".to_string(),
+            outcome: "ok".to_string(),
+        },
+        Frame::Err {
+            code: "NOPE".to_string(),
+            detail: "detail".to_string(),
+        },
     ];
 
     for frame in frames {
@@ -175,13 +196,19 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
 async fn oversized_frame_returns_wire_frame_too_large_and_closes_cleanly() {
     let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
     let (mut a, mut b) = test_link(&clock).await;
-    let oversized = format!("{{\"kind\":\"note\",\"pad\":\"{}\"}}\n", "x".repeat(MAX_FRAME_BYTES));
+    let oversized = format!(
+        "{{\"kind\":\"note\",\"pad\":\"{}\"}}\n",
+        "x".repeat(MAX_FRAME_BYTES)
+    );
 
     a.send_raw_text(&oversized).await.unwrap();
     let err = b.recv().await.unwrap_err();
     assert_eq!(err.code, "WIRE_FRAME_TOO_LARGE");
 
-    let seen = tokio::time::timeout(Duration::from_secs(1), a.recv()).await.unwrap().unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(1), a.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(seen, None);
 }
 
@@ -197,12 +224,15 @@ async fn mutual_handshake_accepts_tokens_and_proves_nonce_ownership_both_directi
     let dial_id = identity(&home, signing_key(), "gw-dial-222222", now);
     let (mut accept, mut dial) = test_link(&clock).await;
 
-    let accept_task = tokio::spawn(async move {
-        handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await
-    });
+    let accept_task =
+        tokio::spawn(
+            async move { handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await },
+        );
     let roots = RootSet::load(&home).unwrap();
     let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
-    let dial_claims = handshake_dialer(&mut dial, &dial_id, &roots, &clock).await.unwrap();
+    let dial_claims = handshake_dialer(&mut dial, &dial_id, &roots, &clock)
+        .await
+        .unwrap();
     let accept_claims = accept_task.await.unwrap().unwrap();
 
     assert_eq!(accept_claims.gateway_id, "gw-dial-222222");
@@ -232,7 +262,11 @@ async fn handshake_refuses_expired_stuffed_wrong_key_and_unknown_root_tokens() {
 
     let stolen_token_key = signing_key();
     let wrong_key = signing_key();
-    let token = sign_token(&claims_for(&stolen_token_key, "gw-stolen-444444", now), &home).unwrap();
+    let token = sign_token(
+        &claims_for(&stolen_token_key, "gw-stolen-444444", now),
+        &home,
+    )
+    .unwrap();
     let stolen = HandshakeIdentity::new(token, wrong_key);
     assert_refused_by_acceptor(&home, &accept_id, stolen, "NONCE_SIG_INVALID", now).await;
 
@@ -257,13 +291,16 @@ async fn assert_refused_by_acceptor(
     let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
     let (mut accept, mut dial) = test_link(&clock).await;
     let accept_id = accept_id.clone();
-    let accept_task = tokio::spawn(async move {
-        handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await
-    });
+    let accept_task =
+        tokio::spawn(
+            async move { handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await },
+        );
 
     let roots = RootSet::load(home).unwrap();
     let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
-    let dial_err = handshake_dialer(&mut dial, &dial_id, &roots, &clock).await.unwrap_err();
+    let dial_err = handshake_dialer(&mut dial, &dial_id, &roots, &clock)
+        .await
+        .unwrap_err();
     let accept_err = accept_task.await.unwrap().unwrap_err();
     assert_eq!(accept_err.code, code);
     assert_eq!(dial_err.code, "WIRE_PEER_ERR");
@@ -298,11 +335,11 @@ async fn pinned_tls_uses_spki_fingerprint_not_hostname_and_rejects_wrong_pin() {
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let url = "wss://127.0.0.1:443/";
     let server_tls = tls.clone();
-    let server = tokio::spawn(async move {
-        accept_pinned_io(server_io, server_tls).await
-    });
+    let server = tokio::spawn(async move { accept_pinned_io(server_io, server_tls).await });
 
-    let mut client = connect_pinned_io(client_io, url, tls.spki_fpr()).await.unwrap();
+    let mut client = connect_pinned_io(client_io, url, tls.spki_fpr())
+        .await
+        .unwrap();
     client.close().await.unwrap();
     let mut server = server.await.unwrap().unwrap();
     assert_eq!(server.recv().await.unwrap(), None);
@@ -312,7 +349,9 @@ async fn pinned_tls_uses_spki_fingerprint_not_hostname_and_rejects_wrong_pin() {
     let server = tokio::spawn(async move {
         let _ = accept_pinned_io(server_io, tls).await;
     });
-    let err = connect_pinned_io(client_io, url, &"0".repeat(64)).await.unwrap_err();
+    let err = connect_pinned_io(client_io, url, &"0".repeat(64))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, "TLS_CERT_PIN_MISMATCH");
     server.await.unwrap();
 }
@@ -326,12 +365,13 @@ async fn cancelling_writer_mid_large_frame_never_delivers_a_torn_line() {
     let (_peer_writer, mut peer_reader) = b.split();
     let text = "x".repeat(MAX_FRAME_BYTES - 1024);
     let frame = Frame::Note {
-        note: Note { text: text.clone(), ..note() },
+        note: Note {
+            text: text.clone(),
+            ..note()
+        },
     };
 
-    let task = tokio::spawn(async move {
-        writer.send(&frame).await
-    });
+    let task = tokio::spawn(async move { writer.send(&frame).await });
     task.abort();
 
     let seen = tokio::time::timeout(Duration::from_secs(1), peer_reader.recv())

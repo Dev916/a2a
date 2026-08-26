@@ -63,9 +63,12 @@ pub fn read_with_local_origin(
     if !root.exists() {
         return Ok(Vec::new());
     }
+    // Always walk from seq 0: dense local-origin numbering depends on every
+    // preceding local entry, so it cannot be computed from a partial window.
     let mut entries = Vec::new();
-    for value in store::read_json_named(&root, "feed", since_seq)
-        .map_err(|e| io_err("reading feed.jsonl", e))?
+    let mut next_local: u64 = 1;
+    for value in
+        store::read_json_named(&root, "feed", 0).map_err(|e| io_err("reading feed.jsonl", e))?
     {
         if is_rotation_marker(&value) {
             continue;
@@ -75,8 +78,24 @@ pub fn read_with_local_origin(
         }
         let mut entry: FeedEntry =
             serde_json::from_value(value).map_err(|e| data_err("decoding feed entry", e))?;
-        backfill_local_origin(&mut entry, local_origin);
-        entries.push(entry);
+        if let Some(local) = local_origin {
+            if entry.origin.as_deref() == Some(local) {
+                if let Some(origin_seq) = entry.origin_seq {
+                    next_local = next_local.max(origin_seq.saturating_add(1));
+                }
+            } else if entry.origin.is_none() && entry.origin_seq.is_none() {
+                // Claim unstamped local entries with a DENSE per-origin counter,
+                // not the global feed seq: replicated entries interleave with
+                // local ones, and a gap in the advertised origin_seq stalls
+                // peers forever (they wait for a seq that will never exist).
+                entry.origin = Some(local.to_string());
+                entry.origin_seq = Some(next_local);
+                next_local = next_local.saturating_add(1);
+            }
+        }
+        if entry.seq > since_seq {
+            entries.push(entry);
+        }
     }
     Ok(entries)
 }
@@ -101,15 +120,6 @@ pub fn existing_gateway_id(home: &A2aHome) -> Option<String> {
 
 pub fn is_feed_bookkeeping(value: &Value) -> bool {
     is_rotation_marker(value) || is_compaction_marker(value)
-}
-
-fn backfill_local_origin(entry: &mut FeedEntry, local_origin: Option<&str>) {
-    if entry.origin.is_none() && entry.origin_seq.is_none() {
-        if let Some(origin) = local_origin {
-            entry.origin = Some(origin.to_string());
-            entry.origin_seq = Some(entry.seq);
-        }
-    }
 }
 
 fn is_rotation_marker(value: &serde_json::Value) -> bool {

@@ -707,13 +707,19 @@ pub fn compact_feed(
     let mut removed = 0usize;
     let mut max_seq = 0u64;
     let mut max_kept_seq = 0u64;
+    // Compaction rewrites the window and may drop the rotated generation, so
+    // unstamped local entries must be claimed persistently here — otherwise
+    // the dense read-time numbering (see feed::read_with_local_origin) would
+    // shift when earlier local entries disappear.
+    let local_origin = feed::existing_gateway_id(home);
+    let mut next_local: u64 = 1;
 
-    for value in rows {
+    for mut value in rows {
         if feed::is_feed_bookkeeping(&value) {
             continue;
         }
         max_seq = max_seq.max(value.get("seq").and_then(Value::as_u64).unwrap_or(0));
-        let entry = match serde_json::from_value::<FeedEntry>(value.clone()) {
+        let mut entry = match serde_json::from_value::<FeedEntry>(value.clone()) {
             Ok(entry) => entry,
             Err(_) => {
                 max_kept_seq =
@@ -722,6 +728,19 @@ pub fn compact_feed(
                 continue;
             }
         };
+        if let Some(local) = local_origin.as_deref() {
+            if entry.origin.as_deref() == Some(local) {
+                if let Some(origin_seq) = entry.origin_seq {
+                    next_local = next_local.max(origin_seq.saturating_add(1));
+                }
+            } else if entry.origin.is_none() && entry.origin_seq.is_none() {
+                entry.origin = Some(local.to_string());
+                entry.origin_seq = Some(next_local);
+                value["origin"] = Value::String(local.to_string());
+                value["origin_seq"] = Value::from(next_local);
+                next_local = next_local.saturating_add(1);
+            }
+        }
         let Some(origin) = entry.origin.clone() else {
             max_kept_seq = max_kept_seq.max(entry.seq);
             kept.push(value);

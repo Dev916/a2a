@@ -658,3 +658,74 @@ fn silently_delete_origin_seq(home: &A2aHome, origin: &str, origin_seq: u64) {
         .collect();
     fs::write(&feed, format!("{}\n", kept.join("\n"))).unwrap();
 }
+
+#[test]
+fn local_posts_interleaved_with_replicated_entries_advertise_dense_origin_seqs() {
+    // Live-fleet regression (a2a-ch7): a replicated entry at feed seq 1 pushed
+    // the first LOCAL post to feed seq 2; seq-based claiming advertised the
+    // local origin at origin_seq 2, peers wanted from 1, and the contiguity
+    // walk returned nothing — a permanent replication deadlock.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    let cfg = cfg_for(&home);
+    write_gateway_key(home.root(), "gw-b");
+
+    // A replicated remote entry occupies feed seq 1.
+    a2a::mesh::feed::append_entry(&home, &cfg, entry("gw-a", 1, "from gw-a")).unwrap();
+    // The first local post lands at feed seq 2.
+    a2a::mesh::feed::append_entry(&home, &cfg, local_entry("first local")).unwrap();
+
+    let digest = replicate::digest_for_home(&home).unwrap();
+    let local = digest.iter().find(|d| d.origin == "gw-b").expect("local origin advertised");
+    assert_eq!(local.max_seq, 1, "dense numbering: first local entry is origin_seq 1");
+
+    let cursors = CursorStore::default();
+    match replicate::entries_for_want(&home, "gw-b", 1, &cursors).unwrap() {
+        WantReply::Entries(entries) => {
+            assert_eq!(entries.len(), 1, "want from 1 serves the local entry");
+            assert_eq!(entries[0].origin_seq, Some(1));
+            assert_eq!(entries[0].text, "first local");
+        }
+        other => panic!("expected entries, got {other:?}"),
+    }
+
+    // A second local post stays contiguous.
+    a2a::mesh::feed::append_entry(&home, &cfg, local_entry("second local")).unwrap();
+    let digest = replicate::digest_for_home(&home).unwrap();
+    let local = digest.iter().find(|d| d.origin == "gw-b").unwrap();
+    assert_eq!(local.max_seq, 2);
+}
+
+#[test]
+fn compaction_persists_dense_claims_so_numbering_survives_generation_drops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    let cfg = cfg_for(&home);
+    write_gateway_key(home.root(), "gw-b");
+
+    // Old removable remote entry (ts far in the past), then a fresh local one.
+    a2a::mesh::feed::append_entry(&home, &cfg, entry("gw-a", 1, "ancient remote")).unwrap();
+    a2a::mesh::feed::append_entry(&home, &cfg, local_entry("fresh local")).unwrap();
+
+    let mut cursors = CursorStore::default();
+    let compaction = replicate::compact_feed(
+        &home,
+        &cfg,
+        Utc::now(),
+        chrono::Duration::days(30),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(compaction.removed, 1, "the ancient remote entry is compacted");
+
+    // The surviving local entry must now be claimed ON DISK: read the raw file
+    // and assert the origin fields were persisted by the rewrite.
+    let raw = fs::read_to_string(home.root().join("mesh/feed.jsonl")).unwrap();
+    let claimed = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v["text"] == "fresh local")
+        .expect("local entry survives compaction");
+    assert_eq!(claimed["origin"], "gw-b", "claim persisted on disk");
+    assert_eq!(claimed["origin_seq"], 1, "dense origin_seq persisted on disk");
+}

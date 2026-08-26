@@ -245,6 +245,7 @@ enum LoopEvent {
     Heartbeat(LoopSlot),
     Endpoint(Option<String>),
     Replication(replicate::ReplicationHealth),
+    SessionEnd { slot: LoopSlot, detail: String },
 }
 
 #[derive(Debug)]
@@ -441,6 +442,14 @@ async fn supervise(
                         health.replication = replication;
                         write_health(&root, &mut health).await?;
                         last_health_flush = Instant::now();
+                    }
+                    LoopEvent::SessionEnd { slot, detail } => {
+                        log.line(json!({
+                            "ts": Utc::now(),
+                            "kind": "link_session_end",
+                            "loop": slot.as_str(),
+                            "detail": detail,
+                        })).await;
                     }
                 }
             }
@@ -806,6 +815,7 @@ where
                         health.endpoint_url = endpoint_url;
                         write_health(root, &mut health).await?;
                     }
+                    LoopEvent::SessionEnd { .. } => {}
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
                         write_health(root, &mut health).await?;
@@ -862,7 +872,9 @@ async fn server_loop(
                     std::future::pending::<()>().await;
                 }
                 while let Some(joined) = sessions.join_next().await {
-                    joined.map_err(join_to_app_err)??;
+                    // A failing session must not turn a clean shutdown into an
+                    // error; the link is going away regardless.
+                    let _ = joined;
                 }
                 return Ok(());
             }
@@ -902,7 +914,16 @@ async fn server_loop(
                 });
             }
             Some(joined) = sessions.join_next(), if !sessions.is_empty() => {
-                joined.map_err(join_to_app_err)??;
+                // One bad connection (port scan, TLS garbage, peer crash) must
+                // not kill the whole loop; log it and keep serving.
+                let detail = match joined {
+                    Ok(Ok(())) => None,
+                    Ok(Err(err)) => Some(format!("{}: {}", err.code, err.message)),
+                    Err(err) => Some(join_to_app_err(err).message),
+                };
+                if let Some(detail) = detail {
+                    let _ = tx.send(LoopEvent::SessionEnd { slot, detail }).await;
+                }
             }
         }
     }
@@ -958,7 +979,9 @@ async fn dialer_loop(
                     std::future::pending::<()>().await;
                 }
                 while let Some(joined) = sessions.join_next().await {
-                    joined.map_err(join_to_app_err)??;
+                    // A failing session must not turn a clean shutdown into an
+                    // error; the link is going away regardless.
+                    let _ = joined;
                 }
                 return Ok(());
             }
@@ -985,7 +1008,16 @@ async fn dialer_loop(
                         Ok(()) => {
                             attempts.remove(&row.gateway_id);
                         }
-                        Err(_) => {
+                        Err(err) => {
+                            let _ = tx
+                                .send(LoopEvent::SessionEnd {
+                                    slot,
+                                    detail: format!(
+                                        "dial {} failed: {}: {}",
+                                        row.gateway_id, err.code, err.message
+                                    ),
+                                })
+                                .await;
                             let attempt = attempts.entry(row.gateway_id.clone()).or_default();
                             *attempt = attempt.saturating_add(1);
                             let cooldown = link::jittered_redial_backoff(
@@ -1005,7 +1037,16 @@ async fn dialer_loop(
                 }
             }
             Some(joined) = sessions.join_next(), if !sessions.is_empty() => {
-                joined.map_err(join_to_app_err)??;
+                // One bad connection (port scan, TLS garbage, peer crash) must
+                // not kill the whole loop; log it and keep serving.
+                let detail = match joined {
+                    Ok(Ok(())) => None,
+                    Ok(Err(err)) => Some(format!("{}: {}", err.code, err.message)),
+                    Err(err) => Some(join_to_app_err(err).message),
+                };
+                if let Some(detail) = detail {
+                    let _ = tx.send(LoopEvent::SessionEnd { slot, detail }).await;
+                }
             }
         }
     }

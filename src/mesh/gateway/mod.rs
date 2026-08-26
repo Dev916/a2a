@@ -127,6 +127,7 @@ pub struct GatewayHealth {
     pub expose: String,
     pub endpoint_url: Option<String>,
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
+    pub replication: replicate::ReplicationHealth,
     pub escalation: Option<Value>,
     pub shutdown: Option<Value>,
 }
@@ -146,6 +147,7 @@ impl GatewayHealth {
                 .into_iter()
                 .map(|slot| (slot, LoopHealth::new(slot)))
                 .collect(),
+            replication: replicate::ReplicationHealth::default(),
             escalation: None,
             shutdown: None,
         }

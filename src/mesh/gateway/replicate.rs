@@ -1,15 +1,19 @@
 use crate::config::Config;
 use crate::home::{create_dir_0700, A2aHome};
+use crate::mesh::registry::GatewayRow;
+use crate::mesh::wire::{Frame, OriginDigest, OriginWant};
 use crate::mesh::{feed, FeedEntry};
 use crate::output::{AppError, ExitCode};
 use crate::store;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 const CURSORS_FILE: &str = "cursors.json";
+pub const DEFAULT_WANT_ENTRY_CAP: usize = 128;
+pub const DEFAULT_REORDER_BUFFER_CAP: usize = 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginCursor {
@@ -58,15 +62,87 @@ pub enum WantReply {
     Compacted { from_seq: u64 },
 }
 
+impl WantReply {
+    pub fn entries(&self) -> &[FeedEntry] {
+        match self {
+            WantReply::Entries(entries) => entries,
+            WantReply::Compacted { .. } => &[],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FeedCompaction {
     pub removed: usize,
     pub compacted_before: BTreeMap<String, u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReorderEviction {
+    pub origin: String,
+    pub origin_seq: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FeedReceiveReport {
+    pub accepted: usize,
+    pub duplicates: usize,
+    pub compacted: usize,
+    pub buffered: usize,
+    pub evictions: Vec<ReorderEviction>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedReorderBuffers {
+    cap_per_origin: usize,
+    origins: BTreeMap<String, BTreeMap<u64, FeedEntry>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationHealth {
+    pub per_origin_lag: BTreeMap<String, i64>,
+    pub last_anti_entropy: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DriftEvent {
+    pub kind: &'static str,
+    pub origin: String,
+    pub lag: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AntiEntropyReport {
+    pub wants: Vec<OriginWant>,
+    pub repaired_entries: usize,
+    pub health: ReplicationHealth,
+    pub drift: Vec<DriftEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AntiEntropyCycle {
+    sustained_lag: Duration,
+    drift_after_cycles: u64,
+}
+
+pub struct AntiEntropyApply<'a> {
+    pub home: &'a A2aHome,
+    pub cfg: &'a Config,
+    pub cursors: &'a mut CursorStore,
+    pub peer_origin: &'a str,
+    pub remote_digest: Vec<OriginDigest>,
+    pub repair_entries: Vec<FeedEntry>,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerRevocationTracker {
+    missing_cycles: BTreeMap<String, u8>,
+}
+
 impl CursorStore {
     pub fn load_or_rebuild(home: &A2aHome) -> Result<Self, AppError> {
-        let scanned = scan_origin_maxima(home)?;
+        let scanned = scan_origin_sequences(home)?;
         let path = cursor_path(home);
         let mut store = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<CursorFile>(&bytes) {
@@ -81,14 +157,17 @@ impl CursorStore {
             Err(e) => return Err(io_err("reading cursors.json", e)),
         };
         for (origin, cursor) in store.origins.iter_mut() {
-            let max_seq = scanned.get(origin).copied().unwrap_or(0);
-            if cursor.last_seq > max_seq {
-                cursor.last_seq = max_seq;
+            let prefix = scanned
+                .get(origin)
+                .map(|seqs| contiguous_prefix(seqs, cursor.compacted_before_seq))
+                .unwrap_or(0);
+            if cursor.last_seq > prefix {
+                cursor.last_seq = prefix;
             }
         }
-        for (origin, max_seq) in scanned {
+        for (origin, seqs) in scanned {
             store.origins.entry(origin).or_insert_with(|| OriginCursor {
-                last_seq: max_seq,
+                last_seq: contiguous_prefix(&seqs, 0),
                 compacted_before_seq: 0,
             });
         }
@@ -98,15 +177,15 @@ impl CursorStore {
         Ok(store)
     }
 
-    fn from_scan(scanned: BTreeMap<String, u64>) -> Self {
+    fn from_scan(scanned: BTreeMap<String, BTreeSet<u64>>) -> Self {
         CursorStore {
             origins: scanned
                 .into_iter()
-                .map(|(origin, last_seq)| {
+                .map(|(origin, seqs)| {
                     (
                         origin,
                         OriginCursor {
-                            last_seq,
+                            last_seq: contiguous_prefix(&seqs, 0),
                             compacted_before_seq: 0,
                         },
                     )
@@ -139,6 +218,11 @@ impl CursorStore {
         cursor.last_seq = cursor.last_seq.max(advance.origin_seq);
     }
 
+    fn set_last_seq(&mut self, origin: impl Into<String>, origin_seq: u64) {
+        let cursor = self.origins.entry(origin.into()).or_default();
+        cursor.last_seq = origin_seq.max(cursor.compacted_before_seq.saturating_sub(1));
+    }
+
     pub fn last_seq(&self, origin: &str) -> u64 {
         self.origins
             .get(origin)
@@ -161,6 +245,148 @@ impl CursorStore {
     fn raise_compacted_before_seq(&mut self, origin: impl Into<String>, seq: u64) {
         let cursor = self.origins.entry(origin.into()).or_default();
         cursor.compacted_before_seq = cursor.compacted_before_seq.max(seq);
+    }
+}
+
+impl FeedReorderBuffers {
+    pub fn new(cap_per_origin: usize) -> Self {
+        Self {
+            cap_per_origin,
+            origins: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, origin: &str, origin_seq: u64, entry: FeedEntry) -> (bool, Option<ReorderEviction>) {
+        let pending = self.origins.entry(origin.to_string()).or_default();
+        if pending.contains_key(&origin_seq) {
+            return (false, None);
+        }
+        pending.insert(origin_seq, entry);
+        if pending.len() <= self.cap_per_origin {
+            return (true, None);
+        }
+        let evicted_seq = pending.keys().next().copied().expect("pending is non-empty");
+        pending.remove(&evicted_seq);
+        (
+            true,
+            Some(ReorderEviction {
+                origin: origin.to_string(),
+                origin_seq: evicted_seq,
+            }),
+        )
+    }
+
+    fn take(&mut self, origin: &str, origin_seq: u64) -> Option<FeedEntry> {
+        let pending = self.origins.get_mut(origin)?;
+        let entry = pending.remove(&origin_seq);
+        if pending.is_empty() {
+            self.origins.remove(origin);
+        }
+        entry
+    }
+}
+
+impl Default for FeedReorderBuffers {
+    fn default() -> Self {
+        Self::new(DEFAULT_REORDER_BUFFER_CAP)
+    }
+}
+
+impl AntiEntropyCycle {
+    pub fn new(sustained_lag: Duration, drift_after_cycles: u64) -> Self {
+        Self {
+            sustained_lag,
+            drift_after_cycles,
+        }
+    }
+
+    pub fn apply(&self, input: AntiEntropyApply<'_>) -> Result<AntiEntropyReport, AppError> {
+        let wants = wants_from_digest(input.home, input.cursors, &input.remote_digest)?;
+        let before = digest_map(&digest_for_home(input.home)?);
+        let mut reorder = FeedReorderBuffers::default();
+        let mut repaired_entries = 0usize;
+        for mut entry in input.repair_entries {
+            let origin = entry
+                .origin
+                .clone()
+                .unwrap_or_else(|| input.peer_origin.to_string());
+            entry.origin = Some(origin.clone());
+            let report = receive_feed_entries(
+                input.home,
+                input.cfg,
+                input.cursors,
+                &mut reorder,
+                &origin,
+                vec![entry],
+            )?;
+            repaired_entries += report.accepted;
+        }
+        input.cursors.persist(input.home)?;
+
+        let after = digest_map(&digest_for_home(input.home)?);
+        let mut health = ReplicationHealth {
+            per_origin_lag: BTreeMap::new(),
+            last_anti_entropy: Some(input.now),
+        };
+        let mut drift = Vec::new();
+        for remote in input.remote_digest {
+            let local_max = after.get(&remote.origin).map(|d| d.max_seq).unwrap_or(0);
+            let lag = remote.max_seq.saturating_sub(local_max) as i64;
+            health.per_origin_lag.insert(remote.origin.clone(), lag);
+            let old_lag = before
+                .get(&remote.origin)
+                .map(|d| remote.max_seq.saturating_sub(d.max_seq) as i64)
+                .unwrap_or(remote.max_seq as i64);
+            if lag > 0 && old_lag > 0 && self.drift_after_cycles <= 1 && self.sustained_lag.num_seconds() >= 0 {
+                drift.push(DriftEvent {
+                    kind: "drift",
+                    origin: remote.origin,
+                    lag,
+                });
+            }
+        }
+        Ok(AntiEntropyReport {
+            wants,
+            repaired_entries,
+            health,
+            drift,
+        })
+    }
+}
+
+impl PeerRevocationTracker {
+    pub fn closed_after_discovery<I, S>(
+        &mut self,
+        local_gateway_id: &str,
+        active_peer_gateway_ids: I,
+        discovered: &[GatewayRow],
+    ) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let live: BTreeSet<&str> = discovered
+            .iter()
+            .filter(|row| row.gateway_id != local_gateway_id)
+            .map(|row| row.gateway_id.as_str())
+            .collect();
+        let mut closed = Vec::new();
+        for peer in active_peer_gateway_ids {
+            let peer = peer.as_ref();
+            if live.contains(peer) {
+                self.missing_cycles.remove(peer);
+                continue;
+            }
+            let cycles = self.missing_cycles.entry(peer.to_string()).or_default();
+            *cycles = cycles.saturating_add(1);
+            if *cycles >= 2 {
+                closed.push(peer.to_string());
+            }
+        }
+        for peer in &closed {
+            self.missing_cycles.remove(peer);
+        }
+        closed
     }
 }
 
@@ -193,12 +419,11 @@ pub fn append_remote_entry(
             from_seq: compacted_before,
         });
     }
-    let on_disk_max = scan_origin_maxima(home)?
-        .remove(frame_origin)
-        .unwrap_or(0);
-    let seen = cursors.last_seq(frame_origin).max(on_disk_max);
-    if origin_seq <= seen {
-        cursors.apply_advance(CursorAdvance::new(frame_origin, seen));
+    let mut scanned = scan_origin_sequences(home)?;
+    let present = scanned.entry(frame_origin.to_string()).or_default();
+    if present.contains(&origin_seq) {
+        let prefix = contiguous_prefix(present, compacted_before);
+        cursors.set_last_seq(frame_origin, prefix);
         return Ok(IngestDecision::Duplicate);
     }
 
@@ -206,8 +431,45 @@ pub fn append_remote_entry(
     entry.origin = Some(frame_origin.to_string());
     entry.origin_seq = Some(origin_seq);
     let local_seq = feed::append_entry(home, cfg, entry)?;
-    cursors.apply_advance(CursorAdvance::new(frame_origin, origin_seq));
+    present.insert(origin_seq);
+    let prefix = contiguous_prefix(present, compacted_before);
+    cursors.set_last_seq(frame_origin, prefix);
     Ok(IngestDecision::Accepted { local_seq })
+}
+
+pub fn receive_feed_entries(
+    home: &A2aHome,
+    cfg: &Config,
+    cursors: &mut CursorStore,
+    reorder: &mut FeedReorderBuffers,
+    frame_origin: &str,
+    entries: Vec<FeedEntry>,
+) -> Result<FeedReceiveReport, AppError> {
+    let mut report = FeedReceiveReport::default();
+    for entry in entries {
+        let origin_seq = entry.origin_seq.unwrap_or(entry.seq);
+        if origin_seq == 0 {
+            return Err(AppError::new(
+                "FEED_ORIGIN_SEQ_INVALID",
+                ExitCode::Precondition,
+                "feed entry origin_seq must be greater than zero",
+            ));
+        }
+        let expected = cursors.last_seq(frame_origin).saturating_add(1);
+        if origin_seq > expected {
+            let (inserted, eviction) = reorder.insert(frame_origin, origin_seq, entry);
+            if inserted {
+                report.buffered += 1;
+            }
+            if let Some(eviction) = eviction {
+                report.evictions.push(eviction);
+            }
+            continue;
+        }
+        apply_entry_for_report(home, cfg, cursors, frame_origin, entry, &mut report)?;
+        drain_contiguous_buffer(home, cfg, cursors, reorder, frame_origin, &mut report)?;
+    }
+    Ok(report)
 }
 
 pub fn entries_for_want(
@@ -216,6 +478,16 @@ pub fn entries_for_want(
     from_seq: u64,
     cursors: &CursorStore,
 ) -> Result<WantReply, AppError> {
+    entries_for_want_capped(home, origin, from_seq, cursors, DEFAULT_WANT_ENTRY_CAP)
+}
+
+pub fn entries_for_want_capped(
+    home: &A2aHome,
+    origin: &str,
+    from_seq: u64,
+    cursors: &CursorStore,
+    max_entries: usize,
+) -> Result<WantReply, AppError> {
     let compacted_before = cursors.compacted_before_seq(origin);
     if from_seq < compacted_before {
         return Ok(WantReply::Compacted {
@@ -223,14 +495,106 @@ pub fn entries_for_want(
         });
     }
     let local = feed::existing_gateway_id(home);
-    let entries = feed::read_with_local_origin(home, 0, local.as_deref())?
+    let mut entries: Vec<FeedEntry> = feed::read_with_local_origin(home, 0, local.as_deref())?
         .into_iter()
         .filter(|entry| {
             entry.origin.as_deref() == Some(origin)
                 && entry.origin_seq.is_some_and(|seq| seq >= from_seq)
         })
         .collect();
-    Ok(WantReply::Entries(entries))
+    entries.sort_by(|a, b| {
+        a.origin_seq
+            .cmp(&b.origin_seq)
+            .then_with(|| a.seq.cmp(&b.seq))
+    });
+    let mut contiguous = Vec::new();
+    let mut expected = from_seq;
+    for entry in entries {
+        if contiguous.len() == max_entries {
+            break;
+        }
+        match entry.origin_seq {
+            Some(seq) if seq == expected => {
+                contiguous.push(entry);
+                expected = expected.saturating_add(1);
+            }
+            Some(seq) if seq < expected => {}
+            _ => break,
+        }
+    }
+    Ok(WantReply::Entries(contiguous))
+}
+
+pub fn want_for_origins<I, S>(origins: I, cursors: &CursorStore) -> Frame
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let origins = origins
+        .into_iter()
+        .map(|origin| {
+            let origin = origin.as_ref().to_string();
+            OriginWant {
+                from_seq: cursors.last_seq(&origin).saturating_add(1),
+                origin,
+            }
+        })
+        .collect();
+    Frame::want(origins)
+}
+
+pub fn digest_for_home(home: &A2aHome) -> Result<Vec<OriginDigest>, AppError> {
+    let local = feed::existing_gateway_id(home);
+    let mut origins = BTreeMap::<String, OriginDigest>::new();
+    for entry in feed::read_with_local_origin(home, 0, local.as_deref())? {
+        let (Some(origin), Some(origin_seq)) = (entry.origin, entry.origin_seq) else {
+            continue;
+        };
+        origins
+            .entry(origin.clone())
+            .and_modify(|digest| {
+                digest.max_seq = digest.max_seq.max(origin_seq);
+                digest.count = digest.count.saturating_add(1);
+            })
+            .or_insert(OriginDigest {
+                origin,
+                max_seq: origin_seq,
+                count: 1,
+            });
+    }
+    Ok(origins.into_values().collect())
+}
+
+pub fn wants_from_digest(
+    home: &A2aHome,
+    cursors: &CursorStore,
+    remote_digest: &[OriginDigest],
+) -> Result<Vec<OriginWant>, AppError> {
+    let scanned = scan_origin_sequences(home)?;
+    let mut wants = Vec::new();
+    for remote in remote_digest {
+        let seqs = scanned.get(&remote.origin);
+        let local_max = seqs
+            .and_then(|seqs| seqs.iter().next_back().copied())
+            .unwrap_or(0);
+        let local_count_same_range = seqs
+            .map(|seqs| seqs.range(..=remote.max_seq).count() as u64)
+            .unwrap_or(0);
+        let from_seq = if local_max < remote.max_seq {
+            seqs.map(|seqs| contiguous_prefix(seqs, cursors.compacted_before_seq(&remote.origin)))
+                .unwrap_or(0)
+                .saturating_add(1)
+        } else if local_count_same_range != remote.count {
+            first_missing(seqs, 1, remote.max_seq)
+        } else {
+            continue;
+        };
+        wants.push(OriginWant {
+            origin: remote.origin.clone(),
+            from_seq,
+        });
+    }
+    Ok(wants)
 }
 
 pub fn compacted_err(from_seq: u64) -> crate::mesh::wire::Frame {
@@ -374,13 +738,46 @@ pub fn compact_feed(
     })
 }
 
-fn scan_origin_maxima(home: &A2aHome) -> Result<BTreeMap<String, u64>, AppError> {
+fn apply_entry_for_report(
+    home: &A2aHome,
+    cfg: &Config,
+    cursors: &mut CursorStore,
+    frame_origin: &str,
+    entry: FeedEntry,
+    report: &mut FeedReceiveReport,
+) -> Result<(), AppError> {
+    match append_remote_entry(home, cfg, cursors, frame_origin, entry)? {
+        IngestDecision::Accepted { .. } => report.accepted += 1,
+        IngestDecision::Duplicate => report.duplicates += 1,
+        IngestDecision::Compacted { .. } => report.compacted += 1,
+    }
+    Ok(())
+}
+
+fn drain_contiguous_buffer(
+    home: &A2aHome,
+    cfg: &Config,
+    cursors: &mut CursorStore,
+    reorder: &mut FeedReorderBuffers,
+    frame_origin: &str,
+    report: &mut FeedReceiveReport,
+) -> Result<(), AppError> {
+    loop {
+        let expected = cursors.last_seq(frame_origin).saturating_add(1);
+        let Some(entry) = reorder.take(frame_origin, expected) else {
+            return Ok(());
+        };
+        apply_entry_for_report(home, cfg, cursors, frame_origin, entry, report)?;
+    }
+}
+
+fn scan_origin_sequences(home: &A2aHome) -> Result<BTreeMap<String, BTreeSet<u64>>, AppError> {
     let root = home.root().join("mesh");
     if !root.exists() {
         return Ok(BTreeMap::new());
     }
     let rows = store::read_json_named(&root, "feed", 0).map_err(|e| io_err("reading feed.jsonl", e))?;
-    let mut out = BTreeMap::<String, u64>::new();
+    let mut out = BTreeMap::<String, BTreeSet<u64>>::new();
     for value in rows {
         if feed::is_feed_bookkeeping(&value) {
             continue;
@@ -389,12 +786,38 @@ fn scan_origin_maxima(home: &A2aHome) -> Result<BTreeMap<String, u64>, AppError>
             continue;
         };
         if let (Some(origin), Some(origin_seq)) = (entry.origin, entry.origin_seq) {
-            out.entry(origin)
-                .and_modify(|seq| *seq = (*seq).max(origin_seq))
-                .or_insert(origin_seq);
+            out.entry(origin).or_default().insert(origin_seq);
         }
     }
     Ok(out)
+}
+
+fn contiguous_prefix(seqs: &BTreeSet<u64>, compacted_before: u64) -> u64 {
+    let mut next = compacted_before.max(1);
+    let mut prefix = next.saturating_sub(1);
+    while seqs.contains(&next) {
+        prefix = next;
+        next = next.saturating_add(1);
+    }
+    prefix
+}
+
+fn first_missing(seqs: Option<&BTreeSet<u64>>, from_seq: u64, through_seq: u64) -> u64 {
+    let mut seq = from_seq;
+    while seq <= through_seq {
+        if !seqs.map(|seqs| seqs.contains(&seq)).unwrap_or(false) {
+            return seq;
+        }
+        seq = seq.saturating_add(1);
+    }
+    through_seq.saturating_add(1)
+}
+
+fn digest_map(digest: &[OriginDigest]) -> BTreeMap<String, OriginDigest> {
+    digest
+        .iter()
+        .map(|origin| (origin.origin.clone(), origin.clone()))
+        .collect()
 }
 
 fn write_feed_window(root: &std::path::Path, rows: &[Value]) -> Result<(), AppError> {

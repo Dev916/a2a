@@ -51,6 +51,14 @@ pub enum Frame {
 }
 
 impl Frame {
+    pub fn digest(origins: Vec<OriginDigest>) -> Self {
+        Frame::Digest { origins }
+    }
+
+    pub fn want(origins: Vec<OriginWant>) -> Self {
+        Frame::Want { origins }
+    }
+
     pub fn to_ndjson(&self) -> Result<String, AppError> {
         let mut line = serde_json::to_string(self).map_err(data_err)?;
         line.push('\n');

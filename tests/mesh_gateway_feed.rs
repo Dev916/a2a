@@ -2,8 +2,11 @@ mod common;
 
 use a2a::home::A2aHome;
 use a2a::mesh::gateway::replicate::{
-    self, CursorAdvance, CursorStore, IngestDecision, WantReply,
+    self, AntiEntropyApply, AntiEntropyCycle, CursorAdvance, CursorStore, FeedReorderBuffers,
+    IngestDecision, PeerRevocationTracker, WantReply,
 };
+use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::wire::{Frame, OriginWant};
 use a2a::mesh::FeedEntry;
 use chrono::{TimeZone, Utc};
 use predicates::prelude::*;
@@ -33,6 +36,22 @@ fn write_gateway_key(home: &Path, gateway_id: &str) {
     )
     .unwrap();
     fs::set_permissions(dir.join("gw.key"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn registry_row(gateway_id: &str, endpoint_url: Option<&str>) -> GatewayRow {
+    GatewayRow {
+        fleet_id: "fleet-a".to_string(),
+        gateway_id: gateway_id.to_string(),
+        owner: "test-owner".to_string(),
+        endpoint_url: endpoint_url.map(str::to_string),
+        pubkey_fpr: format!("{gateway_id}-pub"),
+        cert_fpr: Some(format!("{gateway_id}-cert")),
+        version: "1".to_string(),
+        created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        last_heartbeat: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        revoked_at: None,
+        schema_version: REGISTRY_SCHEMA_VERSION,
+    }
 }
 
 fn feed_json(home: &Path, work: &Path) -> Vec<Value> {
@@ -270,4 +289,236 @@ fn loopback_feed_replication_pushes_local_deltas_with_attribution() {
     .unwrap();
     assert_eq!(replay, 0);
     assert_eq!(a2a::mesh::feed::read(&home_at(&home_b), 0).unwrap().len(), 1);
+}
+
+#[test]
+fn want_catchup_buffers_gaps_and_streams_contiguous_ranges_oldest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_sender = home_at(&tmp.path().join("sender"));
+    let home_receiver = home_at(&tmp.path().join("receiver"));
+    let cfg = cfg_for(&home_sender);
+    let mut sender_cursors = CursorStore::load_or_rebuild(&home_sender).unwrap();
+    let mut receiver_cursors = CursorStore::load_or_rebuild(&home_receiver).unwrap();
+
+    for seq in [1, 2, 3, 4] {
+        replicate::append_remote_entry(
+            &home_sender,
+            &cfg,
+            &mut sender_cursors,
+            "gw-origin",
+            entry("gw-origin", seq, &format!("entry {seq}")),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        replicate::want_for_origins(["gw-origin"], &receiver_cursors),
+        Frame::Want {
+            origins: vec![OriginWant {
+                origin: "gw-origin".to_string(),
+                from_seq: 1,
+            }],
+        }
+    );
+    assert_eq!(
+        replicate::entries_for_want_capped(&home_sender, "gw-origin", 1, &sender_cursors, 2)
+            .unwrap()
+            .entries()
+            .len(),
+        2
+    );
+
+    let mut reorder = FeedReorderBuffers::new(4);
+    let out_of_order = replicate::receive_feed_entries(
+        &home_receiver,
+        &cfg,
+        &mut receiver_cursors,
+        &mut reorder,
+        "gw-origin",
+        vec![entry("gw-origin", 3, "entry 3")],
+    )
+    .unwrap();
+    assert_eq!(out_of_order.accepted, 0);
+    assert_eq!(out_of_order.buffered, 1);
+    assert_eq!(receiver_cursors.last_seq("gw-origin"), 0);
+
+    let filled_gap = replicate::receive_feed_entries(
+        &home_receiver,
+        &cfg,
+        &mut receiver_cursors,
+        &mut reorder,
+        "gw-origin",
+        vec![entry("gw-origin", 1, "entry 1"), entry("gw-origin", 2, "entry 2")],
+    )
+    .unwrap();
+    assert_eq!(filled_gap.accepted, 3);
+    assert_eq!(receiver_cursors.last_seq("gw-origin"), 3);
+
+    let rows = feed_json(home_receiver.root(), tmp.path());
+    let seqs: Vec<u64> = rows
+        .iter()
+        .map(|row| row["origin_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+}
+
+#[test]
+fn reorder_buffer_cap_eviction_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(tmp.path());
+    let cfg = cfg_for(&home);
+    let mut cursors = CursorStore::load_or_rebuild(&home).unwrap();
+    let mut reorder = FeedReorderBuffers::new(1);
+
+    let report = replicate::receive_feed_entries(
+        &home,
+        &cfg,
+        &mut cursors,
+        &mut reorder,
+        "gw-origin",
+        vec![entry("gw-origin", 3, "entry 3"), entry("gw-origin", 4, "entry 4")],
+    )
+    .unwrap();
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.buffered, 2);
+    assert_eq!(report.evictions.len(), 1);
+    assert_eq!(report.evictions[0].origin, "gw-origin");
+    assert_eq!(report.evictions[0].origin_seq, 3);
+}
+
+#[test]
+fn transitive_relay_pushes_every_origin_verbatim_in_both_directions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = cfg_for(&home_at(tmp.path()));
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    let home_c = home_at(&tmp.path().join("c"));
+    let mut a_cursors = CursorStore::load_or_rebuild(&home_a).unwrap();
+    let mut b_cursors = CursorStore::load_or_rebuild(&home_b).unwrap();
+    let mut c_cursors = CursorStore::load_or_rebuild(&home_c).unwrap();
+
+    replicate::append_remote_entry(&home_a, &cfg, &mut a_cursors, "gw-a", entry("gw-a", 1, "from a"))
+        .unwrap();
+    replicate::append_remote_entry(&home_c, &cfg, &mut c_cursors, "gw-c", entry("gw-c", 1, "from c"))
+        .unwrap();
+
+    assert_eq!(
+        replicate::replicate_feed_once(&cfg, &home_a, "gw-a", &home_b, &mut b_cursors).unwrap(),
+        1
+    );
+    assert_eq!(
+        replicate::replicate_feed_once(&cfg, &home_c, "gw-c", &home_b, &mut b_cursors).unwrap(),
+        1
+    );
+    assert_eq!(
+        replicate::replicate_feed_once(&cfg, &home_b, "gw-b", &home_c, &mut c_cursors).unwrap(),
+        1
+    );
+    assert_eq!(
+        replicate::replicate_feed_once(&cfg, &home_b, "gw-b", &home_a, &mut a_cursors).unwrap(),
+        1
+    );
+
+    let a_rows = feed_json(home_a.root(), tmp.path());
+    let c_rows = feed_json(home_c.root(), tmp.path());
+    assert!(a_rows.iter().any(|row| row["origin"] == "gw-c" && row["origin_seq"] == 1));
+    assert!(c_rows.iter().any(|row| row["origin"] == "gw-a" && row["origin_seq"] == 1));
+}
+
+#[test]
+fn anti_entropy_digest_repairs_mid_log_delete_and_updates_health_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = cfg_for(&home_at(tmp.path()));
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    let mut a_cursors = CursorStore::load_or_rebuild(&home_a).unwrap();
+    let mut b_cursors = CursorStore::load_or_rebuild(&home_b).unwrap();
+
+    for seq in [1, 2, 3] {
+        replicate::append_remote_entry(
+            &home_a,
+            &cfg,
+            &mut a_cursors,
+            "gw-a",
+            entry("gw-a", seq, &format!("entry {seq}")),
+        )
+        .unwrap();
+    }
+    replicate::replicate_feed_once(&cfg, &home_a, "gw-a", &home_b, &mut b_cursors).unwrap();
+    silently_delete_origin_seq(&home_b, "gw-a", 2);
+    b_cursors = CursorStore::load_or_rebuild(&home_b).unwrap();
+
+    let digest = replicate::digest_for_home(&home_a).unwrap();
+    assert_eq!(
+        replicate::wants_from_digest(&home_b, &b_cursors, &digest).unwrap(),
+        vec![OriginWant {
+            origin: "gw-a".to_string(),
+            from_seq: 2,
+        }]
+    );
+
+    let cycle = AntiEntropyCycle::new(chrono::Duration::seconds(10), 2);
+    let report = cycle
+        .apply(AntiEntropyApply {
+            home: &home_b,
+            cfg: &cfg,
+            cursors: &mut b_cursors,
+            peer_origin: "gw-a",
+            remote_digest: digest,
+            repair_entries: replicate::entries_for_want_capped(&home_a, "gw-a", 2, &a_cursors, 16)
+            .unwrap()
+            .entries()
+            .to_vec(),
+            now: Utc.timestamp_opt(1_700_000_010, 0).unwrap(),
+        })
+        .unwrap();
+    assert_eq!(report.repaired_entries, 1);
+    assert_eq!(b_cursors.last_seq("gw-a"), 3);
+    assert!(report.health.last_anti_entropy.is_some());
+    assert_eq!(report.health.per_origin_lag.get("gw-a"), Some(&0));
+}
+
+#[tokio::test]
+async fn revoked_peer_is_closed_within_two_anti_entropy_discovery_cycles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = FileRegistry::new(tmp.path());
+    registry.init_schema().unwrap();
+    registry
+        .upsert_self(registry_row("gw-a", Some("wss://127.0.0.1:1")))
+        .await
+        .unwrap();
+    registry
+        .upsert_self(registry_row("gw-b", Some("wss://127.0.0.1:2")))
+        .await
+        .unwrap();
+    let mut tracker = PeerRevocationTracker::default();
+    assert!(tracker
+        .closed_after_discovery("gw-a", ["gw-b"], &registry.discover("fleet-a").await.unwrap())
+        .is_empty());
+
+    registry
+        .revoke("fleet-a", "gw-b", Utc.timestamp_opt(1_700_000_020, 0).unwrap())
+        .await
+        .unwrap();
+    assert!(tracker
+        .closed_after_discovery("gw-a", ["gw-b"], &registry.discover("fleet-a").await.unwrap())
+        .is_empty());
+    assert_eq!(
+        tracker.closed_after_discovery("gw-a", ["gw-b"], &registry.discover("fleet-a").await.unwrap()),
+        vec!["gw-b".to_string()]
+    );
+}
+
+fn silently_delete_origin_seq(home: &A2aHome, origin: &str, origin_seq: u64) {
+    let feed = home.root().join("mesh").join("feed.jsonl");
+    let kept: Vec<String> = fs::read_to_string(&feed)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let value: Value = serde_json::from_str(line).unwrap();
+            !(value["origin"] == origin && value["origin_seq"] == origin_seq)
+        })
+        .map(str::to_string)
+        .collect();
+    fs::write(&feed, format!("{}\n", kept.join("\n"))).unwrap();
 }

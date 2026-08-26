@@ -238,11 +238,15 @@ fn appserver_turn_end_routes_worker_note_to_claude_peer_and_logs_outcome() {
             None
         }
     });
-    assert!(home
-        .join("workers")
-        .join(&id)
-        .join("outbox/1.note.routed.json")
-        .exists());
+    // Delivery to the peer inbox and the outbox marker rename are not atomic;
+    // poll rather than assert to avoid racing the rename under load.
+    until("worker outbox note marked routed", || {
+        home.join("workers")
+            .join(&id)
+            .join("outbox/1.note.routed.json")
+            .exists()
+            .then_some(())
+    });
     let routed = until("mesh_note_routed broker log line", || {
         broker_events(&home).into_iter().find(|v| {
             v["kind"] == "mesh_note_routed"
@@ -295,11 +299,14 @@ fn appserver_worker_note_to_codex_worker_lands_in_target_send_inbox() {
         "{queued_text}"
     );
     assert_eq!(note_files(&home, "codex", target_session).len(), 1);
-    assert!(home
-        .join("workers")
-        .join(&source)
-        .join("outbox/1.note.routed.json")
-        .exists());
+    // Same non-atomic delivery/rename window as the claude-peer test above.
+    until("source outbox note marked routed", || {
+        home.join("workers")
+            .join(&source)
+            .join("outbox/1.note.routed.json")
+            .exists()
+            .then_some(())
+    });
 }
 
 #[test]

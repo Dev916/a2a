@@ -43,6 +43,7 @@ pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 const LOG_CAPACITY: usize = 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -405,6 +406,7 @@ async fn supervise(
     }
     drop(events_tx);
     let mut restarts: BTreeMap<LoopSlot, VecDeque<Instant>> = BTreeMap::new();
+    let mut last_health_flush = Instant::now();
 
     let outcome = loop {
         tokio::select! {
@@ -422,15 +424,23 @@ async fn supervise(
                             slot_health.heartbeats = slot_health.heartbeats.saturating_add(1);
                             slot_health.last_heartbeat = Some(Utc::now());
                         }
-                        write_health(&root, &mut health).await?;
+                        // Heartbeats arrive at ~10Hz per loop; flushing each one
+                        // rewrites the health file ~50x/sec. Coalesce to at most
+                        // one heartbeat-driven flush per HEALTH_FLUSH_INTERVAL.
+                        if last_health_flush.elapsed() >= HEALTH_FLUSH_INTERVAL {
+                            write_health(&root, &mut health).await?;
+                            last_health_flush = Instant::now();
+                        }
                     }
                     LoopEvent::Endpoint(endpoint_url) => {
                         health.endpoint_url = endpoint_url;
                         write_health(&root, &mut health).await?;
+                        last_health_flush = Instant::now();
                     }
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
                         write_health(&root, &mut health).await?;
+                        last_health_flush = Instant::now();
                     }
                 }
             }

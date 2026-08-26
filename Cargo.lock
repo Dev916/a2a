@@ -10,6 +10,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "futures-util",
  "jsonschema",
  "nix",
  "predicates",

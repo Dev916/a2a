@@ -544,6 +544,15 @@ pub enum MeshFleetCmd {
     },
     /// Mark a gateway revoked in the registry
     Revoke { gateway_id: String },
+    /// Mint a root-signed enrollment token for a remote gateway public key
+    Enroll {
+        #[arg(long)]
+        gateway_id: String,
+        #[arg(long)]
+        pubkey: String,
+        #[arg(long, default_value = "-")]
+        out: String,
+    },
     /// Mint root.pub.next and re-sign this machine's gateway token
     #[command(
         after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation."
@@ -559,6 +568,14 @@ pub enum MeshGatewayCmd {
     Status,
     /// Ask the running gateway to stop
     Stop,
+    /// Print this machine's gateway enrollment identity
+    Identity,
+    /// Install a root-signed gateway enrollment token
+    InstallToken {
+        /// Token envelope file, or - to read stdin
+        #[arg(long, value_name = "FILE")]
+        file: String,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

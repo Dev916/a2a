@@ -309,6 +309,77 @@ pub fn ensure_gateway_token(home: &A2aHome, clock: &dyn Clock) -> Result<bool, A
     Ok(true)
 }
 
+pub fn enroll_gateway_token(
+    home: &A2aHome,
+    gateway_id: &str,
+    pubkey_b64: &str,
+    clock: &dyn Clock,
+) -> Result<String, AppError> {
+    validate_gateway_pubkey_b64(pubkey_b64)?;
+    let root_key_path = fleet_dir(home)?.join(ROOT_KEY);
+    if !root_key_path.exists() {
+        return Err(AppError::new(
+            "FLEET_ROOT_KEY_MISSING",
+            ExitCode::Precondition,
+            "fleet root key is required to enroll a remote gateway",
+        )
+        .remedy("run this command on the fleet root machine that holds mesh/fleet/root.key"));
+    }
+    let root_pub_path = root_key_path.with_file_name(ROOT_PUB);
+    let root = read_root_key(&root_key_path)?;
+    if !root_pub_path.exists() {
+        write_root_pub(&root_pub_path, &root)?;
+    }
+    let issued_at = clock.now().timestamp();
+    let claims = TokenClaims {
+        fleet_id: root.fleet_id,
+        gateway_id: gateway_id.to_string(),
+        pubkey_b64: pubkey_b64.to_string(),
+        issued_at,
+        exp: issued_at + 90 * 24 * 60 * 60,
+    };
+    let claims_bytes = canonical_claims(&claims)?;
+    sign_claim_bytes_with_key(&claims_bytes, &root_key_path)
+}
+
+pub fn install_gateway_token(
+    home: &A2aHome,
+    token: &str,
+    clock: &dyn Clock,
+) -> Result<TokenClaims, AppError> {
+    let identity = gateway_identity(home, false)?;
+    let local_pubkey_b64 = gateway_public_key_b64(home)?;
+    let root_pub_path = fleet_dir(home)?.join(ROOT_PUB);
+    if !root_pub_path.exists() {
+        return Err(AppError::new(
+            "TOKEN_UNVERIFIABLE",
+            ExitCode::Precondition,
+            "gateway token cannot be verified because fleet root public key is missing",
+        )
+        .remedy("install mesh/fleet/root.pub first"));
+    }
+    let claims = verify_token(token.trim(), &RootSet::load(home)?, clock)?;
+    if claims.gateway_id != identity.gateway_id {
+        return Err(token_mismatch(
+            "gateway_id",
+            &identity.gateway_id,
+            &claims.gateway_id,
+        ));
+    }
+    if claims.pubkey_b64 != local_pubkey_b64 {
+        return Err(token_mismatch(
+            "pubkey_b64",
+            &local_pubkey_b64,
+            &claims.pubkey_b64,
+        ));
+    }
+    write_string_0600(
+        &gateway_dir(home)?.join(GW_TOKEN),
+        &(token.trim().to_string() + "\n"),
+    )?;
+    Ok(claims)
+}
+
 pub fn sign_token(claims: &TokenClaims, home: &A2aHome) -> Result<String, AppError> {
     let root = fleet_init(home)?;
     let mut claims = claims.clone();
@@ -551,6 +622,24 @@ fn verifying_key_from_b64(s: &str) -> Result<VerifyingKey, ()> {
     let bytes = b64_decode(s).map_err(|_| ())?;
     let key: [u8; 32] = bytes.try_into().map_err(|_| ())?;
     VerifyingKey::from_bytes(&key).map_err(|_| ())
+}
+
+fn validate_gateway_pubkey_b64(pubkey_b64: &str) -> Result<(), AppError> {
+    verifying_key_from_b64(pubkey_b64).map(|_| ()).map_err(|_| {
+        AppError::new(
+            "INVALID_PUBKEY",
+            ExitCode::Precondition,
+            "gateway public key must be a base64-encoded ed25519 verifying key",
+        )
+    })
+}
+
+fn token_mismatch(field: &'static str, expected: &str, actual: &str) -> AppError {
+    AppError::new(
+        "TOKEN_MISMATCH",
+        ExitCode::Precondition,
+        format!("token {field} does not match this gateway: expected {expected}, got {actual}"),
+    )
 }
 
 fn fleet_dir(home: &A2aHome) -> Result<PathBuf, AppError> {

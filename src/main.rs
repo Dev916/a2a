@@ -79,12 +79,15 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshFleetCmd::Init { .. } => "mesh fleet init",
                 MeshFleetCmd::Ls { .. } => "mesh fleet ls",
                 MeshFleetCmd::Revoke { .. } => "mesh fleet revoke",
+                MeshFleetCmd::Enroll { .. } => "mesh fleet enroll",
                 MeshFleetCmd::RotateRoot => "mesh fleet rotate-root",
             },
             MeshCmd::Gateway { cmd } => match cmd {
                 MeshGatewayCmd::Run => "mesh gateway run",
                 MeshGatewayCmd::Status => "mesh gateway status",
                 MeshGatewayCmd::Stop => "mesh gateway stop",
+                MeshGatewayCmd::Identity => "mesh gateway identity",
+                MeshGatewayCmd::InstallToken { .. } => "mesh gateway install-token",
             },
         },
     }

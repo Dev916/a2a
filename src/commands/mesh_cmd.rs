@@ -14,7 +14,9 @@ use crate::mesh::{
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 const MESH_L2_MIGRATION_SQL: &str = include_str!("../../migrations/mesh_l2_0001.sql");
@@ -471,6 +473,35 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
             })?;
             Ok(Outcome::from(Value::Null))
         }
+        MeshFleetCmd::Enroll {
+            gateway_id,
+            pubkey,
+            out,
+        } => {
+            let token = crate::mesh::keys::enroll_gateway_token(
+                home,
+                gateway_id,
+                pubkey,
+                &crate::mesh::keys::SystemClock,
+            )?;
+            let reminder =
+                "joining machine needs: token + mesh/fleet/root.pub + mesh/fleet/registry.env";
+            if out == "-" {
+                if json_mode {
+                    return Ok(Outcome::from(json!({
+                        "token": token,
+                        "reminder": reminder
+                    })));
+                }
+                eprintln!("a2a: {reminder}");
+                return Ok(Outcome::from(Value::String(token)));
+            }
+            write_file_0600(Path::new(out), &(token.clone() + "\n"))?;
+            Ok(Outcome::from(json!({
+                "token_path": out,
+                "reminder": reminder
+            })))
+        }
         MeshFleetCmd::RotateRoot => {
             let rotation = crate::mesh::keys::rotate_root(home, &crate::mesh::keys::SystemClock)?;
             Ok(Outcome::from(json!({
@@ -494,7 +525,103 @@ fn run_gateway(
         MeshGatewayCmd::Run => crate::mesh::gateway::run(home, cfg, quiet),
         MeshGatewayCmd::Status => crate::mesh::gateway::status(home, json_mode),
         MeshGatewayCmd::Stop => crate::mesh::gateway::stop(home),
+        MeshGatewayCmd::Identity => {
+            let identity = crate::mesh::keys::gateway_identity(home, false)?;
+            let pubkey_b64 = crate::mesh::keys::gateway_public_key_b64(home)?;
+            let pubkey_fpr = crate::mesh::keys::gateway_public_key_fingerprint(home)?;
+            if !json_mode {
+                return Ok(Outcome::from(Value::String(format!(
+                    "gateway_id={} pubkey_b64={} pubkey_fpr={} cert_fpr={}",
+                    identity.gateway_id, pubkey_b64, pubkey_fpr, identity.cert_fpr
+                ))));
+            }
+            Ok(Outcome::from(json!({
+                "gateway_id": identity.gateway_id,
+                "pubkey_b64": pubkey_b64,
+                "pubkey_fpr": pubkey_fpr,
+                "cert_fpr": identity.cert_fpr,
+            })))
+        }
+        MeshGatewayCmd::InstallToken { file } => {
+            let token = token_input(file)?;
+            let claims = crate::mesh::keys::install_gateway_token(
+                home,
+                token.trim(),
+                &crate::mesh::keys::SystemClock,
+            )?;
+            if !json_mode {
+                return Ok(Outcome::from(Value::String(format!(
+                    "installed gateway token for {}",
+                    claims.gateway_id
+                ))));
+            }
+            Ok(Outcome::from(json!({
+                "installed": true,
+                "fleet_id": claims.fleet_id,
+                "gateway_id": claims.gateway_id,
+                "exp": claims.exp,
+            })))
+        }
     }
+}
+
+fn token_input(file: &str) -> Result<String, AppError> {
+    if file == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading token: {e}")))?;
+        let token = text.trim();
+        if token.is_empty() {
+            return Err(AppError::new(
+                "TOKEN_REQUIRED",
+                ExitCode::Precondition,
+                "token on stdin was empty",
+            ));
+        }
+        return Ok(token.to_string());
+    }
+    let text = std::fs::read_to_string(file).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Precondition,
+            format!("reading token file {file}: {e}"),
+        )
+    })?;
+    let token = text.trim();
+    if token.is_empty() {
+        return Err(AppError::new(
+            "TOKEN_REQUIRED",
+            ExitCode::Precondition,
+            "token file was empty",
+        ));
+    }
+    Ok(token.to_string())
+}
+
+fn write_file_0600(path: &Path, text: &str) -> Result<(), AppError> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Precondition,
+                format!("writing {path:?}: {e}"),
+            )
+        })?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing {path:?}: {e}")))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("setting token permissions for {path:?}: {e}"),
+        )
+    })
 }
 
 fn registry_input(registry: &str) -> Result<String, AppError> {

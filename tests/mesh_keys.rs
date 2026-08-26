@@ -1,6 +1,7 @@
 use a2a::home::A2aHome;
 use a2a::mesh::keys::{
-    ensure_gateway_token, fleet_init, gateway_identity, gateway_public_key_fingerprint, mint_ulid,
+    enroll_gateway_token, ensure_gateway_token, fleet_init, gateway_identity,
+    gateway_public_key_b64, gateway_public_key_fingerprint, install_gateway_token, mint_ulid,
     sign_token, verify_token, RootSet, TestClock, TokenClaims, SKEW_TOLERANCE_SECS,
 };
 use chrono::{TimeZone, Utc};
@@ -120,6 +121,136 @@ fn self_enrollment_without_root_key_returns_gateway_not_enrolled() {
     let err = ensure_gateway_token(&home, &clock).unwrap_err();
     assert_eq!(err.code, "GATEWAY_NOT_ENROLLED");
     assert!(err.remedy.unwrap().contains("a2a mesh fleet init"));
+}
+
+#[test]
+fn remote_enrollment_token_round_trips_with_root_pub_on_joiner() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root_home = home_in(&root_tmp);
+    let join_tmp = tempfile::tempdir().unwrap();
+    let join_home = home_in(&join_tmp);
+    let fleet = fleet_init(&root_home).unwrap();
+    let identity = gateway_identity(&join_home, false).unwrap();
+    let pubkey_b64 = gateway_public_key_b64(&join_home).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+    fs::create_dir_all(join_tmp.path().join("mesh/fleet")).unwrap();
+    fs::copy(
+        root_tmp.path().join("mesh/fleet/root.pub"),
+        join_tmp.path().join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+
+    let token =
+        enroll_gateway_token(&root_home, &identity.gateway_id, &pubkey_b64, &clock).unwrap();
+    let claims = install_gateway_token(&join_home, &token, &clock).unwrap();
+
+    assert_eq!(claims.fleet_id, fleet.fleet_id);
+    assert_eq!(claims.gateway_id, identity.gateway_id);
+    assert_eq!(claims.pubkey_b64, pubkey_b64);
+    assert_eq!(claims.exp - claims.issued_at, 90 * 24 * 60 * 60);
+    let token_path = join_tmp.path().join("mesh/gateway/gw.token");
+    assert_eq!(mode(&token_path), 0o600);
+    assert_eq!(fs::read_to_string(&token_path).unwrap().trim(), token);
+    let verified = verify_token(&token, &RootSet::load(&join_home).unwrap(), &clock).unwrap();
+    assert_eq!(verified.gateway_id, identity.gateway_id);
+}
+
+#[test]
+fn remote_install_rejects_pubkey_mismatch() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root_home = home_in(&root_tmp);
+    let join_tmp = tempfile::tempdir().unwrap();
+    let join_home = home_in(&join_tmp);
+    let wrong_tmp = tempfile::tempdir().unwrap();
+    let wrong_home = home_in(&wrong_tmp);
+    fleet_init(&root_home).unwrap();
+    let identity = gateway_identity(&join_home, false).unwrap();
+    gateway_identity(&wrong_home, false).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+    fs::create_dir_all(join_tmp.path().join("mesh/fleet")).unwrap();
+    fs::copy(
+        root_tmp.path().join("mesh/fleet/root.pub"),
+        join_tmp.path().join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+
+    let token = enroll_gateway_token(
+        &root_home,
+        &identity.gateway_id,
+        &gateway_public_key_b64(&wrong_home).unwrap(),
+        &clock,
+    )
+    .unwrap();
+    let err = install_gateway_token(&join_home, &token, &clock).unwrap_err();
+    assert_eq!(err.code, "TOKEN_MISMATCH");
+    assert!(err.message.contains("pubkey_b64"), "{}", err.message);
+}
+
+#[test]
+fn remote_install_requires_root_pub_before_writing_token() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root_home = home_in(&root_tmp);
+    let join_tmp = tempfile::tempdir().unwrap();
+    let join_home = home_in(&join_tmp);
+    fleet_init(&root_home).unwrap();
+    let identity = gateway_identity(&join_home, false).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let token = enroll_gateway_token(
+        &root_home,
+        &identity.gateway_id,
+        &gateway_public_key_b64(&join_home).unwrap(),
+        &clock,
+    )
+    .unwrap();
+
+    let err = install_gateway_token(&join_home, &token, &clock).unwrap_err();
+    assert_eq!(err.code, "TOKEN_UNVERIFIABLE");
+    assert!(err.remedy.unwrap().contains("mesh/fleet/root.pub"));
+    assert!(!join_tmp.path().join("mesh/gateway/gw.token").exists());
+}
+
+#[test]
+fn remote_install_rejects_expired_tokens() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root_home = home_in(&root_tmp);
+    let join_tmp = tempfile::tempdir().unwrap();
+    let join_home = home_in(&join_tmp);
+    let fleet = fleet_init(&root_home).unwrap();
+    let identity = gateway_identity(&join_home, false).unwrap();
+    let old_now = 1_700_000_000;
+    let old_claims = TokenClaims {
+        fleet_id: fleet.fleet_id,
+        gateway_id: identity.gateway_id,
+        pubkey_b64: gateway_public_key_b64(&join_home).unwrap(),
+        issued_at: old_now,
+        exp: old_now + 10,
+    };
+    let token = sign_token(&old_claims, &root_home).unwrap();
+
+    fs::create_dir_all(join_tmp.path().join("mesh/fleet")).unwrap();
+    fs::copy(
+        root_tmp.path().join("mesh/fleet/root.pub"),
+        join_tmp.path().join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+
+    let clock = TestClock::new(Utc.timestamp_opt(old_now + 1_000, 0).unwrap());
+    let err = install_gateway_token(&join_home, &token, &clock).unwrap_err();
+    assert_eq!(err.code, "TOKEN_EXPIRED");
+}
+
+#[test]
+fn remote_enroll_rejects_invalid_gateway_public_key() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root_home = home_in(&root_tmp);
+    fleet_init(&root_home).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+
+    let err =
+        enroll_gateway_token(&root_home, "gw-joiner-abcdef", "not-a-key", &clock).unwrap_err();
+    assert_eq!(err.code, "INVALID_PUBKEY");
 }
 
 #[test]

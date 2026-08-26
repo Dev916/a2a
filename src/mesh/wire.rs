@@ -251,6 +251,10 @@ where
     pub async fn close(&mut self) -> Result<(), AppError> {
         self.sink.close().await.map_err(ws_err)
     }
+
+    pub async fn ping(&mut self, payload: Vec<u8>) -> Result<(), AppError> {
+        self.sink.send(Message::Ping(payload)).await.map_err(ws_err)
+    }
 }
 
 pub struct FrameReader<S> {
@@ -336,6 +340,48 @@ impl TlsIdentity {
 
     pub fn spki_fpr(&self) -> &str {
         &self.spki_fpr
+    }
+
+    pub fn from_pem_files(
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+    ) -> Result<Self, AppError> {
+        let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+            AppError::new(
+                "TLS_CERT",
+                ExitCode::Precondition,
+                format!("reading TLS cert: {e}"),
+            )
+        })?;
+        let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
+            AppError::new(
+                "TLS_KEY",
+                ExitCode::Precondition,
+                format!("reading TLS key: {e}"),
+            )
+        })?;
+        let cert_der = pem_block(&cert_pem, "CERTIFICATE").ok_or_else(|| {
+            AppError::new(
+                "TLS_CERT",
+                ExitCode::Precondition,
+                "TLS cert PEM is invalid",
+            )
+        })?;
+        let key_der = pem_block(&key_pem, "PRIVATE KEY").ok_or_else(|| {
+            AppError::new("TLS_KEY", ExitCode::Precondition, "TLS key PEM is invalid")
+        })?;
+        let spki = extract_spki(&cert_der).ok_or_else(|| {
+            AppError::new(
+                "TLS_CERT",
+                ExitCode::Precondition,
+                "TLS cert SPKI is invalid",
+            )
+        })?;
+        Ok(Self {
+            spki_fpr: hex(&Sha256::digest(spki)),
+            cert_der,
+            key_der,
+        })
     }
 }
 
@@ -690,6 +736,14 @@ fn nonce() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     b64_encode(&bytes)
+}
+
+fn pem_block(pem: &str, label: &str) -> Option<Vec<u8>> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let body = pem.split(&begin).nth(1)?.split(&end).next()?;
+    let compact = body.lines().map(str::trim).collect::<String>();
+    b64_decode(&compact).ok()
 }
 
 fn install_rustls_provider() {

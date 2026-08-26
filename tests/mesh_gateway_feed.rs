@@ -81,6 +81,19 @@ fn entry(origin: &str, origin_seq: u64, text: &str) -> FeedEntry {
     }
 }
 
+fn local_entry(text: &str) -> FeedEntry {
+    FeedEntry {
+        seq: 0,
+        origin: None,
+        origin_seq: None,
+        from: "codex:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+        ts: Utc::now(),
+        text: text.to_string(),
+        refs: json!({}),
+        extra: serde_json::Map::new(),
+    }
+}
+
 #[test]
 fn feed_entries_are_layer1_compatible_and_render_canonical_origin_citations() {
     let tmp = tempfile::tempdir().unwrap();
@@ -139,6 +152,70 @@ fn feed_entries_are_layer1_compatible_and_render_canonical_origin_citations() {
     let rows = feed_json(&home, &work);
     assert_eq!(rows[0]["origin"], "gw-local-test");
     assert_eq!(rows[0]["origin_seq"], 1);
+}
+
+#[tokio::test]
+async fn watcher_deltas_push_feed_through_live_session_and_peer_applies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    write_gateway_key(home_a.root(), "gw-a");
+    write_gateway_key(home_b.root(), "gw-b");
+    let cfg_a = cfg_for(&home_a);
+    let cfg_b = cfg_for(&home_b);
+    a2a::mesh::feed::append_entry(&home_a, &cfg_a, local_entry("watcher delta")).unwrap();
+
+    let link = common::start_mesh_link(
+        home_a.clone(),
+        cfg_a.clone(),
+        "gw-a",
+        home_b.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+    let sent =
+        a2a::mesh::gateway::link::push_watcher_deltas(&home_a, &cfg_a, "gw-a", &link.a_state)
+            .await
+            .unwrap();
+    assert!(sent >= 1);
+    common::wait_until(|| {
+        a2a::mesh::feed::read(&home_b, 0)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.origin.as_deref() == Some("gw-a") && entry.text == "watcher delta")
+    })
+    .await;
+    link.stop().await;
+}
+
+#[tokio::test]
+async fn anti_entropy_digest_over_session_repairs_frame_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    write_gateway_key(home_a.root(), "gw-a");
+    write_gateway_key(home_b.root(), "gw-b");
+    let cfg_a = cfg_for(&home_a);
+    let cfg_b = cfg_for(&home_b);
+    for text in ["one", "two", "three"] {
+        a2a::mesh::feed::append_entry(&home_a, &cfg_a, local_entry(text)).unwrap();
+    }
+
+    let link =
+        common::start_mesh_link(home_a.clone(), cfg_a, "gw-a", home_b.clone(), cfg_b, "gw-b").await;
+    a2a::mesh::gateway::link::push_anti_entropy_digest(&home_a, &link.a_state)
+        .await
+        .unwrap();
+    common::wait_until(|| {
+        let rows = a2a::mesh::feed::read(&home_b, 0).unwrap();
+        rows.iter()
+            .filter(|entry| entry.origin.as_deref() == Some("gw-a"))
+            .count()
+            == 3
+    })
+    .await;
+    link.stop().await;
 }
 
 #[test]

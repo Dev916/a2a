@@ -1,13 +1,23 @@
 use a2a::mesh::gateway::link::{
     accept_once_io, dial_gateway_io, discover_outbound_peers, jittered_redial_backoff,
-    LinkDirection, LinkLiveness, LinkRuntimeEvent, LinkTaskSet, LinkWriteOp, OutboundQueue,
-    PeerDamping, PRESENCE_MAILBOX_CAPACITY,
+    LinkDirection, LinkLiveness, LinkRuntimeEvent, LinkSessionParams, LinkStateHandle, LinkTaskSet,
+    LinkWriteOp, OutboundQueue, PeerDamping, PRESENCE_MAILBOX_CAPACITY,
 };
+use a2a::mesh::keys::{fleet_init, sign_token, RootSet, TestClock, TokenClaims};
 use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
-use a2a::mesh::wire::{Frame, TlsIdentity};
+use a2a::mesh::wire::{
+    handshake_acceptor, handshake_dialer, test_link, Frame, HandshakeIdentity, TlsIdentity,
+};
+use a2a::mesh::FeedEntry;
+use a2a::{config, mesh};
 use chrono::{TimeZone, Utc};
+use ed25519_dalek::SigningKey;
+use rand::RngCore;
 use rand::{rngs::StdRng, SeedableRng};
 use serde_json::json;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +36,101 @@ fn row(gateway_id: &str, endpoint: Option<&str>) -> GatewayRow {
         last_heartbeat: now,
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+    }
+}
+
+fn home_at(path: &Path) -> a2a::home::A2aHome {
+    a2a::home::A2aHome::resolve(Some(path)).unwrap()
+}
+
+fn cfg_for(home: &a2a::home::A2aHome) -> config::Config {
+    config::load(home).unwrap().0
+}
+
+fn write_gateway_key(home: &Path, gateway_id: &str) {
+    let dir = home.join("mesh").join("gateway");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("gw.key"),
+        serde_json::to_vec(&json!({
+            "gateway_id": gateway_id,
+            "secret_b64": "test-only-not-a-real-key"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("gw.key"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn signing_key() -> SigningKey {
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    SigningKey::from_bytes(&seed)
+}
+
+fn b64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn handshake_identity(
+    home: &a2a::home::A2aHome,
+    key: SigningKey,
+    gateway_id: &str,
+) -> HandshakeIdentity {
+    let now = Utc::now().timestamp();
+    let claims = TokenClaims {
+        fleet_id: "filled-by-signer".to_string(),
+        gateway_id: gateway_id.to_string(),
+        pubkey_b64: b64_encode(&key.verifying_key().to_bytes()),
+        issued_at: now - 10,
+        exp: now + 1_000,
+    };
+    HandshakeIdentity::new(sign_token(&claims, home).unwrap(), key)
+}
+
+fn feed_entry(text: &str) -> FeedEntry {
+    FeedEntry {
+        seq: 0,
+        origin: None,
+        origin_seq: None,
+        from: "codex:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+        ts: Utc::now(),
+        text: text.to_string(),
+        refs: json!({}),
+        extra: serde_json::Map::new(),
+    }
+}
+
+async fn wait_for(mut pred: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if pred() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition was not met before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -139,6 +244,127 @@ async fn acceptor_and_dialer_connect_over_discovered_injected_io_endpoint() {
         })
     );
     side.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn handshaked_link_sessions_exchange_digest_want_feed_until_homes_converge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let trust_home = home_at(&tmp.path().join("trust"));
+    fleet_init(&trust_home).unwrap();
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    write_gateway_key(home_a.root(), "gw-a");
+    write_gateway_key(home_b.root(), "gw-b");
+    let cfg_a = cfg_for(&home_a);
+    let cfg_b = cfg_for(&home_b);
+    mesh::feed::append_entry(&home_a, &cfg_a, feed_entry("from a")).unwrap();
+
+    let clock = TestClock::new(Utc::now());
+    let (mut accept, mut dial) = test_link(&clock).await;
+    let roots = RootSet::load(&trust_home).unwrap();
+    let accept_id = handshake_identity(&trust_home, signing_key(), "gw-a");
+    let accept_task = tokio::spawn(async move {
+        let peer = handshake_acceptor(&mut accept, &accept_id, &roots, &clock)
+            .await
+            .unwrap();
+        (accept, peer.gateway_id)
+    });
+    let roots = RootSet::load(&trust_home).unwrap();
+    let clock = TestClock::new(Utc::now());
+    let dial_id = handshake_identity(&trust_home, signing_key(), "gw-b");
+    let peer = handshake_dialer(&mut dial, &dial_id, &roots, &clock)
+        .await
+        .unwrap();
+    let (accept, accept_peer) = accept_task.await.unwrap();
+
+    let state_a = LinkStateHandle::new(&home_a, Duration::from_secs(60)).unwrap();
+    let state_b = LinkStateHandle::new(&home_b, Duration::from_secs(60)).unwrap();
+    let token = CancellationToken::new();
+    let task_a = tokio::spawn(a2a::mesh::gateway::link::run_link_session(
+        accept,
+        LinkSessionParams::new(
+            home_a.clone(),
+            cfg_a,
+            "gw-a",
+            accept_peer,
+            LinkDirection::Inbound,
+            state_a,
+            token.child_token(),
+        ),
+    ));
+    let task_b = tokio::spawn(a2a::mesh::gateway::link::run_link_session(
+        dial,
+        LinkSessionParams::new(
+            home_b.clone(),
+            cfg_b,
+            "gw-b",
+            peer.gateway_id,
+            LinkDirection::Outbound,
+            state_b,
+            token.child_token(),
+        ),
+    ));
+
+    wait_for(|| {
+        mesh::feed::read(&home_b, 0)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.origin.as_deref() == Some("gw-a") && entry.text == "from a")
+    })
+    .await;
+    token.cancel();
+    task_a.await.unwrap().unwrap();
+    task_b.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn session_busy_admission_sends_busy_err_and_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(tmp.path());
+    write_gateway_key(home.root(), "gw-b");
+    let cfg = cfg_for(&home);
+    let state = LinkStateHandle::new(&home, Duration::from_secs(60)).unwrap();
+    let clock = TestClock::new(Utc::now());
+    let (mut peer, side) = test_link(&clock).await;
+    let token = CancellationToken::new();
+    let mut params = LinkSessionParams::new(
+        home,
+        cfg,
+        "gw-b",
+        "gw-a",
+        LinkDirection::Inbound,
+        state,
+        token.child_token(),
+    );
+    params.mailbox_payload_cap = 0;
+    params.mailbox_backpressure_window = Duration::ZERO;
+    let task = tokio::spawn(a2a::mesh::gateway::link::run_link_session(side, params));
+
+    peer.recv().await.unwrap();
+    peer.send(&Frame::Feed {
+        origin: "gw-a".to_string(),
+        entries: vec![FeedEntry {
+            seq: 1,
+            origin: Some("gw-a".to_string()),
+            origin_seq: Some(1),
+            from: "codex:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            ts: Utc::now(),
+            text: "blocked".to_string(),
+            refs: json!({}),
+            extra: serde_json::Map::new(),
+        }],
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        peer.recv().await.unwrap(),
+        Some(Frame::Err {
+            code: "BUSY".to_string(),
+            detail: "inbound payload mailbox remained full for 0s".to_string()
+        })
+    );
+    assert_eq!(peer.recv().await.unwrap(), None);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]

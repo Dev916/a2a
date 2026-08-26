@@ -8,6 +8,7 @@ use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, Utc};
 use expose::{Exposure, ExposureProvider, ExposurePublisher, ExposureRow};
 use futures_util::FutureExt;
+use link::{LinkDirection, LinkSessionParams, LinkStateHandle};
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -20,6 +21,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -200,16 +202,27 @@ impl GatewayLog {
 
 #[derive(Clone)]
 struct GatewayRuntimeConfig {
+    home: A2aHome,
+    config: Config,
     outbound_retry_max_secs: u64,
     shutdown_grace_secs: u64,
     panic_slot: Option<LoopSlot>,
     stall_shutdown_slot: Option<LoopSlot>,
+    server_bind_optional: bool,
     registry: Arc<GatewayRegistryRuntime>,
+    links: LinkStateHandle,
 }
 
 impl GatewayRuntimeConfig {
-    fn from_config(cfg: &Config, registry: Arc<GatewayRegistryRuntime>) -> Self {
+    fn from_config(
+        home: &A2aHome,
+        cfg: &Config,
+        registry: Arc<GatewayRegistryRuntime>,
+        links: LinkStateHandle,
+    ) -> Self {
         GatewayRuntimeConfig {
+            home: home.clone(),
+            config: cfg.clone(),
             outbound_retry_max_secs: cfg.mesh.gateway.outbound_retry_max_secs,
             shutdown_grace_secs: cfg.mesh.gateway.shutdown_grace_secs,
             panic_slot: std::env::var("A2A_TEST_MESH_GATEWAY_STUB_PANIC")
@@ -218,7 +231,11 @@ impl GatewayRuntimeConfig {
             stall_shutdown_slot: std::env::var("A2A_TEST_MESH_GATEWAY_STUB_STALL_SHUTDOWN")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            server_bind_optional: std::env::var("A2A_TEST_MESH_GATEWAY_SERVER_BIND_OPTIONAL")
+                .ok()
+                .is_some_and(|value| value == "1"),
             registry,
+            links,
         }
     }
 }
@@ -226,6 +243,7 @@ impl GatewayRuntimeConfig {
 enum LoopEvent {
     Heartbeat(LoopSlot),
     Endpoint(Option<String>),
+    Replication(replicate::ReplicationHealth),
 }
 
 #[derive(Debug)]
@@ -351,7 +369,11 @@ async fn supervise(
     let tracker = TaskTracker::new();
     let log = GatewayLog::start(root.clone());
     let registry_runtime = Arc::new(bootstrap_registry_runtime(home, &cfg)?);
-    let runtime_cfg = GatewayRuntimeConfig::from_config(&cfg, registry_runtime);
+    let link_state = LinkStateHandle::new(
+        home,
+        Duration::from_secs(cfg.mesh.gateway.outbound_retry_max_secs),
+    )?;
+    let runtime_cfg = GatewayRuntimeConfig::from_config(home, &cfg, registry_runtime, link_state);
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| {
             AppError::new(
@@ -404,6 +426,10 @@ async fn supervise(
                     }
                     LoopEvent::Endpoint(endpoint_url) => {
                         health.endpoint_url = endpoint_url;
+                        write_health(&root, &mut health).await?;
+                    }
+                    LoopEvent::Replication(replication) => {
+                        health.replication = replication;
                         write_health(&root, &mut health).await?;
                     }
                 }
@@ -611,22 +637,30 @@ fn spawn_loop(
     cfg: GatewayRuntimeConfig,
 ) {
     let future = async move {
-        let result = if slot == LoopSlot::Registry {
-            AssertUnwindSafe(registry_loop(slot, token, tx, cfg))
-                .catch_unwind()
-                .await
-                .map(|result| result.map_err(|err| format!("{}: {}", err.code, err.message)))
-        } else {
-            AssertUnwindSafe(stub_loop(slot, token, tx, cfg))
-                .catch_unwind()
-                .await
-                .map(|_| Ok(()))
-        };
+        let result = AssertUnwindSafe(run_loop(slot, token, tx, cfg))
+            .catch_unwind()
+            .await
+            .map(|result| result.map_err(|err| format!("{}: {}", err.code, err.message)));
         let result = result.unwrap_or_else(|_| Err("panicked".to_string()));
         (slot, result)
     };
     let tracked = tracker.track_future(future);
     loops.spawn(tracked);
+}
+
+async fn run_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    match slot {
+        LoopSlot::Registry => registry_loop(slot, token, tx, cfg).await,
+        LoopSlot::Server => server_loop(slot, token, tx, cfg).await,
+        LoopSlot::Dialer => dialer_loop(slot, token, tx, cfg).await,
+        LoopSlot::Watcher => watcher_loop(slot, token, tx, cfg).await,
+        LoopSlot::AntiEntropy => anti_entropy_loop(slot, token, tx, cfg).await,
+    }
 }
 
 async fn registry_loop(
@@ -762,21 +796,54 @@ where
                         health.endpoint_url = endpoint_url;
                         write_health(root, &mut health).await?;
                     }
+                    LoopEvent::Replication(replication) => {
+                        health.replication = replication;
+                        write_health(root, &mut health).await?;
+                    }
                 }
             }
         }
     }
 }
 
-async fn stub_loop(
+async fn server_loop(
     slot: LoopSlot,
     token: CancellationToken,
     tx: mpsc::Sender<LoopEvent>,
     cfg: GatewayRuntimeConfig,
-) -> LoopSlot {
+) -> Result<(), AppError> {
     if cfg.panic_slot == Some(slot) {
         panic!("gateway stub loop {slot} panicked by test hook");
     }
+    let listener = TcpListener::bind(("0.0.0.0", cfg.config.mesh.gateway.listen_port as u16))
+        .await
+        .map_err(|e| {
+            if cfg.server_bind_optional {
+                AppError::new(
+                    "GATEWAY_BIND_OPTIONAL",
+                    ExitCode::BrokerUnavailable,
+                    format!("optional mesh gateway listener unavailable: {e}"),
+                )
+            } else {
+                AppError::new(
+                    "GATEWAY_BIND",
+                    ExitCode::BrokerUnavailable,
+                    format!("binding mesh gateway listener: {e}"),
+                )
+            }
+        });
+    let listener = match listener {
+        Ok(listener) => listener,
+        Err(err) if err.code == "GATEWAY_BIND_OPTIONAL" => {
+            return heartbeat_only_loop(slot, token, tx, cfg).await;
+        }
+        Err(err) => return Err(err),
+    };
+    let tls = load_tls_identity(&cfg.home)?;
+    let identity = load_handshake_identity(&cfg.home)?;
+    let roots = keys::RootSet::load(&cfg.home)?;
+    let mut sessions = JoinSet::new();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
     loop {
         tokio::select! {
@@ -784,15 +851,288 @@ async fn stub_loop(
                 if cfg.stall_shutdown_slot == Some(slot) {
                     std::future::pending::<()>().await;
                 }
-                return slot;
+                while let Some(joined) = sessions.join_next().await {
+                    joined.map_err(join_to_app_err)??;
+                }
+                return Ok(());
             }
-            _ = tokio::time::sleep(jittered_heartbeat(HEARTBEAT_INTERVAL)) => {
+            _ = heartbeat.tick() => {
                 if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
-                    return slot;
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.map_err(|e| AppError::new(
+                    "GATEWAY_ACCEPT",
+                    ExitCode::BrokerUnavailable,
+                    format!("accepting gateway link: {e}"),
+                ))?;
+                let tls = tls.clone();
+                let identity = identity.clone();
+                let roots = roots.clone();
+                let params_home = cfg.home.clone();
+                let params_cfg = cfg.config.clone();
+                let local = cfg.registry.row.gateway_id.clone();
+                let state = cfg.links.clone();
+                let child = token.child_token();
+                sessions.spawn(async move {
+                    let mut side = link::accept_once_io(stream, tls).await?;
+                    let peer = crate::mesh::wire::handshake_acceptor(&mut side, &identity, &roots, &SystemClock).await?;
+                    let params = LinkSessionParams::new(
+                        params_home,
+                        params_cfg,
+                        local,
+                        peer.gateway_id.clone(),
+                        LinkDirection::Inbound,
+                        state,
+                        child,
+                    );
+                    link::run_link_session(side, params).await
+                });
+            }
+            Some(joined) = sessions.join_next(), if !sessions.is_empty() => {
+                joined.map_err(join_to_app_err)??;
+            }
+        }
+    }
+}
+
+async fn heartbeat_only_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if cfg.stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(());
+            }
+            _ = heartbeat.tick() => {
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
                 }
             }
         }
     }
+}
+
+async fn dialer_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    if cfg.panic_slot == Some(slot) {
+        panic!("gateway stub loop {slot} panicked by test hook");
+    }
+    let mut sessions = JoinSet::new();
+    let mut attempts = BTreeMap::<String, u32>::new();
+    let mut next_dial_after = BTreeMap::<String, Instant>::new();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut poll = tokio::time::interval(Duration::from_secs(
+        cfg.config.mesh.gateway.replication_poll_secs.max(1),
+    ));
+    let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if cfg.stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
+                while let Some(joined) = sessions.join_next().await {
+                    joined.map_err(join_to_app_err)??;
+                }
+                return Ok(());
+            }
+            _ = heartbeat.tick() => {
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            _ = poll.tick() => {
+                let rows = cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await?;
+                cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
+                for row in link::discover_outbound_peers(&cfg.registry.row.gateway_id, &rows) {
+                    if next_dial_after
+                        .get(&row.gateway_id)
+                        .is_some_and(|next| Instant::now() < *next)
+                    {
+                        continue;
+                    }
+                    if cfg.links.is_live(&row.gateway_id).await || !cfg.links.can_dial(&row.gateway_id, Utc::now()).await {
+                        continue;
+                    }
+                    match dial_and_spawn(row.clone(), &cfg, &token, &mut sessions).await {
+                        Ok(()) => {
+                            attempts.remove(&row.gateway_id);
+                        }
+                        Err(_) => {
+                            let attempt = attempts.entry(row.gateway_id.clone()).or_default();
+                            *attempt = attempt.saturating_add(1);
+                            let cooldown = link::jittered_redial_backoff(
+                                *attempt,
+                                Duration::from_secs(cfg.config.mesh.gateway.outbound_retry_max_secs),
+                                &mut rand::thread_rng(),
+                            );
+                            next_dial_after
+                                .insert(row.gateway_id.clone(), Instant::now() + cooldown);
+                            let _ = cfg.links.record_drop(
+                                &row.gateway_id,
+                                Utc::now(),
+                                cooldown,
+                            ).await;
+                        }
+                    }
+                }
+            }
+            Some(joined) = sessions.join_next(), if !sessions.is_empty() => {
+                joined.map_err(join_to_app_err)??;
+            }
+        }
+    }
+}
+
+async fn dial_and_spawn(
+    row: registry::GatewayRow,
+    cfg: &GatewayRuntimeConfig,
+    token: &CancellationToken,
+    sessions: &mut JoinSet<Result<(), AppError>>,
+) -> Result<(), AppError> {
+    let mut side = link::dial_gateway(&row).await?;
+    let identity = load_handshake_identity(&cfg.home)?;
+    let roots = keys::RootSet::load(&cfg.home)?;
+    let peer =
+        crate::mesh::wire::handshake_dialer(&mut side, &identity, &roots, &SystemClock).await?;
+    let params = LinkSessionParams::new(
+        cfg.home.clone(),
+        cfg.config.clone(),
+        cfg.registry.row.gateway_id.clone(),
+        peer.gateway_id,
+        LinkDirection::Outbound,
+        cfg.links.clone(),
+        token.child_token(),
+    );
+    sessions.spawn(link::run_link_session(side, params));
+    Ok(())
+}
+
+async fn watcher_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    if cfg.panic_slot == Some(slot) {
+        panic!("gateway stub loop {slot} panicked by test hook");
+    }
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut poll = tokio::time::interval(Duration::from_secs(
+        cfg.config.mesh.gateway.replication_poll_secs.max(1),
+    ));
+    let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if cfg.stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(());
+            }
+            _ = heartbeat.tick() => {
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            _ = poll.tick() => {
+                link::push_watcher_deltas(&cfg.home, &cfg.config, &cfg.registry.row.gateway_id, &cfg.links).await?;
+                link::push_spooled_notes(&cfg.home, &cfg.links).await?;
+                link::push_presence_gossip(&cfg.home, &cfg.registry.row.gateway_id, &cfg.links).await?;
+            }
+        }
+    }
+}
+
+async fn anti_entropy_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    if cfg.panic_slot == Some(slot) {
+        panic!("gateway stub loop {slot} panicked by test hook");
+    }
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut anti_entropy = tokio::time::interval(Duration::from_secs(
+        cfg.config.mesh.gateway.anti_entropy_secs.max(1),
+    ));
+    let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if cfg.stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(());
+            }
+            _ = heartbeat.tick() => {
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            _ = anti_entropy.tick() => {
+                link::push_anti_entropy_digest(&cfg.home, &cfg.links).await?;
+                let rows = cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await?;
+                cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
+                presence_wire::retire_stale_origins(
+                    &cfg.home,
+                    Utc::now(),
+                    cfg.config.mesh.gateway.registry_timeout_secs as i64,
+                )?;
+                let mut cursors = replicate::CursorStore::load_or_rebuild(&cfg.home)?;
+                replicate::compact_feed(
+                    &cfg.home,
+                    &cfg.config,
+                    Utc::now(),
+                    chrono::Duration::days(cfg.config.mesh.gateway.feed_retain_days as i64),
+                    &mut cursors,
+                )?;
+                tx.send(LoopEvent::Replication(cfg.links.health().await)).await.ok();
+            }
+        }
+    }
+}
+
+fn load_handshake_identity(
+    home: &A2aHome,
+) -> Result<crate::mesh::wire::HandshakeIdentity, AppError> {
+    Ok(crate::mesh::wire::HandshakeIdentity::new(
+        keys::gateway_token(home)?,
+        keys::gateway_signing_key(home)?,
+    ))
+}
+
+fn load_tls_identity(home: &A2aHome) -> Result<crate::mesh::wire::TlsIdentity, AppError> {
+    let dir = home.root().join("mesh").join("gateway");
+    crate::mesh::wire::TlsIdentity::from_pem_files(&dir.join("gw.crt"), &dir.join("gw.tls.key"))
+}
+
+fn join_to_app_err(err: JoinError) -> AppError {
+    AppError::new(
+        "GATEWAY_LINK_TASK",
+        ExitCode::Internal,
+        format!("gateway link task exited unexpectedly: {err}"),
+    )
 }
 
 fn loop_exit(exited: Result<(LoopSlot, Result<(), String>), JoinError>) -> (LoopSlot, String) {

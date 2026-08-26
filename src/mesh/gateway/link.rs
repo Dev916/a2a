@@ -1,3 +1,6 @@
+use crate::config::Config;
+use crate::home::A2aHome;
+use crate::mesh::gateway::{notes_wire, presence_wire, replicate};
 use crate::mesh::registry::GatewayRow;
 use crate::mesh::wire::{
     accept_pinned, accept_pinned_io, connect_pinned, connect_pinned_io, Frame, Side, TlsIdentity,
@@ -9,16 +12,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub const PRESENCE_MAILBOX_CAPACITY: usize = 64;
 pub const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 pub const SHED_LOG_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
+pub const LINK_OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkDirection {
@@ -229,9 +234,11 @@ pub async fn accept_loop(
                 ))?;
                 let tls = tls.clone();
                 let accepted = accepted.clone();
+                let link_token = token.child_token();
                 links.spawn(async move {
                     let mut side = accept_pinned(stream, tls).await?;
                     let _ = accepted.send(addr).await;
+                    link_token.cancelled().await;
                     let _ = side.close().await;
                     Ok::<(), AppError>(())
                 });
@@ -241,6 +248,582 @@ pub async fn accept_loop(
             }
         }
     }
+}
+
+#[derive(Clone)]
+pub struct LinkStateHandle {
+    inner: Arc<LinkStateInner>,
+}
+
+struct LinkStateInner {
+    links: Mutex<BTreeMap<String, LiveLink>>,
+    damping: Mutex<PeerDamping>,
+    receive_cursors: Mutex<replicate::CursorStore>,
+    health: Mutex<replicate::ReplicationHealth>,
+    registry_cache: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct LiveLink {
+    tx: mpsc::Sender<Frame>,
+    sent_cursors: BTreeMap<String, u64>,
+}
+
+impl LinkStateHandle {
+    pub fn new(home: &A2aHome, damping_window: Duration) -> Result<Self, AppError> {
+        Ok(Self {
+            inner: Arc::new(LinkStateInner {
+                links: Mutex::new(BTreeMap::new()),
+                damping: Mutex::new(PeerDamping::new(damping_window)),
+                receive_cursors: Mutex::new(replicate::CursorStore::load_or_rebuild(home)?),
+                health: Mutex::new(replicate::ReplicationHealth::default()),
+                registry_cache: Mutex::new(()),
+            }),
+        })
+    }
+
+    pub async fn register(&self, peer_gateway_id: String, tx: mpsc::Sender<Frame>) {
+        self.inner.links.lock().await.insert(
+            peer_gateway_id,
+            LiveLink {
+                tx,
+                sent_cursors: BTreeMap::new(),
+            },
+        );
+    }
+
+    pub async fn deregister(&self, peer_gateway_id: &str) {
+        self.inner.links.lock().await.remove(peer_gateway_id);
+    }
+
+    pub async fn is_live(&self, peer_gateway_id: &str) -> bool {
+        self.inner.links.lock().await.contains_key(peer_gateway_id)
+    }
+
+    pub async fn live_peers(&self) -> Vec<String> {
+        self.inner.links.lock().await.keys().cloned().collect()
+    }
+
+    pub async fn sender(&self, peer_gateway_id: &str) -> Option<mpsc::Sender<Frame>> {
+        self.inner
+            .links
+            .lock()
+            .await
+            .get(peer_gateway_id)
+            .map(|link| link.tx.clone())
+    }
+
+    pub async fn send(&self, peer_gateway_id: &str, frame: Frame) -> bool {
+        let tx = self.sender(peer_gateway_id).await;
+        match tx {
+            Some(tx) => tx.send(frame).await.is_ok(),
+            None => false,
+        }
+    }
+
+    pub async fn broadcast(&self, frame: Frame) {
+        let senders = self
+            .inner
+            .links
+            .lock()
+            .await
+            .values()
+            .map(|link| link.tx.clone())
+            .collect::<Vec<_>>();
+        for tx in senders {
+            let _ = tx.send(frame.clone()).await;
+        }
+    }
+
+    pub async fn can_dial(&self, peer_gateway_id: &str, now: DateTime<Utc>) -> bool {
+        self.inner
+            .damping
+            .lock()
+            .await
+            .can_dial(peer_gateway_id, now)
+    }
+
+    pub async fn record_drop(
+        &self,
+        peer_gateway_id: &str,
+        now: DateTime<Utc>,
+        cooldown: Duration,
+    ) -> Option<LinkFlappingEvent> {
+        self.inner
+            .damping
+            .lock()
+            .await
+            .record_connect_drop(peer_gateway_id, now, cooldown)
+    }
+
+    pub async fn health(&self) -> replicate::ReplicationHealth {
+        self.inner.health.lock().await.clone()
+    }
+
+    pub async fn refresh_registry_cache(
+        &self,
+        home: &A2aHome,
+        rows: &[GatewayRow],
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let _guard = self.inner.registry_cache.lock().await;
+        presence_wire::refresh_registry_cache(home, rows, now)
+    }
+}
+
+#[derive(Clone)]
+pub struct LinkSessionParams {
+    pub home: A2aHome,
+    pub cfg: Config,
+    pub local_gateway_id: String,
+    pub peer_gateway_id: String,
+    pub direction: LinkDirection,
+    pub state: LinkStateHandle,
+    pub token: CancellationToken,
+    pub ping_every: Duration,
+    pub mailbox_payload_cap: usize,
+    pub mailbox_backpressure_window: Duration,
+}
+
+impl LinkSessionParams {
+    pub fn new(
+        home: A2aHome,
+        cfg: Config,
+        local_gateway_id: impl Into<String>,
+        peer_gateway_id: impl Into<String>,
+        direction: LinkDirection,
+        state: LinkStateHandle,
+        token: CancellationToken,
+    ) -> Self {
+        let ping_every = Duration::from_secs(cfg.mesh.gateway.ping_secs.max(1));
+        Self {
+            home,
+            cfg,
+            local_gateway_id: local_gateway_id.into(),
+            peer_gateway_id: peer_gateway_id.into(),
+            direction,
+            state,
+            token,
+            ping_every,
+            mailbox_payload_cap: 64,
+            mailbox_backpressure_window: ping_every.saturating_mul(2),
+        }
+    }
+}
+
+pub async fn run_link_session<S>(side: Side<S>, params: LinkSessionParams) -> Result<(), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let LinkSessionParams {
+        home,
+        cfg,
+        local_gateway_id,
+        peer_gateway_id,
+        direction: _,
+        state,
+        token,
+        ping_every,
+        mailbox_payload_cap,
+        mailbox_backpressure_window,
+    } = params;
+    let (mut writer, mut reader) = side.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(LINK_OUTBOUND_CHANNEL_CAPACITY);
+    state
+        .register(peer_gateway_id.clone(), out_tx.clone())
+        .await;
+
+    let (activity_tx, activity_rx) = mpsc::channel(32);
+    let (write_op_tx, mut write_op_rx) = mpsc::channel(32);
+    let close_tx = write_op_tx.clone();
+    let (runtime_tx, mut runtime_rx) = mpsc::channel(8);
+    let liveness_token = token.child_token();
+    let liveness = tokio::spawn(LinkLiveness::new(ping_every).run(
+        activity_rx,
+        write_op_tx,
+        runtime_tx,
+        liveness_token,
+    ));
+
+    let writer_token = token.child_token();
+    let mut writer_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = writer_token.cancelled() => {
+                    let _ = writer.close().await;
+                    return Ok(());
+                }
+                Some(frame) = out_rx.recv() => {
+                    writer.send(&frame).await?;
+                }
+                Some(op) = write_op_rx.recv() => {
+                    match op {
+                        LinkWriteOp::Ping(payload) => writer.ping(payload).await?,
+                        LinkWriteOp::Close(frame) => {
+                            let _ = writer.send(&frame).await;
+                            let _ = writer.close().await;
+                            return Ok(());
+                        }
+                    }
+                }
+                else => {
+                    let _ = writer.close().await;
+                    return Ok(());
+                }
+            }
+        }
+    });
+
+    let initial_digest = replicate::digest_for_home(&home)?;
+    let _ = out_tx
+        .send(Frame::Digest {
+            origins: initial_digest,
+        })
+        .await;
+    let mut mailboxes = InboundMailboxes::new(mailbox_payload_cap, mailbox_backpressure_window);
+    let mut reorder = replicate::FeedReorderBuffers::default();
+    let result = loop {
+        tokio::select! {
+            _ = token.cancelled() => break Ok(()),
+            event = runtime_rx.recv() => {
+                if matches!(event, Some(LinkRuntimeEvent::ClosedForLiveness) | None) {
+                    break Ok(());
+                }
+            }
+            joined = &mut writer_task => {
+                break match joined {
+                    Ok(result) => result,
+                    Err(err) => Err(join_err(err)),
+                };
+            }
+            frame = reader.recv() => {
+                let Some(frame) = frame? else {
+                    break Ok(());
+                };
+                let _ = activity_tx.send(()).await;
+                if let Some(err) = admit_frame(&mut mailboxes, &frame).await {
+                    let _ = close_tx.send(LinkWriteOp::Close(err)).await;
+                    let joined = (&mut writer_task).await;
+                    break match joined {
+                        Ok(result) => result,
+                        Err(err) => Err(join_err(err)),
+                    };
+                }
+                handle_inbound_frame(
+                    InboundCtx {
+                        home: &home,
+                        cfg: &cfg,
+                        local_gateway_id: &local_gateway_id,
+                        peer_gateway_id: &peer_gateway_id,
+                    },
+                    &state,
+                    &mut reorder,
+                    &out_tx,
+                    frame,
+                )
+                .await?;
+            }
+        }
+    };
+
+    token.cancel();
+    liveness.abort();
+    state.deregister(&peer_gateway_id).await;
+    let _ = state
+        .record_drop(
+            &peer_gateway_id,
+            Utc::now(),
+            Duration::from_secs(cfg.mesh.gateway.outbound_retry_max_secs),
+        )
+        .await;
+    result
+}
+
+async fn admit_frame(mailboxes: &mut InboundMailboxes, frame: &Frame) -> Option<Frame> {
+    let now = Utc::now();
+    let admission = match frame {
+        Frame::Feed { .. } => mailboxes.offer_feed(0, now),
+        Frame::Note { .. } => mailboxes.offer_note(0, now),
+        Frame::Presence { .. } => mailboxes.offer_presence(0, now),
+        _ => InboundAdmission::Accepted,
+    };
+    match admission {
+        InboundAdmission::Accepted => {
+            let _ = mailboxes.drain_payloads();
+            None
+        }
+        InboundAdmission::Backpressure => {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = mailboxes.drain_payloads();
+            None
+        }
+        InboundAdmission::Busy(frame) => Some(frame),
+    }
+}
+
+struct InboundCtx<'a> {
+    home: &'a A2aHome,
+    cfg: &'a Config,
+    local_gateway_id: &'a str,
+    peer_gateway_id: &'a str,
+}
+
+async fn handle_inbound_frame(
+    ctx: InboundCtx<'_>,
+    state: &LinkStateHandle,
+    reorder: &mut replicate::FeedReorderBuffers,
+    out_tx: &mpsc::Sender<Frame>,
+    frame: Frame,
+) -> Result<(), AppError> {
+    let InboundCtx {
+        home,
+        cfg,
+        local_gateway_id,
+        peer_gateway_id,
+    } = ctx;
+    match frame {
+        Frame::Digest { origins } => {
+            let cursors = state.inner.receive_cursors.lock().await;
+            let wants = replicate::wants_from_digest(home, &cursors, &origins)?;
+            if !wants.is_empty() {
+                let _ = out_tx.send(Frame::Want { origins: wants }).await;
+            }
+        }
+        Frame::Want { origins } => {
+            let cursors = state.inner.receive_cursors.lock().await;
+            for want in origins {
+                match replicate::entries_for_want_capped(
+                    home,
+                    &want.origin,
+                    want.from_seq,
+                    &cursors,
+                    replicate::DEFAULT_WANT_ENTRY_CAP,
+                )? {
+                    replicate::WantReply::Entries(entries) if !entries.is_empty() => {
+                        let _ = out_tx
+                            .send(Frame::Feed {
+                                origin: want.origin,
+                                entries,
+                            })
+                            .await;
+                    }
+                    replicate::WantReply::Entries(_) => {}
+                    replicate::WantReply::Compacted { from_seq } => {
+                        let _ = out_tx.send(replicate::compacted_err(from_seq)).await;
+                    }
+                }
+            }
+        }
+        Frame::Feed { origin, entries } => {
+            let mut cursors = state.inner.receive_cursors.lock().await;
+            replicate::receive_feed_entries(home, cfg, &mut cursors, reorder, &origin, entries)?;
+            cursors.persist(home)?;
+        }
+        Frame::Note { note } => {
+            let trace_id = note.note_id.clone().unwrap_or_default();
+            let envelope = notes_wire::SpooledNote {
+                schema_version: 1,
+                trace_id: trace_id.clone(),
+                from_gateway: peer_gateway_id.to_string(),
+                to_gateway: local_gateway_id.to_string(),
+                to_peer: note.to.clone(),
+                attempts: 0,
+                next_attempt_after: None,
+                note,
+            };
+            let ack = notes_wire::receive_note(home, cfg, &envelope)?;
+            let outcome = match ack {
+                notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => "delivered",
+                notes_wire::NoteAck::Rejected { .. } => "ingress_refused",
+            };
+            let _ = out_tx
+                .send(Frame::Ack {
+                    ref_id: trace_id,
+                    outcome: outcome.to_string(),
+                })
+                .await;
+        }
+        Frame::Ack { ref_id, outcome } => {
+            let _ = notes_wire::handle_ack(home, peer_gateway_id, &ref_id, &outcome)?;
+        }
+        Frame::Presence { peers } => {
+            presence_wire::merge_presence_frame(home, peer_gateway_id, peers)?;
+        }
+        Frame::Err { .. } | Frame::Challenge { .. } | Frame::Hello { .. } => {}
+    }
+    Ok(())
+}
+
+pub async fn push_watcher_deltas(
+    home: &A2aHome,
+    cfg: &Config,
+    local_gateway_id: &str,
+    state: &LinkStateHandle,
+) -> Result<usize, AppError> {
+    let peers = state.live_peers().await;
+    let mut sent = 0usize;
+    for peer in peers {
+        let (tx, cursors) = {
+            let links = state.inner.links.lock().await;
+            let Some(link) = links.get(&peer) else {
+                continue;
+            };
+            (link.tx.clone(), link.sent_cursors.clone())
+        };
+        let entries = replicate::deltas_for_link(home, local_gateway_id, &cursors)?;
+        if entries.is_empty() {
+            continue;
+        }
+        for (origin, batch) in group_entries(entries) {
+            tx.send(Frame::Feed {
+                origin: origin.clone(),
+                entries: batch.clone(),
+            })
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    "GATEWAY_LINK_SEND",
+                    ExitCode::BrokerUnavailable,
+                    format!("link to {peer} is closed"),
+                )
+            })?;
+            sent += batch.len();
+            let mut links = state.inner.links.lock().await;
+            if let Some(link) = links.get_mut(&peer) {
+                let max_seq = batch
+                    .iter()
+                    .filter_map(|entry| entry.origin_seq)
+                    .max()
+                    .unwrap_or(0);
+                link.sent_cursors
+                    .entry(origin)
+                    .and_modify(|seq| *seq = (*seq).max(max_seq))
+                    .or_insert(max_seq);
+            }
+        }
+    }
+    let _ = cfg;
+    Ok(sent)
+}
+
+pub async fn push_presence_gossip(
+    home: &A2aHome,
+    local_gateway_id: &str,
+    state: &LinkStateHandle,
+) -> Result<(), AppError> {
+    state
+        .broadcast(presence_wire::gossip_frame(home, local_gateway_id)?)
+        .await;
+    Ok(())
+}
+
+pub async fn push_spooled_notes(
+    home: &A2aHome,
+    state: &LinkStateHandle,
+) -> Result<usize, AppError> {
+    let root = crate::mesh::mesh_root(home).join("outbound");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading outbound spool: {e}"),
+            ))
+        }
+    };
+    let mut sent = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading outbound spool: {e}"),
+            )
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|e| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading outbound spool: {e}"),
+                )
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        let gateway = entry.file_name().to_string_lossy().into_owned();
+        if matches!(gateway.as_str(), "sent" | "rejected" | "retired") {
+            continue;
+        }
+        let Some(tx) = state.sender(&gateway).await else {
+            continue;
+        };
+        let notes = std::fs::read_dir(entry.path()).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading outbound notes: {e}"),
+            )
+        })?;
+        for note in notes {
+            let note = note.map_err(|e| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading outbound notes: {e}"),
+                )
+            })?;
+            if !note.file_name().to_string_lossy().ends_with(".note.json") {
+                continue;
+            }
+            let envelope = notes_wire::read_spooled(&note.path())?;
+            if tx
+                .send(Frame::Note {
+                    note: envelope.note,
+                })
+                .await
+                .is_ok()
+            {
+                sent += 1;
+            }
+        }
+    }
+    Ok(sent)
+}
+
+pub async fn push_anti_entropy_digest(
+    home: &A2aHome,
+    state: &LinkStateHandle,
+) -> Result<(), AppError> {
+    let origins = replicate::digest_for_home(home)?;
+    state
+        .broadcast(Frame::Digest {
+            origins: origins.clone(),
+        })
+        .await;
+    let mut health = state.inner.health.lock().await;
+    health.last_anti_entropy = Some(Utc::now());
+    health.per_origin_lag = origins
+        .into_iter()
+        .map(|origin| (origin.origin, 0))
+        .collect();
+    Ok(())
+}
+
+fn group_entries(
+    entries: Vec<crate::mesh::FeedEntry>,
+) -> BTreeMap<String, Vec<crate::mesh::FeedEntry>> {
+    let mut grouped = BTreeMap::<String, Vec<crate::mesh::FeedEntry>>::new();
+    for entry in entries {
+        if let Some(origin) = entry.origin.clone() {
+            grouped.entry(origin).or_default().push(entry);
+        }
+    }
+    grouped
 }
 
 fn join_err(err: tokio::task::JoinError) -> AppError {

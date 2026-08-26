@@ -166,6 +166,41 @@ fn local_presence_changes_persist_counter_and_gossip_frame_sets_home_gateway() {
     assert_eq!(peers[0].presence_seq, 3);
 }
 
+#[tokio::test]
+async fn presence_gossip_merges_counter_lww_through_live_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    let cfg_a = a2a::config::load(&home_a).unwrap().0;
+    let cfg_b = a2a::config::load(&home_b).unwrap().0;
+    write_gateway_key(home_a.root(), "gw-a");
+    write_gateway_key(home_b.root(), "gw-b");
+    let peer = "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    write_presence(home_a.root(), peer, 0, Some("gw-a"));
+    let id = PeerId::parse(peer).unwrap();
+    let mut p = a2a::mesh::presence::load(&home_a, &id).unwrap().unwrap();
+    p.presence_seq = 9;
+    p.status = Some("available".to_string());
+    a2a::mesh::presence::save(&home_a, &p).unwrap();
+
+    let link =
+        common::start_mesh_link(home_a.clone(), cfg_a, "gw-a", home_b.clone(), cfg_b, "gw-b").await;
+    a2a::mesh::gateway::link::push_presence_gossip(&home_a, "gw-a", &link.a_state)
+        .await
+        .unwrap();
+    common::wait_until(|| {
+        a2a::mesh::presence::load(&home_b, &id)
+            .unwrap()
+            .is_some_and(|presence| {
+                presence.presence_seq == 9
+                    && presence.home_gateway.as_deref() == Some("gw-a")
+                    && presence.status.as_deref() == Some("available")
+            })
+    })
+    .await;
+    link.stop().await;
+}
+
 #[test]
 fn roster_renders_remote_peers_via_gateway_and_json_carries_home_gateway() {
     let tmp = tempfile::tempdir().unwrap();

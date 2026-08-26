@@ -262,6 +262,24 @@ pub fn gateway_public_key_fingerprint(home: &A2aHome) -> Result<String, AppError
     Ok(hex(&Sha256::digest(pubkey)))
 }
 
+pub fn gateway_signing_key(home: &A2aHome) -> Result<SigningKey, AppError> {
+    let gateway = read_gateway_key(&gateway_dir(home)?.join(GW_KEY))?;
+    signing_key_from_b64(&gateway.secret_b64).map_err(|_| {
+        AppError::new(
+            "GATEWAY_KEY_INVALID",
+            ExitCode::Precondition,
+            "gateway key file is invalid",
+        )
+    })
+}
+
+pub fn gateway_token(home: &A2aHome) -> Result<String, AppError> {
+    let path = gateway_dir(home)?.join(GW_TOKEN);
+    fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| io_err("reading gateway token", e))
+}
+
 pub fn ensure_gateway_token(home: &A2aHome, clock: &dyn Clock) -> Result<bool, AppError> {
     let token_path = gateway_dir(home)?.join(GW_TOKEN);
     if token_path.exists() {

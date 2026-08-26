@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn stub_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stub-codex")
@@ -152,6 +153,96 @@ pub fn write_brief(dir: &Path, body: &str) -> PathBuf {
     std::fs::write(&p, body).unwrap();
     p
 }
+
+pub struct TestMeshLink {
+    pub a_state: a2a::mesh::gateway::link::LinkStateHandle,
+    pub b_state: a2a::mesh::gateway::link::LinkStateHandle,
+    token: tokio_util::sync::CancellationToken,
+    a_task: tokio::task::JoinHandle<Result<(), a2a::output::AppError>>,
+    b_task: tokio::task::JoinHandle<Result<(), a2a::output::AppError>>,
+}
+
+impl TestMeshLink {
+    pub async fn stop(self) {
+        self.token.cancel();
+        self.a_task.await.unwrap().unwrap();
+        self.b_task.await.unwrap().unwrap();
+    }
+}
+
+pub async fn start_mesh_link(
+    home_a: a2a::home::A2aHome,
+    cfg_a: a2a::config::Config,
+    gateway_a: &str,
+    home_b: a2a::home::A2aHome,
+    cfg_b: a2a::config::Config,
+    gateway_b: &str,
+) -> TestMeshLink {
+    let clock = a2a::mesh::keys::TestClock::new(chrono::Utc::now());
+    let (side_a, side_b) = a2a::mesh::wire::test_link(&clock).await;
+    let a_state =
+        a2a::mesh::gateway::link::LinkStateHandle::new(&home_a, Duration::from_secs(60)).unwrap();
+    let b_state =
+        a2a::mesh::gateway::link::LinkStateHandle::new(&home_b, Duration::from_secs(60)).unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    let a_task = tokio::spawn(a2a::mesh::gateway::link::run_link_session(
+        side_a,
+        a2a::mesh::gateway::link::LinkSessionParams::new(
+            home_a,
+            cfg_a,
+            gateway_a,
+            gateway_b,
+            a2a::mesh::gateway::link::LinkDirection::Outbound,
+            a_state.clone(),
+            token.child_token(),
+        ),
+    ));
+    let b_task = tokio::spawn(a2a::mesh::gateway::link::run_link_session(
+        side_b,
+        a2a::mesh::gateway::link::LinkSessionParams::new(
+            home_b,
+            cfg_b,
+            gateway_b,
+            gateway_a,
+            a2a::mesh::gateway::link::LinkDirection::Inbound,
+            b_state.clone(),
+            token.child_token(),
+        ),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if a_state.is_live(gateway_b).await && b_state.is_live(gateway_a).await {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "test mesh link did not register both sessions"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    TestMeshLink {
+        a_state,
+        b_state,
+        token,
+        a_task,
+        b_task,
+    }
+}
+
+pub async fn wait_until(mut pred: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if pred() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition was not met before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Spawns a general-lane worker with the given STUB_* env; returns (home, tmp_keepalive, worker_id).
 pub fn spawn_with(stub_env: &[(&str, &str)]) -> (PathBuf, tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();

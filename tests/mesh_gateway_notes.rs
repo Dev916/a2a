@@ -110,6 +110,76 @@ fn json_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+#[tokio::test]
+async fn spooled_note_delivers_over_session_acks_and_dedupes_duplicate_note_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let receiver = home_at(&tmp.path().join("receiver"));
+    write_gateway_key(sender.root(), "gw-a");
+    write_gateway_key(receiver.root(), "gw-b");
+    let cfg_a = cfg_for(&sender);
+    let cfg_b = cfg_for(&receiver);
+    let target = "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let note_id = "01K3KV0000000000000000000A";
+    notes_wire::spool_note(
+        &sender,
+        &cfg_a,
+        "gw-a",
+        "gw-b",
+        note(
+            "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            target,
+            "through session",
+            note_id,
+        ),
+    )
+    .unwrap();
+
+    let link = common::start_mesh_link(
+        sender.clone(),
+        cfg_a,
+        "gw-a",
+        receiver.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+    a2a::mesh::gateway::link::push_spooled_notes(&sender, &link.a_state)
+        .await
+        .unwrap();
+    common::wait_until(|| {
+        note_files(receiver.root(), target).len() == 1
+            && json_files(
+                &sender
+                    .root()
+                    .join("mesh")
+                    .join("outbound")
+                    .join("sent")
+                    .join("gw-b"),
+            )
+            .len()
+                == 1
+    })
+    .await;
+
+    link.a_state
+        .send(
+            "gw-b",
+            a2a::mesh::wire::Frame::Note {
+                note: note(
+                    "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    target,
+                    "through session",
+                    note_id,
+                ),
+            },
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(note_files(receiver.root(), target).len(), 1);
+    link.stop().await;
+}
+
 #[test]
 fn note_id_is_flatten_tolerant_and_local_notes_mint_one() {
     let tmp = tempfile::tempdir().unwrap();

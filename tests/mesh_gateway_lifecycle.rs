@@ -6,7 +6,10 @@ use serde_json::Value;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
+
+static NEXT_GATEWAY_PORT: AtomicU16 = AtomicU16::new(20_000);
 
 #[test]
 fn mesh_gateway_config_surface_is_pinned_and_originated() {
@@ -319,6 +322,54 @@ fn gateway_startup_mints_identity_and_self_enrollment_token() {
 }
 
 #[test]
+fn all_real_gateway_slots_boot_with_file_registry_and_shutdown_gracefully() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
+    std::fs::write(
+        home.join("config.toml"),
+        "[mesh.gateway]\nexpose = \"none\"\nregistry_heartbeat_secs = 1\nreplication_poll_secs = 1\nanti_entropy_secs = 1\n",
+    )
+    .unwrap();
+
+    let mut child = spawn_gateway(&home, &work, &[]);
+    let health = wait_for_health_with(&home, |health| {
+        ["registry", "dialer", "watcher", "anti-entropy"]
+            .into_iter()
+            .all(|slot| health["loops"][slot]["heartbeats"].as_u64().unwrap_or(0) >= 1)
+            && (health["loops"]["server"]["heartbeats"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+                || health["loops"]["server"]["last_exit"]
+                    .as_str()
+                    .is_some_and(|exit| exit.contains("GATEWAY_BIND")))
+    });
+    assert_eq!(health["state"], "running");
+    assert!(
+        health["loops"]["server"]["state"] == "running"
+            || health["loops"]["server"]["last_exit"]
+                .as_str()
+                .is_some_and(|exit| exit.contains("GATEWAY_BIND")),
+        "{health}"
+    );
+    assert_eq!(health["loops"]["dialer"]["state"], "running");
+    assert_eq!(health["loops"]["watcher"]["state"], "running");
+    assert_eq!(health["loops"]["anti-entropy"]["state"], "running");
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "stop"])
+        .assert()
+        .success();
+    assert_exits(&mut child, Duration::from_secs(3));
+    let health = read_health(&home);
+    assert_eq!(health["state"], "stopped");
+    assert_eq!(health["shutdown"]["graceful"], true);
+}
+
+#[test]
 fn gateway_startup_without_root_or_token_fails_not_enrolled() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -354,6 +405,7 @@ fn gateway_startup_without_registry_env_fails_unconfigured() {
 }
 
 fn spawn_gateway(home: &std::path::Path, work: &std::path::Path, envs: &[(&str, &str)]) -> Child {
+    let listen_port = NEXT_GATEWAY_PORT.fetch_add(1, Ordering::SeqCst).to_string();
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("a2a"));
     cmd.arg("--home")
         .arg(home)
@@ -362,6 +414,8 @@ fn spawn_gateway(home: &std::path::Path, work: &std::path::Path, envs: &[(&str, 
         .env("A2A_CODEX_BIN", common::stub_path())
         .env("A2A_BROKER_DISABLE", "1")
         .env("A2A_OWNER", common::TEST_OWNER)
+        .env("A2A_MESH_GATEWAY_LISTEN_PORT", listen_port)
+        .env("A2A_TEST_MESH_GATEWAY_SERVER_BIND_OPTIONAL", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in envs {

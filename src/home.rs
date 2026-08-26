@@ -7,6 +7,7 @@ pub const LAYOUT_VERSION: u32 = 1;
 /// The marker file that records the layout the tree was built at.
 pub const LAYOUT_VERSION_FILE: &str = "LAYOUT_VERSION";
 
+#[derive(Clone)]
 pub struct A2aHome {
     root: PathBuf,
 }

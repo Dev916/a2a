@@ -244,6 +244,25 @@ impl PgRegistry {
         .map_err(|_| registry_unreachable_timeout())?
     }
 
+    pub async fn prepared_statement_probe(&self) -> Result<i32, AppError> {
+        let mut conn = self.acquire().await?;
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut last = 0;
+            for _ in 0..2 {
+                let row = sqlx::query("SELECT $1::int4 AS value")
+                    .bind(17_i32)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(registry_unreachable)?;
+                last = row.try_get("value").map_err(registry_unreachable)?;
+            }
+            Ok(last)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
     async fn acquire(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, AppError> {
         let first = !self.first_acquire.swap(true, Ordering::SeqCst);
         let timeout = if first {

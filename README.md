@@ -618,6 +618,70 @@ It parses `roster --json` and `feed --json` against your real `~/.a2a` and
 checks a before/after hash of `~/.a2a/mesh` (or its absence) so those reads prove
 they wrote nothing. It does not register, post or install hooks.
 
+## Mesh Fleet (Layer 2)
+
+Layer 2 links multiple a2a homes into one mesh fleet through a registry and a
+gateway daemon. Initialize the fleet once with a registry URL; file registries
+are useful for loopback tests, and Postgres/Neon is the intended shared
+registry:
+
+```bash
+printf '%s\n' 'postgres://user:pass@ep-name.region.aws.neon.tech/a2a?sslmode=verify-full' |
+  a2a mesh fleet init --registry -
+```
+
+Enrollment means giving a gateway the fleet root public material plus the same
+`mesh/fleet/registry.env`, then minting that gateway's local key material under
+`mesh/gateway/` with 0600 private-key files. A reachable gateway publishes a
+registry row with `endpoint_url` and its TLS certificate fingerprint; an
+outbound-only gateway keeps `endpoint_url = NULL` and can still dial peers that
+are exposed. `a2a mesh fleet ls --json` reads the registry and computes active
+or stale state from heartbeats, while `a2a mesh fleet revoke <gateway-id>` marks
+a gateway untrusted without deleting its history.
+
+Run the gateway in the foreground under a process manager:
+
+```bash
+a2a mesh gateway run
+a2a mesh gateway status --json
+a2a mesh gateway stop
+```
+
+Exposure is controlled by `[mesh.gateway]`. `expose = "none"` keeps the gateway
+outbound-only, `expose = "manual"` publishes `endpoint_url`, and
+`expose = "ngrok"` asks a local ngrok API for a TCP tunnel and converts it to a
+`wss://` endpoint. Neon pooler URLs are supported; when the host contains
+`-pooler`, a2a disables sqlx's statement cache so PgBouncer transaction pooling
+does not collide on prepared statement names after scale-to-zero reconnects.
+
+Security model: gateways connect with pinned TLS, using the SPKI fingerprint in
+the registry rather than trusting hostnames alone. Each gateway also presents a
+fleet-root-signed PoP token and proves possession of the token key during the
+wire handshake. Remote notes pass through the same ingress scanner and size caps
+as local notes before any inbox file is written. The registry stores gateway
+endpoints and public fingerprints only, never private keys, note text or feed
+payloads. Revocation sets `revoked_at`, discovery hides the row immediately, and
+anti-entropy re-checks existing links so revoked gateways are dropped.
+
+The layer-2 live tier is gated twice and writes only its own generated registry
+row; it does not start a gateway daemon against the real home:
+
+```bash
+A2A_MESH_L2_LIVE=1 \
+A2A_MESH_L2_REGISTRY_URL='postgres://...' \
+A2A_MESH_L2_POOLER_URL='postgres://...-pooler...' \
+cargo test --test mesh_l2_live -- --ignored
+```
+
+Operationally, assume every timer is jittered: registry heartbeats, redials,
+outbound note retries and anti-entropy all spread recovery load instead of
+thundering at the same instant. The gateway health file reports
+`replication.per_origin_lag` and `last_anti_entropy`; sustained lag is also
+written as `kind: "drift"` lines in `mesh/gateway/gateway.jsonl`. For Neon,
+expect a cold first acquire after scale-to-zero and keep the gateway's registry
+pool small; layer-2 uses one connection, idle timeout, transaction-local
+statement timeouts and the pooler statement-cache branch above.
+
 ## Sync: giving Codex workers the same capability layer
 
 Two one-way mirrors from the Claude side into the Codex home, both governed by a

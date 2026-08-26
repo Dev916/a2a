@@ -141,6 +141,19 @@ pub struct PeerRevocationTracker {
 }
 
 impl CursorStore {
+    pub fn load_cached(home: &A2aHome) -> Result<Self, AppError> {
+        match std::fs::read(cursor_path(home)) {
+            Ok(bytes) => {
+                let file: CursorFile = serde_json::from_slice(&bytes).map_err(data_err)?;
+                Ok(CursorStore {
+                    origins: file.origins,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(io_err("reading cursors.json", e)),
+        }
+    }
+
     pub fn load_or_rebuild(home: &A2aHome) -> Result<Self, AppError> {
         let scanned = scan_origin_sequences(home)?;
         let path = cursor_path(home);
@@ -216,6 +229,10 @@ impl CursorStore {
     pub fn apply_advance(&mut self, advance: CursorAdvance) {
         let cursor = self.origins.entry(advance.origin).or_default();
         cursor.last_seq = cursor.last_seq.max(advance.origin_seq);
+    }
+
+    pub fn drop_origin(&mut self, origin: &str) -> bool {
+        self.origins.remove(origin).is_some()
     }
 
     fn set_last_seq(&mut self, origin: impl Into<String>, origin_seq: u64) {

@@ -5,7 +5,7 @@ use crate::ids;
 use crate::inbox::MsgKind;
 use crate::mesh::{
     feed, gateway::notes_wire, peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider,
-    INJECT_BUDGET_BYTES, NOTE_MAX_BYTES,
+    Presence, INJECT_BUDGET_BYTES, NOTE_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode};
 use crate::state::{load_snapshot, WorkerSnapshot};
@@ -26,6 +26,7 @@ pub struct RosterRow {
     pub peer: String,
     pub provider: String,
     pub worker_id: Option<String>,
+    pub home_gateway: Option<String>,
     pub label: presence::Label,
     pub status: Option<String>,
     pub working_on: Option<String>,
@@ -208,12 +209,16 @@ pub fn roster(home: &A2aHome, cfg: &Config, now: DateTime<Utc>) -> Result<Vec<Ro
             ),
             None => (None, presence::Label::Stale, None, None),
         };
+        let home_gateway = p
+            .as_ref()
+            .and_then(|p| p.home_gateway.clone().or_else(|| extra_home_gateway(p)));
         rows.insert(
             peer.clone(),
             RosterRow {
                 peer,
                 provider: id.provider.to_string(),
                 worker_id,
+                home_gateway,
                 label,
                 status,
                 working_on,
@@ -237,6 +242,7 @@ pub fn roster(home: &A2aHome, cfg: &Config, now: DateTime<Utc>) -> Result<Vec<Ro
         };
         let existing = rows.remove(&peer);
         let status = existing.as_ref().and_then(|r| r.status.clone());
+        let home_gateway = existing.as_ref().and_then(|r| r.home_gateway.clone());
         let unread_notes = existing.map(|r| r.unread_notes).unwrap_or(unread_notes);
         rows.insert(
             peer.clone(),
@@ -244,6 +250,7 @@ pub fn roster(home: &A2aHome, cfg: &Config, now: DateTime<Utc>) -> Result<Vec<Ro
                 peer,
                 provider: "codex".to_string(),
                 worker_id: Some(worker_id.clone()),
+                home_gateway,
                 label: presence::Label::Active,
                 status,
                 working_on: Some(format!("{}: {}", snap.lane.as_str(), brief_title(home, &worker_id, &snap))),
@@ -475,14 +482,22 @@ fn remote_gateway_route(home: &A2aHome, peer: &PeerId) -> Result<Option<(String,
         return Ok(None);
     };
     let Some(to_gateway) = p
-        .extra
-        .get("home_gateway")
-        .and_then(Value::as_str)
+        .home_gateway
+        .as_deref()
+        .or_else(|| p.extra.get("home_gateway").and_then(Value::as_str))
         .filter(|gateway| !gateway.is_empty() && *gateway != from_gateway)
     else {
         return Ok(None);
     };
     Ok(Some((from_gateway, to_gateway.to_string())))
+}
+
+fn extra_home_gateway(p: &Presence) -> Option<String> {
+    p.extra
+        .get("home_gateway")
+        .and_then(Value::as_str)
+        .filter(|gateway| !gateway.is_empty())
+        .map(str::to_string)
 }
 
 fn seq_of(name: &str) -> Option<u64> {

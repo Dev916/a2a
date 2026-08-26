@@ -101,7 +101,7 @@ use crate::commands::owner;
 use crate::config;
 use crate::home::A2aHome;
 use crate::ids;
-use crate::mesh::{gateway::replicate, notes, presence, PeerId, Presence};
+use crate::mesh::{gateway::{presence_wire, replicate}, notes, presence, PeerId, Presence};
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::redact;
 use crate::reconcile::reconcile;
@@ -375,6 +375,7 @@ struct MeshSweep {
     removed: Vec<String>,
     reclaimed_bytes: u64,
     feed_compaction: Value,
+    origin_retirement: Value,
 }
 
 impl MeshSweep {
@@ -386,6 +387,7 @@ impl MeshSweep {
             removed: Vec::new(),
             reclaimed_bytes: 0,
             feed_compaction: Value::Null,
+            origin_retirement: Value::Null,
         }
     }
 
@@ -401,6 +403,7 @@ impl MeshSweep {
             "kept": self.kept,
             "skipped": self.skipped,
             "feed_compaction": self.feed_compaction,
+            "origin_retirement": self.origin_retirement,
         })
     }
 }
@@ -457,6 +460,12 @@ fn sweep_mesh(
         .gc_after_days
         .saturating_mul(86_400)
         .min(i64::MAX as u64) as i64;
+    if !dry_run {
+        let retirement = presence_wire::retire_stale_origins(home, now, gc_after_secs)?;
+        sweep.origin_retirement = serde_json::to_value(retirement)
+            .map_err(|e| AppError::new("DATA", ExitCode::Internal, format!("serializing origin retirement: {e}")))?;
+    }
+    let local_gateway = crate::mesh::feed::existing_gateway_id(home);
     for entry in entries {
         let entry = entry.map_err(|e| io_err("listing mesh peers", e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -503,11 +512,30 @@ fn sweep_mesh(
             now,
             cfg.mesh.stale_after_secs,
         );
-        let reason = mesh_reclaim_reason(&presence, label, last_seen_age_secs, gc_after_secs);
+        let home_gateway = presence.home_gateway.as_deref().filter(|gateway| !gateway.is_empty());
+        let remote_homed = home_gateway
+            .map(|gateway| local_gateway.as_deref() != Some(gateway))
+            .unwrap_or(false);
+        let home_gateway_retired = match home_gateway {
+            Some(gateway) if remote_homed => {
+                presence_wire::home_gateway_registry_retired(home, gateway, now, gc_after_secs)?
+            }
+            _ => false,
+        };
+        let reason = mesh_reclaim_reason(
+            &presence,
+            label,
+            last_seen_age_secs,
+            gc_after_secs,
+            remote_homed,
+            home_gateway_retired,
+        );
         let Some(reason) = reason else {
             sweep.kept.push(json!({
                 "peer": peer,
-                "reason": if label == presence::Label::Active {
+                "reason": if remote_homed {
+                    "remote home gateway live"
+                } else if label == presence::Label::Active {
                     "active"
                 } else {
                     "stale under gc threshold"
@@ -566,7 +594,12 @@ fn mesh_reclaim_reason(
     label: presence::Label,
     last_seen_age_secs: i64,
     gc_after_secs: i64,
+    remote_homed: bool,
+    home_gateway_retired: bool,
 ) -> Option<&'static str> {
+    if remote_homed {
+        return home_gateway_retired.then_some("home gateway retired");
+    }
     if presence.retired {
         return Some("retired");
     }

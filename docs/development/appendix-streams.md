@@ -20,6 +20,25 @@ bounded per-origin reorder buffer; when the cap evicts an entry the gateway logs
 the eviction so the next anti-entropy cycle can make the loss visible and
 repairable.
 
+## Presence LWW
+
+Presence is an observed-value cache, not a grow-only log, so it uses a
+last-writer-wins register with a gateway-local counter ahead of wall time. A
+presence update wins only when `(presence_seq, last_seen, gateway_id)` is
+lexicographically greater than the cached tuple. The `presence_seq` is persisted
+in gateway state and is monotonic for that gateway, so a peer whose clock moves
+backward still supersedes its own older presence. `last_seen` remains useful
+inside a single counter value, and `gateway_id` is the deterministic final
+tiebreaker that makes replicas converge.
+
+Remote-homed presence carries `home_gateway`; local staleness does not reclaim
+that cache because the home gateway owns the peer's lifecycle. The local cache
+is dropped only after the home gateway has disappeared from the registry, or is
+revoked there, and its last heartbeat is older than the mesh GC horizon.
+Retiring such an origin also removes its cursor and archives its outbound spool
+with an `origin_retired` gateway log line, so a dead destination cannot remain
+in silent retry forever.
+
 ## Aging Detectors
 
 Anti-entropy updates replication health with `last_anti_entropy` and

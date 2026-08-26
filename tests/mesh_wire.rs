@@ -148,6 +148,8 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
                 registered_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 last_seen: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 retired: false,
+                presence_seq: 0,
+                home_gateway: None,
                 cursors: a2a::mesh::Cursors { feed_seq: 0, inbox: None },
                 extra: serde_json::Map::new(),
             }],

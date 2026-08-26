@@ -102,6 +102,8 @@ pub(crate) fn new_presence(home: &A2aHome, id: &PeerId, now: DateTime<Utc>) -> R
         registered_at: now,
         last_seen: now,
         retired: false,
+        presence_seq: 0,
+        home_gateway: None,
         cursors: Cursors {
             feed_seq: current_feed_tip(home)?,
             inbox: None,

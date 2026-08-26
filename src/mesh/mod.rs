@@ -83,6 +83,10 @@ pub struct Presence {
     pub registered_at: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub retired: bool,
+    #[serde(default)]
+    pub presence_seq: u64,
+    #[serde(default)]
+    pub home_gateway: Option<String>,
     pub cursors: Cursors,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,

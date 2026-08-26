@@ -64,6 +64,8 @@ fn serde_shapes_tolerate_unknown_keys() {
         registered_at: now,
         last_seen: now,
         retired: false,
+        presence_seq: 0,
+        home_gateway: None,
         cursors: Cursors {
             feed_seq: 41,
             inbox: Some("last.note.json".to_string()),

@@ -47,7 +47,7 @@ pub fn run(
             if let Some(cwd) = cwd {
                 p.cwd = Some(cwd.to_string_lossy().into_owned());
             }
-            presence::save(home, &p)?;
+            save_presence_change(home, &mut p)?;
             Ok(Outcome::from(Value::Null))
         }
         MeshCmd::Retire(args) => {
@@ -55,7 +55,7 @@ pub fn run(
             let mut p = load_or_register(home, &id)?;
             p.last_seen = Utc::now();
             p.retired = true;
-            presence::save(home, &p)?;
+            save_presence_change(home, &mut p)?;
             Ok(Outcome::from(Value::Null))
         }
         MeshCmd::Status { peer, text } => {
@@ -72,7 +72,7 @@ pub fn run(
             p.last_seen = Utc::now();
             p.retired = false;
             p.status = if text.is_empty() { None } else { Some(text) };
-            presence::save(home, &p)?;
+            save_presence_change(home, &mut p)?;
             Ok(Outcome::from(Value::Null))
         }
         MeshCmd::Post {
@@ -88,7 +88,7 @@ pub fn run(
             let mut p = load_or_register(home, &id)?;
             p.last_seen = Utc::now();
             p.retired = false;
-            presence::save(home, &p)?;
+            save_presence_change(home, &mut p)?;
             let seq = feed::post(home, cfg, &id, &text, refs(ref_beads, ref_worker))?;
             Ok(Outcome::from(json!(seq)))
         }
@@ -207,7 +207,14 @@ fn register(home: &A2aHome, id: &PeerId) -> Result<(), AppError> {
     };
     p.last_seen = now;
     p.retired = false;
-    presence::save(home, &p)
+    save_presence_change(home, &mut p)
+}
+
+fn save_presence_change(home: &A2aHome, p: &mut crate::mesh::Presence) -> Result<(), AppError> {
+    if let Some(gateway_id) = feed::existing_gateway_id(home) {
+        return crate::mesh::gateway::presence_wire::save_local_change(home, p, &gateway_id);
+    }
+    presence::save(home, p)
 }
 
 fn load_or_register(home: &A2aHome, id: &PeerId) -> Result<crate::mesh::Presence, AppError> {
@@ -346,9 +353,13 @@ fn human_roster(rows: &[RosterRow]) -> String {
     rows.iter()
         .map(|row| {
             crate::redact::redact_egress(&format!(
-                "{} {} notes={}{}{}",
+                "{} {}{} notes={}{}{}",
                 row.peer,
                 label(row.label),
+                row.home_gateway
+                    .as_deref()
+                    .map(|gateway| format!(" via {gateway}"))
+                    .unwrap_or_default(),
                 row.unread_notes,
                 row.worker_id
                     .as_deref()

@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use futures_util::FutureExt;
 
+pub mod link;
+
 pub const GATEWAY_LOCK: &str = "gateway.lock";
 pub const GATEWAY_PID: &str = "gateway.pid";
 pub const GATEWAY_HEALTH: &str = "gateway-health.json";

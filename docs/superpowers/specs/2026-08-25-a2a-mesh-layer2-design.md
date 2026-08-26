@@ -1,6 +1,6 @@
 # a2a Mesh Layer 2: Fleet Gateways + Endpoint Registry — Design
 
-**Date:** 2026-08-25 (rev 2: mx-corpus hardening pass — 22 findings + 12 gaps folded in) · **Status:** approved-pending-review · **Epic:** beads `a2a-ecl`; issues `a2a-o4o` (registry, builds FIRST) and `a2a-90l` (gateway)
+**Date:** 2026-08-25 (rev 2.1: corpus hardening + TLS cert pinning resolved during planning) · **Status:** approved-pending-review · **Epic:** beads `a2a-ecl`; issues `a2a-o4o` (registry, builds FIRST) and `a2a-90l` (gateway)
 **Depends on:** Layer 1 (shipped 2026-08-24): the `$A2A_HOME/mesh/` file layer, `a2a mesh` CLI, hooks, worker-originated routing.
 
 ## §1 Purpose & scope
@@ -26,6 +26,7 @@ Out of scope (recorded, §12): stranger registration/trust tiers, e2e payload en
 - **Proof-of-possession — the token is never a pure bearer credential.** Handshake: acceptor sends `challenge{nonce}`; dialer replies `hello{token, nonce_sig}` where `nonce_sig` is the gateway key's signature over the nonce; acceptor verifies the token against the root set AND the signature against the token's `pubkey_b64`, then the roles reverse (mutual). A stolen token file without `gw.key` is useless.
 - **Root rotation**: verification accepts a SET — `root.pub` plus optional `root.pub.next`. `a2a mesh fleet rotate-root` mints the next root, distributes `root.pub.next`, re-signs gateway tokens; the old root is dropped once every registry row shows a token signed by the new one. No fleet-wide re-enroll flag day.
 - **Revocation**: registry rows gain `revoked_at timestamptz`; discovery skips revoked rows, and every link re-verifies its peer against discovery each anti-entropy cycle (§4 loop 5), so a revoked gateway is dropped within ~2 cycles even on an established link. `a2a mesh fleet revoke <gateway-id>` sets it.
+- **Transport TLS — self-signed + fingerprint-pinned.** "wss only" needs a server cert even on a LAN: each gateway generates an rcgen self-signed TLS cert (key beside `gw.key`, 0600) and publishes its SPKI sha256 as `cert_fpr` in its registry row; dialers verify by FINGERPRINT PINNING (custom rustls verifier — hostname irrelevant), so the same wss link is end-to-end private through a bare LAN address, tailscale, or an ngrok TCP tunnel with no ngrok MITM. Cert rotation = re-upsert the row; peers re-pin on next discovery.
 - **Audit provenance**: every handshake line in `gateway.jsonl` (accept AND refuse) records the peer's `gateway_id`, token `pubkey_fpr`, and which root pubkey verified it.
 
 ## §3 The registry (`a2a-o4o`, builds first)
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS mesh_gateways (
   owner          text NOT NULL,
   endpoint_url   text,                      -- wss://…; NULL = enrolled but unreachable (outbound-only)
   pubkey_fpr     text NOT NULL,
+  cert_fpr       text,                      -- SPKI sha256 of the gateway's TLS cert; NULL until first exposure
   version        text NOT NULL,
   created_at     timestamptz NOT NULL DEFAULT now(),
   last_heartbeat timestamptz NOT NULL DEFAULT now(),
@@ -98,7 +100,7 @@ CREATE TABLE IF NOT EXISTS mesh_gateways (
 
 ## §6 Exposure
 
-`[mesh.gateway] expose = "none" | "ngrok" | "manual"`; `manual` takes `endpoint_url` verbatim. `ngrok`: spawn/use the ngrok agent, read the public URL from its local API, upsert the registry, re-upsert on rotation. Behind `trait Exposure { fn current_url() }`. `expose = "none"` gateways are outbound-only (`endpoint_url NULL`) — viable because replication is transitive (§5) through any reachable gateway.
+`[mesh.gateway] expose = "none" | "ngrok" | "manual"`; `manual` takes `endpoint_url` verbatim. `ngrok`: spawn/use the ngrok agent, read the public URL from its local API, upsert the registry, re-upsert on rotation. Behind `trait Exposure { fn current_url() }`. ngrok uses a **TCP tunnel** (not ngrok's TLS termination): the tunnel carries our own fingerprint-pinned TLS end to end, so ngrok never sees plaintext frames. `expose = "none"` gateways are outbound-only (`endpoint_url NULL`) — viable because replication is transitive (§5) through any reachable gateway.
 
 ## §7 Security posture
 

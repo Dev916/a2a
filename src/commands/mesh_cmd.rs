@@ -1,12 +1,24 @@
-use crate::cli::{MeshCmd, MeshPeerArgs};
+use crate::cli::{MeshCmd, MeshFleetCmd, MeshPeerArgs};
 use crate::config::Config;
-use crate::home::A2aHome;
-use crate::mesh::{feed, notes::{self, RosterRow}, presence, scan_or_refuse, FeedEntry, Note, PeerId, Provider, STATUS_MAX_BYTES};
+use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::mesh::{
+    feed,
+    notes::{self, RosterRow},
+    presence,
+    registry::{
+        staleness, FileRegistry, GatewayRow, PgRegistry, Registry,
+        DEFAULT_REGISTRY_HEARTBEAT_SECS, DEFAULT_REGISTRY_TIMEOUT_SECS,
+    },
+    scan_or_refuse, FeedEntry, Note, PeerId, Provider, STATUS_MAX_BYTES,
+};
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+
+const MESH_L2_MIGRATION_SQL: &str = include_str!("../../migrations/mesh_l2_0001.sql");
 
 pub fn run(
     home: &A2aHome,
@@ -159,6 +171,7 @@ pub fn run(
             Ok(Outcome::from(Value::String(block)))
         }
         MeshCmd::Hooks { print } => run_hooks(*print),
+        MeshCmd::Fleet { cmd } => run_fleet(home, cmd, json_mode),
     }
 }
 
@@ -363,4 +376,247 @@ fn short_peer(peer: &str) -> String {
         return peer.chars().take(12).collect();
     };
     format!("{}:{}", provider, uuid.chars().take(8).collect::<String>())
+}
+
+fn run_fleet(
+    home: &A2aHome,
+    cmd: &MeshFleetCmd,
+    json_mode: bool,
+) -> Result<Outcome, AppError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AppError::new("RUNTIME", ExitCode::Internal, format!("starting registry runtime: {e}")))?;
+    match cmd {
+        MeshFleetCmd::Init { registry } => {
+            let fleet = crate::mesh::keys::fleet_init(home)?;
+            let root_fingerprint = crate::mesh::keys::fleet_root_fingerprint(home)?;
+            if let Some(registry) = registry {
+                let url = registry_input(registry)?;
+                write_registry_env(home, &url)?;
+                rt.block_on(async {
+                    let registry = open_registry(&url)?;
+                    registry.apply_migration(MESH_L2_MIGRATION_SQL).await
+                })?;
+            }
+            Ok(Outcome::from(json!({
+                "fleet_id": fleet.fleet_id,
+                "root_fingerprint": root_fingerprint
+            })))
+        }
+        MeshFleetCmd::Ls { json } => {
+            let url = read_registry_env(home)?;
+            let fleet_id = crate::mesh::keys::fleet_init(home)?.fleet_id;
+            let rows = rt.block_on(async {
+                let registry = open_registry(&url)?;
+                registry.discover(&fleet_id).await
+            })?;
+            let now = Utc::now();
+            let data = rows
+                .into_iter()
+                .map(|row| fleet_row_json(row, now))
+                .collect::<Vec<_>>();
+            if json_mode || *json {
+                return Ok(Outcome::from(json!({ "rows": data })));
+            }
+            Ok(Outcome::from(Value::String(human_fleet_rows(&data))))
+        }
+        MeshFleetCmd::Revoke { gateway_id } => {
+            let url = read_registry_env(home)?;
+            let fleet_id = crate::mesh::keys::fleet_init(home)?.fleet_id;
+            rt.block_on(async {
+                let registry = open_registry(&url)?;
+                registry.revoke(&fleet_id, gateway_id, Utc::now()).await
+            })?;
+            Ok(Outcome::from(Value::Null))
+        }
+        MeshFleetCmd::RotateRoot => {
+            let rotation = crate::mesh::keys::rotate_root(home, &crate::mesh::keys::SystemClock)?;
+            Ok(Outcome::from(json!({
+                "fleet_id": rotation.fleet_id,
+                "current_root_fingerprint": rotation.current_fingerprint,
+                "next_root_fingerprint": rotation.next_fingerprint,
+                "gateway_token_rotated": rotation.gateway_token_rotated
+            })))
+        }
+    }
+}
+
+enum RegistryHandle {
+    File(FileRegistry),
+    Pg(PgRegistry),
+}
+
+impl RegistryHandle {
+    async fn apply_migration(&self, sql: &str) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.init_schema(),
+            RegistryHandle::Pg(registry) => registry.apply_migration(sql).await,
+        }
+    }
+}
+
+impl Registry for RegistryHandle {
+    async fn upsert_self(&self, row: GatewayRow) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.upsert_self(row).await,
+            RegistryHandle::Pg(registry) => registry.upsert_self(row).await,
+        }
+    }
+
+    async fn heartbeat(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
+            RegistryHandle::Pg(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
+        }
+    }
+
+    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.discover(fleet_id).await,
+            RegistryHandle::Pg(registry) => registry.discover(fleet_id).await,
+        }
+    }
+
+    async fn retire_self(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
+            RegistryHandle::Pg(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
+        }
+    }
+
+    async fn revoke(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+            RegistryHandle::Pg(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+        }
+    }
+
+    async fn schema_version(&self) -> Result<i32, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.schema_version().await,
+            RegistryHandle::Pg(registry) => registry.schema_version().await,
+        }
+    }
+}
+
+fn open_registry(url: &str) -> Result<RegistryHandle, AppError> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return Ok(RegistryHandle::File(FileRegistry::new(Path::new(path))));
+    }
+    PgRegistry::connect_lazy(url, DEFAULT_REGISTRY_TIMEOUT_SECS).map(RegistryHandle::Pg)
+}
+
+fn registry_input(registry: &str) -> Result<String, AppError> {
+    if registry == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("reading registry URL: {e}")))?;
+        let url = text.trim();
+        if url.is_empty() {
+            return Err(AppError::new(
+                "REGISTRY_URL_REQUIRED",
+                ExitCode::Precondition,
+                "registry URL on stdin was empty",
+            ));
+        }
+        return Ok(url.to_string());
+    }
+    let url = registry.trim();
+    if url.is_empty() {
+        return Err(AppError::new(
+            "REGISTRY_URL_REQUIRED",
+            ExitCode::Precondition,
+            "registry URL was empty",
+        ));
+    }
+    Ok(url.to_string())
+}
+
+fn registry_env_path(home: &A2aHome) -> std::path::PathBuf {
+    home.root().join("mesh").join("fleet").join("registry.env")
+}
+
+fn write_registry_env(home: &A2aHome, url: &str) -> Result<(), AppError> {
+    let path = registry_env_path(home);
+    if let Some(parent) = path.parent() {
+        create_dir_0700(parent)
+            .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("creating fleet dir: {e}")))?;
+    }
+    let mut f = write_new_0600(&path)
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing registry env: {e}")))?;
+    f.write_all(format!("{url}\n").as_bytes())
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing registry env: {e}")))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("setting registry env mode: {e}")))
+}
+
+fn read_registry_env(home: &A2aHome) -> Result<String, AppError> {
+    let path = registry_env_path(home);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        AppError::new(
+            "REGISTRY_URL_REQUIRED",
+            ExitCode::Precondition,
+            format!("reading registry env: {e}"),
+        )
+        .remedy("run `a2a mesh fleet init --registry -`")
+    })?;
+    let url = text.trim();
+    if url.is_empty() {
+        return Err(AppError::new(
+            "REGISTRY_URL_REQUIRED",
+            ExitCode::Precondition,
+            "registry env is empty",
+        )
+        .remedy("run `a2a mesh fleet init --registry -`"));
+    }
+    Ok(url.to_string())
+}
+
+fn fleet_row_json(row: GatewayRow, now: chrono::DateTime<Utc>) -> Value {
+    let state = staleness(row.last_heartbeat, now, DEFAULT_REGISTRY_HEARTBEAT_SECS);
+    json!({
+        "fleet_id": row.fleet_id,
+        "gateway_id": row.gateway_id,
+        "owner": row.owner,
+        "endpoint_url": row.endpoint_url,
+        "pubkey_fpr": row.pubkey_fpr,
+        "cert_fpr": row.cert_fpr,
+        "version": row.version,
+        "created_at": row.created_at,
+        "last_heartbeat": row.last_heartbeat,
+        "revoked_at": row.revoked_at,
+        "schema_version": row.schema_version,
+        "staleness": state,
+    })
+}
+
+fn human_fleet_rows(rows: &[Value]) -> String {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{} {} {}",
+                row["gateway_id"].as_str().unwrap_or(""),
+                row["staleness"].as_str().unwrap_or(""),
+                row["endpoint_url"].as_str().unwrap_or("outbound-only")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

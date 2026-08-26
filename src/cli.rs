@@ -508,6 +508,11 @@ pub enum MeshCmd {
         #[arg(long)]
         print: bool,
     },
+    /// Manage the layer-2 mesh fleet registry
+    Fleet {
+        #[command(subcommand)]
+        cmd: MeshFleetCmd,
+    },
 }
 
 #[derive(clap::Args)]
@@ -516,6 +521,29 @@ pub struct MeshPeerArgs {
     pub session: Option<String>,
     #[arg(long, value_enum, default_value_t = MeshProviderArg::Claude)]
     pub provider: MeshProviderArg,
+}
+
+#[derive(Subcommand)]
+pub enum MeshFleetCmd {
+    /// Mint the fleet root, store the registry URL, and apply the registry migration
+    Init {
+        /// Registry connection string source; use `-` to read from stdin
+        #[arg(long, value_name = "SOURCE")]
+        registry: Option<String>,
+    },
+    /// List gateway registry rows with reader-computed staleness
+    Ls {
+        /// Emit registry rows as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a gateway revoked in the registry
+    Revoke {
+        gateway_id: String,
+    },
+    /// Mint root.pub.next and re-sign this machine's gateway token
+    #[command(after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation.")]
+    RotateRoot,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

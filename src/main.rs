@@ -1,4 +1,4 @@
-use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, SyncCmd};
+use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshFleetCmd, SyncCmd};
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
 use clap::Parser;
@@ -75,6 +75,12 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Roster { .. } => "mesh roster",
             MeshCmd::Inject { .. } => "mesh inject",
             MeshCmd::Hooks { .. } => "mesh hooks",
+            MeshCmd::Fleet { cmd } => match cmd {
+                MeshFleetCmd::Init { .. } => "mesh fleet init",
+                MeshFleetCmd::Ls { .. } => "mesh fleet ls",
+                MeshFleetCmd::Revoke { .. } => "mesh fleet revoke",
+                MeshFleetCmd::RotateRoot => "mesh fleet rotate-root",
+            },
         },
     }
 }

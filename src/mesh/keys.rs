@@ -19,9 +19,11 @@ use ulid::Ulid;
 pub const SKEW_TOLERANCE_SECS: i64 = 300;
 
 const ROOT_KEY: &str = "root.key";
+const ROOT_KEY_NEXT: &str = "root.key.next";
 const ROOT_PUB: &str = "root.pub";
 const ROOT_PUB_NEXT: &str = "root.pub.next";
 const GW_KEY: &str = "gw.key";
+const GW_TOKEN: &str = "token";
 const TLS_CERT: &str = "gw.crt";
 const TLS_KEY: &str = "gw.tls.key";
 const TLS_FPR: &str = "gw.cert.fpr";
@@ -105,6 +107,14 @@ impl RootSet {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootRotation {
+    pub fleet_id: String,
+    pub current_fingerprint: String,
+    pub next_fingerprint: String,
+    pub gateway_token_rotated: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootKeyFile {
@@ -168,6 +178,32 @@ pub fn fleet_init(home: &A2aHome) -> Result<FleetRoot, AppError> {
     Ok(FleetRoot { fleet_id })
 }
 
+pub fn fleet_root_fingerprint(home: &A2aHome) -> Result<String, AppError> {
+    let root = read_root_pub(&fleet_dir(home)?.join(ROOT_PUB))?;
+    root_fingerprint(&root)
+}
+
+pub fn rotate_root(home: &A2aHome, clock: &dyn Clock) -> Result<RootRotation, AppError> {
+    let current = fleet_init(home)?;
+    let dir = fleet_dir(home)?;
+    let current_pub = read_root_pub(&dir.join(ROOT_PUB))?;
+    let signing = new_signing_key();
+    let next_key = RootKeyFile {
+        fleet_id: current.fleet_id.clone(),
+        secret_b64: b64_encode(&signing.to_bytes()),
+    };
+    write_json_0600(&dir.join(ROOT_KEY_NEXT), &next_key)?;
+    write_root_pub(&dir.join(ROOT_PUB_NEXT), &next_key)?;
+    let next_pub = read_root_pub(&dir.join(ROOT_PUB_NEXT))?;
+    let gateway_token_rotated = resign_gateway_token_with_next(home, clock)?.is_some();
+    Ok(RootRotation {
+        fleet_id: current.fleet_id,
+        current_fingerprint: root_fingerprint(&current_pub)?,
+        next_fingerprint: root_fingerprint(&next_pub)?,
+        gateway_token_rotated,
+    })
+}
+
 pub fn gateway_identity(home: &A2aHome, fresh: bool) -> Result<GatewayIdentity, AppError> {
     let dir = gateway_dir(home)?;
     let key_path = dir.join(GW_KEY);
@@ -199,6 +235,41 @@ pub fn sign_token(claims: &TokenClaims, home: &A2aHome) -> Result<String, AppErr
     claims.fleet_id = root.fleet_id;
     let claims_bytes = canonical_claims(&claims)?;
     sign_claim_bytes(&claims_bytes, home)
+}
+
+fn resign_gateway_token_with_next(
+    home: &A2aHome,
+    clock: &dyn Clock,
+) -> Result<Option<String>, AppError> {
+    let gateway_path = gateway_dir(home)?.join(GW_KEY);
+    if !gateway_path.exists() {
+        return Ok(None);
+    }
+    let next_key_path = fleet_dir(home)?.join(ROOT_KEY_NEXT);
+    if !next_key_path.exists() {
+        return Ok(None);
+    }
+    let root = read_root_key(&next_key_path)?;
+    let gateway = read_gateway_key(&gateway_path)?;
+    let signing = signing_key_from_b64(&gateway.secret_b64).map_err(|_| {
+        AppError::new(
+            "GATEWAY_KEY_INVALID",
+            ExitCode::Precondition,
+            "gateway key file is invalid",
+        )
+    })?;
+    let issued_at = clock.now().timestamp();
+    let claims = TokenClaims {
+        fleet_id: root.fleet_id.clone(),
+        gateway_id: gateway.gateway_id,
+        pubkey_b64: b64_encode(&signing.verifying_key().to_bytes()),
+        issued_at,
+        exp: issued_at + 90 * 24 * 60 * 60,
+    };
+    let claims_bytes = canonical_claims(&claims)?;
+    let token = sign_claim_bytes_with_key(&claims_bytes, &next_key_path)?;
+    write_string_0600(&gateway_dir(home)?.join(GW_TOKEN), &(token.clone() + "\n"))?;
+    Ok(Some(token))
 }
 
 pub fn verify_token(
@@ -252,7 +323,11 @@ pub fn mint_ulid(clock: &dyn Clock) -> String {
 }
 
 fn sign_claim_bytes(claims_bytes: &[u8], home: &A2aHome) -> Result<String, AppError> {
-    let root = read_root_key(&fleet_dir(home)?.join(ROOT_KEY))?;
+    sign_claim_bytes_with_key(claims_bytes, &fleet_dir(home)?.join(ROOT_KEY))
+}
+
+fn sign_claim_bytes_with_key(claims_bytes: &[u8], key_path: &Path) -> Result<String, AppError> {
+    let root = read_root_key(key_path)?;
     let signing = signing_key_from_b64(&root.secret_b64).map_err(|_| root_key_invalid())?;
     let sig = signing.sign(claims_bytes);
     let claims_b64 = b64_encode(claims_bytes);
@@ -265,6 +340,17 @@ fn sign_claim_bytes(claims_bytes: &[u8], home: &A2aHome) -> Result<String, AppEr
     let bytes = serde_json::to_vec(&envelope)
         .map_err(|e| AppError::new("SERIALIZE", ExitCode::Internal, e.to_string()))?;
     Ok(b64_encode(&bytes))
+}
+
+fn root_fingerprint(root: &RootPubFile) -> Result<String, AppError> {
+    let key = b64_decode(&root.pubkey_b64).map_err(|_| {
+        AppError::new(
+            "ROOT_PUB_INVALID",
+            ExitCode::Precondition,
+            "fleet root public key file is invalid",
+        )
+    })?;
+    Ok(hex(&Sha256::digest(key)))
 }
 
 fn canonical_claims(claims: &TokenClaims) -> Result<Vec<u8>, AppError> {

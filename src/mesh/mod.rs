@@ -169,3 +169,4 @@ pub mod presence;
 pub mod feed;
 pub mod notes;
 pub mod routing;
+pub mod registry;

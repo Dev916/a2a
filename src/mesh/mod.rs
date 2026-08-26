@@ -150,6 +150,8 @@ pub fn scan_or_refuse(text: &str, code: &'static str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub mod keys;
+
 fn cap_for(code: &str) -> Option<usize> {
     match code {
         "NOTE_TOO_LARGE" => Some(NOTE_MAX_BYTES),

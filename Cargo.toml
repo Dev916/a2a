@@ -26,6 +26,9 @@ toml = "1.1.4"
 # it would silently delete their comments and grouping. `toml` 1.1.4 does NOT
 # re-export this — it is its own crate.
 toml_edit = "0.25"
+ed25519-dalek = "2"
+rcgen = "0.10.0"
+ulid = "1"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

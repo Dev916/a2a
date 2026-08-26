@@ -1,4 +1,4 @@
-use crate::cli::{MeshCmd, MeshFleetCmd, MeshPeerArgs};
+use crate::cli::{MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshPeerArgs};
 use crate::config::Config;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::{
@@ -172,6 +172,7 @@ pub fn run(
         }
         MeshCmd::Hooks { print } => run_hooks(*print),
         MeshCmd::Fleet { cmd } => run_fleet(home, cmd, json_mode),
+        MeshCmd::Gateway { cmd } => run_gateway(home, cfg, cmd, json_mode, quiet),
     }
 }
 
@@ -439,6 +440,20 @@ fn run_fleet(
                 "gateway_token_rotated": rotation.gateway_token_rotated
             })))
         }
+    }
+}
+
+fn run_gateway(
+    home: &A2aHome,
+    cfg: &Config,
+    cmd: &MeshGatewayCmd,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Outcome, AppError> {
+    match cmd {
+        MeshGatewayCmd::Run => crate::mesh::gateway::run(home, cfg, quiet),
+        MeshGatewayCmd::Status => crate::mesh::gateway::status(home, json_mode),
+        MeshGatewayCmd::Stop => crate::mesh::gateway::stop(home),
     }
 }
 

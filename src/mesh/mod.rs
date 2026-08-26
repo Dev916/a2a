@@ -171,3 +171,4 @@ pub mod notes;
 pub mod routing;
 pub mod registry;
 pub mod wire;
+pub mod gateway;

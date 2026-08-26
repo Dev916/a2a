@@ -52,6 +52,16 @@ pub const DEFAULT_EVENTS_MAX_BYTES: u64 = 10_485_760;
 pub const DEFAULT_FEED_MAX_BYTES: u64 = 10_485_760;
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 900;
 pub const DEFAULT_GC_AFTER_DAYS: u64 = 7;
+pub const DEFAULT_MESH_GATEWAY_LISTEN_PORT: u64 = 7787;
+pub const DEFAULT_MESH_GATEWAY_EXPOSE: &str = "none";
+pub const DEFAULT_MESH_GATEWAY_REGISTRY_HEARTBEAT_SECS: u64 = 180;
+pub const DEFAULT_MESH_GATEWAY_REGISTRY_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_MESH_GATEWAY_REPLICATION_POLL_SECS: u64 = 5;
+pub const DEFAULT_MESH_GATEWAY_OUTBOUND_RETRY_MAX_SECS: u64 = 1920;
+pub const DEFAULT_MESH_GATEWAY_PING_SECS: u64 = 30;
+pub const DEFAULT_MESH_GATEWAY_ANTI_ENTROPY_SECS: u64 = 300;
+pub const DEFAULT_MESH_GATEWAY_FEED_RETAIN_DAYS: u64 = 30;
+pub const DEFAULT_MESH_GATEWAY_SHUTDOWN_GRACE_SECS: u64 = 10;
 
 /// Every `[broker]` key, in the order `config show --origin` reports them.
 pub const BROKER_FIELDS: [&str; 2] = ["idle_timeout_secs", "events_max_bytes"];
@@ -152,6 +162,21 @@ pub const SYNC_FIELDS: [&str; 3] = [
 
 /// Every `[mesh]` key, in the order `config show --origin` reports them.
 pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
+
+/// Every `[mesh.gateway]` key, in the order `config show --origin` reports them.
+pub const MESH_GATEWAY_FIELDS: [&str; 11] = [
+    "listen_port",
+    "expose",
+    "endpoint_url",
+    "registry_heartbeat_secs",
+    "registry_timeout_secs",
+    "replication_poll_secs",
+    "outbound_retry_max_secs",
+    "ping_secs",
+    "anti_entropy_secs",
+    "feed_retain_days",
+    "shutdown_grace_secs",
+];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
 pub const LANE_FIELDS: [&str; 11] = [
@@ -408,7 +433,41 @@ pub struct SyncConfig {
 }
 
 /// The `[mesh]` section: same-machine agent mesh read/write horizons.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct MeshGatewayConfig {
+    pub listen_port: u64,
+    pub expose: String,
+    pub endpoint_url: Option<String>,
+    pub registry_heartbeat_secs: u64,
+    pub registry_timeout_secs: u64,
+    pub replication_poll_secs: u64,
+    pub outbound_retry_max_secs: u64,
+    pub ping_secs: u64,
+    pub anti_entropy_secs: u64,
+    pub feed_retain_days: u64,
+    pub shutdown_grace_secs: u64,
+}
+
+impl Default for MeshGatewayConfig {
+    fn default() -> Self {
+        MeshGatewayConfig {
+            listen_port: DEFAULT_MESH_GATEWAY_LISTEN_PORT,
+            expose: DEFAULT_MESH_GATEWAY_EXPOSE.to_string(),
+            endpoint_url: None,
+            registry_heartbeat_secs: DEFAULT_MESH_GATEWAY_REGISTRY_HEARTBEAT_SECS,
+            registry_timeout_secs: DEFAULT_MESH_GATEWAY_REGISTRY_TIMEOUT_SECS,
+            replication_poll_secs: DEFAULT_MESH_GATEWAY_REPLICATION_POLL_SECS,
+            outbound_retry_max_secs: DEFAULT_MESH_GATEWAY_OUTBOUND_RETRY_MAX_SECS,
+            ping_secs: DEFAULT_MESH_GATEWAY_PING_SECS,
+            anti_entropy_secs: DEFAULT_MESH_GATEWAY_ANTI_ENTROPY_SECS,
+            feed_retain_days: DEFAULT_MESH_GATEWAY_FEED_RETAIN_DAYS,
+            shutdown_grace_secs: DEFAULT_MESH_GATEWAY_SHUTDOWN_GRACE_SECS,
+        }
+    }
+}
+
+/// The `[mesh]` section: same-machine agent mesh read/write horizons.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct MeshConfig {
     /// Bytes of `feed.jsonl` before it rotates; `0` disables rotation.
     pub feed_max_bytes: u64,
@@ -416,6 +475,7 @@ pub struct MeshConfig {
     pub stale_after_secs: u64,
     /// Days after retirement/staleness before `gc` may reclaim mesh peer dirs.
     pub gc_after_days: u64,
+    pub gateway: MeshGatewayConfig,
 }
 
 impl Default for MeshConfig {
@@ -424,6 +484,7 @@ impl Default for MeshConfig {
             feed_max_bytes: DEFAULT_FEED_MAX_BYTES,
             stale_after_secs: DEFAULT_STALE_AFTER_SECS,
             gc_after_days: DEFAULT_GC_AFTER_DAYS,
+            gateway: MeshGatewayConfig::default(),
         }
     }
 }
@@ -537,6 +598,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     }
     for field in MESH_FIELDS {
         origins.insert(format!("mesh.{field}"), Origin::Default);
+    }
+    for field in MESH_GATEWAY_FIELDS {
+        origins.insert(format!("mesh.gateway.{field}"), Origin::Default);
     }
 
     let mut lanes = BTreeMap::new();
@@ -734,12 +798,41 @@ fn apply_mesh_file(
         .as_table()
         .ok_or_else(|| cfg_err(format!("mesh: expected a table, got {}", value.type_str())))?;
     for (field, v) in fields {
+        if field == "gateway" {
+            apply_mesh_gateway_file(cfg, origins, warnings, v)?;
+            continue;
+        }
         let dotted = format!("mesh.{field}");
         if !MESH_FIELDS.contains(&field.as_str()) {
             warnings.push(format!("unknown config key: {dotted}"));
             continue;
         }
         apply_mesh_toml(&mut cfg.mesh, &dotted, field, v)?;
+        origins.insert(dotted, Origin::File);
+    }
+    Ok(())
+}
+
+/// `[mesh.gateway]` — the fleet gateway daemon's layer-2 surface.
+fn apply_mesh_gateway_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value.as_table().ok_or_else(|| {
+        cfg_err(format!(
+            "mesh.gateway: expected a table, got {}",
+            value.type_str()
+        ))
+    })?;
+    for (field, v) in fields {
+        let dotted = format!("mesh.gateway.{field}");
+        if !MESH_GATEWAY_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        apply_mesh_gateway_toml(&mut cfg.mesh.gateway, &dotted, field, v)?;
         origins.insert(dotted, Origin::File);
     }
     Ok(())
@@ -927,6 +1020,29 @@ fn apply_mesh_toml(
     Ok(())
 }
 
+fn apply_mesh_gateway_toml(
+    gw: &mut MeshGatewayConfig,
+    dotted: &str,
+    field: &str,
+    v: &toml::Value,
+) -> Result<(), AppError> {
+    match field {
+        "listen_port" => gw.listen_port = want_u64(dotted, v)?,
+        "expose" => gw.expose = want_str(dotted, v)?.to_string(),
+        "endpoint_url" => gw.endpoint_url = Some(want_str(dotted, v)?.to_string()),
+        "registry_heartbeat_secs" => gw.registry_heartbeat_secs = want_u64(dotted, v)?,
+        "registry_timeout_secs" => gw.registry_timeout_secs = want_u64(dotted, v)?,
+        "replication_poll_secs" => gw.replication_poll_secs = want_u64(dotted, v)?,
+        "outbound_retry_max_secs" => gw.outbound_retry_max_secs = want_u64(dotted, v)?,
+        "ping_secs" => gw.ping_secs = want_u64(dotted, v)?,
+        "anti_entropy_secs" => gw.anti_entropy_secs = want_u64(dotted, v)?,
+        "feed_retain_days" => gw.feed_retain_days = want_u64(dotted, v)?,
+        "shutdown_grace_secs" => gw.shutdown_grace_secs = want_u64(dotted, v)?,
+        _ => unreachable!("field membership checked by caller"),
+    }
+    Ok(())
+}
+
 fn apply_lane_toml(
     lc: &mut LaneConfig,
     dotted: &str,
@@ -986,6 +1102,11 @@ pub fn sync_env_key(field: &str) -> String {
 /// `A2A_MESH_<FIELD>` — the env spelling of one `[mesh]` key.
 pub fn mesh_env_key(field: &str) -> String {
     format!("A2A_MESH_{}", field.to_ascii_uppercase())
+}
+
+/// `A2A_MESH_GATEWAY_<FIELD>` — one `[mesh.gateway]` key.
+pub fn mesh_gateway_env_key(field: &str) -> String {
+    format!("A2A_MESH_GATEWAY_{}", field.to_ascii_uppercase())
 }
 
 /// `A2A_LANES_<LANE>_<FIELD>` (upper-cased) plus top-level `A2A_ALLOWED_ROOTS`
@@ -1113,6 +1234,15 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         }
         origins.insert(dotted, Origin::Env);
     }
+    for field in MESH_GATEWAY_FIELDS {
+        let key = mesh_gateway_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        apply_mesh_gateway_str(&mut cfg.mesh.gateway, &key, field, raw.trim())?;
+        origins.insert(format!("mesh.gateway.{field}"), Origin::Env);
+    }
     Ok(())
 }
 
@@ -1161,6 +1291,35 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "max_turns" => lc.max_turns = parse_u64_str(key, s)?,
         "auto_review" => lc.auto_review = parse_bool_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
+    }
+    Ok(())
+}
+
+fn apply_mesh_gateway_str(
+    gw: &mut MeshGatewayConfig,
+    key: &str,
+    field: &str,
+    s: &str,
+) -> Result<(), AppError> {
+    match field {
+        "listen_port" => gw.listen_port = parse_u64_str(key, s)?,
+        "expose" => gw.expose = s.to_string(),
+        "endpoint_url" => {
+            gw.endpoint_url = if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        "registry_heartbeat_secs" => gw.registry_heartbeat_secs = parse_u64_str(key, s)?,
+        "registry_timeout_secs" => gw.registry_timeout_secs = parse_u64_str(key, s)?,
+        "replication_poll_secs" => gw.replication_poll_secs = parse_u64_str(key, s)?,
+        "outbound_retry_max_secs" => gw.outbound_retry_max_secs = parse_u64_str(key, s)?,
+        "ping_secs" => gw.ping_secs = parse_u64_str(key, s)?,
+        "anti_entropy_secs" => gw.anti_entropy_secs = parse_u64_str(key, s)?,
+        "feed_retain_days" => gw.feed_retain_days = parse_u64_str(key, s)?,
+        "shutdown_grace_secs" => gw.shutdown_grace_secs = parse_u64_str(key, s)?,
+        _ => unreachable!("field membership fixed by MESH_GATEWAY_FIELDS"),
     }
     Ok(())
 }

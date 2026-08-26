@@ -513,6 +513,11 @@ pub enum MeshCmd {
         #[command(subcommand)]
         cmd: MeshFleetCmd,
     },
+    /// Run and inspect the layer-2 mesh gateway daemon
+    Gateway {
+        #[command(subcommand)]
+        cmd: MeshGatewayCmd,
+    },
 }
 
 #[derive(clap::Args)]
@@ -544,6 +549,16 @@ pub enum MeshFleetCmd {
     /// Mint root.pub.next and re-sign this machine's gateway token
     #[command(after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation.")]
     RotateRoot,
+}
+
+#[derive(Subcommand)]
+pub enum MeshGatewayCmd {
+    /// Run the mesh gateway supervisor in the foreground
+    Run,
+    /// Report gateway health (exit 7 when it is not running)
+    Status,
+    /// Ask the running gateway to stop
+    Stop,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

@@ -811,6 +811,13 @@ fn async_sources() -> Vec<(String, String)> {
         .map(|e| e.path())
         .filter(|p| p.extension().map(|e| e == "rs").unwrap_or(false))
         .collect();
+    files.extend(
+        std::fs::read_dir(root.join("src/mesh/gateway"))
+            .expect("src/mesh/gateway exists")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "rs").unwrap_or(false)),
+    );
     files.push(root.join("src/rpc.rs"));
     files.sort();
     assert!(

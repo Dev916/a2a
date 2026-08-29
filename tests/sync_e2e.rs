@@ -115,15 +115,16 @@ const MANAGED_SKILLS: [&str; 3] = ["portable", "techniques", "wordy"];
 /// migration step in the pipeline below.
 const BLOCKED_UNTIL_MIGRATED: [&str; 3] = ["atlassian", "google-workspace", "telegram"];
 
-/// The thirteen checks `doctor` publishes, in report order — the same pin
+/// The fourteen checks `doctor` publishes, in report order — the same pin
 /// `tests/cmd_doctor.rs` holds, restated here because this file asserts the
 /// list mid-pipeline rather than in isolation.
-const CHECK_IDS: [&str; 13] = [
+const CHECK_IDS: [&str; 14] = [
     "codex_present",
     "codex_version",
     "layout_version",
     "home_perms",
     "workers_health",
+    "allowed_roots",
     "env_inheritance",
     "app_server_handshake",
     "codex_home_match",
@@ -668,7 +669,7 @@ fn the_pipeline_syncs_both_kinds_into_one_home_and_converges() {
     assert!(!w.tracks_config(), "git no longer tracks config.toml");
     assert!(w.config().exists(), "`--cached`: the working file survives");
 
-    // (6) `doctor` mid-pipeline: thirteen checks, and the two this phase added
+    // (6) `doctor` mid-pipeline: fourteen checks, and the two this phase added
     //     that a completed pipeline must satisfy.
     let (v, code) = w.doctor();
     let ids: Vec<&str> = v["data"]["checks"]

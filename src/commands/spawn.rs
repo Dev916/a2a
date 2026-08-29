@@ -105,7 +105,7 @@ use crate::worktree;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 /// Total budget for everything staged into `context/` (spec §5 keeps the
@@ -242,7 +242,7 @@ pub fn run_with_lineage(
     if let Some(lane) = args.template {
         return Ok(json!(crate::templates::brief_scaffold(lane)));
     }
-    let (cfg, _origins, warnings) = config::load(home)?;
+    let (mut cfg, _origins, warnings) = config::load(home)?;
     let warn = |msg: &str| {
         if !quiet {
             eprintln!("a2a: warning: {msg}");
@@ -262,7 +262,14 @@ pub fn run_with_lineage(
         .cloned()
         .expect("config::load seeds every lane");
 
-    let cwd_plan = resolve_cwd(lane, args.cwd.as_deref(), &cfg.allowed_roots)?;
+    let cwd_plan = resolve_cwd(
+        home,
+        lane,
+        args.cwd.as_deref(),
+        &mut cfg.allowed_roots,
+        json_mode,
+        quiet,
+    )?;
     let wt_gate = worktree_gate(args, &lane_cfg, &cwd_plan, &warn)?;
 
     let brief_path = args.require_brief();
@@ -1427,9 +1434,12 @@ fn discard_pre_genesis(home: &A2aHome, wdir: &Path, id: &str, repo: Option<&Path
 /// (spec §4.9 — it is the exfiltration lane). Every other lane canonicalizes
 /// `--cwd` and checks it against the (already canonicalized) allowlist.
 fn resolve_cwd(
+    home: &A2aHome,
     lane: Lane,
     requested: Option<&Path>,
-    roots: &[PathBuf],
+    roots: &mut Vec<PathBuf>,
+    json_mode: bool,
+    quiet: bool,
 ) -> Result<CwdPlan, AppError> {
     if lane == Lane::Research {
         if requested.is_some() {
@@ -1456,36 +1466,205 @@ fn resolve_cwd(
             ExitCode::Precondition,
             format!("--cwd {}: {e}", raw.display()),
         )
-    })?;
-    if !roots.iter().any(|root| is_under(&canon, root)) {
-        let listed = if roots.is_empty() {
-            "none are configured".to_string()
-        } else {
-            roots
-                .iter()
-                .map(|r| r.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        return Err(AppError::new(
-            "CWD_NOT_ALLOWED",
-            ExitCode::Precondition,
-            format!(
-                "--cwd {} is not under an allowed root ({listed})",
-                canon.display()
-            ),
-        )
         .remedy(
-            "add the root to `allowed_roots` in $A2A_HOME/config.toml (or A2A_ALLOWED_ROOTS)",
-        ));
+            "the directory does not exist on this machine -- pass an existing project directory \
+             (workers run inside it)",
+        )
+    })?;
+    probe_cwd_writable(&canon)?;
+    if !roots.iter().any(|root| is_under(&canon, root)) {
+        return rescue_or_refuse_cwd(home, &canon, roots, json_mode, quiet);
     }
     Ok(CwdPlan::Fixed(canon))
+}
+
+fn rescue_or_refuse_cwd(
+    home: &A2aHome,
+    canon: &Path,
+    roots: &mut Vec<PathBuf>,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<CwdPlan, AppError> {
+    let stdin_tty = std::io::stdin().is_terminal();
+    let stderr_tty = std::io::stderr().is_terminal();
+    let config_writable = if stdin_tty && stderr_tty && !json_mode && !quiet {
+        Some(crate::commands::config_roots::ensure_config_writable(home))
+    } else {
+        None
+    };
+    if rescue_eligibility(
+        stdin_tty && stderr_tty,
+        json_mode,
+        quiet,
+        matches!(config_writable, Some(Ok(()))),
+    ) {
+        let default = canon
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canon.to_path_buf());
+        let listed = allowed_roots_listing(home, roots);
+        eprintln!(
+            "a2a: --cwd {} is not under an allowed root ({}).",
+            canon.display(),
+            listed
+        );
+        eprintln!(
+            "a2a: add an allowed root to {} so spawns can run here.",
+            crate::commands::config_roots::config_path(home).display()
+        );
+        eprint!("a2a: root to add [{}]: ", default.display());
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if let Err(e) = std::io::stdin().read_line(&mut answer) {
+            return Err(cwd_not_allowed(
+                home,
+                canon,
+                roots,
+                Some(format!("reading stdin: {e}")),
+            ));
+        }
+        let home_env = std::env::var("HOME").unwrap_or_default();
+        let wanted = parse_root_answer(&answer, &default, &home_env);
+        let root = crate::commands::config_roots::canonical_root(&wanted)?;
+        if !canon.starts_with(&root) {
+            eprintln!(
+                "a2a: {} does not contain --cwd {}.",
+                root.display(),
+                canon.display()
+            );
+            return Err(cwd_not_allowed(home, canon, roots, None));
+        }
+        let written = crate::commands::config_roots::add_root(home, &root)?;
+        eprintln!(
+            "a2a: added allowed root {} to {}.",
+            written.path.display(),
+            crate::commands::config_roots::config_path(home).display()
+        );
+        if !roots.iter().any(|existing| canon.starts_with(existing)) {
+            roots.push(root);
+        }
+        return Ok(CwdPlan::Fixed(canon.to_path_buf()));
+    }
+
+    let note = match config_writable {
+        Some(Err(e)) => Some(format!(
+            "also could not update {} automatically: {}",
+            crate::commands::config_roots::config_path(home).display(),
+            e.message
+        )),
+        _ => None,
+    };
+    Err(cwd_not_allowed(home, canon, roots, note))
+}
+
+pub(crate) fn rescue_eligibility(
+    tty: bool,
+    json_mode: bool,
+    quiet: bool,
+    config_writable: bool,
+) -> bool {
+    tty && !json_mode && !quiet && config_writable
+}
+
+pub(crate) fn parse_root_answer(input: &str, default: &Path, home_env: &str) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return default.to_path_buf();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if !home_env.is_empty() {
+            return PathBuf::from(home_env).join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+fn probe_cwd_writable(cwd: &Path) -> Result<(), AppError> {
+    let probe = cwd.join(format!(".a2a-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(AppError::new(
+            "CWD_NOT_WRITABLE",
+            ExitCode::Precondition,
+            format!("--cwd {}: {e}", cwd.display()),
+        )
+        .remedy("workers write into --cwd; fix permissions or choose another directory")),
+    }
+}
+
+fn cwd_not_allowed(
+    home: &A2aHome,
+    canon: &Path,
+    roots: &[PathBuf],
+    note: Option<String>,
+) -> AppError {
+    let mut message = format!(
+        "--cwd {} is not under an allowed root ({})",
+        canon.display(),
+        allowed_roots_listing(home, roots)
+    );
+    if let Some(note) = note {
+        message.push_str("; ");
+        message.push_str(&note);
+    }
+    AppError::new("CWD_NOT_ALLOWED", ExitCode::Precondition, message).remedy(
+        "run `a2a config add-root <dir>` (or edit allowed_roots in $A2A_HOME/config.toml / \
+         A2A_ALLOWED_ROOTS)",
+    )
+}
+
+fn allowed_roots_listing(home: &A2aHome, roots: &[PathBuf]) -> String {
+    let configured = config::non_implicit_allowed_roots(home, roots);
+    if configured.is_empty() {
+        "none are configured on this machine".to_string()
+    } else {
+        configured
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Containment by path COMPONENT, never by string prefix: `/x/a` is not under
 /// `/x/ab`. Both sides must already be canonicalized by the caller.
 fn is_under(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
+}
+
+#[cfg(test)]
+mod cwd_rescue_tests {
+    use super::*;
+
+    #[test]
+    fn rescue_requires_tty_human_output_and_writable_config() {
+        assert!(rescue_eligibility(true, false, false, true));
+        assert!(!rescue_eligibility(false, false, false, true));
+        assert!(!rescue_eligibility(true, true, false, true));
+        assert!(!rescue_eligibility(true, false, true, true));
+        assert!(!rescue_eligibility(true, false, false, false));
+    }
+
+    #[test]
+    fn parse_root_answer_accepts_default_and_expands_home_prefix() {
+        let default = Path::new("/tmp/project-parent");
+        assert_eq!(parse_root_answer("\n", default, "/Users/u"), default);
+        assert_eq!(
+            parse_root_answer("~/Development\n", default, "/Users/u"),
+            PathBuf::from("/Users/u/Development")
+        );
+        assert_eq!(
+            parse_root_answer("/opt/src\n", default, "/Users/u"),
+            PathBuf::from("/opt/src")
+        );
+    }
 }
 
 fn parse_and_validate_brief(
@@ -1991,10 +2170,21 @@ mod tests {
 
     #[test]
     fn research_refuses_an_explicit_cwd_and_defaults_to_scratch() {
-        let err = resolve_cwd(Lane::Research, Some(Path::new("/tmp")), &[]).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
+        let mut roots = Vec::new();
+        let err = resolve_cwd(
+            &home,
+            Lane::Research,
+            Some(Path::new("/tmp")),
+            &mut roots,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "RESEARCH_CWD_FIXED");
         assert!(matches!(
-            resolve_cwd(Lane::Research, None, &[]),
+            resolve_cwd(&home, Lane::Research, None, &mut roots, true, false),
             Ok(CwdPlan::Scratch)
         ));
     }

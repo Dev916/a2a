@@ -10,7 +10,7 @@
 //! individual check. Phase 2's four (app-server handshake, codex-home
 //! agreement, broker status, auth mode) were appended to that slice and the
 //! runner was not touched. Phase 3 appended three more the same way (context
-//! canon, the tracked-secret check, sync state). **Thirteen** is the count —
+//! canon, the allowed-roots check, tracked-secret check, sync state).
 //! Phase 1's six, Phase 2's four, Phase 3's three — and it is pinned by a test.
 //!
 //! **Only `fail` is fatal.** `fail` means "a worker spawned right now would
@@ -147,13 +147,14 @@ pub struct Ctx {
 }
 
 /// The check list, in report order. Append-only across phases: Phase 1's six,
-/// then Phase 2's four, then Phase 3's three.
+/// the allowed-roots first-run check, then Phase 2's four, then Phase 3's three.
 const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_present,
     codex_version,
     layout_version,
     home_perms,
     workers_health,
+    allowed_roots,
     env_inheritance,
     app_server_handshake,
     codex_home_match,
@@ -458,6 +459,30 @@ fn env_inheritance(_ctx: &Ctx) -> Check {
         "keep secrets out of the environment a2a itself runs in, or spawn on the \
          app-server transport, whose children inherit nothing else",
     )
+}
+
+fn allowed_roots(ctx: &Ctx) -> Check {
+    let roots = config::non_implicit_allowed_roots(&ctx.home, &ctx.cfg.allowed_roots);
+    if roots.is_empty() {
+        Check::warn(
+            "allowed_roots",
+            "only the implicit $A2A_HOME/worktrees root is configured; project directories are not configured",
+        )
+        .remedy("run `a2a config add-root <dir>` for the project parent directory")
+    } else {
+        Check::ok(
+            "allowed_roots",
+            format!(
+                "{} configured project root(s): {}",
+                roots.len(),
+                roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    }
 }
 
 // ------------------------------------------------------- the phase-2 checks
@@ -1158,12 +1183,13 @@ mod tests {
     use crate::sync::manifest::DriftSummary;
 
     #[test]
-    fn the_check_list_is_exactly_thirteen_named_checks() {
+    fn the_check_list_is_exactly_fourteen_named_checks() {
         // The list is the contract `doctor --json` publishes; a phase that adds
         // a check adds it here and to the acceptance test in the same commit.
-        // Six in Phase 1, four in Phase 2, three in Phase 3 — the ids and their
-        // order are pinned end-to-end by `tests/cmd_doctor.rs`.
-        assert_eq!(CHECKS.len(), 13);
+        // Six in Phase 1, the allowed-roots check, four in Phase 2, three in
+        // Phase 3 — the ids and their order are pinned end-to-end by
+        // `tests/cmd_doctor.rs`.
+        assert_eq!(CHECKS.len(), 14);
     }
 
     #[test]

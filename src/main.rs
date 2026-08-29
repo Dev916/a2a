@@ -47,6 +47,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Doctor => "doctor",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
+            ConfigCmd::AddRoot { .. } => "config add-root",
         },
         Cmd::Broker { cmd } => match cmd {
             BrokerCmd::Run { .. } => "broker run",
@@ -230,6 +231,11 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;
                 a2a::commands::config_show::run(&home, *origin, cli.global.quiet).map(Outcome::from)
+            }
+            ConfigCmd::AddRoot { path } => {
+                let home = A2aHome::resolve(cli.global.home.as_deref())?;
+                a2a::commands::config_roots::run(&home, path, cli.global.json, cli.global.quiet)
+                    .map(Outcome::from)
             }
         },
         Cmd::Broker { cmd } => {

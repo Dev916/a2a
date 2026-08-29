@@ -382,6 +382,12 @@ pub enum ConfigCmd {
         #[arg(long)]
         origin: bool,
     },
+    /// Add a project directory to allowed_roots in $A2A_HOME/config.toml
+    AddRoot {
+        /// Directory to allow worker spawns under
+        #[arg(value_name = "DIR")]
+        path: PathBuf,
+    },
 }
 
 /// The two halves of `a2a sync`, both declared from the release that ships

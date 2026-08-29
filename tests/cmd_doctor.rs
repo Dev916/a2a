@@ -5,16 +5,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The thirteen checks, in report order: Phase 1's six (unchanged ids,
+/// The fourteen checks, in report order: Phase 1's six (unchanged ids,
 /// unchanged order), then Phase 2's four, then Phase 3's three. This list IS
 /// the contract `doctor --json` publishes — a phase that adds a check adds it
 /// here in the same commit.
-const CHECK_IDS: [&str; 13] = [
+const CHECK_IDS: [&str; 14] = [
     "codex_present",
     "codex_version",
     "layout_version",
     "home_perms",
     "workers_health",
+    "allowed_roots",
     "env_inheritance",
     "app_server_handshake",
     "codex_home_match",
@@ -59,7 +60,7 @@ fn detail(v: &serde_json::Value, id: &str) -> String {
 }
 
 #[test]
-fn all_ok_with_stub_exits_zero_and_lists_thirteen_checks() {
+fn all_ok_with_stub_exits_zero_and_lists_fourteen_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |_| {});
     assert_eq!(code, 0);
@@ -71,6 +72,7 @@ fn all_ok_with_stub_exits_zero_and_lists_thirteen_checks() {
         .collect();
     assert_eq!(ids, CHECK_IDS, "the published check list, in report order");
     assert_eq!(check(&v, "codex_present")["status"], "ok");
+    assert_eq!(check(&v, "allowed_roots")["status"], "ok");
     assert_eq!(check(&v, "env_inheritance")["status"], "warn");
     // The stub speaks exec JSONL, not JSON-RPC: the probe fails, and a failed
     // probe is a WARN because the exec transport still works.
@@ -88,6 +90,22 @@ fn all_ok_with_stub_exits_zero_and_lists_thirteen_checks() {
     assert!(detail(&v, "broker_status").contains("A2A_BROKER_DISABLE"));
     // no auth.json under the temp CODEX_HOME
     assert_eq!(check(&v, "auth_mode")["status"], "warn");
+}
+
+#[test]
+fn allowed_roots_warns_when_only_implicit_worktrees_root_remains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_env = tmp.path().join("user-home");
+    std::fs::create_dir_all(&home_env).unwrap();
+    let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |c| {
+        c.env("HOME", &home_env).env_remove("A2A_ALLOWED_ROOTS");
+    });
+    assert_eq!(code, 0);
+    assert_eq!(check(&v, "allowed_roots")["status"], "warn");
+    assert!(check(&v, "allowed_roots")["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("a2a config add-root"));
 }
 
 #[test]

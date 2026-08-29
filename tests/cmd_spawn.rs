@@ -1,6 +1,7 @@
 // tests/cmd_spawn.rs
 mod common;
 use common::*;
+use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn spawn_general_creates_worker_and_runs() {
@@ -46,6 +47,83 @@ fn cwd_outside_allowed_roots_rejected() {
         .code(9);
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["error"]["code"], "CWD_NOT_ALLOWED");
+    assert!(
+        v["error"]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("a2a config add-root <dir>"),
+        "remedy should name the add-root command: {v}"
+    );
+}
+
+#[test]
+fn cwd_not_found_has_remedy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let brief = write_brief(tmp.path(), "x");
+    let missing = tmp.path().join("missing");
+    let out = a2a(&tmp.path().join("home"), tmp.path())
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&missing)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .code(9);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["error"]["code"], "CWD_NOT_FOUND");
+    assert!(v["error"]["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("directory does not exist"));
+}
+
+#[test]
+fn cwd_not_writable_is_refused_before_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let brief = write_brief(tmp.path(), "x");
+    let cwd = tmp.path().join("readonly-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let original = std::fs::metadata(&cwd).unwrap().permissions();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = a2a(&tmp.path().join("home"), tmp.path())
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&cwd)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .code(9);
+
+    std::fs::set_permissions(&cwd, original).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["error"]["code"], "CWD_NOT_WRITABLE");
+    assert!(v["error"]["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("workers write into --cwd"));
+}
+
+#[test]
+fn json_spawn_outside_roots_is_clean_noninteractive_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let brief = write_brief(tmp.path(), "x");
+    let cwd = tmp.path().join("project");
+    let allowed = tmp.path().join("allowed");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&allowed).unwrap();
+    let out = a2a(&tmp.path().join("home"), &allowed)
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&cwd)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .code(9);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["error"]["code"], "CWD_NOT_ALLOWED");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        !stderr.contains("root to add"),
+        "json mode must not prompt: {stderr}"
+    );
 }
 
 #[test]

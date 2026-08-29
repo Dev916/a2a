@@ -121,6 +121,7 @@ pub mod owner {
 }
 
 pub mod broker_cmd;
+pub mod config_roots;
 pub mod config_show;
 pub mod doctor;
 pub mod gc;

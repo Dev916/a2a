@@ -678,7 +678,7 @@ fn live_dry_runs_read_the_real_machine_and_write_nothing() {
     live.assert_nothing_leaked();
 }
 
-/// The real `a2a doctor --json` on this machine: thirteen checks in the pinned
+/// The real `a2a doctor --json` on this machine: fourteen checks in the pinned
 /// order, and the security-class failure Phase 3 introduced.
 ///
 /// Deliberately silent about every other check's status. `~/.codex` is a moving
@@ -687,17 +687,18 @@ fn live_dry_runs_read_the_real_machine_and_write_nothing() {
 /// asserted the whole board would fail for reasons that say nothing about a2a.
 #[test]
 #[ignore = "reads the developer's real ~/.codex; run with A2A_SYNC_LIVE=1 cargo test --test sync_live -- --ignored"]
-fn live_doctor_fails_on_the_tracked_config_and_lists_thirteen_checks() {
-    if !gated("live_doctor_fails_on_the_tracked_config_and_lists_thirteen_checks") {
+fn live_doctor_fails_on_the_tracked_config_and_lists_fourteen_checks() {
+    if !gated("live_doctor_fails_on_the_tracked_config_and_lists_fourteen_checks") {
         return;
     }
-    /// The thirteen, in report order — the same pin `tests/cmd_doctor.rs` holds.
-    const CHECK_IDS: [&str; 13] = [
+    /// The fourteen, in report order — the same pin `tests/cmd_doctor.rs` holds.
+    const CHECK_IDS: [&str; 14] = [
         "codex_present",
         "codex_version",
         "layout_version",
         "home_perms",
         "workers_health",
+        "allowed_roots",
         "env_inheritance",
         "app_server_handshake",
         "codex_home_match",

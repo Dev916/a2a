@@ -530,7 +530,8 @@ impl CoreHandle {
 /// exit, so a caller cannot tell (and need not care) which side refused it.
 fn cwd_refused(detail: String) -> AppError {
     AppError::new("CWD_NOT_ALLOWED", ExitCode::Precondition, detail).remedy(
-        "add the root to `allowed_roots` and `a2a broker restart`, or spawn with `--transport exec`",
+        "run `a2a config add-root <dir>` (or edit allowed_roots in $A2A_HOME/config.toml / \
+         A2A_ALLOWED_ROOTS), then `a2a broker restart`; or spawn with `--transport exec`",
     )
 }
 
@@ -3503,6 +3504,18 @@ mod tests {
     use super::*;
     use crate::config::Lane;
     use crate::home::A2aHome;
+
+    #[test]
+    fn broker_cwd_refusal_remedy_names_config_add_root() {
+        let err = cwd_refused("outside".to_string());
+        assert_eq!(err.code, "CWD_NOT_ALLOWED");
+        assert!(
+            err.remedy
+                .as_deref()
+                .unwrap()
+                .contains("a2a config add-root <dir>")
+        );
+    }
 
     /// The registry's surface is these seventeen messages, and every one of them
     /// is a message — not a lock, not a shared map, not a second door.

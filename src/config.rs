@@ -571,10 +571,23 @@ fn default_lane(lane: Lane) -> LaneConfig {
 }
 
 fn default_allowed_roots() -> Vec<PathBuf> {
-    match std::env::var_os("HOME") {
-        Some(h) => vec![PathBuf::from(h).join("dev")],
-        None => vec![],
-    }
+    let Some(h) = std::env::var_os("HOME") else {
+        return vec![];
+    };
+    let home = PathBuf::from(h);
+    [
+        "dev",
+        "Development",
+        "projects",
+        "code",
+        "src",
+        "repos",
+        "work",
+    ]
+    .into_iter()
+    .map(|name| home.join(name))
+    .filter(|p| p.is_dir())
+    .collect()
 }
 
 fn cfg_err(msg: String) -> AppError {
@@ -652,6 +665,17 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     Ok((cfg, origins, warnings))
 }
 
+pub(crate) fn non_implicit_allowed_roots<'a>(
+    home: &A2aHome,
+    roots: &'a [PathBuf],
+) -> Vec<&'a PathBuf> {
+    let implicit = std::fs::canonicalize(home.worktrees_dir()).ok();
+    roots
+        .iter()
+        .filter(|root| Some(*root) != implicit.as_ref())
+        .collect()
+}
+
 /// `$A2A_HOME/worktrees` is an allowed root by construction — this is the ONE
 /// thing that makes the worktree spawn work on the app-server transport without
 /// touching `src/broker/**`.
@@ -686,6 +710,7 @@ fn append_implicit_worktrees_root(home: &A2aHome, roots: &mut Vec<PathBuf>) {
 /// `/private/tmp`); entries that do not exist are dropped with a warning.
 pub(crate) fn canonicalize_roots(raw: Vec<PathBuf>, warnings: &mut Vec<String>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    let mut dropped = Vec::new();
     for p in raw {
         match std::fs::canonicalize(&p) {
             Ok(c) => {
@@ -693,11 +718,19 @@ pub(crate) fn canonicalize_roots(raw: Vec<PathBuf>, warnings: &mut Vec<String>) 
                     out.push(c);
                 }
             }
-            Err(e) => warnings.push(format!(
-                "dropping allowed_roots entry {} ({e})",
-                p.display()
-            )),
+            Err(e) => dropped.push((p, e)),
         }
+    }
+    let remedy = if out.is_empty() {
+        " -- run `a2a config add-root <dir>` to point a2a at this machine's project directories"
+    } else {
+        ""
+    };
+    for (p, e) in dropped {
+        warnings.push(format!(
+            "dropping allowed_roots entry {} ({e}){remedy}",
+            p.display()
+        ));
     }
     out
 }

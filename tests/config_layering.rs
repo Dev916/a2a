@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+mod common;
 
 fn show(home: &std::path::Path, extra_env: &[(&str, &str)], origin: bool) -> serde_json::Value {
     let mut c = Command::cargo_bin("a2a").unwrap();
@@ -128,6 +129,74 @@ fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
         "stderr must name the dropped root: {stderr}"
     );
     assert_eq!(v["data"]["origins"], serde_json::Value::Null);
+}
+
+#[test]
+fn default_allowed_roots_probe_conventional_directories_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_env = tmp.path().join("user-home");
+    std::fs::create_dir_all(home_env.join("Development")).unwrap();
+    let a2a_home = tmp.path().join("a2a-home");
+
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", &a2a_home)
+        .env("HOME", &home_env)
+        .env_remove("A2A_ALLOWED_ROOTS")
+        .args(["--json", "config", "show", "--origin"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let roots = v["data"]["allowed_roots"].as_array().unwrap();
+    assert_eq!(
+        roots[0],
+        serde_json::json!(std::fs::canonicalize(home_env.join("Development"))
+            .unwrap()
+            .to_str()
+            .unwrap()),
+        "the conventional Development directory is a default root"
+    );
+    assert_eq!(v["data"]["origins"]["allowed_roots"], "default");
+}
+
+#[test]
+fn missing_default_roots_warn_with_add_root_remedy_when_no_non_implicit_roots_survive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_env = tmp.path().join("user-home");
+    std::fs::create_dir_all(&home_env).unwrap();
+    let brief = tmp.path().join("brief.md");
+    std::fs::write(&brief, "x\n").unwrap();
+    let cwd = tmp.path().join("real-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path().join("a2a-home"))
+        .env("HOME", &home_env)
+        .env_remove("A2A_ALLOWED_ROOTS")
+        .env("A2A_CODEX_BIN", common::stub_path())
+        .env("A2A_BROKER_DISABLE", "1")
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&cwd)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .code(9);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("none are configured on this machine"),
+        "spawn should report that no project roots are configured: {v}"
+    );
+    assert!(
+        v["error"]["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("a2a config add-root <dir>"),
+        "spawn should tell first-run users how to configure roots: {v}"
+    );
 }
 
 /// The other half of the implicit root: a home INSIDE an allowed root leaves

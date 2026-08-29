@@ -166,6 +166,25 @@ pub fn fleet_init(home: &A2aHome) -> Result<FleetRoot, AppError> {
         });
     }
 
+    // root.pub without root.key is the signature of a JOINER home. Minting
+    // here would fork the machine onto a phantom fleet and clobber the
+    // root.pub its owner installed (live incident: a joiner running the
+    // read-only `fleet ls` was silently re-homed this way).
+    if pub_path.exists() {
+        let joined = read_root_pub(&pub_path)?;
+        return Err(AppError::new(
+            "FLEET_ALREADY_JOINED",
+            ExitCode::Precondition,
+            format!(
+                "this machine is enrolled in {} as a joiner (mesh/fleet/root.pub without root.key); refusing to mint a new fleet root",
+                joined.fleet_id
+            ),
+        )
+        .remedy(
+            "joiner machines never run `fleet init` — see docs/mesh-join.md; to genuinely re-init, remove mesh/fleet/root.pub first",
+        ));
+    }
+
     let signing = new_signing_key();
     let pubkey = signing.verifying_key().to_bytes();
     let fleet_id = format!("fleet-{}", &hex(&Sha256::digest(pubkey))[..8]);
@@ -292,7 +311,7 @@ pub fn ensure_gateway_token(home: &A2aHome, clock: &dyn Clock) -> Result<bool, A
             ExitCode::Precondition,
             "gateway enrollment token is missing and this home has no fleet root key",
         )
-        .remedy("run `a2a mesh fleet init` on the root machine or install a token minted for this gateway"));
+        .remedy("on the fleet's root machine run `a2a mesh fleet enroll` for this gateway's pubkey, then install it here with `a2a mesh gateway install-token` (docs/mesh-join.md); a brand-new fleet starts with `a2a mesh fleet init` on the machine that will hold the root"));
     }
 
     let identity = gateway_identity(home, false)?;

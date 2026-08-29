@@ -84,3 +84,82 @@ fn cli_identity_enroll_and_install_token_round_trip() {
     assert_eq!(mode(&token_path), 0o600);
     assert_eq!(fs::read_to_string(token_path).unwrap().trim(), token);
 }
+
+// Live-fleet incident (a2a-mx4): read-only fleet commands resolved the fleet id
+// via fleet_init, which MINTS a new root on any home without root.key — so a
+// joiner running `fleet ls` silently forked itself onto a phantom fleet and
+// clobbered the root.pub its owner installed.
+
+fn joiner_home_on_fleet(root_tmp: &Path, join_tmp: &Path) {
+    cmd(root_tmp)
+        .args(["--json", "mesh", "fleet", "init"])
+        .assert()
+        .success();
+    fs::create_dir_all(join_tmp.join("mesh/fleet")).unwrap();
+    fs::copy(
+        root_tmp.join("mesh/fleet/root.pub"),
+        join_tmp.join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+    let registry_dir = root_tmp.join("file-registry");
+    fs::create_dir_all(&registry_dir).unwrap();
+    let url = format!("file:{}", registry_dir.display());
+    fs::write(root_tmp.join("mesh/fleet/registry.env"), format!("{url}\n")).unwrap();
+    fs::write(join_tmp.join("mesh/fleet/registry.env"), format!("{url}\n")).unwrap();
+}
+
+#[test]
+fn fleet_ls_on_a_joiner_home_never_mints_and_uses_the_installed_fleet() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let join_tmp = tempfile::tempdir().unwrap();
+    joiner_home_on_fleet(root_tmp.path(), join_tmp.path());
+    let pub_before = fs::read(join_tmp.path().join("mesh/fleet/root.pub")).unwrap();
+
+    let ls = cmd(join_tmp.path())
+        .args(["mesh", "fleet", "ls", "--json"])
+        .assert()
+        .success();
+    let out = json_out(&ls);
+    assert_eq!(out["ok"], true, "{out}");
+
+    assert!(
+        !join_tmp.path().join("mesh/fleet/root.key").exists(),
+        "fleet ls must never mint a root key on a joiner"
+    );
+    let pub_after = fs::read(join_tmp.path().join("mesh/fleet/root.pub")).unwrap();
+    assert_eq!(pub_before, pub_after, "fleet ls must not rewrite root.pub");
+}
+
+#[test]
+fn fleet_init_refuses_to_clobber_a_joiner_home() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let join_tmp = tempfile::tempdir().unwrap();
+    joiner_home_on_fleet(root_tmp.path(), join_tmp.path());
+    let pub_before = fs::read(join_tmp.path().join("mesh/fleet/root.pub")).unwrap();
+
+    let init = cmd(join_tmp.path())
+        .args(["--json", "mesh", "fleet", "init"])
+        .assert()
+        .failure();
+    let out = json_out(&init);
+    assert_eq!(out["error"]["code"], "FLEET_ALREADY_JOINED", "{out}");
+
+    let pub_after = fs::read(join_tmp.path().join("mesh/fleet/root.pub")).unwrap();
+    assert_eq!(pub_before, pub_after, "refused init must not touch root.pub");
+    assert!(!join_tmp.path().join("mesh/fleet/root.key").exists());
+}
+
+#[test]
+fn fleet_rotate_root_on_a_joiner_home_refuses_instead_of_minting() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let join_tmp = tempfile::tempdir().unwrap();
+    joiner_home_on_fleet(root_tmp.path(), join_tmp.path());
+
+    let rotate = cmd(join_tmp.path())
+        .args(["--json", "mesh", "fleet", "rotate-root"])
+        .assert()
+        .failure();
+    let out = json_out(&rotate);
+    assert_eq!(out["error"]["code"], "FLEET_ALREADY_JOINED", "{out}");
+    assert!(!join_tmp.path().join("mesh/fleet/root.key").exists());
+}

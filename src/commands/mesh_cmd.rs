@@ -449,7 +449,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
         }
         MeshFleetCmd::Ls { json } => {
             let url = read_registry_env(home)?;
-            let fleet_id = crate::mesh::keys::fleet_init(home)?.fleet_id;
+            let fleet_id = crate::mesh::keys::fleet_id(home)?;
             let rows = rt.block_on(async {
                 let registry = open_registry(&url)?;
                 registry.discover(&fleet_id).await
@@ -466,7 +466,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
         }
         MeshFleetCmd::Revoke { gateway_id } => {
             let url = read_registry_env(home)?;
-            let fleet_id = crate::mesh::keys::fleet_init(home)?.fleet_id;
+            let fleet_id = crate::mesh::keys::fleet_id(home)?;
             rt.block_on(async {
                 let registry = open_registry(&url)?;
                 registry.revoke(&fleet_id, gateway_id, Utc::now()).await

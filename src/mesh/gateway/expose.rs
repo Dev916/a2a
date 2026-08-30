@@ -140,6 +140,23 @@ pub struct ExposureRow {
 pub struct ExposureTick {
     pub endpoint_url: Option<String>,
     pub upserted: bool,
+    pub exposure_error: Option<String>,
+    pub exposure_error_since: Option<DateTime<Utc>>,
+    pub exposure_error_change: Option<ExposureErrorChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExposureErrorChange {
+    pub error: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub suppressed: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ExposureErrorState {
+    message: String,
+    since: DateTime<Utc>,
+    suppressed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +164,7 @@ pub struct ExposurePublisher {
     row: ExposureRow,
     last_endpoint_url: Option<Option<String>>,
     created_at: Option<DateTime<Utc>>,
+    exposure_error: Option<ExposureErrorState>,
 }
 
 impl ExposurePublisher {
@@ -155,6 +173,7 @@ impl ExposurePublisher {
             row,
             last_endpoint_url: None,
             created_at: None,
+            exposure_error: None,
         }
     }
 
@@ -168,7 +187,41 @@ impl ExposurePublisher {
         R: Registry,
         E: Exposure,
     {
-        let endpoint_url = exposure.current_url().await?;
+        let endpoint_url = match exposure.current_url().await {
+            Ok(endpoint_url) => endpoint_url,
+            Err(err) => {
+                registry
+                    .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
+                    .await?;
+                let message = format!("{}: {}", err.code, err.message);
+                let exposure_error_change = match &mut self.exposure_error {
+                    Some(state) => {
+                        state.suppressed = state.suppressed.saturating_add(1);
+                        None
+                    }
+                    None => {
+                        self.exposure_error = Some(ExposureErrorState {
+                            message: message.clone(),
+                            since: now,
+                            suppressed: 0,
+                        });
+                        Some(ExposureErrorChange {
+                            error: Some(message.clone()),
+                            since: Some(now),
+                            suppressed: 0,
+                        })
+                    }
+                };
+                let state = self.exposure_error.as_ref().expect("exposure error recorded");
+                return Ok(ExposureTick {
+                    endpoint_url: self.last_endpoint_url.clone().flatten(),
+                    upserted: false,
+                    exposure_error: Some(state.message.clone()),
+                    exposure_error_since: Some(state.since),
+                    exposure_error_change,
+                });
+            }
+        };
         let changed = self
             .last_endpoint_url
             .as_ref()
@@ -183,9 +236,17 @@ impl ExposurePublisher {
                 .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
                 .await?;
         }
+        let exposure_error_change = self.exposure_error.take().map(|state| ExposureErrorChange {
+            error: None,
+            since: Some(state.since),
+            suppressed: state.suppressed,
+        });
         Ok(ExposureTick {
             endpoint_url,
             upserted: changed,
+            exposure_error: None,
+            exposure_error_since: None,
+            exposure_error_change,
         })
     }
 

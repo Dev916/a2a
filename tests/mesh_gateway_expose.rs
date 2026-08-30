@@ -5,9 +5,9 @@ use a2a::mesh::gateway::expose::{
 use a2a::mesh::gateway::link::{accept_once_io, dial_gateway_io};
 use a2a::mesh::gateway::{gateway_root, run_registry_slot_for_test, RegistrySlotParams};
 use a2a::mesh::keys::{self, Clock, SystemClock};
-use a2a::mesh::registry::{FileRegistry, Registry};
+use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
 use a2a::mesh::wire::TlsIdentity;
-use a2a::output::ExitCode;
+use a2a::output::{AppError, ExitCode};
 use chrono::{DateTime, TimeZone, Utc};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -276,6 +276,234 @@ async fn real_registry_slot_with_fake_ngrok_publishes_row_and_health_endpoint() 
 }
 
 #[tokio::test]
+async fn registry_slot_keeps_heartbeating_when_ngrok_resolution_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = a2a::home::A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
+    keys::fleet_init(&home).unwrap();
+    let identity = keys::gateway_identity(&home, false).unwrap();
+    keys::ensure_gateway_token(&home, &SystemClock).unwrap();
+
+    let registry = FileRegistry::new(tmp.path().join("registry"));
+    registry.init_schema().unwrap();
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let fleet_id = keys::fleet_id(&home).unwrap();
+    let pubkey_fpr = keys::gateway_public_key_fingerprint(&home).unwrap();
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    registry
+        .upsert_self(GatewayRow {
+            fleet_id: fleet_id.clone(),
+            gateway_id: identity.gateway_id.clone(),
+            owner: "test-owner".to_string(),
+            endpoint_url: Some("wss://stale.tcp.ngrok.test:19000".to_string()),
+            pubkey_fpr: pubkey_fpr.clone(),
+            cert_fpr: Some(identity.cert_fpr.clone()),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at: t0,
+            last_heartbeat: t0,
+            revoked_at: None,
+            schema_version: REGISTRY_SCHEMA_VERSION,
+        })
+        .await
+        .unwrap();
+
+    let row = ExposureRow {
+        fleet_id: fleet_id.clone(),
+        gateway_id: identity.gateway_id.clone(),
+        owner: "test-owner".to_string(),
+        pubkey_fpr,
+        cert_fpr: identity.cert_fpr,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let ngrok = NgrokExposure::with_api(7787, FakeNgrok::always_error("agent API refused"));
+    let clock = Arc::new(StepClock::new(t0));
+    let token = CancellationToken::new();
+    let root = gateway_root(&home);
+    let run = run_registry_slot_for_test(
+        &root,
+        &cfg,
+        RegistrySlotParams {
+            registry: &registry,
+            exposure: &ngrok,
+            publisher: ExposurePublisher::new(row),
+            heartbeat_interval: Duration::from_millis(20),
+            clock: clock.as_ref(),
+            stall_shutdown_slot: None,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+
+    let t1 = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+    clock.set(t1);
+    let first = wait_for_heartbeat_after_while_running(&mut run, &registry, &fleet_id, t0).await;
+    assert_eq!(
+        first.endpoint_url.as_deref(),
+        Some("wss://stale.tcp.ngrok.test:19000")
+    );
+
+    let t2 = Utc.timestamp_opt(1_700_000_002, 0).unwrap();
+    clock.set(t2);
+    let second = wait_for_heartbeat_after_while_running(&mut run, &registry, &fleet_id, t1).await;
+    assert_eq!(
+        second.endpoint_url.as_deref(),
+        Some("wss://stale.tcp.ngrok.test:19000")
+    );
+
+    let health = wait_for_health_while_running(&mut run, &root, |health| {
+        health["exposure_error"].is_string()
+    })
+    .await;
+    assert!(health["exposure_error"]
+        .as_str()
+        .unwrap()
+        .contains("agent API refused"));
+    assert!(health["exposure_error_since"].is_string());
+    let log = wait_for_log_line_while_running(&mut run, &root, "\"kind\":\"exposure_error\"").await;
+    assert!(log.contains("\"state\":\"down\""));
+    assert_eq!(
+        count_log_lines(&root, "\"kind\":\"exposure_error\""),
+        1,
+        "down->still-down must not spam exposure_error log lines"
+    );
+
+    token.cancel();
+    tokio::select! {
+        result = &mut run => result.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("registry slot did not stop after cancellation"),
+    }
+}
+
+#[tokio::test]
+async fn registry_slot_clears_exposure_error_after_ngrok_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = a2a::home::A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
+    keys::fleet_init(&home).unwrap();
+    let identity = keys::gateway_identity(&home, false).unwrap();
+    keys::ensure_gateway_token(&home, &SystemClock).unwrap();
+
+    let registry = FileRegistry::new(tmp.path().join("registry"));
+    registry.init_schema().unwrap();
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let fleet_id = keys::fleet_id(&home).unwrap();
+    let pubkey_fpr = keys::gateway_public_key_fingerprint(&home).unwrap();
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    registry
+        .upsert_self(GatewayRow {
+            fleet_id: fleet_id.clone(),
+            gateway_id: identity.gateway_id.clone(),
+            owner: "test-owner".to_string(),
+            endpoint_url: Some("wss://stale.tcp.ngrok.test:19000".to_string()),
+            pubkey_fpr: pubkey_fpr.clone(),
+            cert_fpr: Some(identity.cert_fpr.clone()),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at: t0,
+            last_heartbeat: t0,
+            revoked_at: None,
+            schema_version: REGISTRY_SCHEMA_VERSION,
+        })
+        .await
+        .unwrap();
+
+    let row = ExposureRow {
+        fleet_id: fleet_id.clone(),
+        gateway_id: identity.gateway_id.clone(),
+        owner: "test-owner".to_string(),
+        pubkey_fpr,
+        cert_fpr: identity.cert_fpr,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let ngrok = NgrokExposure::with_api(
+        7787,
+        FakeNgrok::scripted(vec![
+            Err("agent API refused"),
+            Err("agent API refused"),
+            Ok(NgrokTunnels { tunnels: vec![] }),
+        ]),
+    );
+    let clock = Arc::new(StepClock::new(t0));
+    let token = CancellationToken::new();
+    let root = gateway_root(&home);
+    let run = run_registry_slot_for_test(
+        &root,
+        &cfg,
+        RegistrySlotParams {
+            registry: &registry,
+            exposure: &ngrok,
+            publisher: ExposurePublisher::new(row),
+            heartbeat_interval: Duration::from_millis(20),
+            clock: clock.as_ref(),
+            stall_shutdown_slot: None,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+
+    let t1 = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+    clock.set(t1);
+    wait_for_health_while_running(&mut run, &root, |health| {
+        health["exposure_error"].is_string()
+    })
+    .await;
+
+    let t2 = Utc.timestamp_opt(1_700_000_002, 0).unwrap();
+    clock.set(t2);
+    wait_for_row_in_fleet_while_running(
+        &mut run,
+        &registry,
+        &fleet_id,
+        Some("wss://1.tcp.ngrok.test:19001"),
+    )
+    .await;
+    let health = wait_for_health_while_running(&mut run, &root, |health| {
+        health["endpoint_url"].as_str() == Some("wss://1.tcp.ngrok.test:19001")
+            && health["exposure_error"].is_null()
+            && health["exposure_error_since"].is_null()
+    })
+    .await;
+    assert_eq!(
+        health["endpoint_url"].as_str(),
+        Some("wss://1.tcp.ngrok.test:19001")
+    );
+    let recovery = wait_for_log_line_while_running(&mut run, &root, "\"state\":\"recovered\"").await;
+    assert!(recovery.contains("\"kind\":\"exposure_error\""));
+
+    token.cancel();
+    tokio::select! {
+        result = &mut run => result.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("registry slot did not stop after cancellation"),
+    }
+}
+
+#[tokio::test]
+async fn exposure_loop_still_exits_on_registry_failure() {
+    let exposure = ManualExposure::new(Some("wss://example.test:7787".to_string()));
+    let clock = StepClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let token = CancellationToken::new();
+    let row = ExposureRow {
+        fleet_id: "fleet-a".to_string(),
+        gateway_id: "gw-a".to_string(),
+        owner: "owner-a".to_string(),
+        pubkey_fpr: "pub-a".to_string(),
+        cert_fpr: "cert-a".to_string(),
+        version: "test".to_string(),
+    };
+    let mut publisher = ExposurePublisher::new(row);
+
+    let err = run_exposure_loop(
+        &FailingRegistry,
+        &exposure,
+        &mut publisher,
+        Duration::from_secs(60),
+        &clock,
+        token,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code, "REGISTRY_TEST_FAILURE");
+}
+
+#[tokio::test]
 async fn dialer_uses_discovered_cert_fingerprint_and_rejects_wrong_pin() {
     let tls = TlsIdentity::self_signed(vec!["localhost".to_string()]).unwrap();
     let (client, server) = tokio::io::duplex(a2a::mesh::wire::MAX_FRAME_BYTES * 2 + 4096);
@@ -398,6 +626,119 @@ async fn wait_for_row_in_fleet(
     );
 }
 
+async fn wait_for_heartbeat_after_while_running<F>(
+    run: &mut std::pin::Pin<&mut F>,
+    registry: &FileRegistry,
+    fleet_id: &str,
+    after: DateTime<Utc>,
+) -> GatewayRow
+where
+    F: std::future::Future<Output = Result<(), AppError>>,
+{
+    for _ in 0..100 {
+        let rows = registry.discover(fleet_id).await.unwrap();
+        if let Some(row) = rows
+            .first()
+            .filter(|row| row.last_heartbeat > after)
+            .cloned()
+        {
+            return row;
+        }
+        tokio::select! {
+            result = run.as_mut() => panic!("registry slot exited unexpectedly: {:?}", result),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    panic!(
+        "registry heartbeat did not advance after {:?}: {:?}",
+        after,
+        registry.discover(fleet_id).await.unwrap()
+    );
+}
+
+async fn wait_for_row_in_fleet_while_running<F>(
+    run: &mut std::pin::Pin<&mut F>,
+    registry: &FileRegistry,
+    fleet_id: &str,
+    expected_url: Option<&str>,
+) where
+    F: std::future::Future<Output = Result<(), AppError>>,
+{
+    for _ in 0..100 {
+        let rows = registry.discover(fleet_id).await.unwrap();
+        if rows
+            .first()
+            .map(|row| row.endpoint_url.as_deref() == expected_url)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::select! {
+            result = run.as_mut() => panic!("registry slot exited unexpectedly: {:?}", result),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    panic!(
+        "registry did not publish expected url {:?}: {:?}",
+        expected_url,
+        registry.discover(fleet_id).await.unwrap()
+    );
+}
+
+async fn wait_for_health_while_running<F>(
+    run: &mut std::pin::Pin<&mut F>,
+    root: &std::path::Path,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value
+where
+    F: std::future::Future<Output = Result<(), AppError>>,
+{
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(root.join("gateway-health.json")) {
+            if let Ok(health) = serde_json::from_str::<serde_json::Value>(&text) {
+                if predicate(&health) {
+                    return health;
+                }
+            }
+        }
+        tokio::select! {
+            result = run.as_mut() => panic!("registry slot exited unexpectedly: {:?}", result),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    panic!("gateway health did not match expected predicate");
+}
+
+async fn wait_for_log_line_while_running<F>(
+    run: &mut std::pin::Pin<&mut F>,
+    root: &std::path::Path,
+    needle: &str,
+) -> String
+where
+    F: std::future::Future<Output = Result<(), AppError>>,
+{
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(root.join("gateway.jsonl")) {
+            if let Some(line) = text.lines().find(|line| line.contains(needle)) {
+                return line.to_string();
+            }
+        }
+        tokio::select! {
+            result = run.as_mut() => panic!("registry slot exited unexpectedly: {:?}", result),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    panic!("gateway jsonl did not contain {needle}");
+}
+
+fn count_log_lines(root: &std::path::Path, needle: &str) -> usize {
+    std::fs::read_to_string(root.join("gateway.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .count()
+}
+
 trait NgrokTestExt {
     fn api_requests(&self) -> Vec<String>;
 }
@@ -408,35 +749,78 @@ impl NgrokTestExt for NgrokExposure<FakeNgrok> {
     }
 }
 
+enum FakeNgrokResponse {
+    Ok(NgrokTunnels),
+    Err(String),
+}
+
 struct FakeNgrok {
-    gets: Mutex<VecDeque<NgrokTunnels>>,
+    gets: Mutex<VecDeque<FakeNgrokResponse>>,
+    default_error: Option<String>,
     requests: Mutex<Vec<String>>,
 }
 
 impl FakeNgrok {
     fn new(gets: Vec<NgrokTunnels>) -> Self {
         Self {
-            gets: Mutex::new(gets.into()),
+            gets: Mutex::new(gets.into_iter().map(FakeNgrokResponse::Ok).collect()),
+            default_error: None,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn scripted(gets: Vec<Result<NgrokTunnels, &'static str>>) -> Self {
+        Self {
+            gets: Mutex::new(
+                gets.into_iter()
+                    .map(|result| match result {
+                        Ok(tunnels) => FakeNgrokResponse::Ok(tunnels),
+                        Err(message) => FakeNgrokResponse::Err(message.to_string()),
+                    })
+                    .collect(),
+            ),
+            default_error: None,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn always_error(message: &'static str) -> Self {
+        Self {
+            gets: Mutex::new(VecDeque::new()),
+            default_error: Some(message.to_string()),
             requests: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl NgrokApi for FakeNgrok {
-    async fn tunnels(&self) -> Result<NgrokTunnels, a2a::output::AppError> {
+    async fn tunnels(&self) -> Result<NgrokTunnels, AppError> {
         self.requests
             .lock()
             .unwrap()
             .push("GET /api/tunnels".to_string());
-        Ok(self
-            .gets
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(NgrokTunnels { tunnels: vec![] }))
+        match self.gets.lock().unwrap().pop_front() {
+            Some(FakeNgrokResponse::Ok(tunnels)) => Ok(tunnels),
+            Some(FakeNgrokResponse::Err(message)) => Err(AppError::new(
+                "NGROK_UNAVAILABLE",
+                ExitCode::BrokerUnavailable,
+                message,
+            )),
+            None => {
+                if let Some(message) = &self.default_error {
+                    Err(AppError::new(
+                        "NGROK_UNAVAILABLE",
+                        ExitCode::BrokerUnavailable,
+                        message.clone(),
+                    ))
+                } else {
+                    Ok(NgrokTunnels { tunnels: vec![] })
+                }
+            }
+        }
     }
 
-    async fn start_tunnel(&self, listen_port: u64) -> Result<NgrokTunnel, a2a::output::AppError> {
+    async fn start_tunnel(&self, listen_port: u64) -> Result<NgrokTunnel, AppError> {
         self.requests
             .lock()
             .unwrap()
@@ -450,4 +834,55 @@ impl NgrokApi for FakeNgrok {
             }),
         })
     }
+}
+
+struct FailingRegistry;
+
+impl Registry for FailingRegistry {
+    async fn upsert_self(&self, _row: GatewayRow) -> Result<(), AppError> {
+        Err(registry_test_failure())
+    }
+
+    async fn heartbeat(
+        &self,
+        _fleet_id: &str,
+        _gateway_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        Err(registry_test_failure())
+    }
+
+    async fn discover(&self, _fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        Err(registry_test_failure())
+    }
+
+    async fn retire_self(
+        &self,
+        _fleet_id: &str,
+        _gateway_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        Err(registry_test_failure())
+    }
+
+    async fn revoke(
+        &self,
+        _fleet_id: &str,
+        _gateway_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        Err(registry_test_failure())
+    }
+
+    async fn schema_version(&self) -> Result<i32, AppError> {
+        Err(registry_test_failure())
+    }
+}
+
+fn registry_test_failure() -> AppError {
+    AppError::new(
+        "REGISTRY_TEST_FAILURE",
+        ExitCode::BrokerUnavailable,
+        "registry test failure",
+    )
 }

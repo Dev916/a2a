@@ -6,7 +6,7 @@ use crate::mesh::{
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, Utc};
-use expose::{Exposure, ExposureProvider, ExposurePublisher, ExposureRow};
+use expose::{Exposure, ExposureErrorChange, ExposureProvider, ExposurePublisher, ExposureRow};
 use futures_util::FutureExt;
 use link::{LinkDirection, LinkSessionParams, LinkStateHandle};
 use nix::fcntl::{Flock, FlockArg};
@@ -138,6 +138,8 @@ pub struct GatewayHealth {
     pub listen_port: u64,
     pub expose: String,
     pub endpoint_url: Option<String>,
+    pub exposure_error: Option<String>,
+    pub exposure_error_since: Option<DateTime<Utc>>,
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
     pub replication: replicate::ReplicationHealth,
     pub escalation: Option<Value>,
@@ -155,6 +157,8 @@ impl GatewayHealth {
             listen_port: cfg.mesh.gateway.listen_port,
             expose: cfg.mesh.gateway.expose.clone(),
             endpoint_url: None,
+            exposure_error: None,
+            exposure_error_since: None,
             loops: LoopSlot::ALL
                 .into_iter()
                 .map(|slot| (slot, LoopHealth::new(slot)))
@@ -244,6 +248,7 @@ impl GatewayRuntimeConfig {
 enum LoopEvent {
     Heartbeat(LoopSlot),
     Endpoint(Option<String>),
+    ExposureError(ExposureErrorChange),
     Replication(replicate::ReplicationHealth),
     SessionEnd { slot: LoopSlot, detail: String },
 }
@@ -439,6 +444,12 @@ async fn supervise(
                         write_health(&root, &mut health).await?;
                         last_health_flush = Instant::now();
                     }
+                    LoopEvent::ExposureError(change) => {
+                        apply_exposure_error_change(&mut health, &change);
+                        write_health(&root, &mut health).await?;
+                        last_health_flush = Instant::now();
+                        log.line(exposure_error_log_value(LoopSlot::Registry, &change)).await;
+                    }
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
                         write_health(&root, &mut health).await?;
@@ -576,6 +587,32 @@ fn gateway_owner() -> String {
     std::env::var("A2A_OWNER")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn apply_exposure_error_change(health: &mut GatewayHealth, change: &ExposureErrorChange) {
+    health.exposure_error = change.error.clone();
+    health.exposure_error_since = change.error.as_ref().and(change.since);
+}
+
+fn exposure_error_log_value(slot: LoopSlot, change: &ExposureErrorChange) -> Value {
+    match &change.error {
+        Some(error) => json!({
+            "ts": Utc::now(),
+            "kind": "exposure_error",
+            "loop": slot.as_str(),
+            "state": "down",
+            "error": error,
+            "since": change.since,
+        }),
+        None => json!({
+            "ts": Utc::now(),
+            "kind": "exposure_error",
+            "loop": slot.as_str(),
+            "state": "recovered",
+            "since": change.since,
+            "suppressed": change.suppressed,
+        }),
+    }
 }
 
 async fn shutdown(
@@ -763,6 +800,12 @@ where
                 }
             }
             Some(tick) = exposure_rx.recv() => {
+                if let Some(change) = tick.exposure_error_change {
+                    if tx.send(LoopEvent::ExposureError(change)).await.is_err() {
+                        token.cancel();
+                        return Ok(());
+                    }
+                }
                 if tx.send(LoopEvent::Endpoint(tick.endpoint_url)).await.is_err() {
                     token.cancel();
                     return Ok(());
@@ -814,6 +857,11 @@ where
                     LoopEvent::Endpoint(endpoint_url) => {
                         health.endpoint_url = endpoint_url;
                         write_health(root, &mut health).await?;
+                    }
+                    LoopEvent::ExposureError(change) => {
+                        apply_exposure_error_change(&mut health, &change);
+                        write_health(root, &mut health).await?;
+                        write_jsonl(root, exposure_error_log_value(LoopSlot::Registry, &change));
                     }
                     LoopEvent::SessionEnd { .. } => {}
                     LoopEvent::Replication(replication) => {

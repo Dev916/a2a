@@ -269,6 +269,11 @@ pub fn gateway_public_key_b64(home: &A2aHome) -> Result<String, AppError> {
     Ok(b64_encode(&signing.verifying_key().to_bytes()))
 }
 
+pub fn gateway_id(home: &A2aHome) -> Result<String, AppError> {
+    let gateway = read_gateway_key(&gateway_dir(home)?.join(GW_KEY))?;
+    Ok(gateway.gateway_id)
+}
+
 pub fn gateway_public_key_fingerprint(home: &A2aHome) -> Result<String, AppError> {
     let pubkey_b64 = gateway_public_key_b64(home)?;
     let pubkey = b64_decode(&pubkey_b64).map_err(|_| {
@@ -297,6 +302,60 @@ pub fn gateway_token(home: &A2aHome) -> Result<String, AppError> {
     fs::read_to_string(&path)
         .map(|s| s.trim().to_string())
         .map_err(|e| io_err("reading gateway token", e))
+}
+
+pub fn ensure_and_verify_gateway_enrollment(
+    home: &A2aHome,
+    clock: &dyn Clock,
+) -> Result<GatewayIdentity, AppError> {
+    let identity = gateway_identity(home, false)?;
+    ensure_gateway_token(home, clock)?;
+    let pubkey_b64 = gateway_public_key_b64(home)?;
+    verify_gateway_token(home, &identity.gateway_id, &pubkey_b64, clock)?;
+    Ok(identity)
+}
+
+pub fn verify_gateway_token(
+    home: &A2aHome,
+    gateway_id: &str,
+    pubkey_b64: &str,
+    clock: &dyn Clock,
+) -> Result<TokenClaims, AppError> {
+    let token = gateway_token(home)?;
+    let home_fleet_id = fleet_id(home)?;
+    let roots = RootSet::load(home)?;
+    let claims = match verify_token(token.trim(), &roots, clock) {
+        Ok(claims) => claims,
+        Err(err) if err.code == "TOKEN_EXPIRED" => return Err(gateway_token_expired(err.message)),
+        Err(err) => {
+            if err.code == "TOKEN_INVALID" {
+                if let Ok(claims) = unverified_token_claims(token.trim()) {
+                    if claims.fleet_id != home_fleet_id {
+                        return Err(gateway_fleet_mismatch(&claims.fleet_id, &home_fleet_id));
+                    }
+                }
+            }
+            return Err(gateway_token_invalid(err.message));
+        }
+    };
+    if claims.fleet_id != home_fleet_id {
+        return Err(gateway_fleet_mismatch(&claims.fleet_id, &home_fleet_id));
+    }
+    if claims.gateway_id != gateway_id {
+        return Err(gateway_token_mismatch(
+            "gateway_id",
+            gateway_id,
+            &claims.gateway_id,
+        ));
+    }
+    if claims.pubkey_b64 != pubkey_b64 {
+        return Err(gateway_token_mismatch(
+            "pubkey_b64",
+            pubkey_b64,
+            &claims.pubkey_b64,
+        ));
+    }
+    Ok(claims)
 }
 
 pub fn ensure_gateway_token(home: &A2aHome, clock: &dyn Clock) -> Result<bool, AppError> {
@@ -488,6 +547,16 @@ pub fn verify_token(
     Ok(claims)
 }
 
+fn unverified_token_claims(token_b64: &str) -> Result<TokenClaims, AppError> {
+    let token = b64_decode(token_b64).map_err(|_| token_invalid("token is not base64"))?;
+    let envelope: TokenEnvelope =
+        serde_json::from_slice(&token).map_err(|_| token_invalid("token envelope is invalid"))?;
+    let claims_bytes =
+        b64_decode(&envelope.claims_b64).map_err(|_| token_invalid("claims are not base64"))?;
+    serde_json::from_slice(&claims_bytes)
+        .map_err(|_| claims_invalid("claims are invalid or contain unknown fields"))
+}
+
 pub fn mint_ulid(clock: &dyn Clock) -> String {
     let millis = clock.now().timestamp_millis().max(0) as u64;
     let when = SystemTime::UNIX_EPOCH + StdDuration::from_millis(millis);
@@ -659,6 +728,40 @@ fn token_mismatch(field: &'static str, expected: &str, actual: &str) -> AppError
         ExitCode::Precondition,
         format!("token {field} does not match this gateway: expected {expected}, got {actual}"),
     )
+}
+
+fn gateway_fleet_mismatch(token_fleet_id: &str, home_fleet_id: &str) -> AppError {
+    AppError::new(
+        "GATEWAY_FLEET_MISMATCH",
+        ExitCode::Precondition,
+        format!("token belongs to {token_fleet_id}, this home's root.pub says {home_fleet_id}"),
+    )
+    .remedy("restore the fleet's root.pub (docs/mesh-join.md) or re-enroll this gateway")
+}
+
+fn gateway_token_mismatch(field: &'static str, expected: &str, actual: &str) -> AppError {
+    AppError::new(
+        "GATEWAY_TOKEN_MISMATCH",
+        ExitCode::Precondition,
+        format!(
+            "gateway token {field} mismatch: expected local {field} {expected}, got {actual}"
+        ),
+    )
+    .remedy("re-enroll: `a2a mesh fleet enroll` on the root machine, `a2a mesh gateway install-token` here")
+}
+
+fn gateway_token_expired(detail: String) -> AppError {
+    AppError::new("GATEWAY_TOKEN_EXPIRED", ExitCode::Precondition, detail)
+        .remedy("re-enroll: `a2a mesh fleet enroll` on the root machine, `a2a mesh gateway install-token` here")
+}
+
+fn gateway_token_invalid(detail: String) -> AppError {
+    AppError::new(
+        "GATEWAY_TOKEN_INVALID",
+        ExitCode::Precondition,
+        format!("gateway token is invalid: {detail}"),
+    )
+    .remedy("re-enroll: `a2a mesh fleet enroll` on the root machine, `a2a mesh gateway install-token` here")
 }
 
 fn fleet_dir(home: &A2aHome) -> Result<PathBuf, AppError> {

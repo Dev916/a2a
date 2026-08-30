@@ -213,3 +213,24 @@ impl worker as `result-schema.json` and enforced at the turn boundary: a result
 that does not carry every required key fails the worker `schema_violation`
 instead of reporting `done`.
 <!-- a2a:end devloop-dispatch -->
+
+<!-- a2a:section mesh-milestones -->
+## Mesh milestones
+
+When this machine runs an agent mesh (`a2a mesh status` exits 0), post
+milestone entries to the shared feed so peer machines' sessions learn about
+your work ambiently. Three classes only — **land / block / handoff** — and
+nothing else:
+
+- **land**: an epic, plan, or release completes its acceptance gate —
+  `a2a mesh post "landed: <what> — <headline fact> (<repo>)"`.
+- **block**: work stops on something a peer might unblock or needs to know —
+  `a2a mesh post "blocked: <what> — <one-line reason> (<repo>)"`.
+- **handoff**: work is ready for someone else to pick up — name the artifact
+  (brief path, branch, issue id) so a peer session can act on it directly.
+
+Never post per-task passes, progress chatter, or anything a peer would not
+act on: ambient injection has a hard budget, and a noisy feed teaches peers
+to ignore it. One line each, with a repo or path reference. Posting must
+never fail the surrounding work — treat `a2a mesh post` errors as no-ops.
+<!-- a2a:end mesh-milestones -->

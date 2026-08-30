@@ -54,6 +54,15 @@ pub fn write_new_0600(p: &Path) -> std::io::Result<File> {
         .open(p)
 }
 
+/// Create exclusively, 0600. Use when concurrent creators must pick one winner.
+pub fn create_new_0600(p: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(p)
+}
+
 impl A2aHome {
     pub fn resolve(flag: Option<&Path>) -> Result<Self, AppError> {
         let root = root_for(flag);

@@ -273,6 +273,72 @@ fn daemonless_two_peers_post_and_feed_redacts_human_output() {
 }
 
 #[test]
+fn bare_terminal_posts_use_one_persisted_user_identity_with_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    cli(tmp.path())
+        .args(["mesh", "post", "first bare post"])
+        .assert()
+        .success();
+    cli(tmp.path())
+        .args(["mesh", "post", "second bare post"])
+        .assert()
+        .success();
+
+    let entries = feed_json(tmp.path(), None);
+    assert_eq!(entries.len(), 2);
+    let from = entries[0]["from"].as_str().unwrap();
+    assert!(
+        from.starts_with("user:"),
+        "bare terminal identity should use user provider: {from}"
+    );
+    assert_eq!(entries[1]["from"], from);
+
+    let identity_file = tmp.path().join("mesh").join("user-identity.json");
+    let identity: Value =
+        serde_json::from_str(&fs::read_to_string(&identity_file).unwrap()).unwrap();
+    assert_eq!(
+        identity["session_uuid"],
+        from.strip_prefix("user:").unwrap()
+    );
+    assert!(identity["created_at"].as_str().is_some());
+    assert_eq!(
+        fs::metadata(&identity_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let target = "66666666-6666-6666-6666-666666666666";
+    cli(tmp.path())
+        .args(["mesh", "register", "--session", target])
+        .assert()
+        .success();
+    cli(tmp.path())
+        .args(["mesh", "note", &format!("claude:{target}"), "-"])
+        .write_stdin("bare note")
+        .assert()
+        .success();
+    let files = note_files(tmp.path(), "claude", target);
+    let note: Value = serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(note["from"], from);
+
+    let explicit = "44444444-4444-4444-4444-444444444444";
+    cli(tmp.path())
+        .args(["mesh", "post", "--session", explicit, "explicit post"])
+        .assert()
+        .success();
+    let claude_env = "55555555-5555-5555-5555-555555555555";
+    cli(tmp.path())
+        .env("CLAUDE_SESSION_ID", claude_env)
+        .args(["mesh", "post", "env post"])
+        .assert()
+        .success();
+
+    let entries = feed_json(tmp.path(), None);
+    assert_eq!(entries[2]["from"], format!("claude:{explicit}"));
+    assert_eq!(entries[3]["from"], format!("claude:{claude_env}"));
+}
+
+#[test]
 fn note_to_peer_lands_private_fifo_and_inbox_consume_archives_it() {
     let tmp = tempfile::tempdir().unwrap();
     let alice = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";

@@ -30,7 +30,7 @@ pub fn run(
 ) -> Result<Outcome, AppError> {
     match cmd {
         MeshCmd::Register(args) => {
-            register(home, &peer_id(args)?)?;
+            register(home, &peer_id(home, args)?)?;
             Ok(Outcome::from(Value::Null))
         }
         MeshCmd::Heartbeat {
@@ -38,7 +38,7 @@ pub fn run(
             working_on,
             cwd,
         } => {
-            let id = peer_id(peer)?;
+            let id = peer_id(home, peer)?;
             let mut p = load_or_register(home, &id)?;
             p.last_seen = Utc::now();
             p.retired = false;
@@ -52,7 +52,7 @@ pub fn run(
             Ok(Outcome::from(Value::Null))
         }
         MeshCmd::Retire(args) => {
-            let id = peer_id(args)?;
+            let id = peer_id(home, args)?;
             let mut p = load_or_register(home, &id)?;
             p.last_seen = Utc::now();
             p.retired = true;
@@ -60,7 +60,7 @@ pub fn run(
             Ok(Outcome::from(Value::Null))
         }
         MeshCmd::Status { peer, text } => {
-            let id = peer_id(peer)?;
+            let id = peer_id(home, peer)?;
             let mut text = text.clone();
             if text == "-" {
                 text.clear();
@@ -83,7 +83,7 @@ pub fn run(
             ref_beads,
             ref_worker,
         } => {
-            let id = peer_id(peer)?;
+            let id = peer_id(home, peer)?;
             let text = post_text(text.as_deref(), message_file.as_deref())?;
             feed::validate_post_text(&text)?;
             let mut p = load_or_register(home, &id)?;
@@ -114,7 +114,7 @@ pub fn run(
             ref_beads,
             ref_worker,
         } => {
-            let from = peer_id(peer)?;
+            let from = peer_id(home, peer)?;
             let text = note_text(stdin.as_deref(), message_file.as_deref())?;
             let target = notes::resolve_target(home, cfg, target)?;
             notes::write_note(
@@ -140,7 +140,7 @@ pub fn run(
             json,
             consume,
         } => {
-            let id = peer_id(peer)?;
+            let id = peer_id(home, peer)?;
             let rows = notes::unread(home, &id)?;
             let files = rows.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
             let notes_only = rows.into_iter().map(|(_, n)| n).collect::<Vec<_>>();
@@ -180,7 +180,7 @@ pub fn run(
             Ok(Outcome::from(Value::String(human_roster(&rows))))
         }
         MeshCmd::Inject { peer, json } => {
-            let id = peer_id(peer)?;
+            let id = peer_id(home, peer)?;
             let Some(block) = notes::inject(home, cfg, &id, Utc::now())? else {
                 return Ok(Outcome::from(Value::Null));
             };
@@ -214,10 +214,9 @@ pub fn run_hooks(print: bool) -> Result<Outcome, AppError> {
     )))
 }
 
-fn peer_id(args: &MeshPeerArgs) -> Result<PeerId, AppError> {
+fn peer_id(home: &A2aHome, args: &MeshPeerArgs) -> Result<PeerId, AppError> {
     let provider = Provider::from(args.provider);
-    let session = presence::resolve_session(args.session.as_deref())?;
-    PeerId::parse(&format!("{provider}:{session}"))
+    presence::resolve_peer_id(home, provider, args.session.as_deref())
 }
 
 fn register(home: &A2aHome, id: &PeerId) -> Result<(), AppError> {

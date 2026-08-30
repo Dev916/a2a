@@ -20,6 +20,11 @@ fn peer_ids_parse_display_and_round_trip_to_dir_names() {
             Provider::Codex,
             "codex-01a024c0-a14e-7b93-a380-9382233fe37e",
         ),
+        (
+            "user:9b6285d5-74d0-47c0-9652-7d4bce30ef8f",
+            Provider::User,
+            "user-9b6285d5-74d0-47c0-9652-7d4bce30ef8f",
+        ),
     ] {
         let id = PeerId::parse(raw).unwrap();
         assert_eq!(id.provider, provider);

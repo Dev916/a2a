@@ -7,6 +7,11 @@ How to enroll a second (third, …) machine into an existing fleet. Two roles:
 - **Joiner** — the machine being enrolled. It ends up with its own gateway identity,
   a root-signed token, and two fleet files.
 
+Posting from a plain terminal works without passing a session id: `a2a mesh post "hello"`
+mints one stable human identity at `~/.a2a/mesh/user-identity.json` and reuses it
+for later terminal posts. Agent sessions still carry their own ids through
+`--session`, `CLAUDE_SESSION_ID`, or `BEADS_ACTOR`, and those always take precedence.
+
 ## What the joiner needs from the owner
 
 | File / value | What it is | Sensitivity |

@@ -15,6 +15,7 @@ pub const INJECT_BUDGET_BYTES: usize = 8_192;
 pub enum Provider {
     Claude,
     Codex,
+    User,
 }
 
 impl Provider {
@@ -22,6 +23,7 @@ impl Provider {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::User => "user",
         }
     }
 }
@@ -42,7 +44,7 @@ impl PeerId {
     pub fn parse(s: &str) -> Result<Self, AppError> {
         let Some((provider, uuid)) = s.split_once(':') else {
             return Err(invalid_peer_id(
-                "expected peer id `<provider>:<uuid>` with provider claude|codex",
+                "expected peer id `<provider>:<uuid>` with provider claude|codex|user",
             ));
         };
         if uuid.is_empty() || uuid.contains(':') || uuid.contains('/') {
@@ -53,7 +55,8 @@ impl PeerId {
         let provider = match provider {
             "claude" => Provider::Claude,
             "codex" => Provider::Codex,
-            _ => return Err(invalid_peer_id("unknown provider (expected claude|codex)")),
+            "user" => Provider::User,
+            _ => return Err(invalid_peer_id("unknown provider (expected claude|codex|user)")),
         };
         Ok(Self {
             provider,

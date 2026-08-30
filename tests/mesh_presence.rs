@@ -132,21 +132,24 @@ fn register_resolves_session_from_the_pinned_chain() {
 }
 
 #[test]
-fn unknown_session_is_a_typed_refusal_that_names_all_sources() {
+fn register_without_session_uses_the_persisted_user_identity() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = cli(tmp.path())
-        .args(["--json", "mesh", "register"])
+    cli(tmp.path())
+        .args(["mesh", "register"])
         .assert()
-        .code(9);
-    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(v["ok"], false);
-    assert_eq!(v["command"], "mesh register");
-    assert_eq!(v["error"]["code"], "MESH_SESSION_UNKNOWN");
-    let message = v["error"]["message"].as_str().unwrap();
-    assert!(message.contains("--session"), "{message}");
-    assert!(message.contains("CLAUDE_SESSION_ID"), "{message}");
-    assert!(message.contains("BEADS_ACTOR"), "{message}");
-    assert!(message.contains("cc-<uuid>"), "{message}");
+        .success();
+
+    let identity_file = tmp.path().join("mesh").join("user-identity.json");
+    let identity: Value =
+        serde_json::from_str(&fs::read_to_string(&identity_file).unwrap()).unwrap();
+    let session = identity["session_uuid"].as_str().unwrap();
+    let presence = read_presence(tmp.path(), "user", session);
+    assert_eq!(presence["peer"], format!("user:{session}"));
+    assert_eq!(presence["provider"], "user");
+    assert_eq!(
+        fs::metadata(&identity_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]

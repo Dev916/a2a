@@ -589,6 +589,7 @@ pub enum MeshGatewayCmd {
 pub enum MeshProviderArg {
     Claude,
     Codex,
+    User,
 }
 
 impl From<MeshProviderArg> for crate::mesh::Provider {
@@ -596,6 +597,7 @@ impl From<MeshProviderArg> for crate::mesh::Provider {
         match provider {
             MeshProviderArg::Claude => crate::mesh::Provider::Claude,
             MeshProviderArg::Codex => crate::mesh::Provider::Codex,
+            MeshProviderArg::User => crate::mesh::Provider::User,
         }
     }
 }

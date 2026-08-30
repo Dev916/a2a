@@ -9,9 +9,10 @@
 //! `fn(&Ctx) -> Check`; the runner maps over it and knows nothing about any
 //! individual check. Phase 2's four (app-server handshake, codex-home
 //! agreement, broker status, auth mode) were appended to that slice and the
-//! runner was not touched. Phase 3 appended three more the same way (context
-//! canon, the allowed-roots check, tracked-secret check, sync state).
-//! Phase 1's six, Phase 2's four, Phase 3's three — and it is pinned by a test.
+//! runner was not touched. The mesh enrollment check and Phase 3's three
+//! (context canon, the allowed-roots check, tracked-secret check, sync state)
+//! were appended the same way. Phase 1's six, Phase 2's four, mesh enrollment,
+//! Phase 3's three — and it is pinned by a test.
 //!
 //! **Only `fail` is fatal.** `fail` means "a worker spawned right now would
 //! not work" and exits 9 (precondition); `warn` means "this will bite you
@@ -46,6 +47,7 @@ use crate::brokerclient::{self, Handshake};
 use crate::config::{self, Config};
 use crate::exec::{self, Liveness};
 use crate::home::{self, A2aHome, LAYOUT_VERSION};
+use crate::mesh::keys;
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
 use crate::rpc::RpcError;
@@ -147,7 +149,8 @@ pub struct Ctx {
 }
 
 /// The check list, in report order. Append-only across phases: Phase 1's six,
-/// the allowed-roots first-run check, then Phase 2's four, then Phase 3's three.
+/// the allowed-roots first-run check, Phase 2's four, mesh enrollment, then
+/// Phase 3's three.
 const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_present,
     codex_version,
@@ -159,6 +162,7 @@ const CHECKS: &[fn(&Ctx) -> Check] = &[
     app_server_handshake,
     codex_home_match,
     broker_status,
+    gateway_enrollment,
     auth_mode,
     context_canon,
     codex_config_secrets,
@@ -179,6 +183,15 @@ const API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// Where codex keeps the login every worker shares (spec §4.2).
 const AUTH_JSON: &str = "auth.json";
+const GATEWAY_TOKEN_REENROLL_REMEDY: &str = "re-enroll: `a2a mesh fleet enroll` on the root machine, `a2a mesh gateway install-token` here";
+
+struct FixedClock(DateTime<Utc>);
+
+impl keys::Clock for FixedClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
 
 pub fn run(home_flag: Option<&Path>, json_mode: bool, quiet: bool) -> Result<Outcome, AppError> {
     let home = match A2aHome::resolve(home_flag) {
@@ -753,6 +766,60 @@ fn display_or<'a>(s: &'a str, fallback: &'a str) -> &'a str {
     }
 }
 
+fn gateway_enrollment(ctx: &Ctx) -> Check {
+    if !gateway_material_exists(&ctx.home) {
+        return Check::ok(
+            "gateway_enrollment",
+            "no mesh gateway material present — enrollment check skipped",
+        );
+    }
+    match gateway_enrollment_verdict(ctx) {
+        Ok(check) => check,
+        Err(err) => {
+            let mut check = Check::warn(
+                "gateway_enrollment",
+                format!("{}: {}", err.code, err.message),
+            );
+            check.remedy = Some(
+                err.remedy
+                    .unwrap_or_else(|| GATEWAY_TOKEN_REENROLL_REMEDY.to_string()),
+            );
+            check
+        }
+    }
+}
+
+fn gateway_material_exists(home: &A2aHome) -> bool {
+    let dir = home.root().join("mesh").join("gateway");
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.any(|entry| {
+            entry
+                .map(|entry| entry.path().is_file())
+                .unwrap_or(true)
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn gateway_enrollment_verdict(ctx: &Ctx) -> Result<Check, AppError> {
+    let gateway_id = keys::gateway_id(&ctx.home)?;
+    let pubkey_b64 = keys::gateway_public_key_b64(&ctx.home)?;
+    let clock = FixedClock(ctx.now);
+    let claims = keys::verify_gateway_token(&ctx.home, &gateway_id, &pubkey_b64, &clock)?;
+    Ok(Check::ok(
+        "gateway_enrollment",
+        format!(
+            "gateway token verifies for fleet {} gateway {} until {}",
+            claims.fleet_id,
+            claims.gateway_id,
+            DateTime::from_timestamp(claims.exp, 0)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| claims.exp.to_string())
+        ),
+    ))
+}
+
 /// Which plan the fleet bills to, from the two facts that decide it — and only
 /// from facts this process can read without touching the network.
 ///
@@ -1183,13 +1250,14 @@ mod tests {
     use crate::sync::manifest::DriftSummary;
 
     #[test]
-    fn the_check_list_is_exactly_fourteen_named_checks() {
+    fn the_check_list_is_exactly_fifteen_named_checks() {
         // The list is the contract `doctor --json` publishes; a phase that adds
         // a check adds it here and to the acceptance test in the same commit.
-        // Six in Phase 1, the allowed-roots check, four in Phase 2, three in
-        // Phase 3 — the ids and their order are pinned end-to-end by
+        // Six in Phase 1, the allowed-roots check, four in Phase 2, the mesh
+        // enrollment check, and three in Phase 3 — the ids and their order are
+        // pinned end-to-end by
         // `tests/cmd_doctor.rs`.
-        assert_eq!(CHECKS.len(), 14);
+        assert_eq!(CHECKS.len(), 15);
     }
 
     #[test]

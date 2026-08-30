@@ -255,6 +255,7 @@ enum DaemonOutcome {
 }
 
 pub fn run(home: &A2aHome, cfg: &Config, quiet: bool) -> Result<Outcome, AppError> {
+    keys::ensure_and_verify_gateway_enrollment(home, &SystemClock)?;
     let root = gateway_root(home);
     let Some(lock) = acquire_lock(&root)? else {
         if !quiet {
@@ -541,8 +542,7 @@ fn bootstrap_registry_runtime(
     home: &A2aHome,
     cfg: &Config,
 ) -> Result<GatewayRegistryRuntime, AppError> {
-    let identity = keys::gateway_identity(home, false)?;
-    keys::ensure_gateway_token(home, &SystemClock)?;
+    let identity = keys::ensure_and_verify_gateway_enrollment(home, &SystemClock)?;
     let registry_url = read_gateway_registry_env(home)?;
     let registry = registry::open_registry(&registry_url)?;
     let exposure = ExposureProvider::from_config(cfg)?;

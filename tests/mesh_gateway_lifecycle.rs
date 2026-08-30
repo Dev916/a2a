@@ -1,5 +1,7 @@
 mod common;
 
+use a2a::mesh::keys::{self, TestClock, TokenClaims, SKEW_TOLERANCE_SECS};
+use chrono::{TimeZone, Utc};
 use a2a::mesh::registry::Registry;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -402,6 +404,157 @@ fn gateway_startup_without_registry_env_fails_unconfigured() {
         .failure()
         .stderr(predicate::str::contains("REGISTRY_UNCONFIGURED"))
         .stderr(predicate::str::contains("a2a mesh fleet init --registry -"));
+}
+
+#[test]
+fn gateway_startup_refuses_token_from_another_fleet_before_health() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet_a = tmp.path().join("fleet-a");
+    let fleet_b = tmp.path().join("fleet-b");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&fleet_a, &tmp.path().join("registry-a"));
+    prepare_gateway_home(&fleet_b, &tmp.path().join("registry-b"));
+
+    let home_b = a2a::home::A2aHome::resolve(Some(&fleet_b)).unwrap();
+    let identity = keys::gateway_identity(&home_b, false).unwrap();
+    let token = keys::enroll_gateway_token(
+        &home_b,
+        &identity.gateway_id,
+        &keys::gateway_public_key_b64(&home_b).unwrap(),
+        &TestClock::new(Utc::now()),
+    )
+    .unwrap();
+    keys::install_gateway_token(&home_b, &token, &TestClock::new(Utc::now())).unwrap();
+    std::fs::remove_file(fleet_b.join("mesh/fleet/root.key")).unwrap();
+    std::fs::copy(
+        fleet_a.join("mesh/fleet/root.pub"),
+        fleet_b.join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+
+    common::a2a(&fleet_b, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GATEWAY_FLEET_MISMATCH"))
+        .stderr(predicate::str::contains("restore the fleet's root.pub"));
+    assert!(
+        !fleet_b.join("mesh/gateway-health.json").exists(),
+        "startup enrollment failure must happen before health is written"
+    );
+    assert!(
+        !fleet_b.join("mesh/gateway.pid").exists(),
+        "startup enrollment failure must happen before pidfile commit"
+    );
+}
+
+#[test]
+fn gateway_startup_refuses_garbage_token_as_invalid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
+    let resolved = a2a::home::A2aHome::resolve(Some(&home)).unwrap();
+    keys::gateway_identity(&resolved, false).unwrap();
+    std::fs::write(home.join("mesh/gateway/gw.token"), "not a token\n").unwrap();
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GATEWAY_TOKEN_INVALID"));
+    assert!(!home.join("mesh/gateway-health.json").exists());
+}
+
+#[test]
+fn gateway_startup_refuses_token_for_another_gateway_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
+    let resolved = a2a::home::A2aHome::resolve(Some(&home)).unwrap();
+    let local = keys::gateway_identity(&resolved, false).unwrap();
+    let claims = TokenClaims {
+        fleet_id: String::new(),
+        gateway_id: format!("{}-other", local.gateway_id),
+        pubkey_b64: keys::gateway_public_key_b64(&resolved).unwrap(),
+        issued_at: Utc::now().timestamp(),
+        exp: Utc::now().timestamp() + 3600,
+    };
+    let token = keys::sign_token(&claims, &resolved).unwrap();
+    std::fs::write(home.join("mesh/gateway/gw.token"), format!("{token}\n")).unwrap();
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GATEWAY_TOKEN_MISMATCH"))
+        .stderr(predicate::str::contains("gateway_id"));
+    assert!(!home.join("mesh/gateway-health.json").exists());
+}
+
+#[test]
+fn gateway_startup_refuses_token_for_another_gateway_pubkey() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let other = tmp.path().join("other");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
+    let resolved = a2a::home::A2aHome::resolve(Some(&home)).unwrap();
+    let other_home = a2a::home::A2aHome::resolve(Some(&other)).unwrap();
+    let local = keys::gateway_identity(&resolved, false).unwrap();
+    keys::gateway_identity(&other_home, false).unwrap();
+    let claims = TokenClaims {
+        fleet_id: String::new(),
+        gateway_id: local.gateway_id,
+        pubkey_b64: keys::gateway_public_key_b64(&other_home).unwrap(),
+        issued_at: Utc::now().timestamp(),
+        exp: Utc::now().timestamp() + 3600,
+    };
+    let token = keys::sign_token(&claims, &resolved).unwrap();
+    std::fs::write(home.join("mesh/gateway/gw.token"), format!("{token}\n")).unwrap();
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GATEWAY_TOKEN_MISMATCH"))
+        .stderr(predicate::str::contains("pubkey_b64"));
+    assert!(!home.join("mesh/gateway-health.json").exists());
+}
+
+#[test]
+fn gateway_startup_refuses_expired_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
+    let resolved = a2a::home::A2aHome::resolve(Some(&home)).unwrap();
+    let identity = keys::gateway_identity(&resolved, false).unwrap();
+    let issued_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap().timestamp();
+    let claims = TokenClaims {
+        fleet_id: String::new(),
+        gateway_id: identity.gateway_id,
+        pubkey_b64: keys::gateway_public_key_b64(&resolved).unwrap(),
+        issued_at,
+        exp: Utc::now().timestamp() - SKEW_TOLERANCE_SECS - 1,
+    };
+    let token = keys::sign_token(&claims, &resolved).unwrap();
+    std::fs::write(home.join("mesh/gateway/gw.token"), format!("{token}\n")).unwrap();
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("GATEWAY_TOKEN_EXPIRED"))
+        .stderr(predicate::str::contains("a2a mesh fleet enroll"))
+        .stderr(predicate::str::contains("a2a mesh gateway install-token"));
+    assert!(!home.join("mesh/gateway-health.json").exists());
 }
 
 fn spawn_gateway(home: &std::path::Path, work: &std::path::Path, envs: &[(&str, &str)]) -> Child {

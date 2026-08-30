@@ -5,11 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The fourteen checks, in report order: Phase 1's six (unchanged ids,
+/// The fifteen checks, in report order: Phase 1's six (unchanged ids,
 /// unchanged order), then Phase 2's four, then Phase 3's three. This list IS
 /// the contract `doctor --json` publishes — a phase that adds a check adds it
 /// here in the same commit.
-const CHECK_IDS: [&str; 14] = [
+const CHECK_IDS: [&str; 15] = [
     "codex_present",
     "codex_version",
     "layout_version",
@@ -20,6 +20,7 @@ const CHECK_IDS: [&str; 14] = [
     "app_server_handshake",
     "codex_home_match",
     "broker_status",
+    "gateway_enrollment",
     "auth_mode",
     "context_canon",
     "codex_config_secrets",
@@ -60,7 +61,7 @@ fn detail(v: &serde_json::Value, id: &str) -> String {
 }
 
 #[test]
-fn all_ok_with_stub_exits_zero_and_lists_fourteen_checks() {
+fn all_ok_with_stub_exits_zero_and_lists_fifteen_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |_| {});
     assert_eq!(code, 0);
@@ -89,6 +90,8 @@ fn all_ok_with_stub_exits_zero_and_lists_fourteen_checks() {
     assert_eq!(check(&v, "broker_status")["status"], "warn");
     assert!(detail(&v, "broker_status").contains("A2A_BROKER_DISABLE"));
     // no auth.json under the temp CODEX_HOME
+    assert_eq!(check(&v, "gateway_enrollment")["status"], "ok");
+    assert!(detail(&v, "gateway_enrollment").contains("no mesh gateway material"));
     assert_eq!(check(&v, "auth_mode")["status"], "warn");
 }
 
@@ -319,6 +322,35 @@ fn a_running_broker_is_reported_up() {
 
     drop(guard);
     assert_no_broker_left(&home);
+}
+
+#[test]
+fn gateway_enrollment_warns_on_invalid_gateway_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("h");
+    let work = tmp.path().join("work");
+
+    a2a(&home, &work)
+        .args(["--json", "mesh", "fleet", "init"])
+        .assert()
+        .success();
+    a2a(&home, &work)
+        .args(["--json", "mesh", "gateway", "identity"])
+        .assert()
+        .success();
+    std::fs::write(home.join("mesh/gateway/gw.token"), "not a token\n").unwrap();
+
+    let (v, code) = checks(&home, tmp.path(), |_| {});
+    assert_eq!(code, 0, "gateway enrollment warnings are not fatal to doctor");
+    assert_eq!(check(&v, "gateway_enrollment")["status"], "warn");
+    let d = detail(&v, "gateway_enrollment");
+    assert!(d.contains("GATEWAY_TOKEN_INVALID"), "{d}");
+    assert!(
+        check(&v, "gateway_enrollment")["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("a2a mesh fleet enroll")
+    );
 }
 
 fn wait_for_socket(home: &Path) {

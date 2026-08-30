@@ -8,6 +8,10 @@ mod common;
 use common::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const DEVLOOP_RESULT: &str =
+    r#"{"status":"pass","iterations":1,"summary":"ok","evidence":{},"files_changed":[],"next_step_hint":null}"#;
 
 struct Fix {
     home: PathBuf,
@@ -30,6 +34,41 @@ fn fixture() -> Fix {
     }
 }
 
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git is on PATH");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn init_repo(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    git_ok(dir, &["init", "-q", "-b", "main"]);
+    git_ok(dir, &["config", "user.email", "a2a@example.invalid"]);
+    git_ok(dir, &["config", "user.name", "a2a test"]);
+    git_ok(dir, &["config", "commit.gpgsign", "false"]);
+    git_ok(dir, &["config", "core.hooksPath", "no-such-hooks"]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git_ok(dir, &["add", "a.txt"]);
+    git_ok(dir, &["commit", "-q", "-m", "init"]);
+    std::fs::canonicalize(dir).unwrap()
+}
+
+fn impl_brief(dir: &Path) -> PathBuf {
+    write_brief(
+        dir,
+        "---\nacceptance_criteria:\n  - it works\nverify:\n  - cargo test\n---\ndo the thing\n",
+    )
+}
+
 impl Fix {
     fn root(&self) -> &Path {
         self.tmp.path()
@@ -47,6 +86,28 @@ impl Fix {
             .arg(&self.work)
             .arg("--brief")
             .arg(&self.brief)
+            .assert()
+            .success();
+        json_of(&out)
+            .pointer("/data/id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn spawn_impl(&self, repo: &Path, brief: &Path, extra: &[&str], sleep: Option<&str>) -> String {
+        let mut c = a2a(&self.home, self.root());
+        if let Some(s) = sleep {
+            c.env("STUB_SLEEP", s);
+        }
+        c.env("STUB_LAST_MSG", DEVLOOP_RESULT);
+        let out = c
+            .args(["--json", "spawn", "--lane", "impl", "--cwd"])
+            .arg(repo)
+            .arg("--brief")
+            .arg(brief)
+            .args(extra)
             .assert()
             .success();
         json_of(&out)
@@ -131,6 +192,67 @@ fn a_respawn_records_lineage_and_inherits_the_parents_identity() {
     );
     assert_eq!(csnap["parent_id"], parent);
     assert_eq!(csnap["attempt"], 2);
+}
+
+/// A parent spawned with `--no-worktree` must retry in the same directory, even
+/// when its lane would normally create a worktree.
+#[test]
+fn respawning_a_no_worktree_parent_keeps_no_worktree_semantics() {
+    let f = fixture();
+    let repo = init_repo(&f.work);
+    let brief = impl_brief(f.root());
+    let parent = f.spawn_impl(&repo, &brief, &["--no-worktree"], Some("30"));
+    f.kill(&parent);
+
+    let out = f
+        .cmd()
+        .env("STUB_LAST_MSG", DEVLOOP_RESULT)
+        .args(["--json", "respawn", &parent])
+        .assert()
+        .success();
+    let data = json_of(&out)["data"].clone();
+    let child = data["id"].as_str().unwrap().to_string();
+    let psnap = read_snapshot(&f.home, &parent);
+    let csnap = read_snapshot(&f.home, &child);
+
+    assert_eq!(psnap["worktree"], Value::Null, "parent opted out");
+    assert_eq!(data["worktree"], Value::Null, "{data}");
+    assert_eq!(csnap["worktree"], Value::Null, "{csnap}");
+    assert_eq!(data["cwd"], serde_json::json!(repo), "{data}");
+    assert_eq!(csnap["cwd"], psnap["cwd"], "same non-worktree cwd");
+}
+
+/// A retry of a worktree-backed parent gets a fresh tree of its own, never the
+/// failed attempt's directory.
+#[test]
+fn respawning_a_worktree_parent_creates_a_fresh_child_worktree() {
+    let f = fixture();
+    let repo = init_repo(&f.work);
+    let brief = impl_brief(f.root());
+    let parent = f.spawn_impl(&repo, &brief, &[], Some("30"));
+    f.kill(&parent);
+
+    let out = f
+        .cmd()
+        .env("STUB_LAST_MSG", DEVLOOP_RESULT)
+        .args(["--json", "respawn", &parent])
+        .assert()
+        .success();
+    let data = json_of(&out)["data"].clone();
+    let child = data["id"].as_str().unwrap().to_string();
+    let psnap = read_snapshot(&f.home, &parent);
+    let csnap = read_snapshot(&f.home, &child);
+    let expected_branch = format!("a2a/impl/{child}");
+
+    assert_ne!(child, parent, "respawn allocates a new worker");
+    assert_ne!(
+        csnap["worktree"]["path"], psnap["worktree"]["path"],
+        "child must not reuse the parent's worktree"
+    );
+    assert_eq!(csnap["worktree"]["repo"], serde_json::json!(repo));
+    assert_eq!(csnap["worktree"]["branch"], expected_branch);
+    assert_eq!(data["worktree"]["path"], csnap["worktree"]["path"]);
+    assert_eq!(data["cwd"], csnap["worktree"]["path"]);
 }
 
 /// `--brief` replaces the brief — and the sha proves the child is judged

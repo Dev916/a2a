@@ -47,8 +47,8 @@
 //!   a fresh scratch (pinned).
 //! * **A worktree worker**, whose `cwd` is the *worktree* — a path under
 //!   `$A2A_HOME/worktrees/` that is not under any allowed root and belongs to a
-//!   worker that is over. The child inherits the parent repo instead and the
-//!   lane's worktree default gives it a tree of its own.
+//!   worker that is over. The child inherits the parent repo instead and asks
+//!   the spawn path for a tree of its own.
 
 use crate::cli::SpawnArgs;
 use crate::commands::owner;
@@ -155,11 +155,13 @@ fn next_attempt(id: &str, parent: &WorkerSnapshot, max_attempts: u64) -> Result<
 /// The child's spawn arguments, derived from the parent's record.
 ///
 /// Every field this does NOT set is deliberate: an elevation is never
-/// inherited (§5 wants a fresh `--reason` every time), `--transport` is left to
-/// resolve itself, and the worktree flags are left unset so the lane's own
-/// default decides — a retry of an impl worker should get its own tree, not the
-/// dead one's.
+/// inherited (§5 wants a fresh `--reason` every time), and `--transport` is
+/// left to resolve itself. The worktree flags are the parent's effective mode:
+/// no tree means `--no-worktree` semantics, while a tree means a fresh tree for
+/// the child.
 fn inherited_args(parent: &WorkerSnapshot, parent_dir: &Path, brief: Option<&Path>) -> SpawnArgs {
+    let inherit_worktree = parent.worktree.is_some();
+    let inherit_no_worktree = parent.lane != Lane::Research && parent.worktree.is_none();
     SpawnArgs {
         lane: Some(parent.lane),
         cwd: inherited_cwd(parent),
@@ -182,12 +184,12 @@ fn inherited_args(parent: &WorkerSnapshot, parent_dir: &Path, brief: Option<&Pat
         model: Some(parent.model.clone()),
         effort: Some(parent.effort.clone()),
         transport: None,
-        worktree: false,
+        worktree: inherit_worktree,
         no_queue: false,
         // The PARENT's owner, not the caller's: a forced cross-owner respawn is
         // a repair, not a transfer.
         owner: parent.owner.clone(),
-        no_worktree: false,
+        no_worktree: inherit_no_worktree,
         base_ref: None,
         danger_full_access: false,
         reason: None,
@@ -331,8 +333,22 @@ mod tests {
         assert_eq!(args.schema, Some(PathBuf::from("/w/parent/schema.json")));
         // Never inherited: an elevation needs a fresh `--reason` every time.
         assert!(!args.danger_full_access && args.reason.is_none());
-        // The lane's own worktree default decides, so a retry gets its own tree.
-        assert!(!args.worktree && !args.no_worktree);
+        // The parent's effective no-worktree mode wins over the lane default.
+        assert!(!args.worktree && args.no_worktree);
+
+        let mut wt_parent = parent.clone();
+        wt_parent.cwd = PathBuf::from("/home/.a2a/worktrees/impl-0814t1300-aaaa");
+        wt_parent.worktree = Some(crate::state::WorktreeRef {
+            path: wt_parent.cwd.clone(),
+            branch: "a2a/impl/impl-0814t1300-aaaa".into(),
+            base_ref: "abc123".into(),
+            repo: PathBuf::from("/dev/proj"),
+        });
+        let args = inherited_args(&wt_parent, Path::new("/w/parent"), None);
+        assert!(
+            args.worktree && !args.no_worktree,
+            "a worktree-backed parent gets a fresh child worktree"
+        );
 
         let replaced = inherited_args(
             &parent,

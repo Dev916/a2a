@@ -80,7 +80,13 @@ direction works out).
 ### 5. Joiner: run the gateway
 
 ```sh
-a2a mesh gateway run    # foreground; background it however you prefer
+a2a mesh gateway run --daemon
+```
+
+To survive reboot, install the per-user service instead:
+
+```sh
+a2a mesh gateway install-service
 ```
 
 Verify from either machine:

@@ -569,11 +569,22 @@ pub enum MeshFleetCmd {
 #[derive(Subcommand)]
 pub enum MeshGatewayCmd {
     /// Run the mesh gateway supervisor in the foreground
-    Run,
+    Run {
+        /// Detach a gateway process and return after it reports healthy
+        #[arg(long)]
+        daemon: bool,
+        /// Hidden marker used by the re-execed daemon child
+        #[arg(long, hide = true)]
+        daemonized: bool,
+    },
     /// Report gateway health (exit 7 when it is not running)
     Status,
     /// Ask the running gateway to stop
     Stop,
+    /// Install the mesh gateway as a per-user service
+    InstallService,
+    /// Uninstall the per-user mesh gateway service
+    UninstallService,
     /// Print this machine's gateway enrollment identity
     Identity,
     /// Install a root-signed gateway enrollment token

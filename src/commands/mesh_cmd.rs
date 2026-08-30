@@ -24,6 +24,7 @@ const MESH_L2_MIGRATION_SQL: &str = include_str!("../../migrations/mesh_l2_0001.
 pub fn run(
     home: &A2aHome,
     cfg: &Config,
+    home_arg: Option<&Path>,
     cmd: &MeshCmd,
     json_mode: bool,
     quiet: bool,
@@ -191,7 +192,7 @@ pub fn run(
         }
         MeshCmd::Hooks { print } => run_hooks(*print),
         MeshCmd::Fleet { cmd } => run_fleet(home, cmd, json_mode),
-        MeshCmd::Gateway { cmd } => run_gateway(home, cfg, cmd, json_mode, quiet),
+        MeshCmd::Gateway { cmd } => run_gateway(home, cfg, home_arg, cmd, json_mode, quiet),
     }
 }
 
@@ -516,14 +517,22 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
 fn run_gateway(
     home: &A2aHome,
     cfg: &Config,
+    home_arg: Option<&Path>,
     cmd: &MeshGatewayCmd,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
     match cmd {
-        MeshGatewayCmd::Run => crate::mesh::gateway::run(home, cfg, quiet),
+        MeshGatewayCmd::Run {
+            daemon,
+            daemonized,
+        } => crate::mesh::gateway::run(home, cfg, quiet, *daemon, *daemonized),
         MeshGatewayCmd::Status => crate::mesh::gateway::status(home, json_mode),
         MeshGatewayCmd::Stop => crate::mesh::gateway::stop(home),
+        MeshGatewayCmd::InstallService => {
+            crate::mesh::gateway::install_service(home, cfg, home_arg, quiet)
+        }
+        MeshGatewayCmd::UninstallService => crate::mesh::gateway::uninstall_service(home, quiet),
         MeshGatewayCmd::Identity => {
             let identity = crate::mesh::keys::gateway_identity(home, false)?;
             let pubkey_b64 = crate::mesh::keys::gateway_public_key_b64(home)?;

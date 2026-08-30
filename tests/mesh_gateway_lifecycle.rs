@@ -144,6 +144,63 @@ fn gateway_status_is_exit_7_until_a_supervisor_writes_health() {
 }
 
 #[test]
+fn gateway_daemon_reexec_starts_reports_pid_status_and_stops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &tmp.path().join("registry"));
+
+    let out = daemon_gateway_cmd(&home, &work)
+        .args(["--json", "mesh", "gateway", "run", "--daemon"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let started: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(started["data"]["started"], true);
+    let pid = started["data"]["pid"].as_u64().unwrap();
+    assert!(pid > 0);
+    assert_eq!(
+        started["data"]["log"].as_str(),
+        Some(home.join("mesh").join("gateway.daemon.log").to_string_lossy().as_ref())
+    );
+
+    let status = common::a2a(&home, &work)
+        .args(["--json", "mesh", "gateway", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(status["data"]["running"], true);
+    assert_eq!(status["data"]["health"]["pid"].as_u64(), Some(pid));
+    assert!(home.join("mesh").join("gateway.daemon.log").exists());
+
+    let already = daemon_gateway_cmd(&home, &work)
+        .args(["--json", "mesh", "gateway", "run", "--daemon"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let already: Value = serde_json::from_slice(&already).unwrap();
+    assert_eq!(already["data"]["started"], false);
+    assert_eq!(already["data"]["already_running"], true);
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "stop"])
+        .assert()
+        .success();
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "status"])
+        .assert()
+        .code(7);
+}
+
+#[test]
 fn supervisor_escalates_panicking_loop_and_releases_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -575,6 +632,14 @@ fn spawn_gateway(home: &std::path::Path, work: &std::path::Path, envs: &[(&str, 
         cmd.env(k, v);
     }
     cmd.spawn().unwrap()
+}
+
+fn daemon_gateway_cmd(home: &std::path::Path, work: &std::path::Path) -> assert_cmd::Command {
+    let listen_port = NEXT_GATEWAY_PORT.fetch_add(1, Ordering::SeqCst).to_string();
+    let mut cmd = common::a2a(home, work);
+    cmd.env("A2A_MESH_GATEWAY_LISTEN_PORT", listen_port)
+        .env("A2A_TEST_MESH_GATEWAY_SERVER_BIND_OPTIONAL", "1");
+    cmd
 }
 
 fn prepare_gateway_home(home: &std::path::Path, registry_dir: &std::path::Path) {

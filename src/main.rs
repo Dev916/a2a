@@ -84,9 +84,11 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshFleetCmd::RotateRoot => "mesh fleet rotate-root",
             },
             MeshCmd::Gateway { cmd } => match cmd {
-                MeshGatewayCmd::Run => "mesh gateway run",
+                MeshGatewayCmd::Run { .. } => "mesh gateway run",
                 MeshGatewayCmd::Status => "mesh gateway status",
                 MeshGatewayCmd::Stop => "mesh gateway stop",
+                MeshGatewayCmd::InstallService => "mesh gateway install-service",
+                MeshGatewayCmd::UninstallService => "mesh gateway uninstall-service",
                 MeshGatewayCmd::Identity => "mesh gateway identity",
                 MeshGatewayCmd::InstallToken { .. } => "mesh gateway install-token",
             },
@@ -322,7 +324,14 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             }
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
             let (cfg, _, _) = a2a::config::load(&home)?;
-            a2a::commands::mesh_cmd::run(&home, &cfg, cmd, cli.global.json, cli.global.quiet)
+            a2a::commands::mesh_cmd::run(
+                &home,
+                &cfg,
+                cli.global.home.as_deref(),
+                cmd,
+                cli.global.json,
+                cli.global.quiet,
+            )
         }
     }
 }

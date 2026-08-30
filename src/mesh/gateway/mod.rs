@@ -10,15 +10,19 @@ use expose::{Exposure, ExposureErrorChange, ExposureProvider, ExposurePublisher,
 use futures_util::FutureExt;
 use link::{LinkDirection, LinkSessionParams, LinkStateHandle};
 use nix::fcntl::{Flock, FlockArg};
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{kill, SigHandler, Signal};
 use nix::unistd::Pid;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -37,6 +41,7 @@ pub const GATEWAY_LOCK: &str = "gateway.lock";
 pub const GATEWAY_PID: &str = "gateway.pid";
 pub const GATEWAY_HEALTH: &str = "gateway-health.json";
 pub const GATEWAY_JSONL: &str = "gateway.jsonl";
+pub const GATEWAY_DAEMON_LOG: &str = "gateway.daemon.log";
 pub const HEALTH_SCHEMA_VERSION: u32 = 1;
 pub const MAX_RESTARTS: usize = 5;
 pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
@@ -44,6 +49,7 @@ pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const LOG_CAPACITY: usize = 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -259,7 +265,17 @@ enum DaemonOutcome {
     NonZero(Value),
 }
 
-pub fn run(home: &A2aHome, cfg: &Config, quiet: bool) -> Result<Outcome, AppError> {
+pub fn run(
+    home: &A2aHome,
+    cfg: &Config,
+    quiet: bool,
+    daemon: bool,
+    daemonized: bool,
+) -> Result<Outcome, AppError> {
+    if daemon && !daemonized {
+        return run_daemon_parent(home, quiet);
+    }
+
     keys::ensure_and_verify_gateway_enrollment(home, &SystemClock)?;
     let root = gateway_root(home);
     let Some(lock) = acquire_lock(&root)? else {
@@ -294,6 +310,425 @@ pub fn run(home: &A2aHome, cfg: &Config, quiet: bool) -> Result<Outcome, AppErro
         Ok(DaemonOutcome::NonZero(data)) => Ok(Outcome::with(data, ExitCode::Internal)),
         Err(e) => Err(e),
     }
+}
+
+fn run_daemon_parent(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
+    let root = gateway_root(home);
+    if !lock_is_free(&root) {
+        if !quiet {
+            eprintln!("a2a: mesh gateway already running");
+        }
+        return Ok(Outcome::from(
+            json!({"started": false, "already_running": true}),
+        ));
+    }
+
+    let log_path = root.join(GATEWAY_DAEMON_LOG);
+    let stdout = crate::exec::open_append_0600(&log_path).map_err(|e| io_error(&log_path, e))?;
+    let stderr = stdout.try_clone().map_err(|e| io_error(&log_path, e))?;
+    let devnull = File::open("/dev/null").map_err(|e| io_error(Path::new("/dev/null"), e))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        AppError::new(
+            "GATEWAY_DAEMON_SPAWN",
+            ExitCode::Internal,
+            format!("resolving current executable: {e}"),
+        )
+    })?;
+    let args = daemonized_args();
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::from(devnull))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()
+                .map_err(|e| std::io::Error::other(format!("setsid: {e}")))?;
+            nix::sys::signal::signal(Signal::SIGHUP, SigHandler::SigIgn)
+                .map_err(|e| std::io::Error::other(format!("ignoring SIGHUP: {e}")))?;
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::new(
+            "GATEWAY_DAEMON_SPAWN",
+            ExitCode::Internal,
+            format!("spawning mesh gateway daemon: {e}"),
+        )
+    })?;
+    let pid = child.id();
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| {
+            AppError::new(
+                "GATEWAY_DAEMON_START",
+                ExitCode::Internal,
+                format!("checking daemon startup: {e}"),
+            )
+        })? {
+            let tail = tail_log_lines(&log_path, 40);
+            return Err(AppError::new(
+                "GATEWAY_DAEMON_START",
+                ExitCode::Precondition,
+                format!("mesh gateway daemon exited during startup with {status}: {tail}"),
+            )
+            .data(json!({
+                "pid": pid,
+                "exit_status": status.code(),
+                "log": log_path,
+                "log_tail": tail,
+            })));
+        }
+        if let Some(health) = GatewayHealth::read(home) {
+            if health.pid == pid && health.state == "running" {
+                return Ok(Outcome::from(json!({
+                    "started": true,
+                    "pid": pid,
+                    "log": log_path,
+                })));
+            }
+        }
+        if Instant::now() >= deadline {
+            let tail = tail_log_lines(&log_path, 40);
+            return Err(AppError::new(
+                "GATEWAY_DAEMON_START_TIMEOUT",
+                ExitCode::BrokerUnavailable,
+                format!(
+                    "mesh gateway daemon pid {pid} did not report healthy within {}s: {tail}",
+                    DAEMON_START_TIMEOUT.as_secs()
+                ),
+            )
+            .data(json!({"pid": pid, "log": log_path, "log_tail": tail})));
+        }
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+}
+
+fn daemonized_args() -> Vec<OsString> {
+    let mut args = Vec::new();
+    let mut saw_daemonized = false;
+    for arg in std::env::args_os().skip(1) {
+        if arg == "--daemon" {
+            continue;
+        }
+        if arg == "--daemonized" {
+            saw_daemonized = true;
+        }
+        args.push(arg);
+    }
+    if !saw_daemonized {
+        args.push(OsString::from("--daemonized"));
+    }
+    args
+}
+
+fn tail_log_lines(path: &Path, max_lines: usize) -> String {
+    let mut text = String::new();
+    if File::open(path)
+        .and_then(|mut f| f.read_to_string(&mut text))
+        .is_err()
+    {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().rev().take(max_lines).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+pub fn install_service(
+    home: &A2aHome,
+    cfg: &Config,
+    home_arg: Option<&Path>,
+    quiet: bool,
+) -> Result<Outcome, AppError> {
+    let exe = std::env::current_exe().map_err(|e| {
+        AppError::new(
+            "GATEWAY_SERVICE",
+            ExitCode::Internal,
+            format!("resolving current executable: {e}"),
+        )
+    })?;
+    let home_flag = home_arg.map(|_| home.root().to_path_buf());
+    let log_path = gateway_root(home).join(GATEWAY_DAEMON_LOG);
+    let reload_skipped = service_reload_skipped();
+    let platform = install_service_for_platform(&exe, home_flag.as_deref(), &log_path, reload_skipped)?;
+    if cfg.mesh.gateway.expose == "ngrok" && !quiet {
+        eprintln!(
+            "a2a: ngrok exposure needs a running `ngrok start --none` agent; keep it alive the same way."
+        );
+    }
+    Ok(Outcome::from(json!({
+        "installed": true,
+        "path": platform.path,
+        "status_command": platform.status_command,
+        "reload_skipped": reload_skipped,
+    })))
+}
+
+pub fn uninstall_service(home: &A2aHome, quiet: bool) -> Result<Outcome, AppError> {
+    let _ = gateway_root(home);
+    let reload_skipped = service_reload_skipped();
+    let platform = uninstall_service_for_platform(reload_skipped)?;
+    if !quiet {
+        eprintln!("a2a: removed {}", platform.path.display());
+        eprintln!("a2a: status command: {}", platform.status_command);
+    }
+    Ok(Outcome::from(json!({
+        "uninstalled": true,
+        "path": platform.path,
+        "status_command": platform.status_command,
+        "reload_skipped": reload_skipped,
+    })))
+}
+
+struct ServiceInstall {
+    path: PathBuf,
+    status_command: &'static str,
+}
+
+fn service_reload_skipped() -> bool {
+    std::env::var("A2A_TEST_SKIP_SERVICE_RELOAD")
+        .ok()
+        .is_some_and(|value| value == "1")
+}
+
+#[cfg(target_os = "macos")]
+fn install_service_for_platform(
+    exe: &Path,
+    home_arg: Option<&Path>,
+    log_path: &Path,
+    reload_skipped: bool,
+) -> Result<ServiceInstall, AppError> {
+    let path = home_dir()?.join("Library/LaunchAgents/dev.a2a.mesh-gateway.plist");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+    }
+    let args = service_args(exe, home_arg);
+    std::fs::write(&path, launch_agent_plist(&args, log_path)).map_err(|e| io_error(&path, e))?;
+    if !reload_skipped {
+        let uid = nix::unistd::Uid::current().as_raw().to_string();
+        let target = format!("gui/{uid}");
+        let service = format!("{target}/dev.a2a.mesh-gateway");
+        let _ = Command::new("launchctl").args(["bootout", &service]).status();
+        let bootstrap = Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(&target)
+            .arg(&path)
+            .status()
+            .map_err(|e| service_error(format!("running launchctl bootstrap: {e}")))?;
+        if !bootstrap.success() {
+            let load = Command::new("launchctl")
+                .args(["load", "-w"])
+                .arg(&path)
+                .status()
+                .map_err(|e| service_error(format!("running launchctl load -w: {e}")))?;
+            if !load.success() {
+                return Err(service_error(format!(
+                    "launchctl bootstrap exited with {bootstrap}; launchctl load -w exited with {load}"
+                )));
+            }
+        }
+    }
+    Ok(ServiceInstall {
+        path,
+        status_command: "launchctl print gui/$UID/dev.a2a.mesh-gateway",
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_service_for_platform(reload_skipped: bool) -> Result<ServiceInstall, AppError> {
+    let path = home_dir()?.join("Library/LaunchAgents/dev.a2a.mesh-gateway.plist");
+    if !reload_skipped {
+        let uid = nix::unistd::Uid::current().as_raw().to_string();
+        let service = format!("gui/{uid}/dev.a2a.mesh-gateway");
+        let bootout = Command::new("launchctl").args(["bootout", &service]).status();
+        if bootout.as_ref().is_err() || bootout.as_ref().is_ok_and(|s| !s.success()) {
+            let _ = Command::new("launchctl").args(["unload", "-w"]).arg(&path).status();
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(&path, e)),
+    }
+    Ok(ServiceInstall {
+        path,
+        status_command: "launchctl print gui/$UID/dev.a2a.mesh-gateway",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn install_service_for_platform(
+    exe: &Path,
+    home_arg: Option<&Path>,
+    log_path: &Path,
+    reload_skipped: bool,
+) -> Result<ServiceInstall, AppError> {
+    let path = home_dir()?.join(".config/systemd/user/a2a-mesh-gateway.service");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+    }
+    let args = service_args(exe, home_arg);
+    std::fs::write(&path, systemd_unit(&args, log_path)).map_err(|e| io_error(&path, e))?;
+    if !reload_skipped {
+        run_service_command(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+        run_service_command(Command::new("systemctl").args([
+            "--user",
+            "enable",
+            "--now",
+            "a2a-mesh-gateway.service",
+        ]))?;
+    }
+    Ok(ServiceInstall {
+        path,
+        status_command: "systemctl --user status a2a-mesh-gateway.service",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_service_for_platform(reload_skipped: bool) -> Result<ServiceInstall, AppError> {
+    let path = home_dir()?.join(".config/systemd/user/a2a-mesh-gateway.service");
+    if !reload_skipped {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "a2a-mesh-gateway.service"])
+            .status();
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(&path, e)),
+    }
+    if !reload_skipped {
+        run_service_command(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+    }
+    Ok(ServiceInstall {
+        path,
+        status_command: "systemctl --user status a2a-mesh-gateway.service",
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn install_service_for_platform(
+    _exe: &Path,
+    _home_arg: Option<&Path>,
+    _log_path: &Path,
+    _reload_skipped: bool,
+) -> Result<ServiceInstall, AppError> {
+    Err(service_error("gateway service install is supported on macOS and Linux"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn uninstall_service_for_platform(_reload_skipped: bool) -> Result<ServiceInstall, AppError> {
+    Err(service_error("gateway service uninstall is supported on macOS and Linux"))
+}
+
+fn service_args(exe: &Path, home_arg: Option<&Path>) -> Vec<PathBuf> {
+    let mut args = vec![exe.to_path_buf()];
+    if let Some(home) = home_arg {
+        args.push(PathBuf::from("--home"));
+        args.push(home.to_path_buf());
+    }
+    args.push(PathBuf::from("mesh"));
+    args.push(PathBuf::from("gateway"));
+    args.push(PathBuf::from("run"));
+    args
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_plist(args: &[PathBuf], log_path: &Path) -> String {
+    let mut plist = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.a2a.mesh-gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+"#,
+    );
+    for arg in args {
+        plist.push_str("    <string>");
+        plist.push_str(&xml_escape(&arg.to_string_lossy()));
+        plist.push_str("</string>\n");
+    }
+    plist.push_str(
+        r#"  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>"#,
+    );
+    plist.push_str(&xml_escape(&log_path.to_string_lossy()));
+    plist.push_str(
+        r#"</string>
+  <key>StandardErrorPath</key>
+  <string>"#,
+    );
+    plist.push_str(&xml_escape(&log_path.to_string_lossy()));
+    plist.push_str(
+        r#"</string>
+</dict>
+</plist>
+"#,
+    );
+    plist
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit(args: &[PathBuf], log_path: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=a2a mesh gateway\n\n[Service]\nExecStart={}\nRestart=always\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+        args.iter()
+            .map(|arg| systemd_quote(&arg.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        systemd_quote(&log_path.to_string_lossy()),
+        systemd_quote(&log_path.to_string_lossy())
+    )
+}
+
+fn home_dir() -> Result<PathBuf, AppError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| service_error("HOME is not set"))
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_quote(text: &str) -> String {
+    if text
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b':' | b'='))
+    {
+        return text.to_string();
+    }
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(target_os = "linux")]
+fn run_service_command(cmd: &mut Command) -> Result<(), AppError> {
+    let status = cmd
+        .status()
+        .map_err(|e| service_error(format!("running service command: {e}")))?;
+    if !status.success() {
+        return Err(service_error(format!("service command exited with {status}")));
+    }
+    Ok(())
+}
+
+fn service_error(message: impl Into<String>) -> AppError {
+    AppError::new("GATEWAY_SERVICE", ExitCode::Precondition, message)
 }
 
 pub fn status(home: &A2aHome, json_mode: bool) -> Result<Outcome, AppError> {

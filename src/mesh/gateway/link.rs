@@ -83,6 +83,10 @@ impl PeerDamping {
             .unwrap_or(true)
     }
 
+    pub fn reset_peer(&mut self, peer_gateway_id: &str) {
+        self.peers.remove(peer_gateway_id);
+    }
+
     pub fn record_connect_drop(
         &mut self,
         peer_gateway_id: &str,
@@ -354,6 +358,10 @@ impl LinkStateHandle {
             .lock()
             .await
             .record_connect_drop(peer_gateway_id, now, cooldown)
+    }
+
+    pub async fn reset_peer_damping(&self, peer_gateway_id: &str) {
+        self.inner.damping.lock().await.reset_peer(peer_gateway_id);
     }
 
     pub async fn health(&self) -> replicate::ReplicationHealth {

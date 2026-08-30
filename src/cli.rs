@@ -456,7 +456,7 @@ pub enum MeshCmd {
         #[arg(long = "ref-worker", value_name = "ID")]
         ref_worker: Vec<String>,
     },
-    /// Read the shared mesh feed
+    /// Read the shared mesh feed; with --follow, --json prints one entry object per line
     Feed {
         /// Only entries strictly after this seq
         #[arg(long, value_name = "SEQ")]
@@ -464,6 +464,9 @@ pub enum MeshCmd {
         /// Emit full feed entries as JSON
         #[arg(long)]
         json: bool,
+        /// Keep printing feed entries as they appear; with --json this is JSONL
+        #[arg(long)]
+        follow: bool,
     },
     /// Send a directed mesh note to a peer or worker id
     Note {

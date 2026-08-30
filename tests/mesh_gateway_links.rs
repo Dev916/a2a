@@ -15,10 +15,11 @@ use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use rand::{rngs::StdRng, SeedableRng};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -194,6 +195,98 @@ async fn discovery_orders_deduped_links_and_damped_side_still_accepts_inbound() 
     assert_eq!(
         damping.health(now + chrono::Duration::seconds(121))["gw-b"]["state"],
         "cooldown"
+    );
+}
+
+#[test]
+fn peer_damping_reset_peer_drops_cooldown_and_flap_history() {
+    let mut damping = PeerDamping::new(Duration::from_secs(300));
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    assert!(damping
+        .record_connect_drop("gw-b", now, Duration::from_secs(1_920))
+        .is_none());
+    assert!(damping
+        .record_connect_drop(
+            "gw-b",
+            now + chrono::Duration::seconds(60),
+            Duration::from_secs(1_920)
+        )
+        .is_none());
+    assert!(damping
+        .record_connect_drop(
+            "gw-b",
+            now + chrono::Duration::seconds(120),
+            Duration::from_secs(1_920)
+        )
+        .is_some());
+    assert!(!damping.can_dial("gw-b", now + chrono::Duration::seconds(121)));
+
+    damping.reset_peer("gw-b");
+
+    assert!(damping.can_dial("gw-b", now + chrono::Duration::seconds(121)));
+    assert!(damping.health(now + chrono::Duration::seconds(121))["gw-b"].is_null());
+}
+
+#[test]
+fn refresh_dial_state_resets_changed_rows_preserves_unchanged_and_forgets_vanished_peers() {
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let mut last_seen = BTreeMap::from([
+        (
+            "gw-b".to_string(),
+            (Some("wss://127.0.0.1:1".to_string()), Some("old-cert".to_string())),
+        ),
+        (
+            "gw-c".to_string(),
+            (Some("wss://127.0.0.1:3".to_string()), Some("gw-c-cert".to_string())),
+        ),
+        (
+            "gw-d".to_string(),
+            (Some("wss://127.0.0.1:4".to_string()), Some("gw-d-cert".to_string())),
+        ),
+    ]);
+    let mut attempts = BTreeMap::from([
+        ("gw-b".to_string(), 4),
+        ("gw-c".to_string(), 2),
+        ("gw-d".to_string(), 7),
+    ]);
+    let mut next_dial_after = BTreeMap::from([
+        ("gw-b".to_string(), Instant::now() + Duration::from_secs(600)),
+        ("gw-c".to_string(), Instant::now() + Duration::from_secs(600)),
+        ("gw-d".to_string(), Instant::now() + Duration::from_secs(600)),
+    ]);
+    let mut damping = PeerDamping::new(Duration::from_secs(300));
+    for offset in [0, 60, 120] {
+        let _ = damping.record_connect_drop(
+            "gw-b",
+            now + chrono::Duration::seconds(offset),
+            Duration::from_secs(1_920),
+        );
+    }
+    assert!(!damping.can_dial("gw-b", now + chrono::Duration::seconds(121)));
+
+    let mut changed = row("gw-b", Some("wss://127.0.0.1:2"));
+    changed.cert_fpr = Some("old-cert".to_string());
+    let unchanged = row("gw-c", Some("wss://127.0.0.1:3"));
+    let reset = a2a::mesh::gateway::refresh_dial_state(
+        &mut last_seen,
+        &[changed, unchanged],
+        &mut attempts,
+        &mut next_dial_after,
+        &mut damping,
+    );
+
+    assert_eq!(reset, vec!["gw-b".to_string()]);
+    assert!(!attempts.contains_key("gw-b"));
+    assert!(!next_dial_after.contains_key("gw-b"));
+    assert!(damping.can_dial("gw-b", now + chrono::Duration::seconds(121)));
+    assert_eq!(attempts.get("gw-c"), Some(&2));
+    assert!(next_dial_after.contains_key("gw-c"));
+    assert!(!last_seen.contains_key("gw-d"));
+    assert!(!attempts.contains_key("gw-d"));
+    assert!(!next_dial_after.contains_key("gw-d"));
+    assert_eq!(
+        last_seen.get("gw-b"),
+        Some(&(Some("wss://127.0.0.1:2".to_string()), Some("old-cert".to_string())))
     );
 }
 

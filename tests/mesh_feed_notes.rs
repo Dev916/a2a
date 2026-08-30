@@ -4,8 +4,15 @@ use a2a::state::WorkerSnapshot;
 use assert_cmd::Command;
 use serde_json::{json, Value};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const FOLLOW_POLL: Duration = Duration::from_millis(25);
+const FOLLOW_DEADLINE: Duration = Duration::from_secs(5);
 
 fn cli(home: &Path) -> Command {
     let mut c = Command::cargo_bin("a2a").unwrap();
@@ -17,6 +24,98 @@ fn cli(home: &Path) -> Command {
         .env_remove("A2A_SHIM_BIN")
         .env_remove("A2A_BROKER_DISABLE");
     c
+}
+
+fn a2a_bin() -> PathBuf {
+    assert_cmd::cargo::cargo_bin("a2a")
+}
+
+struct FeedFollower {
+    child: std::process::Child,
+    lines: Arc<Mutex<Vec<String>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FeedFollower {
+    fn start(home: &Path, json: bool) -> Self {
+        let mut cmd = std::process::Command::new(a2a_bin());
+        cmd.arg("--home").arg(home).args(["mesh", "feed", "--follow"]);
+        if json {
+            cmd.arg("--json");
+        }
+        let mut child = cmd
+            .env_remove("A2A_HOME")
+            .env_remove("CLAUDE_SESSION_ID")
+            .env_remove("BEADS_ACTOR")
+            .env_remove("A2A_JSON")
+            .env_remove("A2A_BROKER_BIN")
+            .env_remove("A2A_SHIM_BIN")
+            .env_remove("A2A_BROKER_DISABLE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("feed follower starts");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => sink.lock().unwrap().push(line),
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            child,
+            lines,
+            reader: Some(reader),
+        }
+    }
+
+    fn lines_now(&self) -> Vec<String> {
+        self.lines.lock().unwrap().clone()
+    }
+
+    fn interrupt(mut self) -> i32 {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGINT,
+        )
+        .unwrap();
+        let deadline = Instant::now() + FOLLOW_DEADLINE;
+        let status = loop {
+            match self.child.try_wait().expect("try_wait") {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("feed follower did not exit after SIGINT");
+                }
+                None => std::thread::sleep(FOLLOW_POLL),
+            }
+        };
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        status.code().unwrap_or(-1)
+    }
+}
+
+fn wait_for_feed_line(follower: &FeedFollower, text: &str) -> Vec<String> {
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    loop {
+        let lines = follower.lines_now();
+        if lines.iter().any(|line| line.contains(text)) {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {text:?}; lines so far: {lines:?}"
+        );
+        std::thread::sleep(FOLLOW_POLL);
+    }
 }
 
 fn feed_json(home: &Path, since: Option<u64>) -> Vec<Value> {
@@ -190,6 +289,68 @@ fn post_reads_stdin_or_message_file_and_feed_since_is_strictly_after() {
     assert!(stdout.contains("from stdin"));
     assert!(stdout.contains("from file"));
     assert!(!stdout.contains("second line"));
+}
+
+#[test]
+fn feed_follow_prints_backlog_then_only_new_entries_and_sigint_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = "77777777-7777-7777-7777-777777777777";
+
+    cli(tmp.path())
+        .args(["mesh", "post", "--session", session, "follow backlog"])
+        .assert()
+        .success();
+
+    let follower = FeedFollower::start(tmp.path(), false);
+    wait_for_feed_line(&follower, "follow backlog");
+
+    cli(tmp.path())
+        .args(["mesh", "post", "--session", session, "follow live"])
+        .assert()
+        .success();
+
+    let lines = wait_for_feed_line(&follower, "follow live");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("follow live"))
+            .count(),
+        1,
+        "live entry should be printed exactly once: {lines:?}"
+    );
+    assert_eq!(follower.interrupt(), 0);
+}
+
+#[test]
+fn feed_follow_json_is_one_entry_per_line_for_backlog_and_live_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = "88888888-8888-8888-8888-888888888888";
+
+    cli(tmp.path())
+        .args(["mesh", "post", "--session", session, "json backlog"])
+        .assert()
+        .success();
+
+    let follower = FeedFollower::start(tmp.path(), true);
+    wait_for_feed_line(&follower, "json backlog");
+
+    cli(tmp.path())
+        .args(["mesh", "post", "--session", session, "json live"])
+        .assert()
+        .success();
+
+    let lines = wait_for_feed_line(&follower, "json live");
+    let objects: Vec<Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("jsonl entry ({e}): {line}")))
+        .collect();
+    assert_eq!(objects.iter().filter(|v| v["text"] == "json backlog").count(), 1);
+    assert_eq!(objects.iter().filter(|v| v["text"] == "json live").count(), 1);
+    assert!(
+        objects.iter().all(|v| v["schema_version"].is_null()),
+        "follow --json prints entries, not envelopes: {objects:?}"
+    );
+    assert_eq!(follower.interrupt(), 0);
 }
 
 #[test]

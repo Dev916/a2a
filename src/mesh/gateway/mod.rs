@@ -43,6 +43,55 @@ pub const GATEWAY_HEALTH: &str = "gateway-health.json";
 pub const GATEWAY_JSONL: &str = "gateway.jsonl";
 pub const GATEWAY_DAEMON_LOG: &str = "gateway.daemon.log";
 pub const HEALTH_SCHEMA_VERSION: u32 = 1;
+
+pub type DialPeerRowIdentity = (Option<String>, Option<String>);
+
+pub fn refresh_dial_state(
+    last_seen: &mut BTreeMap<String, DialPeerRowIdentity>,
+    rows: &[registry::GatewayRow],
+    attempts: &mut BTreeMap<String, u32>,
+    next_dial_after: &mut BTreeMap<String, Instant>,
+    damping: &mut link::PeerDamping,
+) -> Vec<String> {
+    let reset = refresh_dial_state_maps(last_seen, rows, attempts, next_dial_after);
+    for peer in &reset {
+        damping.reset_peer(peer);
+    }
+    reset
+}
+
+fn refresh_dial_state_maps(
+    last_seen: &mut BTreeMap<String, DialPeerRowIdentity>,
+    rows: &[registry::GatewayRow],
+    attempts: &mut BTreeMap<String, u32>,
+    next_dial_after: &mut BTreeMap<String, Instant>,
+) -> Vec<String> {
+    let mut current = BTreeMap::new();
+    for row in rows {
+        current.insert(row.gateway_id.clone(), row_identity(row));
+    }
+
+    last_seen.retain(|peer, _| current.contains_key(peer));
+    attempts.retain(|peer, _| current.contains_key(peer));
+    next_dial_after.retain(|peer, _| current.contains_key(peer));
+
+    let mut reset = Vec::new();
+    for (peer, identity) in current {
+        match last_seen.insert(peer.clone(), identity.clone()) {
+            Some(previous) if previous != identity => {
+                attempts.remove(&peer);
+                next_dial_after.remove(&peer);
+                reset.push(peer);
+            }
+            _ => {}
+        }
+    }
+    reset
+}
+
+fn row_identity(row: &registry::GatewayRow) -> DialPeerRowIdentity {
+    (row.endpoint_url.clone(), row.cert_fpr.clone())
+}
 pub const MAX_RESTARTS: usize = 5;
 pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
 
@@ -1450,6 +1499,7 @@ async fn dialer_loop(
     let mut sessions = JoinSet::new();
     let mut attempts = BTreeMap::<String, u32>::new();
     let mut next_dial_after = BTreeMap::<String, Instant>::new();
+    let mut last_seen = BTreeMap::<String, DialPeerRowIdentity>::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut poll = tokio::time::interval(Duration::from_secs(
         cfg.config.mesh.gateway.replication_poll_secs.max(1),
@@ -1476,6 +1526,14 @@ async fn dialer_loop(
             }
             _ = poll.tick() => {
                 let rows = cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await?;
+                for peer in refresh_dial_state_maps(
+                    &mut last_seen,
+                    &rows,
+                    &mut attempts,
+                    &mut next_dial_after,
+                ) {
+                    cfg.links.reset_peer_damping(&peer).await;
+                }
                 cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
                 for row in link::discover_outbound_peers(&cfg.registry.row.gateway_id, &rows) {
                     if next_dial_after

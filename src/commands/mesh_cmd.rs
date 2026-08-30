@@ -18,8 +18,10 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::time::Duration;
 
 const MESH_L2_MIGRATION_SQL: &str = include_str!("../../migrations/mesh_l2_0001.sql");
+const FEED_FOLLOW_POLL: Duration = Duration::from_secs(1);
 
 pub fn run(
     home: &A2aHome,
@@ -94,7 +96,15 @@ pub fn run(
             let seq = feed::post(home, cfg, &id, &text, refs(ref_beads, ref_worker))?;
             Ok(Outcome::from(json!(seq)))
         }
-        MeshCmd::Feed { since, json } => {
+        MeshCmd::Feed {
+            since,
+            json,
+            follow,
+        } => {
+            if *follow {
+                follow_feed(home, since.unwrap_or(0), json_mode || *json)?;
+                std::process::exit(0);
+            }
             let entries = feed::read(home, since.unwrap_or(0))?;
             if json_mode || *json {
                 let value = serde_json::to_value(entries).map_err(|e| {
@@ -333,6 +343,58 @@ fn note_text(stdin: Option<&str>, message_file: Option<&Path>) -> Result<String,
             "provide note text on stdin `-` or --message-file",
         )),
     }
+}
+
+fn follow_feed(home: &A2aHome, since: u64, json: bool) -> Result<(), AppError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AppError::new("ASYNC", ExitCode::Internal, format!("starting runtime: {e}")))?;
+    runtime.block_on(async move {
+        let mut cursor = since;
+        loop {
+            let entries = feed::read(home, cursor)?;
+            if !entries.is_empty() {
+                print_feed_entries(&entries, json)?;
+                cursor = entries
+                    .iter()
+                    .map(|entry| entry.seq)
+                    .max()
+                    .unwrap_or(cursor);
+            }
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|e| {
+                        AppError::new("SIGNAL", ExitCode::Internal, format!("waiting for Ctrl-C: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(FEED_FOLLOW_POLL) => {}
+            }
+        }
+    })
+}
+
+fn print_feed_entries(entries: &[FeedEntry], json: bool) -> Result<(), AppError> {
+    if json {
+        for entry in entries {
+            let value = serde_json::to_value(entry).map_err(|e| {
+                AppError::new("DATA", ExitCode::Internal, format!("serializing feed: {e}"))
+            })?;
+            let value = crate::commands::tail::redact_value(&value);
+            println!("{}", serde_json::to_string(&value).map_err(|e| {
+                AppError::new("DATA", ExitCode::Internal, format!("serializing feed: {e}"))
+            })?);
+        }
+    } else {
+        let text = human_feed(entries);
+        if !text.is_empty() {
+            println!("{text}");
+        }
+    }
+    std::io::stdout()
+        .flush()
+        .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("flushing stdout: {e}")))
 }
 
 fn refs(beads: &[String], workers: &[String]) -> Value {

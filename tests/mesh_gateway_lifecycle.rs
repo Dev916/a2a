@@ -429,6 +429,54 @@ fn all_real_gateway_slots_boot_with_file_registry_and_shutdown_gracefully() {
 }
 
 #[test]
+fn registry_unreachable_does_not_restart_or_escalate_gateway_loops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    prepare_gateway_home(&home, &std::path::PathBuf::from("/nonexistent/a2a-registry-blip"));
+    std::fs::write(
+        home.join("config.toml"),
+        "[mesh.gateway]\nexpose = \"none\"\nregistry_heartbeat_secs = 1\nreplication_poll_secs = 1\nanti_entropy_secs = 1\n",
+    )
+    .unwrap();
+
+    let mut child = spawn_gateway(&home, &work, &[]);
+    let health = wait_for_health_with(&home, |health| {
+        ["registry", "server", "dialer", "watcher", "anti-entropy"]
+            .into_iter()
+            .all(|slot| health["loops"][slot]["state"] == "running")
+            && ["registry", "server", "dialer", "watcher", "anti-entropy"]
+                .into_iter()
+                .all(|slot| health["loops"][slot]["restarts"].as_u64() == Some(0))
+            && health["registry_error"].is_string()
+            && health["registry_error_since"].is_string()
+    });
+    assert_eq!(health["state"], "running");
+    assert!(
+        health["registry_error"]
+            .as_str()
+            .unwrap()
+            .contains("creating file registry"),
+        "{health}"
+    );
+    let log = wait_for_log_contains(&home, r#""kind":"registry_error""#);
+    assert!(log.contains(r#""kind":"registry_error""#), "{log}");
+    assert!(log.contains(r#""state":"down""#), "{log}");
+    assert!(!log.contains(r#""kind":"loop_exit""#), "{log}");
+    assert!(!log.contains(r#""kind":"escalation""#), "{log}");
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "stop"])
+        .assert()
+        .success();
+    assert_exits(&mut child, Duration::from_secs(3));
+    let health = read_health(&home);
+    assert_eq!(health["state"], "stopped");
+    assert_eq!(health["shutdown"]["graceful"], true);
+}
+
+#[test]
 fn gateway_startup_without_root_or_token_fails_not_enrolled() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -706,6 +754,20 @@ fn read_health(home: &std::path::Path) -> Value {
         &std::fs::read_to_string(home.join("mesh").join("gateway-health.json")).unwrap(),
     )
     .unwrap()
+}
+
+fn wait_for_log_contains(home: &std::path::Path, needle: &str) -> String {
+    let path = home.join("mesh").join("gateway.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if text.contains(needle) {
+                return text;
+            }
+        }
+        assert!(Instant::now() < deadline, "gateway log did not contain {needle}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn assert_exits(child: &mut Child, patience: Duration) {

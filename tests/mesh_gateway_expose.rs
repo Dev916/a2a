@@ -1,6 +1,7 @@
 use a2a::mesh::gateway::expose::{
-    run_exposure_loop, Exposure, ExposurePublisher, ExposureRow, ManualExposure, NgrokApi,
-    NgrokExposure, NgrokTunnel, NgrokTunnelConfig, NgrokTunnels, NoneExposure,
+    run_exposure_loop, run_exposure_loop_with_events, Exposure, ExposurePublisher, ExposureRow,
+    ManualExposure, NgrokApi, NgrokExposure, NgrokTunnel, NgrokTunnelConfig, NgrokTunnels,
+    NoneExposure,
 };
 use a2a::mesh::gateway::link::{accept_once_io, dial_gateway_io};
 use a2a::mesh::gateway::{gateway_root, run_registry_slot_for_test, RegistrySlotParams};
@@ -475,7 +476,92 @@ async fn registry_slot_clears_exposure_error_after_ngrok_recovers() {
 }
 
 #[tokio::test]
-async fn exposure_loop_still_exits_on_registry_failure() {
+async fn registry_slot_retries_registry_write_failures_and_reports_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = a2a::home::A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
+    keys::fleet_init(&home).unwrap();
+    let identity = keys::gateway_identity(&home, false).unwrap();
+    keys::ensure_gateway_token(&home, &SystemClock).unwrap();
+
+    let registry = FlippingRegistry::new(tmp.path().join("registry"), 3);
+    registry.inner.init_schema().unwrap();
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let fleet_id = keys::fleet_id(&home).unwrap();
+    let row = ExposureRow {
+        fleet_id: fleet_id.clone(),
+        gateway_id: identity.gateway_id,
+        owner: "test-owner".to_string(),
+        pubkey_fpr: keys::gateway_public_key_fingerprint(&home).unwrap(),
+        cert_fpr: identity.cert_fpr,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let exposure = ManualExposure::new(Some("wss://manual.example.test:7787".to_string()));
+    let clock = Arc::new(StepClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let token = CancellationToken::new();
+    let root = gateway_root(&home);
+    let run = run_registry_slot_for_test(
+        &root,
+        &cfg,
+        RegistrySlotParams {
+            registry: &registry,
+            exposure: &exposure,
+            publisher: ExposurePublisher::new(row),
+            heartbeat_interval: Duration::from_millis(20),
+            clock: clock.as_ref(),
+            stall_shutdown_slot: None,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+
+    let health = wait_for_health_while_running(&mut run, &root, |health| {
+        health["registry_error"].is_string()
+            && health["registry_error_since"].is_string()
+            && health["loops"]["registry"]["restarts"].as_u64() == Some(0)
+    })
+    .await;
+    assert!(health["registry_error"]
+        .as_str()
+        .unwrap()
+        .contains("registry test failure"));
+    let down = wait_for_log_line_while_running(&mut run, &root, "\"kind\":\"registry_error\"").await;
+    assert!(down.contains("\"state\":\"down\""));
+    assert_eq!(
+        count_log_lines(&root, "\"kind\":\"registry_error\""),
+        1,
+        "down->still-down must not spam registry_error log lines"
+    );
+
+    clock.set(Utc.timestamp_opt(1_700_000_004, 0).unwrap());
+    wait_for_row_in_fleet_while_running(
+        &mut run,
+        &registry.inner,
+        &fleet_id,
+        Some("wss://manual.example.test:7787"),
+    )
+    .await;
+    let health = wait_for_health_while_running(&mut run, &root, |health| {
+        health["registry_error"].is_null()
+            && health["registry_error_since"].is_null()
+            && health["endpoint_url"].as_str() == Some("wss://manual.example.test:7787")
+            && health["loops"]["registry"]["restarts"].as_u64() == Some(0)
+    })
+    .await;
+    assert_eq!(health["loops"]["registry"]["last_exit"], serde_json::Value::Null);
+    let recovered =
+        wait_for_log_line_while_running(&mut run, &root, "\"state\":\"recovered\"").await;
+    assert!(recovered.contains("\"kind\":\"registry_error\""));
+    assert_eq!(count_log_lines(&root, "\"kind\":\"loop_exit\""), 0);
+
+    token.cancel();
+    tokio::select! {
+        result = &mut run => result.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("registry slot did not stop after cancellation"),
+    }
+}
+
+#[tokio::test]
+async fn exposure_loop_retries_registry_failures_without_exiting() {
     let exposure = ManualExposure::new(Some("wss://example.test:7787".to_string()));
     let clock = StepClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
     let token = CancellationToken::new();
@@ -488,19 +574,47 @@ async fn exposure_loop_still_exits_on_registry_failure() {
         version: "test".to_string(),
     };
     let mut publisher = ExposurePublisher::new(row);
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = FlippingRegistry::new(tmp.path(), 1);
+    registry.inner.init_schema().unwrap();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(4);
 
-    let err = run_exposure_loop(
-        &FailingRegistry,
+    let run = run_exposure_loop_with_events(
+        &registry,
         &exposure,
         &mut publisher,
-        Duration::from_secs(60),
+        Duration::from_millis(20),
         &clock,
-        token,
-    )
-    .await
-    .unwrap_err();
+        token.clone(),
+        Some(events_tx),
+    );
+    tokio::pin!(run);
 
-    assert_eq!(err.code, "REGISTRY_TEST_FAILURE");
+    let first = tokio::select! {
+        result = &mut run => panic!("exposure loop exited on registry failure: {:?}", result),
+        tick = events_rx.recv() => tick.expect("first tick is sent"),
+    };
+    assert!(first.registry_error.is_some());
+    assert!(first.registry_error_since.is_some());
+    assert!(first.registry_error_change.is_some());
+
+    let second = tokio::select! {
+        result = &mut run => panic!("exposure loop exited after registry failure: {:?}", result),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("exposure loop did not retry"),
+        tick = events_rx.recv() => tick.expect("second tick is sent"),
+    };
+    assert!(second.registry_error.is_none());
+    assert!(second.registry_error_since.is_none());
+    assert_eq!(
+        second.endpoint_url.as_deref(),
+        Some("wss://example.test:7787")
+    );
+
+    token.cancel();
+    tokio::select! {
+        result = &mut run => result.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("exposure loop did not stop after cancellation"),
+    }
 }
 
 #[tokio::test]
@@ -836,46 +950,70 @@ impl NgrokApi for FakeNgrok {
     }
 }
 
-struct FailingRegistry;
+struct FlippingRegistry {
+    inner: FileRegistry,
+    failures_remaining: Mutex<usize>,
+}
 
-impl Registry for FailingRegistry {
-    async fn upsert_self(&self, _row: GatewayRow) -> Result<(), AppError> {
-        Err(registry_test_failure())
+impl FlippingRegistry {
+    fn new(root: impl AsRef<std::path::Path>, failures: usize) -> Self {
+        Self {
+            inner: FileRegistry::new(root),
+            failures_remaining: Mutex::new(failures),
+        }
+    }
+
+    fn maybe_fail(&self) -> Result<(), AppError> {
+        let mut remaining = self.failures_remaining.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            Err(registry_test_failure())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Registry for FlippingRegistry {
+    async fn upsert_self(&self, row: GatewayRow) -> Result<(), AppError> {
+        self.maybe_fail()?;
+        self.inner.upsert_self(row).await
     }
 
     async fn heartbeat(
         &self,
-        _fleet_id: &str,
-        _gateway_id: &str,
-        _now: DateTime<Utc>,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        Err(registry_test_failure())
+        self.maybe_fail()?;
+        self.inner.heartbeat(fleet_id, gateway_id, now).await
     }
 
-    async fn discover(&self, _fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
-        Err(registry_test_failure())
+    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        self.inner.discover(fleet_id).await
     }
 
     async fn retire_self(
         &self,
-        _fleet_id: &str,
-        _gateway_id: &str,
-        _now: DateTime<Utc>,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        Err(registry_test_failure())
+        self.inner.retire_self(fleet_id, gateway_id, now).await
     }
 
     async fn revoke(
         &self,
-        _fleet_id: &str,
-        _gateway_id: &str,
-        _now: DateTime<Utc>,
+        fleet_id: &str,
+        gateway_id: &str,
+        now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        Err(registry_test_failure())
+        self.inner.revoke(fleet_id, gateway_id, now).await
     }
 
     async fn schema_version(&self) -> Result<i32, AppError> {
-        Err(registry_test_failure())
+        self.inner.schema_version().await
     }
 }
 

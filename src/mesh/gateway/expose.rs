@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::mesh::keys::Clock;
 use crate::mesh::registry::{GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
 use crate::output::{AppError, ExitCode};
+use super::RegistryErrorChange;
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::Deserialize;
@@ -143,6 +144,9 @@ pub struct ExposureTick {
     pub exposure_error: Option<String>,
     pub exposure_error_since: Option<DateTime<Utc>>,
     pub exposure_error_change: Option<ExposureErrorChange>,
+    pub registry_error: Option<String>,
+    pub registry_error_since: Option<DateTime<Utc>>,
+    pub registry_error_change: Option<RegistryErrorChange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +169,7 @@ pub struct ExposurePublisher {
     last_endpoint_url: Option<Option<String>>,
     created_at: Option<DateTime<Utc>>,
     exposure_error: Option<ExposureErrorState>,
+    registry_error: Option<ExposureErrorState>,
 }
 
 impl ExposurePublisher {
@@ -174,6 +179,7 @@ impl ExposurePublisher {
             last_endpoint_url: None,
             created_at: None,
             exposure_error: None,
+            registry_error: None,
         }
     }
 
@@ -190,9 +196,13 @@ impl ExposurePublisher {
         let endpoint_url = match exposure.current_url().await {
             Ok(endpoint_url) => endpoint_url,
             Err(err) => {
-                registry
+                let registry_error_change = match registry
                     .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
-                    .await?;
+                    .await
+                {
+                    Ok(()) => self.clear_registry_error(),
+                    Err(err) => self.record_registry_error(&err, now),
+                };
                 let message = format!("{}: {}", err.code, err.message);
                 let exposure_error_change = match &mut self.exposure_error {
                     Some(state) => {
@@ -213,41 +223,113 @@ impl ExposurePublisher {
                     }
                 };
                 let state = self.exposure_error.as_ref().expect("exposure error recorded");
+                let (registry_error, registry_error_since) = self.registry_error_fields();
                 return Ok(ExposureTick {
                     endpoint_url: self.last_endpoint_url.clone().flatten(),
                     upserted: false,
                     exposure_error: Some(state.message.clone()),
                     exposure_error_since: Some(state.since),
                     exposure_error_change,
+                    registry_error,
+                    registry_error_since,
+                    registry_error_change,
                 });
             }
         };
-        let changed = self
-            .last_endpoint_url
-            .as_ref()
-            .map(|last| last != &endpoint_url)
-            .unwrap_or(true);
-        if changed {
-            let row = self.gateway_row(endpoint_url.clone(), now);
-            registry.upsert_self(row).await?;
-            self.last_endpoint_url = Some(endpoint_url.clone());
-        } else {
-            registry
-                .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
-                .await?;
-        }
         let exposure_error_change = self.exposure_error.take().map(|state| ExposureErrorChange {
             error: None,
             since: Some(state.since),
             suppressed: state.suppressed,
         });
+        let changed = self
+            .last_endpoint_url
+            .as_ref()
+            .map(|last| last != &endpoint_url)
+            .unwrap_or(true);
+        let registry_result = if changed {
+            let row = self.gateway_row(endpoint_url.clone(), now);
+            registry.upsert_self(row).await.map(|()| true)
+        } else {
+            registry
+                .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
+                .await
+                .map(|()| false)
+        };
+        let upserted = match registry_result {
+            Ok(upserted) => {
+                if changed {
+                    self.last_endpoint_url = Some(endpoint_url.clone());
+                }
+                upserted
+            }
+            Err(err) => {
+                let registry_error_change = self.record_registry_error(&err, now);
+                let (registry_error, registry_error_since) = self.registry_error_fields();
+                return Ok(ExposureTick {
+                    endpoint_url: self.last_endpoint_url.clone().flatten(),
+                    upserted: false,
+                    exposure_error: None,
+                    exposure_error_since: None,
+                    exposure_error_change,
+                    registry_error,
+                    registry_error_since,
+                    registry_error_change,
+                });
+            }
+        };
+        let registry_error_change = self.clear_registry_error();
         Ok(ExposureTick {
             endpoint_url,
-            upserted: changed,
+            upserted,
             exposure_error: None,
             exposure_error_since: None,
             exposure_error_change,
+            registry_error: None,
+            registry_error_since: None,
+            registry_error_change,
         })
+    }
+
+    fn record_registry_error(
+        &mut self,
+        err: &AppError,
+        now: DateTime<Utc>,
+    ) -> Option<RegistryErrorChange> {
+        let message = format!("{}: {}", err.code, err.message);
+        match &mut self.registry_error {
+            Some(state) => {
+                state.message = message;
+                state.suppressed = state.suppressed.saturating_add(1);
+                None
+            }
+            None => {
+                self.registry_error = Some(ExposureErrorState {
+                    message: message.clone(),
+                    since: now,
+                    suppressed: 0,
+                });
+                Some(RegistryErrorChange {
+                    error: Some(message),
+                    since: Some(now),
+                    suppressed: 0,
+                })
+            }
+        }
+    }
+
+    fn clear_registry_error(&mut self) -> Option<RegistryErrorChange> {
+        self.registry_error.take().map(|state| RegistryErrorChange {
+            error: None,
+            since: Some(state.since),
+            suppressed: state.suppressed,
+        })
+    }
+
+    fn registry_error_fields(&self) -> (Option<String>, Option<DateTime<Utc>>) {
+        self.registry_error
+            .as_ref()
+            .map(|state| (Some(state.message.clone()), Some(state.since)))
+            .unwrap_or((None, None))
     }
 
     fn gateway_row(&mut self, endpoint_url: Option<String>, now: DateTime<Utc>) -> GatewayRow {

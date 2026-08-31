@@ -195,6 +195,10 @@ pub struct GatewayHealth {
     pub endpoint_url: Option<String>,
     pub exposure_error: Option<String>,
     pub exposure_error_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub registry_error: Option<String>,
+    #[serde(default)]
+    pub registry_error_since: Option<DateTime<Utc>>,
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
     pub replication: replicate::ReplicationHealth,
     pub escalation: Option<Value>,
@@ -214,6 +218,8 @@ impl GatewayHealth {
             endpoint_url: None,
             exposure_error: None,
             exposure_error_since: None,
+            registry_error: None,
+            registry_error_since: None,
             loops: LoopSlot::ALL
                 .into_iter()
                 .map(|slot| (slot, LoopHealth::new(slot)))
@@ -304,8 +310,30 @@ enum LoopEvent {
     Heartbeat(LoopSlot),
     Endpoint(Option<String>),
     ExposureError(ExposureErrorChange),
+    RegistryError(RegistryErrorReport),
     Replication(replicate::ReplicationHealth),
     SessionEnd { slot: LoopSlot, detail: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryErrorChange {
+    pub error: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub suppressed: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RegistryErrorReport {
+    slot: LoopSlot,
+    error: Option<String>,
+    at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct RegistryErrorState {
+    message: String,
+    since: DateTime<Utc>,
+    suppressed: u64,
 }
 
 #[derive(Debug)]
@@ -897,6 +925,7 @@ async fn supervise(
     }
     drop(events_tx);
     let mut restarts: BTreeMap<LoopSlot, VecDeque<Instant>> = BTreeMap::new();
+    let mut registry_error = None;
     let mut last_health_flush = Instant::now();
 
     let outcome = loop {
@@ -933,6 +962,17 @@ async fn supervise(
                         write_health(&root, &mut health).await?;
                         last_health_flush = Instant::now();
                         log.line(exposure_error_log_value(LoopSlot::Registry, &change)).await;
+                    }
+                    LoopEvent::RegistryError(report) => {
+                        if let Some((slot, change)) = apply_registry_error_report(
+                            &mut health,
+                            &mut registry_error,
+                            report,
+                        ) {
+                            write_health(&root, &mut health).await?;
+                            last_health_flush = Instant::now();
+                            log.line(registry_error_log_value(slot, &change)).await;
+                        }
                     }
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
@@ -1091,6 +1131,90 @@ fn exposure_error_log_value(slot: LoopSlot, change: &ExposureErrorChange) -> Val
         None => json!({
             "ts": Utc::now(),
             "kind": "exposure_error",
+            "loop": slot.as_str(),
+            "state": "recovered",
+            "since": change.since,
+            "suppressed": change.suppressed,
+        }),
+    }
+}
+
+fn registry_error_down(slot: LoopSlot, err: &AppError) -> LoopEvent {
+    LoopEvent::RegistryError(RegistryErrorReport {
+        slot,
+        error: Some(format!("{}: {}", err.code, err.message)),
+        at: Utc::now(),
+    })
+}
+
+fn registry_error_recovered(slot: LoopSlot) -> LoopEvent {
+    LoopEvent::RegistryError(RegistryErrorReport {
+        slot,
+        error: None,
+        at: Utc::now(),
+    })
+}
+
+fn apply_registry_error_report(
+    health: &mut GatewayHealth,
+    state: &mut Option<RegistryErrorState>,
+    report: RegistryErrorReport,
+) -> Option<(LoopSlot, RegistryErrorChange)> {
+    match report.error {
+        Some(error) => match state {
+            Some(state) => {
+                state.message = error.clone();
+                state.suppressed = state.suppressed.saturating_add(1);
+                health.registry_error = Some(error);
+                health.registry_error_since = Some(state.since);
+                None
+            }
+            None => {
+                *state = Some(RegistryErrorState {
+                    message: error.clone(),
+                    since: report.at,
+                    suppressed: 0,
+                });
+                health.registry_error = Some(error.clone());
+                health.registry_error_since = Some(report.at);
+                Some((
+                    report.slot,
+                    RegistryErrorChange {
+                        error: Some(error),
+                        since: Some(report.at),
+                        suppressed: 0,
+                    },
+                ))
+            }
+        },
+        None => state.take().map(|state| {
+            health.registry_error = None;
+            health.registry_error_since = None;
+            (
+                report.slot,
+                RegistryErrorChange {
+                    error: None,
+                    since: Some(state.since),
+                    suppressed: state.suppressed,
+                },
+            )
+        }),
+    }
+}
+
+fn registry_error_log_value(slot: LoopSlot, change: &RegistryErrorChange) -> Value {
+    match &change.error {
+        Some(error) => json!({
+            "ts": Utc::now(),
+            "kind": "registry_error",
+            "loop": slot.as_str(),
+            "state": "down",
+            "error": error,
+            "since": change.since,
+        }),
+        None => json!({
+            "ts": Utc::now(),
+            "kind": "registry_error",
             "loop": slot.as_str(),
             "state": "recovered",
             "since": change.since,
@@ -1284,6 +1408,15 @@ where
                 }
             }
             Some(tick) = exposure_rx.recv() => {
+                let registry_report = RegistryErrorReport {
+                    slot,
+                    error: tick.registry_error.clone(),
+                    at: tick.registry_error_since.unwrap_or_else(Utc::now),
+                };
+                if tx.send(LoopEvent::RegistryError(registry_report)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
                 if let Some(change) = tick.exposure_error_change {
                     if tx.send(LoopEvent::ExposureError(change)).await.is_err() {
                         token.cancel();
@@ -1325,6 +1458,7 @@ where
     let (tx, mut rx) = mpsc::channel::<LoopEvent>(LOG_CAPACITY);
     let run = registry_exposure_loop(LoopSlot::Registry, token, tx, params);
     tokio::pin!(run);
+    let mut registry_error = None;
     loop {
         tokio::select! {
             result = &mut run => return result,
@@ -1346,6 +1480,16 @@ where
                         apply_exposure_error_change(&mut health, &change);
                         write_health(root, &mut health).await?;
                         write_jsonl(root, exposure_error_log_value(LoopSlot::Registry, &change));
+                    }
+                    LoopEvent::RegistryError(report) => {
+                        if let Some((slot, change)) = apply_registry_error_report(
+                            &mut health,
+                            &mut registry_error,
+                            report,
+                        ) {
+                            write_health(root, &mut health).await?;
+                            write_jsonl(root, registry_error_log_value(slot, &change));
+                        }
                     }
                     LoopEvent::SessionEnd { .. } => {}
                     LoopEvent::Replication(replication) => {
@@ -1525,7 +1669,22 @@ async fn dialer_loop(
                 }
             }
             _ = poll.tick() => {
-                let rows = cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await?;
+                let rows = match cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await {
+                    Ok(rows) => {
+                        if tx.send(registry_error_recovered(slot)).await.is_err() {
+                            token.cancel();
+                            return Ok(());
+                        }
+                        rows
+                    }
+                    Err(err) => {
+                        if tx.send(registry_error_down(slot, &err)).await.is_err() {
+                            token.cancel();
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
                 for peer in refresh_dial_state_maps(
                     &mut last_seen,
                     &rows,
@@ -1684,8 +1843,21 @@ async fn anti_entropy_loop(
             }
             _ = anti_entropy.tick() => {
                 link::push_anti_entropy_digest(&cfg.home, &cfg.links).await?;
-                let rows = cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await?;
-                cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
+                match cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await {
+                    Ok(rows) => {
+                        if tx.send(registry_error_recovered(slot)).await.is_err() {
+                            token.cancel();
+                            return Ok(());
+                        }
+                        cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
+                    }
+                    Err(err) => {
+                        if tx.send(registry_error_down(slot, &err)).await.is_err() {
+                            token.cancel();
+                            return Ok(());
+                        }
+                    }
+                }
                 presence_wire::retire_stale_origins(
                     &cfg.home,
                     Utc::now(),

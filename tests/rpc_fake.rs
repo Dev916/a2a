@@ -487,7 +487,16 @@ async fn server_requests_are_routed_and_the_turn_waits_for_the_answer() {
     f.assert_quiet().await;
 
     f.client
-        .respond(req.id.clone(), Ok(json!({"decision": "denied"})))
+        .respond(
+            req.id.clone(),
+            Ok(json!({
+                "decision": {
+                    "denied": {
+                        "rejection": "a2a is unattended and denies interactive approval requests"
+                    }
+                }
+            })),
+        )
         .await
         .expect("respond");
 
@@ -569,7 +578,16 @@ async fn the_responder_denies_the_exec_approval_and_only_then_does_the_turn_comp
 
     assert_eq!(answer.method, "execCommandApproval");
     assert_eq!(answer.disposition, Disposition::Denied);
-    assert_eq!(answer.payload, Ok(json!({"decision": "denied"})));
+    assert_eq!(
+        answer.payload,
+        Ok(json!({
+            "decision": {
+                "denied": {
+                    "rejection": "a2a is unattended and denies interactive approval requests"
+                }
+            }
+        }))
+    );
     // What the caller logs as a lifecycle envelope: the pair, not the command.
     assert_eq!(
         answer.raw(),

@@ -18,10 +18,11 @@
 //! * **The payloads are schema-exact, per family.** The deny spellings are *not*
 //!   uniform across methods, and guessing produces a response the server rejects
 //!   — which is indistinguishable from not answering at all. `ReviewDecision`
-//!   (the older `execCommandApproval` / `applyPatchApproval` family) spells it
-//!   `"denied"`; the newer `item/*` approval family spells it `"decline"`;
-//!   elicitation answers on `action`, not `decision`; and a dynamic tool call
-//!   wants a *successful-shaped* response carrying `success:false`.
+//!   (the older `execCommandApproval` / `applyPatchApproval` family) uses the
+//!   tagged `{"denied":{"rejection":…}}` shape; the newer `item/*` approval
+//!   family spells it `"decline"`; elicitation answers on `action`, not
+//!   `decision`; and a dynamic tool call wants a *successful-shaped* response
+//!   carrying `success:false`.
 //!
 //! **Four methods have no deny shape at all.** Their response schemas require
 //! fields `a2a` cannot fabricate — granted permissions, user answers, ChatGPT
@@ -34,11 +35,12 @@
 //! that they still require the impossible fields, so if a deny variant is ever
 //! added upstream this table gets a failing test rather than staying wrong.
 //!
-//! No approval response carries a `reason` field. Human-readable rationale
-//! belongs in the worker's event log — [`Answer::raw`] is the `{method,
-//! disposition}` pair the caller logs as an [`crate::events::EventKind::ServerRequest`]
-//! lifecycle envelope. Routing that envelope to the owning worker is the
-//! broker demux's job, not this module's.
+//! No approval response carries a `reason` field. The legacy review family now
+//! requires a nested `rejection` string, for which a2a sends a fixed generic
+//! explanation. [`Answer::raw`] remains only the `{method, disposition}` pair
+//! the caller logs as an [`crate::events::EventKind::ServerRequest`] lifecycle
+//! envelope. Routing that envelope to the owning worker is the broker demux's
+//! job, not this module's.
 
 use crate::rpc::ServerRequestFrame;
 use serde::{Deserialize, Serialize};
@@ -63,6 +65,9 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// have never heard of that" are different operational events.
 pub const NO_DENY_SHAPE: i64 = -32000;
 
+/// Required by the tagged `ReviewDecision::Denied` payload in codex 0.152.1.
+const APPROVAL_REJECTION: &str = "a2a is unattended and denies interactive approval requests";
+
 /// What `a2a` did with a server→client request, in the vocabulary the worker's
 /// event log uses. Four values, because the four wire families are genuinely
 /// different — collapsing them would make the log unable to distinguish "the
@@ -70,7 +75,7 @@ pub const NO_DENY_SHAPE: i64 = -32000;
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
-    /// `ReviewDecision` family: answered `{"decision":"denied"}`.
+    /// `ReviewDecision` family: answered with a tagged `decision.denied`.
     Denied,
     /// `item/*` approval and elicitation families: answered `"decline"`.
     Declined,
@@ -133,7 +138,11 @@ pub fn respond_to(frame: &ServerRequestFrame) -> Answer {
         // --- ReviewDecision family (snake_case values) ---------------------
         "execCommandApproval" | "applyPatchApproval" => (
             Disposition::Denied,
-            Ok(serde_json::json!({ "decision": "denied" })),
+            Ok(serde_json::json!({
+                "decision": {
+                    "denied": { "rejection": APPROVAL_REJECTION }
+                }
+            })),
         ),
 
         // --- item/* approval family (camelCase values) ---------------------
@@ -273,7 +282,15 @@ mod tests {
             let a = answer(method);
             assert_eq!(a.method, method);
             assert_eq!(a.disposition, Disposition::Denied);
-            assert_eq!(a.payload, Ok(json!({"decision": "denied"})), "{method}");
+            assert_eq!(
+                a.payload,
+                Ok(json!({
+                    "decision": {
+                        "denied": {"rejection": APPROVAL_REJECTION}
+                    }
+                })),
+                "{method}"
+            );
         }
         for method in [
             "item/commandExecution/requestApproval",
@@ -306,7 +323,10 @@ mod tests {
         let new = answer("item/commandExecution/requestApproval")
             .payload
             .unwrap();
-        assert_eq!(old["decision"], "denied");
+        assert_eq!(
+            old["decision"]["denied"]["rejection"],
+            APPROVAL_REJECTION
+        );
         assert_eq!(new["decision"], "decline");
         assert_ne!(old, new);
     }

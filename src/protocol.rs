@@ -285,7 +285,6 @@ pub enum SandboxPolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
     Untrusted,
-    OnFailure,
     OnRequest,
     Never,
     #[serde(other)]
@@ -557,6 +556,7 @@ pub enum ThreadItemKind {
     UserMessage,
     HookPrompt,
     AgentMessage,
+    FunctionCallOutput,
     Plan,
     Reasoning,
     CommandExecution,
@@ -567,6 +567,7 @@ pub enum ThreadItemKind {
     SubAgentActivity,
     WebSearch,
     ImageView,
+    Sleep,
     ImageGeneration,
     EnteredReviewMode,
     ExitedReviewMode,
@@ -588,7 +589,7 @@ impl ThreadItemKind {
 
 /// A thread item, kept deliberately shallow: the discriminant plus the raw
 /// payload. The fold cares about the kind and a couple of well-known fields;
-/// typing all seventeen payloads would be churn with no consumer.
+/// typing all nineteen payloads would be churn with no consumer.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ThreadItem {
     #[serde(rename = "type")]
@@ -824,11 +825,12 @@ mod tests {
 
     #[test]
     fn every_thread_item_discriminant_is_pinned() {
-        // Exactly the camelCase set the 0.140.0 schema defines.
+        // Exactly the camelCase set the 0.152.1 schema defines.
         for (wire, want) in [
             ("userMessage", ThreadItemKind::UserMessage),
             ("hookPrompt", ThreadItemKind::HookPrompt),
             ("agentMessage", ThreadItemKind::AgentMessage),
+            ("functionCallOutput", ThreadItemKind::FunctionCallOutput),
             ("plan", ThreadItemKind::Plan),
             ("reasoning", ThreadItemKind::Reasoning),
             ("commandExecution", ThreadItemKind::CommandExecution),
@@ -839,6 +841,7 @@ mod tests {
             ("subAgentActivity", ThreadItemKind::SubAgentActivity),
             ("webSearch", ThreadItemKind::WebSearch),
             ("imageView", ThreadItemKind::ImageView),
+            ("sleep", ThreadItemKind::Sleep),
             ("imageGeneration", ThreadItemKind::ImageGeneration),
             ("enteredReviewMode", ThreadItemKind::EnteredReviewMode),
             ("exitedReviewMode", ThreadItemKind::ExitedReviewMode),
@@ -962,6 +965,35 @@ mod tests {
             let got: SandboxModeParam = serde_json::from_value(serde_json::json!(wire)).unwrap();
             assert_eq!(got, mode);
         }
+    }
+
+    #[test]
+    fn approval_policy_string_variants_match_the_live_schema() {
+        let raw = std::fs::read_to_string(snapshot_dir().join("v2/ThreadStartParams.json"))
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let live: BTreeSet<String> = doc["definitions"]["AskForApproval"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|branch| branch["enum"].as_array().into_iter().flatten())
+            .filter_map(|value| value.as_str().map(String::from))
+            .collect();
+        let typed: BTreeSet<String> = [
+            ApprovalPolicy::Untrusted,
+            ApprovalPolicy::OnRequest,
+            ApprovalPolicy::Never,
+        ]
+        .into_iter()
+        .map(|policy| {
+            serde_json::to_value(policy)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+        assert_eq!(typed, live);
     }
 
     // --- outbound params vs each snapshot's `required` list -----------------

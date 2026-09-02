@@ -14,7 +14,7 @@ regen costs **zero tokens and needs no auth**.
 
 ## Captured against
 
-- `codex-cli 0.140.0` (`codex --version`), 2026-08-17.
+- `codex-cli 0.152.1` (`codex --version`), 2026-09-02.
 - Version range the binary accepts lives in `config::DEFAULT_CODEX_VERSION_RANGE`
   (`>=0.140, <0.150`). This file does not duplicate it.
 
@@ -76,8 +76,8 @@ Extracted method sets (set-compared, not byte-diffed):
 
 | file | source | count at capture |
 |---|---|---|
-| `client_request_methods.txt` | `ClientRequest.json` → `oneOf[].properties.method.enum[0]`, sorted+deduped | 84 |
-| `server_notification_methods.txt` | `ServerNotification.json`, same extraction | 66 |
+| `client_request_methods.txt` | `ClientRequest.json` → `oneOf[].properties.method.enum[0]`, sorted+deduped | 98 |
+| `server_notification_methods.txt` | `ServerNotification.json`, same extraction | 81 |
 
 ## The two rules
 

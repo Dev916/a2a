@@ -206,7 +206,7 @@ def die(code):
 
 
 # ---------------------------------------------------------------------------
-# payload builders (shaped like the real 0.140.0 frames)
+# payload builders (shaped like the live app-server frames)
 # ---------------------------------------------------------------------------
 
 
@@ -220,6 +220,7 @@ def thread_obj(tid, cwd):
         "preview": "",
         "ephemeral": False,
         "modelProvider": "openai",
+        "projectId": None,
         "createdAt": ts,
         "updatedAt": ts,
         "status": {"type": "idle"},

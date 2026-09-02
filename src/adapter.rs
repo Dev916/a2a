@@ -65,9 +65,12 @@ pub const APP_SERVER_ARGS: [&str; 1] = ["app-server"];
 /// simply never opens a realtime session, so every one of these is noise. Pinned
 /// against `schema/v2-snapshot/server_notification_methods.txt` by a test, so a
 /// new realtime method upstream fails the suite instead of leaking through.
-pub const SUPPRESSED_REALTIME_METHODS: [&str; 8] = [
+pub const SUPPRESSED_REALTIME_METHODS: [&str; 11] = [
     "thread/realtime/closed",
     "thread/realtime/error",
+    "thread/realtime/item/completed",
+    "thread/realtime/item/started",
+    "thread/realtime/item/transcript/delta",
     "thread/realtime/itemAdded",
     "thread/realtime/outputAudio/delta",
     "thread/realtime/sdp",
@@ -699,7 +702,7 @@ mod tests {
             opts.len(),
             SUPPRESSED_NOTIFICATION_METHODS.len() + SUPPRESSED_REALTIME_METHODS.len()
         );
-        assert_eq!(opts.len(), 19);
+        assert_eq!(opts.len(), 22);
         for m in SUPPRESSED_NOTIFICATION_METHODS {
             assert!(opts.contains(&m.to_string()), "{m} missing");
         }

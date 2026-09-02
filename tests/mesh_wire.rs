@@ -9,6 +9,7 @@ use chrono::{TimeZone, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::time::Duration;
 
@@ -85,6 +86,18 @@ fn claims_for(key: &SigningKey, gateway_id: &str, now: i64) -> TokenClaims {
         issued_at: now - 10,
         exp: now + 1_000,
     }
+}
+
+fn hello_sig(key: &SigningKey, nonce: &str) -> String {
+    let nonce_bytes = b64_decode(nonce);
+    let mut digest = Sha256::new();
+    digest.update(b"a2a/hello/v1\0");
+    digest.update(&nonce_bytes);
+    b64_encode(&key.sign(&digest.finalize()).to_bytes())
+}
+
+fn raw_nonce_sig(key: &SigningKey, nonce: &str) -> String {
+    b64_encode(&key.sign(nonce.as_bytes()).to_bytes())
 }
 
 fn identity(home: &A2aHome, key: SigningKey, gateway_id: &str, now: i64) -> HandshakeIdentity {
@@ -237,6 +250,157 @@ async fn mutual_handshake_accepts_tokens_and_proves_nonce_ownership_both_directi
 
     assert_eq!(accept_claims.gateway_id, "gw-dial-222222");
     assert_eq!(dial_claims.gateway_id, "gw-accept-111111");
+}
+
+#[tokio::test]
+async fn dialer_refuses_malformed_peer_challenge_before_sending_hello() {
+    let invalid_nonces = [
+        "short".to_string(),
+        "!".repeat(44),
+        b64_encode(&[7u8; 31]),
+    ];
+
+    for invalid_nonce in invalid_nonces {
+        let now = 1_700_000_000;
+        let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_in(&tmp);
+        fleet_init(&home).unwrap();
+        let dial_id = identity(&home, signing_key(), "gw-dial-222222", now);
+        let roots = RootSet::load(&home).unwrap();
+        let (mut peer, mut dial) = test_link(&clock).await;
+        let dial_task =
+            tokio::spawn(
+                async move { handshake_dialer(&mut dial, &dial_id, &roots, &clock).await },
+            );
+
+        peer.send(&Frame::Challenge {
+            nonce: invalid_nonce,
+        })
+        .await
+        .unwrap();
+        let refusal = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refusal,
+            Some(Frame::Err {
+                code: "HANDSHAKE_BAD_NONCE".to_string(),
+                detail: "challenge nonce must be 44 chars of base64 decoding to 32 bytes"
+                    .to_string(),
+            })
+        );
+        let err = tokio::time::timeout(Duration::from_secs(1), dial_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.code, "HANDSHAKE_BAD_NONCE");
+    }
+}
+
+#[tokio::test]
+async fn acceptor_refuses_malformed_peer_challenge_before_sending_hello() {
+    let invalid_nonces = [
+        "short".to_string(),
+        "!".repeat(44),
+        b64_encode(&[7u8; 31]),
+    ];
+
+    for invalid_nonce in invalid_nonces {
+        let now = 1_700_000_000;
+        let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_in(&tmp);
+        fleet_init(&home).unwrap();
+        let accept_id = identity(&home, signing_key(), "gw-accept-111111", now);
+        let dial_key = signing_key();
+        let dial_token = sign_token(&claims_for(&dial_key, "gw-dial-222222", now), &home).unwrap();
+        let roots = RootSet::load(&home).unwrap();
+        let (mut accept, mut dial) = test_link(&clock).await;
+        let accept_task =
+            tokio::spawn(
+                async move { handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await },
+            );
+
+        let Frame::Challenge {
+            nonce: accept_nonce,
+        } = dial.recv().await.unwrap().unwrap()
+        else {
+            panic!("expected acceptor challenge");
+        };
+        dial.send(&Frame::Hello {
+            token: dial_token,
+            nonce_sig: hello_sig(&dial_key, &accept_nonce),
+        })
+        .await
+        .unwrap();
+        dial.send(&Frame::Challenge {
+            nonce: invalid_nonce,
+        })
+        .await
+        .unwrap();
+
+        let refusal = tokio::time::timeout(Duration::from_secs(1), dial.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refusal,
+            Some(Frame::Err {
+                code: "HANDSHAKE_BAD_NONCE".to_string(),
+                detail: "challenge nonce must be 44 chars of base64 decoding to 32 bytes"
+                    .to_string(),
+            })
+        );
+        let err = accept_task.await.unwrap().unwrap_err();
+        assert_eq!(err.code, "HANDSHAKE_BAD_NONCE");
+    }
+}
+
+#[tokio::test]
+async fn old_raw_nonce_hello_signature_no_longer_verifies() {
+    let now = 1_700_000_000;
+    let clock = TestClock::new(Utc.timestamp_opt(now, 0).unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    fleet_init(&home).unwrap();
+    let accept_id = identity(&home, signing_key(), "gw-accept-111111", now);
+    let dial_key = signing_key();
+    let dial_token = sign_token(&claims_for(&dial_key, "gw-dial-222222", now), &home).unwrap();
+    let roots = RootSet::load(&home).unwrap();
+    let (mut accept, mut dial) = test_link(&clock).await;
+    let accept_task =
+        tokio::spawn(
+            async move { handshake_acceptor(&mut accept, &accept_id, &roots, &clock).await },
+        );
+
+    let Frame::Challenge { nonce } = dial.recv().await.unwrap().unwrap() else {
+        panic!("expected acceptor challenge");
+    };
+    dial.send(&Frame::Hello {
+        token: dial_token,
+        nonce_sig: raw_nonce_sig(&dial_key, &nonce),
+    })
+    .await
+    .unwrap();
+    dial.send(&Frame::Challenge {
+        nonce: b64_encode(&[3u8; 32]),
+    })
+    .await
+    .unwrap();
+
+    let refusal = tokio::time::timeout(Duration::from_secs(1), dial.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        refusal,
+        Some(Frame::Err { code, .. }) if code == "NONCE_SIG_INVALID"
+    ));
+    let err = accept_task.await.unwrap().unwrap_err();
+    assert_eq!(err.code, "NONCE_SIG_INVALID");
 }
 
 #[tokio::test]

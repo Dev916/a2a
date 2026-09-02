@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, client_async, WebSocketStream};
 
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const HELLO_SIGNATURE_DOMAIN: &[u8] = b"a2a/hello/v1\0";
 
 static RUSTLS_PROVIDER: Once = Once::new();
 
@@ -481,6 +482,13 @@ where
     else {
         return Err(unexpected_frame("challenge"));
     };
+    let peer_nonce = match require_nonce_shape(&peer_nonce) {
+        Ok(peer_nonce) => peer_nonce,
+        Err(err) => {
+            refuse_handshake(side, &err).await;
+            return Err(err);
+        }
+    };
     side.send(&hello_frame(identity, &peer_nonce)).await?;
     Ok(peer)
 }
@@ -497,6 +505,13 @@ where
     let Frame::Challenge { nonce: peer_nonce } = expect_frame(side.recv().await?, "challenge")?
     else {
         return Err(unexpected_frame("challenge"));
+    };
+    let peer_nonce = match require_nonce_shape(&peer_nonce) {
+        Ok(peer_nonce) => peer_nonce,
+        Err(err) => {
+            refuse_handshake(side, &err).await;
+            return Err(err);
+        }
     };
     side.send(&hello_frame(identity, &peer_nonce)).await?;
     let local_nonce = nonce();
@@ -589,8 +604,10 @@ fn verify_hello(
             )
         })?;
     let signature = Signature::from_bytes(&sig_bytes);
+    let nonce = require_nonce_shape(nonce)?;
+    let message = hello_signature_message(&nonce);
     verifying_key
-        .verify(nonce.as_bytes(), &signature)
+        .verify(&message, &signature)
         .map_err(|_| {
             AppError::new(
                 "NONCE_SIG_INVALID",
@@ -601,12 +618,56 @@ fn verify_hello(
     Ok(claims)
 }
 
-fn hello_frame(identity: &HandshakeIdentity, nonce: &str) -> Frame {
-    let sig = identity.signing_key.sign(nonce.as_bytes());
+fn require_nonce_shape(nonce: &str) -> Result<[u8; 32], AppError> {
+    if nonce.len() != 44 {
+        return Err(handshake_bad_nonce());
+    }
+    let bytes: [u8; 32] = b64_decode(nonce)
+        .map_err(|_| handshake_bad_nonce())?
+        .try_into()
+        .map_err(|_| handshake_bad_nonce())?;
+    if b64_encode(&bytes) != nonce {
+        return Err(handshake_bad_nonce());
+    }
+    Ok(bytes)
+}
+
+fn hello_signature_message(nonce: &[u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(HELLO_SIGNATURE_DOMAIN);
+    digest.update(nonce);
+    digest.finalize().into()
+}
+
+fn hello_frame(identity: &HandshakeIdentity, nonce: &[u8; 32]) -> Frame {
+    let message = hello_signature_message(nonce);
+    let sig = identity.signing_key.sign(&message);
     Frame::Hello {
         token: identity.token.clone(),
         nonce_sig: b64_encode(&sig.to_bytes()),
     }
+}
+
+async fn refuse_handshake<S>(side: &mut Side<S>, err: &AppError)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = side
+        .send(&Frame::Err {
+            code: err.code.to_string(),
+            detail: err.message.clone(),
+        })
+        .await;
+    let _ = side.close().await;
+}
+
+fn handshake_bad_nonce() -> AppError {
+    AppError::new(
+        "HANDSHAKE_BAD_NONCE",
+        ExitCode::Precondition,
+        "challenge nonce must be 44 chars of base64 decoding to 32 bytes",
+    )
+    .remedy("upgrade both mesh peers to a2a 0.3.0 or newer and retry the handshake")
 }
 
 fn expect_frame(frame: Option<Frame>, expected: &'static str) -> Result<Frame, AppError> {

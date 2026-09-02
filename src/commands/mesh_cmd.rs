@@ -14,13 +14,12 @@ use crate::mesh::{
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-const MESH_L2_MIGRATION_SQL: &str = include_str!("../../migrations/mesh_l2_0001.sql");
 const FEED_FOLLOW_POLL: Duration = Duration::from_secs(1);
 
 pub fn run(
@@ -501,7 +500,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 write_registry_env(home, &url)?;
                 rt.block_on(async {
                     let registry = open_registry(&url)?;
-                    registry.apply_migration(MESH_L2_MIGRATION_SQL).await
+                    apply_mesh_migrations(&registry).await.map(|_| ())
                 })?;
             }
             Ok(Outcome::from(json!({
@@ -525,6 +524,15 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 return Ok(Outcome::from(json!({ "rows": data })));
             }
             Ok(Outcome::from(Value::String(human_fleet_rows(&data))))
+        }
+        MeshFleetCmd::Migrate => {
+            require_fleet_root_key(home)?;
+            let url = read_registry_env(home)?;
+            let applied = rt.block_on(async {
+                let registry = open_registry(&url)?;
+                apply_mesh_migrations(&registry).await
+            })?;
+            Ok(Outcome::from(json!({ "applied": applied })))
         }
         MeshFleetCmd::Revoke { gateway_id } => {
             let url = read_registry_env(home)?;
@@ -723,6 +731,85 @@ fn registry_input(registry: &str) -> Result<String, AppError> {
         ));
     }
     Ok(url.to_string())
+}
+
+fn require_fleet_root_key(home: &A2aHome) -> Result<(), AppError> {
+    let fleet_dir = home.root().join("mesh").join("fleet");
+    if fleet_dir.join("root.key").exists() {
+        return Ok(());
+    }
+    if fleet_dir.join("root.pub").exists() {
+        return crate::mesh::keys::fleet_init(home).map(|_| ());
+    }
+    Err(AppError::new(
+        "FLEET_ROOT_KEY_MISSING",
+        ExitCode::Precondition,
+        "fleet migration must run on the root machine that holds mesh/fleet/root.key",
+    )
+    .remedy("run `a2a mesh fleet init` on the fleet root machine, or copy registry.env there and retry"))
+}
+
+async fn apply_mesh_migrations(
+    registry: &crate::mesh::registry::RegistryHandle,
+) -> Result<Vec<String>, AppError> {
+    let migrations = mesh_migration_files()?;
+    let mut applied = Vec::with_capacity(migrations.len());
+    for (name, sql) in migrations {
+        registry.apply_migration(&sql).await?;
+        applied.push(name);
+    }
+    Ok(applied)
+}
+
+fn mesh_migration_files() -> Result<Vec<(String, String)>, AppError> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| {
+        AppError::new(
+            "INTERNAL",
+            ExitCode::Internal,
+            format!("reading migrations directory {}: {e}", dir.display()),
+        )
+    })? {
+        let entry = entry.map_err(|e| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("reading migrations directory {}: {e}", dir.display()),
+            )
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("mesh_l") || !name.ends_with(".sql") {
+            continue;
+        }
+        let sql = fs::read_to_string(&path).map_err(|e| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("reading migration {}: {e}", path.display()),
+            )
+        })?;
+        if statement_terminators(&sql) != 1 || !sql.trim_end().ends_with(';') {
+            return Err(AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                format!("migration {name} must contain exactly one SQL statement"),
+            ));
+        }
+        files.push((name.to_string(), sql));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+fn statement_terminators(sql: &str) -> usize {
+    sql.lines()
+        .map(|line| line.split_once("--").map(|(sql, _)| sql).unwrap_or(line))
+        .map(|line| line.matches(';').count())
+        .sum()
 }
 
 fn fleet_row_json(row: GatewayRow, now: chrono::DateTime<Utc>) -> Value {

@@ -560,6 +560,8 @@ pub enum MeshFleetCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Apply all mesh fleet registry migrations; root machine only
+    Migrate,
     /// Mark a gateway revoked in the registry
     Revoke { gateway_id: String },
     /// Mint a root-signed enrollment token for a remote gateway public key

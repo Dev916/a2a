@@ -163,3 +163,43 @@ fn fleet_rotate_root_on_a_joiner_home_refuses_instead_of_minting() {
     assert_eq!(out["error"]["code"], "FLEET_ALREADY_JOINED", "{out}");
     assert!(!join_tmp.path().join("mesh/fleet/root.key").exists());
 }
+
+#[test]
+fn fleet_migrate_is_root_only_and_idempotent() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let registry_dir = root_tmp.path().join("file-registry");
+    let registry_url = format!("file:{}", registry_dir.display());
+
+    cmd(root_tmp.path())
+        .args(["--json", "mesh", "fleet", "init"])
+        .assert()
+        .success();
+    fs::write(
+        root_tmp.path().join("mesh/fleet/registry.env"),
+        format!("{registry_url}\n"),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let migrate = cmd(root_tmp.path())
+            .args(["--json", "mesh", "fleet", "migrate"])
+            .assert()
+            .success();
+        let out = json_out(&migrate);
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["command"], "mesh fleet migrate");
+        assert_eq!(out["data"]["applied"].as_array().unwrap().len(), 2);
+    }
+    assert!(registry_dir.join("mesh_gateways.json").exists());
+    assert!(registry_dir.join("mesh_work_items.json").exists());
+
+    let join_tmp = tempfile::tempdir().unwrap();
+    joiner_home_on_fleet(root_tmp.path(), join_tmp.path());
+    let migrate = cmd(join_tmp.path())
+        .args(["--json", "mesh", "fleet", "migrate"])
+        .assert()
+        .failure();
+    let out = json_out(&migrate);
+    assert_eq!(out["error"]["code"], "FLEET_ALREADY_JOINED", "{out}");
+    assert!(!join_tmp.path().join("mesh/fleet/root.key").exists());
+}

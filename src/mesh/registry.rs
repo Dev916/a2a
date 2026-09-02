@@ -1,12 +1,14 @@
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Acquire, PgPool, Row};
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +19,50 @@ pub const DEFAULT_REGISTRY_HEARTBEAT_SECS: u64 = 180;
 pub const DEFAULT_REGISTRY_TIMEOUT_SECS: u64 = 10;
 
 const FILE_REGISTRY_ROWS: &str = "mesh_gateways.json";
+const FILE_WORK_ROWS: &str = "mesh_work_items.json";
+const FILE_WORK_LOCK: &str = "mesh_work_items.lock";
 const SET_LOCAL_STATEMENT_TIMEOUT: &str = concat!("SET", " LOCAL statement_timeout = ");
+const WORK_SELECT_BY_ID_SQL: &str = concat!(
+    "SELECT ",
+    "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
+    "swept_by, created_at, updated_at, expires_at, schema_version ",
+    "FROM mesh_work_items WHERE fleet_id = $1 AND work_id = $2"
+);
+const WORK_CLAIM_SQL: &str = concat!(
+    "UPDATE mesh_work_items SET status = 'approved', claimed_by = $3, updated_at = now() ",
+    "WHERE fleet_id = $1 AND work_id = $2 AND status = 'offered' ",
+    "AND (addressing = 'pool' OR addressing = $4) RETURNING ",
+    "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
+    "swept_by, created_at, updated_at, expires_at, schema_version"
+);
+const WORK_TRANSITION_SQL: &str = concat!(
+    "UPDATE mesh_work_items SET status = $4, ",
+    "result_ref = CASE WHEN $5 THEN $6 ELSE result_ref END, ",
+    "result_delivery = CASE WHEN $7 THEN $8 ELSE result_delivery END, ",
+    "swept_by = CASE WHEN $9 THEN $10 ELSE swept_by END, ",
+    "updated_at = COALESCE($11, now()) ",
+    "WHERE fleet_id = $1 AND work_id = $2 AND status = $3 ",
+    "AND ($12 = 'any' OR ($12 = 'sender' AND sender_gw = $13) ",
+    "OR ($12 = 'claimer' AND claimed_by = $13)) RETURNING ",
+    "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
+    "swept_by, created_at, updated_at, expires_at, schema_version"
+);
+const WORK_LIST_SQL: &str = concat!(
+    "SELECT ",
+    "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
+    "swept_by, created_at, updated_at, expires_at, schema_version ",
+    "FROM mesh_work_items WHERE fleet_id = $1 ",
+    "AND ($2::text IS NULL OR status = $2) ",
+    "AND ($3::text IS NULL OR claimed_by = $3) ",
+    "ORDER BY created_at, work_id"
+);
+const WORK_SWEEP_ABANDONED_SQL: &str = concat!(
+    "UPDATE mesh_work_items SET status = 'failed', swept_by = $2, updated_at = now() ",
+    "WHERE fleet_id = $1 AND claimed_by = $2 AND status IN ('approved', 'running') ",
+    "AND updated_at < now() - ($3::bigint * interval '1 second') RETURNING ",
+    "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
+    "swept_by, created_at, updated_at, expires_at, schema_version"
+);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayRow {
@@ -32,6 +77,107 @@ pub struct GatewayRow {
     pub last_heartbeat: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub schema_version: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStatus {
+    Offered,
+    Approved,
+    Running,
+    Done,
+    Failed,
+    Acked,
+    Declined,
+    Cancelled,
+    Expired,
+}
+
+impl WorkStatus {
+    fn as_sql(self) -> &'static str {
+        match self {
+            WorkStatus::Offered => "offered",
+            WorkStatus::Approved => "approved",
+            WorkStatus::Running => "running",
+            WorkStatus::Done => "done",
+            WorkStatus::Failed => "failed",
+            WorkStatus::Acked => "acked",
+            WorkStatus::Declined => "declined",
+            WorkStatus::Cancelled => "cancelled",
+            WorkStatus::Expired => "expired",
+        }
+    }
+
+    fn from_sql(value: &str) -> Result<Self, AppError> {
+        match value {
+            "offered" => Ok(WorkStatus::Offered),
+            "approved" => Ok(WorkStatus::Approved),
+            "running" => Ok(WorkStatus::Running),
+            "done" => Ok(WorkStatus::Done),
+            "failed" => Ok(WorkStatus::Failed),
+            "acked" => Ok(WorkStatus::Acked),
+            "declined" => Ok(WorkStatus::Declined),
+            "cancelled" => Ok(WorkStatus::Cancelled),
+            "expired" => Ok(WorkStatus::Expired),
+            _ => Err(AppError::new(
+                "WORK_STATUS_INVALID",
+                ExitCode::Internal,
+                format!("registry returned unknown work status {value:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkRow {
+    pub fleet_id: String,
+    pub work_id: String,
+    pub sender_gw: String,
+    pub addressing: String,
+    pub status: WorkStatus,
+    pub claimed_by: Option<String>,
+    pub result_ref: Option<String>,
+    pub result_delivery: Option<String>,
+    pub swept_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub schema_version: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ClaimOutcome {
+    Won,
+    Lost(WorkRow),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum TransitionOutcome {
+    Applied,
+    Lost(WorkRow),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkOwner {
+    Sender(String),
+    Claimer(String),
+    Any,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkPatch {
+    pub result_ref: Option<Option<String>>,
+    pub result_delivery: Option<Option<String>>,
+    pub swept_by: Option<Option<String>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkListFilter {
+    pub status: Option<WorkStatus>,
+    pub claimed_by: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -73,6 +219,45 @@ pub trait Registry {
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
     async fn schema_version(&self) -> Result<i32, AppError>;
+    async fn work_insert(&self, row: WorkRow) -> Result<(), AppError>;
+    async fn work_claim(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer_gw: &str,
+    ) -> Result<ClaimOutcome, AppError>;
+    async fn work_transition(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        from: WorkStatus,
+        to: WorkStatus,
+        owner: WorkOwner,
+        patch: WorkPatch,
+    ) -> Result<TransitionOutcome, AppError>;
+    async fn work_get(&self, fleet_id: &str, work_id: &str) -> Result<Option<WorkRow>, AppError>;
+    async fn work_list(
+        &self,
+        fleet_id: &str,
+        filter: WorkListFilter,
+    ) -> Result<Vec<WorkRow>, AppError>;
+    async fn work_touch_running(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer: &str,
+    ) -> Result<(), AppError>;
+    async fn work_sweep_expired(
+        &self,
+        fleet_id: &str,
+        swept_by: &str,
+    ) -> Result<Vec<String>, AppError>;
+    async fn work_sweep_abandoned(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        stall: Duration,
+    ) -> Result<Vec<WorkRow>, AppError>;
 }
 
 #[derive(Clone, Debug)]
@@ -92,11 +277,34 @@ impl FileRegistry {
         if !self.rows_path().exists() {
             self.write_rows(&[])?;
         }
+        if !self.work_rows_path().exists() {
+            self.write_work_rows_locked(&[])?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_migration(&self, sql: &str) -> Result<(), AppError> {
+        self.ensure_root()?;
+        if sql.contains("mesh_work_items") {
+            if !self.work_rows_path().exists() {
+                self.write_work_rows_locked(&[])?;
+            }
+        } else if sql.contains("mesh_gateways") && !self.rows_path().exists() {
+            self.write_rows(&[])?;
+        }
         Ok(())
     }
 
     fn rows_path(&self) -> PathBuf {
         self.root.join(FILE_REGISTRY_ROWS)
+    }
+
+    fn work_rows_path(&self) -> PathBuf {
+        self.root.join(FILE_WORK_ROWS)
+    }
+
+    fn work_lock_path(&self) -> PathBuf {
+        self.root.join(FILE_WORK_LOCK)
     }
 
     fn ensure_root(&self) -> Result<(), AppError> {
@@ -142,6 +350,87 @@ impl FileRegistry {
                 format!("writing file registry: {e}"),
             )
         })
+    }
+
+    fn lock_work_rows(&self) -> Result<Flock<File>, AppError> {
+        self.ensure_root()?;
+        let path = self.work_lock_path();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("opening file registry work lock: {e}"),
+                )
+            })?;
+        Flock::lock(file, FlockArg::LockExclusive).map_err(|(_file, errno)| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("locking file registry work rows: {errno}"),
+            )
+        })
+    }
+
+    fn read_work_rows_unlocked(&self) -> Result<Vec<WorkRow>, AppError> {
+        let path = self.work_rows_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&path).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading file registry work rows: {e}"),
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            AppError::new(
+                "REGISTRY_FILE_INVALID",
+                ExitCode::Precondition,
+                format!("file registry work rows are invalid: {e}"),
+            )
+        })
+    }
+
+    fn write_work_rows_unlocked(&self, rows: &[WorkRow]) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec_pretty(rows)
+            .map_err(|e| AppError::new("SERIALIZE", ExitCode::Internal, e.to_string()))?;
+        crate::store::write_atomic(&self.work_rows_path(), &bytes).map_err(|e| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("writing file registry work rows: {e}"),
+            )
+        })
+    }
+
+    fn write_work_rows_locked(&self, rows: &[WorkRow]) -> Result<(), AppError> {
+        let _lock = self.lock_work_rows()?;
+        self.write_work_rows_unlocked(rows)
+    }
+
+    fn with_work_rows<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<WorkRow>) -> Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        let _lock = self.lock_work_rows()?;
+        let mut rows = self.read_work_rows_unlocked()?;
+        let out = f(&mut rows)?;
+        rows.sort_by(|a, b| {
+            a.fleet_id
+                .cmp(&b.fleet_id)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.work_id.cmp(&b.work_id))
+        });
+        self.write_work_rows_unlocked(&rows)?;
+        Ok(out)
     }
 }
 
@@ -214,6 +503,199 @@ impl Registry for FileRegistry {
     async fn schema_version(&self) -> Result<i32, AppError> {
         Ok(REGISTRY_SCHEMA_VERSION)
     }
+
+    async fn work_insert(&self, row: WorkRow) -> Result<(), AppError> {
+        self.with_work_rows(|rows| {
+            rows.retain(|r| !(r.fleet_id == row.fleet_id && r.work_id == row.work_id));
+            rows.push(row);
+            Ok(())
+        })
+    }
+
+    async fn work_claim(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer_gw: &str,
+    ) -> Result<ClaimOutcome, AppError> {
+        self.with_work_rows(|rows| {
+            let row = work_row_mut(rows, fleet_id, work_id)?;
+            let directed_to_me = format!("directed:{claimer_gw}");
+            if row.status == WorkStatus::Offered
+                && (row.addressing == "pool" || row.addressing == directed_to_me)
+            {
+                row.status = WorkStatus::Approved;
+                row.claimed_by = Some(claimer_gw.to_string());
+                row.updated_at = Utc::now();
+                Ok(ClaimOutcome::Won)
+            } else {
+                Ok(ClaimOutcome::Lost(row.clone()))
+            }
+        })
+    }
+
+    async fn work_transition(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        from: WorkStatus,
+        to: WorkStatus,
+        owner: WorkOwner,
+        patch: WorkPatch,
+    ) -> Result<TransitionOutcome, AppError> {
+        self.with_work_rows(|rows| {
+            let row = work_row_mut(rows, fleet_id, work_id)?;
+            if row.status == from && owner_matches(row, &owner) {
+                row.status = to;
+                apply_work_patch(row, patch);
+                Ok(TransitionOutcome::Applied)
+            } else {
+                Ok(TransitionOutcome::Lost(row.clone()))
+            }
+        })
+    }
+
+    async fn work_get(&self, fleet_id: &str, work_id: &str) -> Result<Option<WorkRow>, AppError> {
+        let _lock = self.lock_work_rows()?;
+        Ok(self
+            .read_work_rows_unlocked()?
+            .into_iter()
+            .find(|r| r.fleet_id == fleet_id && r.work_id == work_id))
+    }
+
+    async fn work_list(
+        &self,
+        fleet_id: &str,
+        filter: WorkListFilter,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        let _lock = self.lock_work_rows()?;
+        let mut rows = self
+            .read_work_rows_unlocked()?
+            .into_iter()
+            .filter(|r| r.fleet_id == fleet_id)
+            .filter(|r| filter.status.is_none_or(|status| r.status == status))
+            .filter(|r| {
+                filter
+                    .claimed_by
+                    .as_deref()
+                    .is_none_or(|claimer| r.claimed_by.as_deref() == Some(claimer))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.work_id.cmp(&b.work_id)));
+        Ok(rows)
+    }
+
+    async fn work_touch_running(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer: &str,
+    ) -> Result<(), AppError> {
+        self.with_work_rows(|rows| {
+            let row = work_row_mut(rows, fleet_id, work_id)?;
+            if row.status == WorkStatus::Running && row.claimed_by.as_deref() == Some(claimer) {
+                row.updated_at = Utc::now();
+            }
+            Ok(())
+        })
+    }
+
+    async fn work_sweep_expired(
+        &self,
+        fleet_id: &str,
+        swept_by: &str,
+    ) -> Result<Vec<String>, AppError> {
+        self.with_work_rows(|rows| {
+            let now = Utc::now();
+            let mut swept = Vec::new();
+            for row in rows {
+                if row.fleet_id == fleet_id
+                    && row.status == WorkStatus::Offered
+                    && row.expires_at < now
+                {
+                    row.status = WorkStatus::Expired;
+                    row.swept_by = Some(swept_by.to_string());
+                    row.updated_at = now;
+                    swept.push(row.work_id.clone());
+                }
+            }
+            swept.sort();
+            Ok(swept)
+        })
+    }
+
+    async fn work_sweep_abandoned(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        stall: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        let stall = chrono::Duration::from_std(stall).map_err(|e| {
+            AppError::new(
+                "DURATION_INVALID",
+                ExitCode::Precondition,
+                format!("claim stall duration is invalid: {e}"),
+            )
+        })?;
+        self.with_work_rows(|rows| {
+            let now = Utc::now();
+            let cutoff = now - stall;
+            let mut swept = Vec::new();
+            for row in rows {
+                if row.fleet_id == fleet_id
+                    && matches!(row.status, WorkStatus::Approved | WorkStatus::Running)
+                    && row.claimed_by.as_deref() == Some(claimer_gw)
+                    && row.updated_at < cutoff
+                {
+                    row.status = WorkStatus::Failed;
+                    row.swept_by = Some(claimer_gw.to_string());
+                    row.updated_at = now;
+                    swept.push(row.clone());
+                }
+            }
+            swept.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+            Ok(swept)
+        })
+    }
+}
+
+fn work_row_mut<'a>(
+    rows: &'a mut [WorkRow],
+    fleet_id: &str,
+    work_id: &str,
+) -> Result<&'a mut WorkRow, AppError> {
+    rows.iter_mut()
+        .find(|r| r.fleet_id == fleet_id && r.work_id == work_id)
+        .ok_or_else(|| work_not_found(fleet_id, work_id))
+}
+
+fn owner_matches(row: &WorkRow, owner: &WorkOwner) -> bool {
+    match owner {
+        WorkOwner::Sender(gw) => row.sender_gw == *gw,
+        WorkOwner::Claimer(gw) => row.claimed_by.as_deref() == Some(gw.as_str()),
+        WorkOwner::Any => true,
+    }
+}
+
+fn apply_work_patch(row: &mut WorkRow, patch: WorkPatch) {
+    if let Some(result_ref) = patch.result_ref {
+        row.result_ref = result_ref;
+    }
+    if let Some(result_delivery) = patch.result_delivery {
+        row.result_delivery = result_delivery;
+    }
+    if let Some(swept_by) = patch.swept_by {
+        row.swept_by = swept_by;
+    }
+    row.updated_at = patch.updated_at.unwrap_or_else(Utc::now);
+}
+
+fn work_not_found(fleet_id: &str, work_id: &str) -> AppError {
+    AppError::new(
+        "WORK_NOT_FOUND",
+        ExitCode::Precondition,
+        format!("work item {fleet_id}/{work_id} was not found"),
+    )
 }
 
 pub struct PgRegistry {
@@ -230,7 +712,7 @@ pub enum RegistryHandle {
 impl RegistryHandle {
     pub async fn apply_migration(&self, sql: &str) -> Result<(), AppError> {
         match self {
-            RegistryHandle::File(registry) => registry.init_schema(),
+            RegistryHandle::File(registry) => registry.apply_migration(sql),
             RegistryHandle::Pg(registry) => registry.apply_migration(sql).await,
         }
     }
@@ -291,6 +773,113 @@ impl Registry for RegistryHandle {
         match self {
             RegistryHandle::File(registry) => registry.schema_version().await,
             RegistryHandle::Pg(registry) => registry.schema_version().await,
+        }
+    }
+
+    async fn work_insert(&self, row: WorkRow) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.work_insert(row).await,
+            RegistryHandle::Pg(registry) => registry.work_insert(row).await,
+        }
+    }
+
+    async fn work_claim(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer_gw: &str,
+    ) -> Result<ClaimOutcome, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.work_claim(fleet_id, work_id, claimer_gw).await,
+            RegistryHandle::Pg(registry) => registry.work_claim(fleet_id, work_id, claimer_gw).await,
+        }
+    }
+
+    async fn work_transition(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        from: WorkStatus,
+        to: WorkStatus,
+        owner: WorkOwner,
+        patch: WorkPatch,
+    ) -> Result<TransitionOutcome, AppError> {
+        match self {
+            RegistryHandle::File(registry) => {
+                registry
+                    .work_transition(fleet_id, work_id, from, to, owner, patch)
+                    .await
+            }
+            RegistryHandle::Pg(registry) => {
+                registry
+                    .work_transition(fleet_id, work_id, from, to, owner, patch)
+                    .await
+            }
+        }
+    }
+
+    async fn work_get(&self, fleet_id: &str, work_id: &str) -> Result<Option<WorkRow>, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.work_get(fleet_id, work_id).await,
+            RegistryHandle::Pg(registry) => registry.work_get(fleet_id, work_id).await,
+        }
+    }
+
+    async fn work_list(
+        &self,
+        fleet_id: &str,
+        filter: WorkListFilter,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.work_list(fleet_id, filter).await,
+            RegistryHandle::Pg(registry) => registry.work_list(fleet_id, filter).await,
+        }
+    }
+
+    async fn work_touch_running(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer: &str,
+    ) -> Result<(), AppError> {
+        match self {
+            RegistryHandle::File(registry) => {
+                registry.work_touch_running(fleet_id, work_id, claimer).await
+            }
+            RegistryHandle::Pg(registry) => {
+                registry.work_touch_running(fleet_id, work_id, claimer).await
+            }
+        }
+    }
+
+    async fn work_sweep_expired(
+        &self,
+        fleet_id: &str,
+        swept_by: &str,
+    ) -> Result<Vec<String>, AppError> {
+        match self {
+            RegistryHandle::File(registry) => registry.work_sweep_expired(fleet_id, swept_by).await,
+            RegistryHandle::Pg(registry) => registry.work_sweep_expired(fleet_id, swept_by).await,
+        }
+    }
+
+    async fn work_sweep_abandoned(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        stall: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        match self {
+            RegistryHandle::File(registry) => {
+                registry
+                    .work_sweep_abandoned(fleet_id, claimer_gw, stall)
+                    .await
+            }
+            RegistryHandle::Pg(registry) => {
+                registry
+                    .work_sweep_abandoned(fleet_id, claimer_gw, stall)
+                    .await
+            }
         }
     }
 }
@@ -610,6 +1199,277 @@ impl Registry for PgRegistry {
         .await
         .map_err(|_| registry_unreachable_timeout())?
     }
+
+    async fn work_insert(&self, row: WorkRow) -> Result<(), AppError> {
+        let mut conn = self.acquire().await?;
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            sqlx::query(
+                "INSERT INTO mesh_work_items \
+                 (fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, \
+                  result_delivery, swept_by, created_at, updated_at, expires_at, schema_version) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            )
+            .bind(row.fleet_id)
+            .bind(row.work_id)
+            .bind(row.sender_gw)
+            .bind(row.addressing)
+            .bind(row.status.as_sql())
+            .bind(row.claimed_by)
+            .bind(row.result_ref)
+            .bind(row.result_delivery)
+            .bind(row.swept_by)
+            .bind(row.created_at)
+            .bind(row.updated_at)
+            .bind(row.expires_at)
+            .bind(row.schema_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(registry_work_error)?;
+            tx.commit().await.map_err(registry_unreachable)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_claim(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer_gw: &str,
+    ) -> Result<ClaimOutcome, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let work_id = work_id.to_string();
+        let claimer_gw = claimer_gw.to_string();
+        let directed_to_me = format!("directed:{claimer_gw}");
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let updated = sqlx::query(WORK_CLAIM_SQL)
+                .bind(&fleet_id)
+                .bind(&work_id)
+                .bind(&claimer_gw)
+                .bind(&directed_to_me)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(registry_work_error)?;
+            if updated.is_some() {
+                tx.commit().await.map_err(registry_unreachable)?;
+                return Ok(ClaimOutcome::Won);
+            }
+            let row = pg_work_get_tx(&mut tx, &fleet_id, &work_id).await?;
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(ClaimOutcome::Lost(row))
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_transition(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        from: WorkStatus,
+        to: WorkStatus,
+        owner: WorkOwner,
+        patch: WorkPatch,
+    ) -> Result<TransitionOutcome, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let work_id = work_id.to_string();
+        let (owner_kind, owner_value) = match owner {
+            WorkOwner::Sender(gw) => ("sender", gw),
+            WorkOwner::Claimer(gw) => ("claimer", gw),
+            WorkOwner::Any => ("any", String::new()),
+        };
+        let (set_result_ref, result_ref) = patch_value(patch.result_ref);
+        let (set_result_delivery, result_delivery) = patch_value(patch.result_delivery);
+        let (set_swept_by, swept_by) = patch_value(patch.swept_by);
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let updated = sqlx::query(WORK_TRANSITION_SQL)
+                .bind(&fleet_id)
+                .bind(&work_id)
+                .bind(from.as_sql())
+                .bind(to.as_sql())
+                .bind(set_result_ref)
+                .bind(result_ref)
+                .bind(set_result_delivery)
+                .bind(result_delivery)
+                .bind(set_swept_by)
+                .bind(swept_by)
+                .bind(patch.updated_at)
+                .bind(owner_kind)
+                .bind(owner_value)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(registry_work_error)?;
+            if updated.is_some() {
+                tx.commit().await.map_err(registry_unreachable)?;
+                return Ok(TransitionOutcome::Applied);
+            }
+            let row = pg_work_get_tx(&mut tx, &fleet_id, &work_id).await?;
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(TransitionOutcome::Lost(row))
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_get(&self, fleet_id: &str, work_id: &str) -> Result<Option<WorkRow>, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let work_id = work_id.to_string();
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let row = sqlx::query(WORK_SELECT_BY_ID_SQL)
+                .bind(&fleet_id)
+                .bind(&work_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(registry_work_error)?
+                .map(pg_work_row)
+                .transpose()?;
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(row)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_list(
+        &self,
+        fleet_id: &str,
+        filter: WorkListFilter,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let status = filter.status.map(|s| s.as_sql().to_string());
+        let claimed_by = filter.claimed_by;
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let rows = sqlx::query(WORK_LIST_SQL)
+                .bind(&fleet_id)
+                .bind(status)
+                .bind(claimed_by)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(registry_work_error)?
+                .into_iter()
+                .map(pg_work_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_touch_running(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer: &str,
+    ) -> Result<(), AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let work_id = work_id.to_string();
+        let claimer = claimer.to_string();
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            sqlx::query(
+                "UPDATE mesh_work_items SET updated_at = now() \
+                 WHERE fleet_id = $1 AND work_id = $2 AND status = 'running' AND claimed_by = $3",
+            )
+            .bind(fleet_id)
+            .bind(work_id)
+            .bind(claimer)
+            .execute(&mut *tx)
+            .await
+            .map_err(registry_work_error)?;
+            tx.commit().await.map_err(registry_unreachable)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_sweep_expired(
+        &self,
+        fleet_id: &str,
+        swept_by: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let swept_by = swept_by.to_string();
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let mut ids = sqlx::query(
+                "UPDATE mesh_work_items \
+                 SET status = 'expired', swept_by = $2, updated_at = now() \
+                 WHERE fleet_id = $1 AND status = 'offered' AND expires_at < now() \
+                 RETURNING work_id",
+            )
+            .bind(fleet_id)
+            .bind(swept_by)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(registry_work_error)?
+            .into_iter()
+            .map(|row| row.try_get("work_id").map_err(registry_work_error))
+            .collect::<Result<Vec<String>, _>>()?;
+            ids.sort();
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(ids)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_sweep_abandoned(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        stall: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let claimer_gw = claimer_gw.to_string();
+        let stall_secs = i64::try_from(stall.as_secs()).unwrap_or(i64::MAX);
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let mut rows = sqlx::query(WORK_SWEEP_ABANDONED_SQL)
+                .bind(fleet_id)
+                .bind(claimer_gw)
+                .bind(stall_secs)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(registry_work_error)?
+                .into_iter()
+                .map(pg_work_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
 }
 
 pub fn registry_plan(url: &str) -> Result<RegistryPlan, AppError> {
@@ -693,6 +1553,52 @@ fn pg_row(row: sqlx::postgres::PgRow) -> Result<GatewayRow, AppError> {
     })
 }
 
+fn pg_work_row(row: sqlx::postgres::PgRow) -> Result<WorkRow, AppError> {
+    let status: String = row.try_get("status").map_err(registry_work_error)?;
+    Ok(WorkRow {
+        fleet_id: row.try_get("fleet_id").map_err(registry_work_error)?,
+        work_id: row.try_get("work_id").map_err(registry_work_error)?,
+        sender_gw: row.try_get("sender_gw").map_err(registry_work_error)?,
+        addressing: row.try_get("addressing").map_err(registry_work_error)?,
+        status: WorkStatus::from_sql(&status)?,
+        claimed_by: row.try_get("claimed_by").map_err(registry_work_error)?,
+        result_ref: row.try_get("result_ref").map_err(registry_work_error)?,
+        result_delivery: row
+            .try_get("result_delivery")
+            .map_err(registry_work_error)?,
+        swept_by: row.try_get("swept_by").map_err(registry_work_error)?,
+        created_at: row.try_get("created_at").map_err(registry_work_error)?,
+        updated_at: row.try_get("updated_at").map_err(registry_work_error)?,
+        expires_at: row.try_get("expires_at").map_err(registry_work_error)?,
+        schema_version: row
+            .try_get("schema_version")
+            .map_err(registry_work_error)?,
+    })
+}
+
+async fn pg_work_get_tx<'c>(
+    tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+    fleet_id: &str,
+    work_id: &str,
+) -> Result<WorkRow, AppError> {
+    sqlx::query(WORK_SELECT_BY_ID_SQL)
+        .bind(fleet_id)
+        .bind(work_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(registry_work_error)?
+        .map(pg_work_row)
+        .transpose()?
+        .ok_or_else(|| work_not_found(fleet_id, work_id))
+}
+
+fn patch_value(value: Option<Option<String>>) -> (bool, Option<String>) {
+    match value {
+        Some(value) => (true, value),
+        None => (false, None),
+    }
+}
+
 fn query_param(url: &str, name: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     let query = query.split('#').next().unwrap_or(query);
@@ -727,6 +1633,20 @@ fn registry_unreachable(e: sqlx::Error) -> AppError {
         format!("registry is unreachable: {e}"),
     )
     .remedy("check the registry URL, network path, and database availability")
+}
+
+fn registry_work_error(e: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db) = &e {
+        if db.code().as_deref() == Some("42P01") {
+            return AppError::new(
+                "WORK_SCHEMA_MISSING",
+                ExitCode::Precondition,
+                "mesh work registry schema is missing",
+            )
+            .remedy("the fleet root machine must run `a2a mesh fleet migrate`");
+        }
+    }
+    registry_unreachable(e)
 }
 
 fn registry_unreachable_timeout() -> AppError {

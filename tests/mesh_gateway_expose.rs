@@ -6,7 +6,10 @@ use a2a::mesh::gateway::expose::{
 use a2a::mesh::gateway::link::{accept_once_io, dial_gateway_io};
 use a2a::mesh::gateway::{gateway_root, run_registry_slot_for_test, RegistrySlotParams};
 use a2a::mesh::keys::{self, Clock, SystemClock};
-use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::registry::{
+    ClaimOutcome, FileRegistry, GatewayRow, Registry, TransitionOutcome, WorkListFilter,
+    WorkOwner, WorkPatch, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
+};
 use a2a::mesh::wire::TlsIdentity;
 use a2a::output::{AppError, ExitCode};
 use chrono::{DateTime, TimeZone, Utc};
@@ -1014,6 +1017,71 @@ impl Registry for FlippingRegistry {
 
     async fn schema_version(&self) -> Result<i32, AppError> {
         self.inner.schema_version().await
+    }
+
+    async fn work_insert(&self, row: WorkRow) -> Result<(), AppError> {
+        self.inner.work_insert(row).await
+    }
+
+    async fn work_claim(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer_gw: &str,
+    ) -> Result<ClaimOutcome, AppError> {
+        self.inner.work_claim(fleet_id, work_id, claimer_gw).await
+    }
+
+    async fn work_transition(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        from: WorkStatus,
+        to: WorkStatus,
+        owner: WorkOwner,
+        patch: WorkPatch,
+    ) -> Result<TransitionOutcome, AppError> {
+        self.inner
+            .work_transition(fleet_id, work_id, from, to, owner, patch)
+            .await
+    }
+
+    async fn work_get(&self, fleet_id: &str, work_id: &str) -> Result<Option<WorkRow>, AppError> {
+        self.inner.work_get(fleet_id, work_id).await
+    }
+
+    async fn work_list(
+        &self,
+        fleet_id: &str,
+        filter: WorkListFilter,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        self.inner.work_list(fleet_id, filter).await
+    }
+
+    async fn work_touch_running(
+        &self,
+        fleet_id: &str,
+        work_id: &str,
+        claimer: &str,
+    ) -> Result<(), AppError> {
+        self.inner.work_touch_running(fleet_id, work_id, claimer).await
+    }
+
+    async fn work_sweep_expired(
+        &self,
+        fleet_id: &str,
+        swept_by: &str,
+    ) -> Result<Vec<String>, AppError> {
+        self.inner.work_sweep_expired(fleet_id, swept_by).await
+    }
+
+    async fn work_sweep_abandoned(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        stall: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        self.inner.work_sweep_abandoned(fleet_id, claimer_gw, stall).await
     }
 }
 

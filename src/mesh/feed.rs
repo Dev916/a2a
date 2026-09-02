@@ -50,6 +50,20 @@ pub fn validate_post_text(text: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub fn validate_refs_size(refs: &Value, max_bytes: u64) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec(refs).map_err(|e| data_err("serializing refs", e))?;
+    let len = bytes.len() as u64;
+    if max_bytes != 0 && len > max_bytes {
+        return Err(AppError::new(
+            "WORK_TOO_LARGE",
+            ExitCode::Precondition,
+            format!("refs are {len} bytes, exceeding cap {max_bytes} bytes"),
+        )
+        .remedy("shorten the work envelope or increase the configured mesh.work cap"));
+    }
+    Ok(())
+}
+
 pub fn read(home: &A2aHome, since_seq: u64) -> Result<Vec<FeedEntry>, AppError> {
     read_with_local_origin(home, since_seq, existing_gateway_id(home).as_deref())
 }

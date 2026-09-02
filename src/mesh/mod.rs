@@ -108,6 +108,7 @@ pub struct Note {
     pub from: String,
     pub to: String,
     pub ts: DateTime<Utc>,
+    #[serde(default = "default_note_kind")]
     pub kind: String,
     pub text: String,
     pub refs: serde_json::Value,
@@ -187,3 +188,8 @@ pub mod registry;
 pub mod routing;
 pub mod wire;
 pub mod work;
+pub mod work_store;
+
+fn default_note_kind() -> String {
+    "note".to_string()
+}

@@ -624,8 +624,11 @@ async fn handle_inbound_frame(
         }
         Frame::Feed { origin, entries } => {
             let mut cursors = state.inner.receive_cursors.lock().await;
-            replicate::receive_feed_entries(home, cfg, &mut cursors, reorder, &origin, entries)?;
-            cursors.persist(home)?;
+            if replicate::receive_feed_entries(home, cfg, &mut cursors, reorder, &origin, entries)
+                .is_ok()
+            {
+                cursors.persist(home)?;
+            }
         }
         Frame::Note { note } => {
             let trace_id = note.note_id.clone().unwrap_or_default();
@@ -639,15 +642,21 @@ async fn handle_inbound_frame(
                 next_attempt_after: None,
                 note,
             };
-            let ack = notes_wire::receive_note(home, cfg, &envelope)?;
+            let ack = notes_wire::receive_note(home, cfg, &envelope).unwrap_or(
+                notes_wire::NoteAck::Rejected {
+                    code: "ingress_refused".to_string(),
+                },
+            );
             let outcome = match ack {
-                notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => "delivered",
-                notes_wire::NoteAck::Rejected { .. } => "ingress_refused",
+                notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => {
+                    "delivered".to_string()
+                }
+                notes_wire::NoteAck::Rejected { code } => code,
             };
             let _ = out_tx
                 .send(Frame::Ack {
                     ref_id: trace_id,
-                    outcome: outcome.to_string(),
+                    outcome,
                 })
                 .await;
         }

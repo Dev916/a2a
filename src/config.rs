@@ -52,6 +52,9 @@ pub const DEFAULT_EVENTS_MAX_BYTES: u64 = 10_485_760;
 pub const DEFAULT_FEED_MAX_BYTES: u64 = 10_485_760;
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 900;
 pub const DEFAULT_GC_AFTER_DAYS: u64 = 7;
+pub const DEFAULT_MESH_WORK_MAX_DIRECTED_BYTES: u64 = 262_144;
+pub const DEFAULT_MESH_WORK_MAX_POOL_BYTES: u64 = 32_768;
+pub const DEFAULT_MESH_WORK_RESULT_NOTE_MAX_BYTES: u64 = 65_536;
 pub const DEFAULT_MESH_GATEWAY_LISTEN_PORT: u64 = 7787;
 pub const DEFAULT_MESH_GATEWAY_EXPOSE: &str = "none";
 pub const DEFAULT_MESH_GATEWAY_REGISTRY_HEARTBEAT_SECS: u64 = 180;
@@ -166,6 +169,13 @@ pub const UPDATE_FIELDS: [&str; 1] = ["repo_url"];
 
 /// Every `[mesh]` key, in the order `config show --origin` reports them.
 pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
+
+/// Every `[mesh.work]` key, in the order `config show --origin` reports them.
+pub const MESH_WORK_FIELDS: [&str; 3] = [
+    "max_directed_bytes",
+    "max_pool_bytes",
+    "result_note_max_bytes",
+];
 
 /// Every `[mesh.gateway]` key, in the order `config show --origin` reports them.
 pub const MESH_GATEWAY_FIELDS: [&str; 11] = [
@@ -487,6 +497,23 @@ impl Default for MeshGatewayConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct MeshWorkConfig {
+    pub max_directed_bytes: u64,
+    pub max_pool_bytes: u64,
+    pub result_note_max_bytes: u64,
+}
+
+impl Default for MeshWorkConfig {
+    fn default() -> Self {
+        MeshWorkConfig {
+            max_directed_bytes: DEFAULT_MESH_WORK_MAX_DIRECTED_BYTES,
+            max_pool_bytes: DEFAULT_MESH_WORK_MAX_POOL_BYTES,
+            result_note_max_bytes: DEFAULT_MESH_WORK_RESULT_NOTE_MAX_BYTES,
+        }
+    }
+}
+
 /// The `[mesh]` section: same-machine agent mesh read/write horizons.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct MeshConfig {
@@ -496,6 +523,7 @@ pub struct MeshConfig {
     pub stale_after_secs: u64,
     /// Days after retirement/staleness before `gc` may reclaim mesh peer dirs.
     pub gc_after_days: u64,
+    pub work: MeshWorkConfig,
     pub gateway: MeshGatewayConfig,
 }
 
@@ -505,6 +533,7 @@ impl Default for MeshConfig {
             feed_max_bytes: DEFAULT_FEED_MAX_BYTES,
             stale_after_secs: DEFAULT_STALE_AFTER_SECS,
             gc_after_days: DEFAULT_GC_AFTER_DAYS,
+            work: MeshWorkConfig::default(),
             gateway: MeshGatewayConfig::default(),
         }
     }
@@ -636,6 +665,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     }
     for field in MESH_FIELDS {
         origins.insert(format!("mesh.{field}"), Origin::Default);
+    }
+    for field in MESH_WORK_FIELDS {
+        origins.insert(format!("mesh.work.{field}"), Origin::Default);
     }
     for field in MESH_GATEWAY_FIELDS {
         origins.insert(format!("mesh.gateway.{field}"), Origin::Default);
@@ -890,12 +922,41 @@ fn apply_mesh_file(
             apply_mesh_gateway_file(cfg, origins, warnings, v)?;
             continue;
         }
+        if field == "work" {
+            apply_mesh_work_file(cfg, origins, warnings, v)?;
+            continue;
+        }
         let dotted = format!("mesh.{field}");
         if !MESH_FIELDS.contains(&field.as_str()) {
             warnings.push(format!("unknown config key: {dotted}"));
             continue;
         }
         apply_mesh_toml(&mut cfg.mesh, &dotted, field, v)?;
+        origins.insert(dotted, Origin::File);
+    }
+    Ok(())
+}
+
+/// `[mesh.work]` — work handoff carriage and result payload caps.
+fn apply_mesh_work_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value.as_table().ok_or_else(|| {
+        cfg_err(format!(
+            "mesh.work: expected a table, got {}",
+            value.type_str()
+        ))
+    })?;
+    for (field, v) in fields {
+        let dotted = format!("mesh.work.{field}");
+        if !MESH_WORK_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        apply_mesh_work_toml(&mut cfg.mesh.work, &dotted, field, v)?;
         origins.insert(dotted, Origin::File);
     }
     Ok(())
@@ -1106,6 +1167,21 @@ fn apply_mesh_toml(
     Ok(())
 }
 
+fn apply_mesh_work_toml(
+    work: &mut MeshWorkConfig,
+    dotted: &str,
+    field: &str,
+    v: &toml::Value,
+) -> Result<(), AppError> {
+    match field {
+        "max_directed_bytes" => work.max_directed_bytes = want_u64(dotted, v)?,
+        "max_pool_bytes" => work.max_pool_bytes = want_u64(dotted, v)?,
+        "result_note_max_bytes" => work.result_note_max_bytes = want_u64(dotted, v)?,
+        _ => unreachable!("field membership checked by caller"),
+    }
+    Ok(())
+}
+
 fn apply_mesh_gateway_toml(
     gw: &mut MeshGatewayConfig,
     dotted: &str,
@@ -1193,6 +1269,11 @@ pub fn update_env_key(field: &str) -> String {
 /// `A2A_MESH_<FIELD>` — the env spelling of one `[mesh]` key.
 pub fn mesh_env_key(field: &str) -> String {
     format!("A2A_MESH_{}", field.to_ascii_uppercase())
+}
+
+/// `A2A_MESH_WORK_<FIELD>` — one `[mesh.work]` key.
+pub fn mesh_work_env_key(field: &str) -> String {
+    format!("A2A_MESH_WORK_{}", field.to_ascii_uppercase())
 }
 
 /// `A2A_MESH_GATEWAY_<FIELD>` — one `[mesh.gateway]` key.
@@ -1332,6 +1413,15 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         }
         origins.insert(dotted, Origin::Env);
     }
+    for field in MESH_WORK_FIELDS {
+        let key = mesh_work_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        apply_mesh_work_str(&mut cfg.mesh.work, &key, field, raw.trim())?;
+        origins.insert(format!("mesh.work.{field}"), Origin::Env);
+    }
     for field in MESH_GATEWAY_FIELDS {
         let key = mesh_gateway_env_key(field);
         let Some(raw) = std::env::var_os(&key) else {
@@ -1389,6 +1479,21 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "max_turns" => lc.max_turns = parse_u64_str(key, s)?,
         "auto_review" => lc.auto_review = parse_bool_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
+    }
+    Ok(())
+}
+
+fn apply_mesh_work_str(
+    work: &mut MeshWorkConfig,
+    key: &str,
+    field: &str,
+    s: &str,
+) -> Result<(), AppError> {
+    match field {
+        "max_directed_bytes" => work.max_directed_bytes = parse_u64_str(key, s)?,
+        "max_pool_bytes" => work.max_pool_bytes = parse_u64_str(key, s)?,
+        "result_note_max_bytes" => work.result_note_max_bytes = parse_u64_str(key, s)?,
+        _ => unreachable!("field membership fixed by MESH_WORK_FIELDS"),
     }
     Ok(())
 }
@@ -1980,6 +2085,9 @@ mod tests {
         assert_eq!(mesh.feed_max_bytes, 10_485_760);
         assert_eq!(mesh.stale_after_secs, 900);
         assert_eq!(mesh.gc_after_days, 7);
+        assert_eq!(mesh.work.max_directed_bytes, 262_144);
+        assert_eq!(mesh.work.max_pool_bytes, 32_768);
+        assert_eq!(mesh.work.result_note_max_bytes, 65_536);
         assert_eq!(DEFAULT_FEED_MAX_BYTES, 10_485_760);
         assert_eq!(DEFAULT_STALE_AFTER_SECS, 900);
         assert_eq!(DEFAULT_GC_AFTER_DAYS, 7);
@@ -1987,17 +2095,28 @@ mod tests {
             MESH_FIELDS,
             ["feed_max_bytes", "stale_after_secs", "gc_after_days"]
         );
+        assert_eq!(
+            MESH_WORK_FIELDS,
+            [
+                "max_directed_bytes",
+                "max_pool_bytes",
+                "result_note_max_bytes"
+            ]
+        );
         assert_eq!(mesh_env_key("feed_max_bytes"), "A2A_MESH_FEED_MAX_BYTES");
+        assert_eq!(
+            mesh_work_env_key("max_pool_bytes"),
+            "A2A_MESH_WORK_MAX_POOL_BYTES"
+        );
         assert_eq!(
             mesh_env_key("stale_after_secs"),
             "A2A_MESH_STALE_AFTER_SECS"
         );
         assert_eq!(mesh_env_key("gc_after_days"), "A2A_MESH_GC_AFTER_DAYS");
 
-        let table: toml::Table =
-            "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n"
-                .parse()
-                .unwrap();
+        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n[mesh.work]\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\nresult_note_max_bytes = 2048\n"
+            .parse()
+            .unwrap();
         let mut cfg = Config {
             codex_bin: None,
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
@@ -2015,7 +2134,14 @@ mod tests {
         assert_eq!(cfg.mesh.feed_max_bytes, 4096);
         assert_eq!(cfg.mesh.stale_after_secs, 60);
         assert_eq!(cfg.mesh.gc_after_days, 3);
+        assert_eq!(cfg.mesh.work.max_directed_bytes, 8192);
+        assert_eq!(cfg.mesh.work.max_pool_bytes, 4096);
+        assert_eq!(cfg.mesh.work.result_note_max_bytes, 2048);
         assert_eq!(origins.get("mesh.feed_max_bytes"), Some(&Origin::File));
+        assert_eq!(
+            origins.get("mesh.work.max_pool_bytes"),
+            Some(&Origin::File)
+        );
         assert!(
             warnings.iter().any(|w| w.contains("mesh.bogus")),
             "{warnings:?}"

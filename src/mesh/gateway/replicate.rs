@@ -2,7 +2,13 @@ use crate::config::Config;
 use crate::home::{create_dir_0700, A2aHome};
 use crate::mesh::registry::GatewayRow;
 use crate::mesh::wire::{Frame, OriginDigest, OriginWant};
-use crate::mesh::{feed, FeedEntry};
+use crate::mesh::{
+    feed,
+    keys::SystemClock,
+    work::{verify_envelope, WorkAddressing, WorkEnvelope},
+    work_store::{self, WorkSource},
+    FeedEntry,
+};
 use crate::output::{AppError, ExitCode};
 use crate::store;
 use chrono::{DateTime, Duration, Utc};
@@ -54,6 +60,7 @@ pub enum IngestDecision {
     Accepted { local_seq: u64 },
     Duplicate,
     Compacted { from_seq: u64 },
+    Rejected { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +95,7 @@ pub struct FeedReceiveReport {
     pub accepted: usize,
     pub duplicates: usize,
     pub compacted: usize,
+    pub rejected: usize,
     pub buffered: usize,
     pub evictions: Vec<ReorderEviction>,
 }
@@ -436,14 +444,18 @@ pub fn append_remote_entry(
             "feed frame origin is empty",
         ));
     }
-    feed::validate_post_text(&entry.text)?;
     let origin_seq = entry.origin_seq.unwrap_or(entry.seq);
     if origin_seq == 0 {
-        return Err(AppError::new(
-            "FEED_ORIGIN_SEQ_INVALID",
-            ExitCode::Precondition,
-            "feed entry origin_seq must be greater than zero",
-        ));
+        return Ok(IngestDecision::Rejected {
+            reason: "FEED_ORIGIN_SEQ_INVALID".to_string(),
+        });
+    }
+    if let Err(err) = feed::validate_post_text(&entry.text) {
+        cursors.apply_advance(CursorAdvance::new(frame_origin, origin_seq));
+        log_feed_ingest_refused(home, frame_origin, origin_seq, err.code);
+        return Ok(IngestDecision::Rejected {
+            reason: err.code.to_string(),
+        });
     }
     let compacted_before = cursors.compacted_before_seq(frame_origin);
     if origin_seq < compacted_before {
@@ -459,13 +471,26 @@ pub fn append_remote_entry(
         return Ok(IngestDecision::Duplicate);
     }
 
+    let previous = cursors.last_seq(frame_origin);
+    if let Err(err) = validate_work_refs(home, cfg, &entry) {
+        cursors.apply_advance(CursorAdvance::new(frame_origin, origin_seq));
+        log_feed_ingest_refused(home, frame_origin, origin_seq, err.code);
+        return Ok(IngestDecision::Rejected {
+            reason: err.code.to_string(),
+        });
+    }
+
     entry.seq = 0;
     entry.origin = Some(frame_origin.to_string());
     entry.origin_seq = Some(origin_seq);
     let local_seq = feed::append_entry(home, cfg, entry)?;
     present.insert(origin_seq);
     let prefix = contiguous_prefix(present, compacted_before);
-    cursors.set_last_seq(frame_origin, prefix);
+    if origin_seq <= previous.saturating_add(1) {
+        cursors.set_last_seq(frame_origin, previous.max(origin_seq).max(prefix));
+    } else {
+        cursors.set_last_seq(frame_origin, prefix);
+    }
     Ok(IngestDecision::Accepted { local_seq })
 }
 
@@ -481,11 +506,8 @@ pub fn receive_feed_entries(
     for entry in entries {
         let origin_seq = entry.origin_seq.unwrap_or(entry.seq);
         if origin_seq == 0 {
-            return Err(AppError::new(
-                "FEED_ORIGIN_SEQ_INVALID",
-                ExitCode::Precondition,
-                "feed entry origin_seq must be greater than zero",
-            ));
+            report.rejected += 1;
+            continue;
         }
         let expected = cursors.last_seq(frame_origin).saturating_add(1);
         if origin_seq > expected {
@@ -803,6 +825,7 @@ fn apply_entry_for_report(
         IngestDecision::Accepted { .. } => report.accepted += 1,
         IngestDecision::Duplicate => report.duplicates += 1,
         IngestDecision::Compacted { .. } => report.compacted += 1,
+        IngestDecision::Rejected { .. } => report.rejected += 1,
     }
     Ok(())
 }
@@ -821,6 +844,57 @@ fn drain_contiguous_buffer(
             return Ok(());
         };
         apply_entry_for_report(home, cfg, cursors, frame_origin, entry, report)?;
+    }
+}
+
+fn validate_work_refs(home: &A2aHome, cfg: &Config, entry: &FeedEntry) -> Result<(), AppError> {
+    feed::validate_refs_size(&entry.refs, cfg.mesh.work.max_pool_bytes)?;
+    let Some(work) = entry.refs.get("work") else {
+        return Ok(());
+    };
+    let envelope: WorkEnvelope = serde_json::from_value(work.clone()).map_err(|e| {
+        AppError::new(
+            "WORK_SCHEMA_MISSING",
+            ExitCode::Precondition,
+            format!("decoding refs.work: {e}"),
+        )
+    })?;
+    crate::mesh::work::validate_envelope_hygiene(&envelope, cfg.mesh.work.max_pool_bytes as usize)?;
+    let verified = verify_envelope(home, &envelope, &SystemClock)?;
+    if verified.envelope.addressing != WorkAddressing::Pool {
+        return Err(AppError::new(
+            "WORK_TOKEN_MISMATCH",
+            ExitCode::Precondition,
+            "feed refs.work must carry a pool-addressed work envelope",
+        ));
+    }
+    work_store::store_offer(home, verified, WorkSource::Pool)?;
+    Ok(())
+}
+
+fn log_feed_ingest_refused(
+    home: &A2aHome,
+    origin: &str,
+    origin_seq: u64,
+    code: &str,
+) {
+    let dir = home.root().join("mesh").join("gateway");
+    if create_dir_0700(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = crate::exec::open_append_0600(&dir.join(super::GATEWAY_JSONL)) {
+        let line = json!({
+            "ts": Utc::now(),
+            "kind": "feed",
+            "origin": origin,
+            "origin_seq": origin_seq,
+            "action": "work_ingest_refused",
+            "code": code,
+        });
+        if let Ok(mut bytes) = serde_json::to_vec(&line) {
+            bytes.push(b'\n');
+            let _ = std::io::Write::write_all(&mut f, &bytes);
+        }
     }
 }
 

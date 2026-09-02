@@ -65,7 +65,7 @@ pub struct UnsignedWorkEnvelope {
     pub max_bytes: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedEnvelope {
     pub envelope: WorkEnvelope,
     pub sender_claims: TokenClaims,

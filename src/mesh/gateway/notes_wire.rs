@@ -1,6 +1,13 @@
 use crate::config::Config;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
-use crate::mesh::{peer_dir, scan_or_refuse, Note, PeerId, NOTE_MAX_BYTES};
+use crate::mesh::{
+    feed,
+    keys::SystemClock,
+    peer_dir, scan_or_refuse,
+    work::{verify_envelope, WorkEnvelope},
+    work_store::{self, WorkSource, WORK_OFFER_KIND},
+    Note, PeerId, NOTE_MAX_BYTES,
+};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
 use rand::Rng;
@@ -197,7 +204,9 @@ pub fn handle_ack(
             );
             Ok(true)
         }
-        "ingress_refused" | "TOKEN_EXPIRED" => {
+        "ingress_refused" | "TOKEN_EXPIRED" | "WORK_SIGNATURE_INVALID" | "WORK_SENDER_UNKNOWN"
+        | "WORK_TOKEN_MISMATCH" | "WORK_EXPIRED" | "WORK_TOO_LARGE" | "WORK_BAD_REPO_URL"
+        | "WORK_WRONG_FLEET" | "WORK_SCHEMA_MISSING" | "WORK_CONTROL_CHARS" => {
             archive(sender, &path, "rejected", to_gateway)?;
             log_note_action(
                 sender,
@@ -215,7 +224,7 @@ pub fn handle_ack(
 
 pub fn receive_note(
     home: &A2aHome,
-    _cfg: &Config,
+    cfg: &Config,
     envelope: &SpooledNote,
 ) -> Result<NoteAck, AppError> {
     let Some(note_id) = envelope.note.note_id.as_deref().filter(|s| !s.is_empty()) else {
@@ -242,7 +251,10 @@ pub fn receive_note(
         );
         return Ok(NoteAck::Duplicate);
     }
-    if validate_note_ingress(&envelope.note).is_err() {
+    if envelope.note.kind == WORK_OFFER_KIND {
+        return receive_work_offer(home, cfg, envelope, note_id);
+    }
+    if validate_note_ingress(cfg, &envelope.note).is_err() {
         log_note_action(
             home,
             &envelope.from_gateway,
@@ -267,6 +279,53 @@ pub fn receive_note(
         "delivered",
     );
     Ok(NoteAck::Delivered)
+}
+
+fn receive_work_offer(
+    home: &A2aHome,
+    cfg: &Config,
+    envelope: &SpooledNote,
+    note_id: &str,
+) -> Result<NoteAck, AppError> {
+    let result = validate_note_ingress(cfg, &envelope.note)
+        .and_then(|_| validate_gateway_addressee(home, &envelope.note.to))
+        .and_then(|_| feed::validate_refs_size(&envelope.note.refs, cfg.mesh.work.max_directed_bytes))
+        .and_then(|_| work_envelope_from_refs(&envelope.note.refs))
+        .and_then(|work| {
+            crate::mesh::work::validate_envelope_hygiene(
+                &work,
+                cfg.mesh.work.max_directed_bytes as usize,
+            )?;
+            verify_envelope(home, &work, &SystemClock)
+        })
+        .and_then(|verified| work_store::store_offer(home, verified, WorkSource::Directed));
+    match result {
+        Ok(_) => {
+            remember_delivered(home, &envelope.from_gateway, note_id)?;
+            log_note_action(
+                home,
+                &envelope.from_gateway,
+                &envelope.to_gateway,
+                &envelope.to_peer,
+                &envelope.trace_id,
+                "delivered",
+            );
+            Ok(NoteAck::Delivered)
+        }
+        Err(err) => {
+            log_work_ingest_refused(
+                home,
+                &envelope.from_gateway,
+                &envelope.to_gateway,
+                &envelope.to_peer,
+                &envelope.trace_id,
+                err.code,
+            );
+            Ok(NoteAck::Rejected {
+                code: err.code.to_string(),
+            })
+        }
+    }
 }
 
 pub(crate) fn write_note_file_with_id(
@@ -306,7 +365,7 @@ pub(crate) fn mint_note_id() -> String {
     ulid::Ulid::new().to_string()
 }
 
-fn validate_note_ingress(note: &Note) -> Result<(), AppError> {
+fn validate_note_ingress(cfg: &Config, note: &Note) -> Result<(), AppError> {
     scan_or_refuse(&note.text, "SECRET_IN_NOTE")?;
     let len = note.text.len();
     if len > NOTE_MAX_BYTES {
@@ -316,7 +375,44 @@ fn validate_note_ingress(note: &Note) -> Result<(), AppError> {
             format!("text is {len} bytes, exceeding cap {NOTE_MAX_BYTES} bytes"),
         ));
     }
+    feed::validate_refs_size(&note.refs, cfg.mesh.work.max_directed_bytes)?;
     Ok(())
+}
+
+fn validate_gateway_addressee(home: &A2aHome, to: &str) -> Result<(), AppError> {
+    let Some(gateway_id) = to.strip_prefix("gateway:") else {
+        return Err(AppError::new(
+            "WORK_TOKEN_MISMATCH",
+            ExitCode::Precondition,
+            "work_offer notes must be addressed to gateway:<gateway_id>",
+        ));
+    };
+    let local_gateway = crate::mesh::keys::gateway_id(home)?;
+    if gateway_id != local_gateway {
+        return Err(AppError::new(
+            "WORK_TOKEN_MISMATCH",
+            ExitCode::Precondition,
+            format!("work_offer targets gateway {gateway_id}, local gateway is {local_gateway}"),
+        ));
+    }
+    Ok(())
+}
+
+fn work_envelope_from_refs(refs: &serde_json::Value) -> Result<WorkEnvelope, AppError> {
+    let Some(work) = refs.get("work") else {
+        return Err(AppError::new(
+            "WORK_SCHEMA_MISSING",
+            ExitCode::Precondition,
+            "work_offer note refs must contain refs.work",
+        ));
+    };
+    serde_json::from_value(work.clone()).map_err(|e| {
+        AppError::new(
+            "WORK_SCHEMA_MISSING",
+            ExitCode::Precondition,
+            format!("decoding refs.work: {e}"),
+        )
+    })
 }
 
 fn schedule_retry<R: Rng + ?Sized>(
@@ -505,6 +601,36 @@ fn log_note_action(
             "to_gateway": to_gateway,
             "to_peer": to_peer,
             "action": action,
+        });
+        if let Ok(mut bytes) = serde_json::to_vec(&line) {
+            bytes.push(b'\n');
+            let _ = f.write_all(&bytes);
+        }
+    }
+}
+
+fn log_work_ingest_refused(
+    home: &A2aHome,
+    from_gateway: &str,
+    to_gateway: &str,
+    to_peer: &str,
+    trace_id: &str,
+    code: &str,
+) {
+    let dir = home.root().join("mesh").join("gateway");
+    if create_dir_0700(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = crate::exec::open_append_0600(&dir.join(super::GATEWAY_JSONL)) {
+        let line = json!({
+            "ts": Utc::now(),
+            "kind": "note",
+            "trace_id": trace_id,
+            "from_gateway": from_gateway,
+            "to_gateway": to_gateway,
+            "to_peer": to_peer,
+            "action": "work_ingest_refused",
+            "code": code,
         });
         if let Ok(mut bytes) = serde_json::to_vec(&line) {
             bytes.push(b'\n');

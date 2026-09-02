@@ -1,10 +1,18 @@
 mod common;
 
 use a2a::home::A2aHome;
+use a2a::mesh::keys::{
+    enroll_gateway_token, fleet_init, gateway_identity, gateway_public_key_b64,
+    install_gateway_token, SystemClock,
+};
 use a2a::mesh::gateway::notes_wire::{
     self, deliver_spooled_once, receive_note, NoteAck, NoteDeliveryTarget,
 };
-use a2a::mesh::{Note, PeerId};
+use a2a::mesh::work::{
+    sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo,
+};
+use a2a::mesh::work_store::{self, WORK_OFFER_KIND};
+use a2a::mesh::{notes, Note, PeerId};
 use chrono::{TimeZone, Utc};
 use rand::{rngs::StdRng, SeedableRng};
 use serde_json::{json, Value};
@@ -18,6 +26,23 @@ fn home_at(path: &Path) -> A2aHome {
 
 fn cfg_for(home: &A2aHome) -> a2a::config::Config {
     a2a::config::load(home).unwrap().0
+}
+
+fn copy_root_pub(root: &Path, joiner: &Path) {
+    fs::create_dir_all(joiner.join("mesh/fleet")).unwrap();
+    fs::copy(
+        root.join("mesh/fleet/root.pub"),
+        joiner.join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+}
+
+fn enroll_joiner(root: &A2aHome, joiner: &A2aHome, clock: &SystemClock) -> String {
+    let identity = gateway_identity(joiner, false).unwrap();
+    let pubkey_b64 = gateway_public_key_b64(joiner).unwrap();
+    let token = enroll_gateway_token(root, &identity.gateway_id, &pubkey_b64, clock).unwrap();
+    install_gateway_token(joiner, &token, clock).unwrap();
+    identity.gateway_id
 }
 
 fn write_gateway_key(home: &Path, gateway_id: &str) {
@@ -70,6 +95,54 @@ fn note(from: &str, to: &str, text: &str, note_id: &str) -> Note {
         kind: "note".to_string(),
         text: text.to_string(),
         refs: json!({}),
+        extra: serde_json::Map::new(),
+    }
+}
+
+fn signed_work_fixture(
+    work_id: &str,
+) -> (tempfile::TempDir, A2aHome, A2aHome, String, WorkEnvelope) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = home_at(&tmp.path().join("root"));
+    let sender = home_at(&tmp.path().join("sender"));
+    let receiver = home_at(&tmp.path().join("receiver"));
+    let clock = SystemClock;
+    fleet_init(&root).unwrap();
+    copy_root_pub(root.root(), sender.root());
+    copy_root_pub(root.root(), receiver.root());
+    enroll_joiner(&root, &sender, &clock);
+    let receiver_gateway = enroll_joiner(&root, &receiver, &clock);
+    let env = sign_envelope(
+        &sender,
+        UnsignedWorkEnvelope {
+            work_id: work_id.to_string(),
+            session: "codex:sender-session".to_string(),
+            addressing: WorkAddressing::Directed(receiver_gateway.clone()),
+            repo: WorkRepo {
+                remote_url: "https://github.com/example/project.git".to_string(),
+                base_ref: "main".to_string(),
+            },
+            title: "Implement mesh handoff".to_string(),
+            brief_text: "---\nlane: impl\n---\nDo the task.".to_string(),
+            acceptance: "focused test passes".to_string(),
+            ttl_days: 7,
+            max_bytes: 262_144,
+        },
+        &clock,
+    )
+    .unwrap();
+    (tmp, sender, receiver, receiver_gateway, env)
+}
+
+fn work_note(to_gateway: &str, env: &WorkEnvelope, note_id: &str) -> Note {
+    Note {
+        note_id: Some(note_id.to_string()),
+        from: "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+        to: format!("gateway:{to_gateway}"),
+        ts: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        kind: WORK_OFFER_KIND.to_string(),
+        text: format!("work offer: {} ({})", env.title, env.work_id),
+        refs: json!({ "work": env }),
         extra: serde_json::Map::new(),
     }
 }
@@ -515,4 +588,106 @@ fn token_expired_ack_archives_immediately_without_retry() {
         .len(),
         1
     );
+}
+
+#[test]
+fn gateway_addressed_work_offer_is_verified_stored_and_not_session_injected() {
+    let (tmp, _sender, receiver, receiver_gateway, env) =
+        signed_work_fixture("01HZ7P7Q0V0V7G01J4J8R8M2Q2");
+    let cfg = cfg_for(&receiver);
+    let peer = "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let note = work_note(&receiver_gateway, &env, "01K3KV00000000000000000005");
+    let spooled = notes_wire::SpooledNote {
+        schema_version: 1,
+        trace_id: "01K3KV00000000000000000005".to_string(),
+        from_gateway: env.sender.gateway_id.clone(),
+        to_gateway: receiver_gateway.clone(),
+        to_peer: note.to.clone(),
+        attempts: 0,
+        next_attempt_after: None,
+        note,
+    };
+
+    assert_eq!(
+        receive_note(&receiver, &cfg, &spooled).unwrap(),
+        NoteAck::Delivered
+    );
+    let stored = receiver
+        .root()
+        .join("work")
+        .join("inbox")
+        .join(format!("{}.json", env.work_id));
+    assert!(stored.exists(), "directed work is stored");
+    assert_eq!(
+        fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(note_files(receiver.root(), peer).is_empty());
+    assert!(notes::inject(
+        &receiver,
+        &cfg,
+        &PeerId::parse(peer).unwrap(),
+        Utc.timestamp_opt(1_700_000_010, 0).unwrap()
+    )
+    .unwrap()
+    .is_none());
+
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    common::a2a(receiver.root(), &work)
+        .args([
+            "mesh",
+            "inbox",
+            "--provider",
+            "codex",
+            "--session",
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ])
+        .assert()
+        .success()
+        .stdout("");
+    common::a2a(receiver.root(), &work)
+        .args([
+            "mesh",
+            "inject",
+            "--provider",
+            "codex",
+            "--session",
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn bad_work_offer_is_rejected_logged_and_not_stored() {
+    let (_tmp, _sender, receiver, receiver_gateway, mut env) =
+        signed_work_fixture("01HZ7P7Q0V0V7G01J4J8R8M2Q3");
+    env.title.push_str(" tampered");
+    let cfg = cfg_for(&receiver);
+    let note = work_note(&receiver_gateway, &env, "01K3KV00000000000000000006");
+    let spooled = notes_wire::SpooledNote {
+        schema_version: 1,
+        trace_id: "01K3KV00000000000000000006".to_string(),
+        from_gateway: env.sender.gateway_id.clone(),
+        to_gateway: receiver_gateway,
+        to_peer: note.to.clone(),
+        attempts: 0,
+        next_attempt_after: None,
+        note,
+    };
+
+    assert_eq!(
+        receive_note(&receiver, &cfg, &spooled).unwrap(),
+        NoteAck::Rejected {
+            code: "WORK_SIGNATURE_INVALID".to_string()
+        }
+    );
+    assert!(work_store::list(&receiver).unwrap().is_empty());
+    let log =
+        fs::read_to_string(receiver.root().join("mesh").join("gateway").join("gateway.jsonl"))
+            .unwrap();
+    assert!(log.contains(r#""action":"work_ingest_refused""#), "{log}");
+    assert!(log.contains(r#""code":"WORK_SIGNATURE_INVALID""#), "{log}");
 }

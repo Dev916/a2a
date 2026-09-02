@@ -1,11 +1,19 @@
 mod common;
 
 use a2a::home::A2aHome;
+use a2a::mesh::keys::{
+    enroll_gateway_token, fleet_init, gateway_identity, gateway_public_key_b64,
+    install_gateway_token, SystemClock,
+};
 use a2a::mesh::gateway::replicate::{
     self, AntiEntropyApply, AntiEntropyCycle, CursorAdvance, CursorStore, FeedReorderBuffers,
     IngestDecision, PeerRevocationTracker, WantReply,
 };
 use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::work::{
+    sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo,
+};
+use a2a::mesh::work_store;
 use a2a::mesh::wire::{Frame, OriginWant};
 use a2a::mesh::FeedEntry;
 use chrono::{TimeZone, Utc};
@@ -36,6 +44,56 @@ fn write_gateway_key(home: &Path, gateway_id: &str) {
     )
     .unwrap();
     fs::set_permissions(dir.join("gw.key"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn copy_root_pub(root: &Path, joiner: &Path) {
+    fs::create_dir_all(joiner.join("mesh/fleet")).unwrap();
+    fs::copy(
+        root.join("mesh/fleet/root.pub"),
+        joiner.join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+}
+
+fn enroll_joiner(root: &A2aHome, joiner: &A2aHome, clock: &SystemClock) -> String {
+    let identity = gateway_identity(joiner, false).unwrap();
+    let pubkey_b64 = gateway_public_key_b64(joiner).unwrap();
+    let token = enroll_gateway_token(root, &identity.gateway_id, &pubkey_b64, clock).unwrap();
+    install_gateway_token(joiner, &token, clock).unwrap();
+    identity.gateway_id
+}
+
+fn pool_work_fixture(work_id: &str) -> (tempfile::TempDir, A2aHome, A2aHome, WorkEnvelope) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = home_at(&tmp.path().join("root"));
+    let sender = home_at(&tmp.path().join("sender"));
+    let receiver = home_at(&tmp.path().join("receiver"));
+    let clock = SystemClock;
+    fleet_init(&root).unwrap();
+    copy_root_pub(root.root(), sender.root());
+    copy_root_pub(root.root(), receiver.root());
+    enroll_joiner(&root, &sender, &clock);
+    enroll_joiner(&root, &receiver, &clock);
+    let env = sign_envelope(
+        &sender,
+        UnsignedWorkEnvelope {
+            work_id: work_id.to_string(),
+            session: "codex:sender-session".to_string(),
+            addressing: WorkAddressing::Pool,
+            repo: WorkRepo {
+                remote_url: "https://github.com/example/project.git".to_string(),
+                base_ref: "main".to_string(),
+            },
+            title: "Implement mesh handoff".to_string(),
+            brief_text: "---\nlane: impl\n---\nDo the task.".to_string(),
+            acceptance: "focused test passes".to_string(),
+            ttl_days: 7,
+            max_bytes: 262_144,
+        },
+        &clock,
+    )
+    .unwrap();
+    (tmp, sender, receiver, env)
 }
 
 fn registry_row(gateway_id: &str, endpoint_url: Option<&str>) -> GatewayRow {
@@ -267,6 +325,51 @@ fn remote_ingress_appends_before_advancing_and_rebuilds_or_repairs_cursors_by_sc
     fs::write(&cursor_path, b"not json").unwrap();
     let rebuilt = CursorStore::load_or_rebuild(&home).unwrap();
     assert_eq!(rebuilt.last_seq("gw-remote"), 1);
+}
+
+#[test]
+fn feed_work_refs_materialize_pool_work_and_rejected_refs_advance_cursor() {
+    let (_tmp, _sender, receiver, env) = pool_work_fixture("01HZ7P7Q0V0V7G01J4J8R8M2Q4");
+    let mut cfg = cfg_for(&receiver);
+    let mut cursors = CursorStore::load_or_rebuild(&receiver).unwrap();
+    let mut work_entry = entry("gw-remote", 1, "work offered");
+    work_entry.refs = json!({ "work": env });
+
+    assert_eq!(
+        replicate::append_remote_entry(&receiver, &cfg, &mut cursors, "gw-remote", work_entry)
+            .unwrap(),
+        IngestDecision::Accepted { local_seq: 1 }
+    );
+    let stored = work_store::load(&receiver, "01HZ7P7Q0V0V7G01J4J8R8M2Q4")
+        .unwrap()
+        .expect("pool work is materialized");
+    assert_eq!(stored.source, work_store::WorkSource::Pool);
+    assert_eq!(cursors.last_seq("gw-remote"), 1);
+
+    cfg.mesh.work.max_pool_bytes = 2;
+    let mut rejected = entry("gw-remote", 2, "oversized refs");
+    rejected.refs = json!({ "work": { "too_large": "x".repeat(32) } });
+    assert_eq!(
+        replicate::append_remote_entry(&receiver, &cfg, &mut cursors, "gw-remote", rejected)
+            .unwrap(),
+        IngestDecision::Rejected {
+            reason: "WORK_TOO_LARGE".to_string()
+        }
+    );
+    assert_eq!(
+        cursors.last_seq("gw-remote"),
+        2,
+        "rejected work refs still skip and advance the origin cursor"
+    );
+
+    cfg.mesh.work.max_pool_bytes = 32_768;
+    let mut after = entry("gw-remote", 3, "after skipped work");
+    after.refs = json!({});
+    assert_eq!(
+        replicate::append_remote_entry(&receiver, &cfg, &mut cursors, "gw-remote", after).unwrap(),
+        IngestDecision::Accepted { local_seq: 2 }
+    );
+    assert_eq!(cursors.last_seq("gw-remote"), 3);
 }
 
 #[test]
@@ -728,4 +831,72 @@ fn compaction_persists_dense_claims_so_numbering_survives_generation_drops() {
         .expect("local entry survives compaction");
     assert_eq!(claimed["origin"], "gw-b", "claim persisted on disk");
     assert_eq!(claimed["origin_seq"], 1, "dense origin_seq persisted on disk");
+}
+
+#[tokio::test]
+async fn rejected_work_refs_over_live_link_advance_cursor_and_session_survives() {
+    let (_tmp, _sender, receiver, _env) = pool_work_fixture("01HZ7P7Q0V0V7G01J4J8R8M2Q5");
+    let home_a = home_at(&receiver.root().join("peer-a"));
+    let home_b = receiver;
+    write_gateway_key(home_a.root(), "gw-a");
+    let mut cfg_a = cfg_for(&home_a);
+    let mut cfg_b = cfg_for(&home_b);
+    cfg_a.mesh.work.max_pool_bytes = 2;
+    cfg_b.mesh.work.max_pool_bytes = 2;
+
+    let link = common::start_mesh_link(
+        home_a.clone(),
+        cfg_a.clone(),
+        "gw-a",
+        home_b.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+    let mut rejected = entry("gw-a", 1, "oversized work");
+    rejected.refs = json!({ "work": { "too_large": "x".repeat(32) } });
+    assert!(
+        link.a_state
+            .send(
+                "gw-b",
+                Frame::Feed {
+                    origin: "gw-a".to_string(),
+                    entries: vec![rejected],
+                },
+            )
+            .await
+    );
+    common::wait_until(|| {
+        CursorStore::load_cached(&home_b)
+            .unwrap()
+            .last_seq("gw-a")
+            == 1
+    })
+    .await;
+
+    let mut accepted = entry("gw-a", 2, "after rejected refs");
+    accepted.refs = json!({});
+    assert!(
+        link.a_state
+            .send(
+                "gw-b",
+                Frame::Feed {
+                    origin: "gw-a".to_string(),
+                    entries: vec![accepted],
+                },
+            )
+            .await
+    );
+    common::wait_until(|| {
+        a2a::mesh::feed::read(&home_b, 0)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.origin.as_deref() == Some("gw-a")
+                    && entry.origin_seq == Some(2)
+                    && entry.text == "after rejected refs"
+            })
+    })
+    .await;
+    link.stop().await;
 }

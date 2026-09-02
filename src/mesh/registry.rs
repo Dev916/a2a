@@ -696,6 +696,7 @@ fn work_not_found(fleet_id: &str, work_id: &str) -> AppError {
         ExitCode::Precondition,
         format!("work item {fleet_id}/{work_id} was not found"),
     )
+    .remedy("check `a2a mesh work list` or ask the sender to re-send the work")
 }
 
 pub struct PgRegistry {

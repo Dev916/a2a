@@ -536,6 +536,11 @@ pub enum MeshCmd {
         #[command(subcommand)]
         cmd: MeshGatewayCmd,
     },
+    /// Send, receive, and settle layer-3 mesh work handoffs
+    Work {
+        #[command(subcommand)]
+        cmd: MeshWorkCmd,
+    },
 }
 
 #[derive(clap::Args)]
@@ -607,6 +612,62 @@ pub enum MeshGatewayCmd {
         #[arg(long, value_name = "FILE")]
         file: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum MeshWorkCmd {
+    /// Send directed work to one gateway
+    Send(MeshWorkSendArgs),
+    /// Offer work to the open fleet pool
+    Offer(MeshWorkOfferArgs),
+    /// List local work with registry status overlaid
+    List,
+    /// Show one work item
+    Show { work_id: String },
+    /// Decline offered work and notify the sender
+    Decline {
+        work_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Cancel an offered item you sent
+    Cancel { work_id: String },
+    /// Show sender-side work status
+    Status { work_id: Option<String> },
+    /// Acknowledge a done or failed item you sent
+    Ack { work_id: String },
+}
+
+#[derive(clap::Args)]
+pub struct MeshWorkSendArgs {
+    #[arg(long)]
+    pub to: String,
+    #[command(flatten)]
+    pub common: MeshWorkCreateArgs,
+}
+
+#[derive(clap::Args)]
+pub struct MeshWorkOfferArgs {
+    #[command(flatten)]
+    pub common: MeshWorkCreateArgs,
+}
+
+#[derive(clap::Args)]
+pub struct MeshWorkCreateArgs {
+    #[arg(long)]
+    pub repo: String,
+    #[arg(long)]
+    pub base_ref: String,
+    #[arg(long)]
+    pub title: String,
+    #[arg(long, value_name = "FILE")]
+    pub brief: PathBuf,
+    #[arg(long)]
+    pub acceptance: String,
+    #[arg(long)]
+    pub ttl_days: Option<i64>,
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

@@ -1,4 +1,6 @@
-use a2a::cli::{BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshFleetCmd, MeshGatewayCmd, SyncCmd};
+use a2a::cli::{
+    BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshWorkCmd, SyncCmd,
+};
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
 use clap::Parser;
@@ -93,6 +95,16 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshGatewayCmd::UninstallService => "mesh gateway uninstall-service",
                 MeshGatewayCmd::Identity => "mesh gateway identity",
                 MeshGatewayCmd::InstallToken { .. } => "mesh gateway install-token",
+            },
+            MeshCmd::Work { cmd } => match cmd {
+                MeshWorkCmd::Send(_) => "mesh work send",
+                MeshWorkCmd::Offer(_) => "mesh work offer",
+                MeshWorkCmd::List => "mesh work list",
+                MeshWorkCmd::Show { .. } => "mesh work show",
+                MeshWorkCmd::Decline { .. } => "mesh work decline",
+                MeshWorkCmd::Cancel { .. } => "mesh work cancel",
+                MeshWorkCmd::Status { .. } => "mesh work status",
+                MeshWorkCmd::Ack { .. } => "mesh work ack",
             },
         },
     }

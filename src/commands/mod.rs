@@ -130,6 +130,7 @@ pub mod interrupt;
 pub mod kill;
 pub mod ls;
 pub mod mesh_cmd;
+pub mod work_cmd;
 pub mod respawn;
 pub mod result;
 pub mod resume;

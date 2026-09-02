@@ -624,6 +624,12 @@ pub enum MeshWorkCmd {
     List,
     /// Show one work item
     Show { work_id: String },
+    /// Approve offered work and spawn an impl worker
+    Approve {
+        work_id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Decline offered work and notify the sender
     Decline {
         work_id: String,

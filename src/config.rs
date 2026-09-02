@@ -717,6 +717,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
 
     cfg.allowed_roots = canonicalize_roots(std::mem::take(&mut cfg.allowed_roots), &mut warnings);
     append_implicit_worktrees_root(home, &mut cfg.allowed_roots);
+    append_implicit_work_root(home, &mut cfg.allowed_roots);
     Ok((cfg, origins, warnings))
 }
 
@@ -724,10 +725,12 @@ pub(crate) fn non_implicit_allowed_roots<'a>(
     home: &A2aHome,
     roots: &'a [PathBuf],
 ) -> Vec<&'a PathBuf> {
-    let implicit = std::fs::canonicalize(home.worktrees_dir()).ok();
+    let implicit_worktrees = std::fs::canonicalize(home.worktrees_dir()).ok();
+    let implicit_work = std::fs::canonicalize(home.work_dir()).ok();
     roots
         .iter()
-        .filter(|root| Some(*root) != implicit.as_ref())
+        .filter(|root| Some(*root) != implicit_worktrees.as_ref())
+        .filter(|root| Some(*root) != implicit_work.as_ref())
         .collect()
 }
 
@@ -759,6 +762,19 @@ fn append_implicit_worktrees_root(home: &A2aHome, roots: &mut Vec<PathBuf>) {
         return;
     }
     roots.push(worktrees);
+}
+
+/// `$A2A_HOME/work` is the mesh handoff checkout root (§7), and must ride the
+/// same implicit allowed-roots path as `$A2A_HOME/worktrees` so both the CLI and
+/// broker admit approve-spawn cwd paths after `config::load`.
+fn append_implicit_work_root(home: &A2aHome, roots: &mut Vec<PathBuf>) {
+    let Ok(work) = std::fs::canonicalize(home.work_dir()) else {
+        return;
+    };
+    if roots.iter().any(|root| work.starts_with(root)) {
+        return;
+    }
+    roots.push(work);
 }
 
 /// Canonicalize each root (resolving symlinks such as macOS `/tmp` →

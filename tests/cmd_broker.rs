@@ -1497,11 +1497,24 @@ fn the_broker_revalidates_the_wire_cwd_against_its_own_allowed_roots() {
     let scratch = tmp.path().join("scratch");
     std::fs::create_dir_all(&allowed).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
+    let resolved = a2a::home::A2aHome::resolve(Some(&home)).unwrap();
+    let work_repo = resolved.root().join("work").join("work-1").join("repo");
+    std::fs::create_dir_all(&work_repo).unwrap();
     let guard = common::BrokerGuard::new(&home);
 
     // The daemon's allowlist is `allowed/` and nothing else.
     run(a2a(&home, &allowed, &["broker", "run"]), &scratch, "run");
     wait_for_broker(&home);
+    let status = run(
+        a2a(&home, &allowed, &["--json", "broker", "status"]),
+        &scratch,
+        "status-work-root",
+    );
+    let roots = status.data()["allowed_roots"].as_array().unwrap().clone();
+    assert!(
+        roots.contains(&json!(resolved.root().join("work").canonicalize().unwrap())),
+        "broker should start with the implicit mesh work root: {roots:?}"
+    );
 
     let ghost = home.join("workers").join("general-0817t1200-ghos");
     let mut raw = Raw::hello(&home);
@@ -1519,11 +1532,19 @@ fn the_broker_revalidates_the_wire_cwd_against_its_own_allowed_roots() {
     assert_eq!(refused["body"]["exit"], json!(9), "{refused}");
     assert!(!ghost.exists(), "a refused spawn creates nothing");
 
+    let admitted = raw.req(
+        2,
+        "admit",
+        json!({"dir": ghost, "cwd": work_repo, "lane": "general"}),
+    );
+    assert_eq!(admitted["type"], json!("resp"), "{admitted}");
+    assert_eq!(admitted["body"]["decision"], json!("admit"), "{admitted}");
+
     // ... and the research rule is re-run too: research runs in its own scratch
     // dir, never in a repo, whoever is asking.
     let research = home.join("workers").join("research-0817t1200-rsch");
     let refused = raw.req(
-        2,
+        3,
         "spawn",
         json!({"dir": research, "cwd": allowed, "lane": "research"}),
     );

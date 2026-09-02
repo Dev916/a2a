@@ -1,6 +1,7 @@
 // tests/cmd_spawn.rs
 mod common;
 use common::*;
+use a2a::home::A2aHome;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
@@ -32,6 +33,32 @@ fn cwd_allowlist_canonicalizes_both_sides() {
     // canonicalizes to /private/var/... on macOS — success proves both sides are canonicalized.
     let (_home, _tmp, id) = spawn_with(&[]);
     assert!(!id.is_empty());
+}
+
+#[test]
+fn implicit_mesh_work_root_admits_no_worktree_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let allowed = tmp.path().join("allowed");
+    std::fs::create_dir_all(&allowed).unwrap();
+    let resolved = A2aHome::resolve(Some(&home)).unwrap();
+    let repo = resolved.root().join("work").join("work-1").join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let brief = write_brief(
+        tmp.path(),
+        "---\nlane: impl\nacceptance_criteria:\n  - focused test passes\nverify:\n  - cargo test --test cmd_spawn\n---\n# x\n",
+    );
+
+    let out = a2a(&home, &allowed)
+        .args(["--json", "spawn", "--lane", "impl", "--no-worktree", "--cwd"])
+        .arg(&repo)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["cwd"], serde_json::json!(repo.canonicalize().unwrap()));
+    assert!(resolved.root().join("work").is_dir());
 }
 
 #[test]

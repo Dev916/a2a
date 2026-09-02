@@ -86,6 +86,9 @@
 //! refusal must not leave the credential sitting in `workers/<id>/brief.md`),
 //! and `--cwd` is canonicalized on BOTH sides before it is compared to the
 //! allowlist component-wise — `/x/a` must never satisfy a root of `/x/ab`.
+//! `config::load` appends the implicit `$A2A_HOME/work` root as well as the
+//! worktrees root, which is what lets mesh work approval spawn with
+//! `--no-worktree --cwd $A2A_HOME/work/<id>/repo` without a local config edit.
 
 use crate::brief::{self, Brief};
 use crate::brokerclient::{self, BrokerClient};

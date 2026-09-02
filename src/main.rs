@@ -101,6 +101,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshWorkCmd::Offer(_) => "mesh work offer",
                 MeshWorkCmd::List => "mesh work list",
                 MeshWorkCmd::Show { .. } => "mesh work show",
+                MeshWorkCmd::Approve { .. } => "mesh work approve",
                 MeshWorkCmd::Decline { .. } => "mesh work decline",
                 MeshWorkCmd::Cancel { .. } => "mesh work cancel",
                 MeshWorkCmd::Status { .. } => "mesh work status",

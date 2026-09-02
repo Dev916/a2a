@@ -69,6 +69,10 @@ impl A2aHome {
         create_dir_0700(&root).map_err(io_err)?;
         create_dir_0700(&root.join("workers")).map_err(io_err)?;
         create_dir_0700(&root.join("worktrees")).map_err(io_err)?;
+        // Best-effort: the work dir is recreated on demand by `mesh work
+        // approve`; a read-only home must not fail open() for commands that
+        // never touch work (their own writability checks own that error).
+        let _ = create_dir_0700(&root.join("work"));
         let vf = root.join(LAYOUT_VERSION_FILE);
         if vf.exists() {
             let v: u32 = fs::read_to_string(&vf)
@@ -122,6 +126,9 @@ impl A2aHome {
     }
     pub fn worktrees_dir(&self) -> PathBuf {
         self.root.join("worktrees")
+    }
+    pub fn work_dir(&self) -> PathBuf {
+        self.root.join("work")
     }
     pub fn list_worker_ids(&self) -> std::io::Result<Vec<String>> {
         let mut out = vec![];

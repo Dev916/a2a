@@ -1405,7 +1405,10 @@ impl BrokerCore {
     async fn handle(&mut self, msg: CoreMsg) {
         match msg {
             CoreMsg::Admit { req, reply } => {
-                let outcome = self.decide_admission(&req).await;
+                let outcome = match self.gates(&req).await {
+                    Ok(()) => self.decide_admission(&req).await,
+                    Err(e) => Err(e),
+                };
                 let _ = reply.send(outcome);
             }
             CoreMsg::Spawn { req, reply } => {

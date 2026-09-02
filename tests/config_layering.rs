@@ -108,8 +108,8 @@ fn allowed_roots_canonicalized_and_missing_dropped_with_warning() {
     let roots = v["data"]["allowed_roots"].as_array().unwrap();
     assert_eq!(
         roots.len(),
-        2,
-        "missing root dropped, implicit one added: {roots:?}"
+        3,
+        "missing root dropped, implicit worktrees+work added: {roots:?}"
     );
     assert_eq!(
         roots[0],

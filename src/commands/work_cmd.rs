@@ -12,6 +12,7 @@ use crate::mesh::{
         WorkListFilter, WorkOwner, WorkPatch, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
     },
     work::{sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo},
+    work_exec::{self, RealGit, RealSpawner},
     work_store::{self, StoredWork, WORK_CANCELLED_KIND, WORK_OFFER_KIND, WORK_RESULT_KIND},
     Note, PeerId,
 };
@@ -60,6 +61,7 @@ pub fn run(
             MeshWorkCmd::Offer(args) => offer(home, cfg, args).await?,
             MeshWorkCmd::List => list(home, quiet).await?,
             MeshWorkCmd::Show { work_id } => show(home, work_id).await?,
+            MeshWorkCmd::Approve { work_id, dry_run } => approve(home, work_id, *dry_run).await?,
             MeshWorkCmd::Decline { work_id, reason } => {
                 decline(home, cfg, work_id, reason.as_deref()).await?
             }
@@ -175,6 +177,18 @@ async fn show(home: &A2aHome, work_id: &str) -> Result<Value, AppError> {
         out["title"] = json!(work_id);
     }
     Ok(out)
+}
+
+async fn approve(home: &A2aHome, work_id: &str, dry_run: bool) -> Result<Value, AppError> {
+    let git = RealGit;
+    let spawner = RealSpawner;
+    if dry_run {
+        return work_exec::approve_dry_run(home, &git, &spawner, work_id).await;
+    }
+    let registry = registry(home)?;
+    let outcome = work_exec::advance_approve(home, &registry, &git, &spawner, work_id).await?;
+    serde_json::to_value(outcome)
+        .map_err(|e| AppError::new("SERIALIZE", ExitCode::Internal, e.to_string()))
 }
 
 async fn decline(

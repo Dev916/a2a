@@ -602,6 +602,10 @@ fn canonical_claims(claims: &TokenClaims) -> Result<Vec<u8>, AppError> {
         ("issued_at", json!(claims.issued_at)),
         ("pubkey_b64", json!(claims.pubkey_b64)),
     ]);
+    canonical_json_fields(fields)
+}
+
+pub(crate) fn canonical_json_fields(fields: BTreeMap<&str, Value>) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&fields)
         .map_err(|e| AppError::new("SERIALIZE", ExitCode::Internal, e.to_string()))
 }
@@ -706,7 +710,7 @@ fn signing_key_from_b64(s: &str) -> Result<SigningKey, ()> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
-fn verifying_key_from_b64(s: &str) -> Result<VerifyingKey, ()> {
+pub(crate) fn verifying_key_from_b64(s: &str) -> Result<VerifyingKey, ()> {
     let bytes = b64_decode(s).map_err(|_| ())?;
     let key: [u8; 32] = bytes.try_into().map_err(|_| ())?;
     VerifyingKey::from_bytes(&key).map_err(|_| ())
@@ -877,7 +881,7 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn b64_encode(bytes: &[u8]) -> String {
+pub(crate) fn b64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -900,7 +904,7 @@ fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn b64_decode(s: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>, ()> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return Err(());

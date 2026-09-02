@@ -186,3 +186,4 @@ pub mod presence;
 pub mod registry;
 pub mod routing;
 pub mod wire;
+pub mod work;

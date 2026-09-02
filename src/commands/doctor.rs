@@ -183,7 +183,8 @@ const API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// Where codex keeps the login every worker shares (spec §4.2).
 const AUTH_JSON: &str = "auth.json";
-const GATEWAY_TOKEN_REENROLL_REMEDY: &str = "re-enroll: `a2a mesh fleet enroll` on the root machine, `a2a mesh gateway install-token` here";
+const GATEWAY_TOKEN_REENROLL_REMEDY: &str =
+    "re-enroll: `a2a mesh fleet enroll` on the root machine, `a2a mesh gateway install-token` here";
 
 struct FixedClock(DateTime<Utc>);
 
@@ -792,11 +793,9 @@ fn gateway_enrollment(ctx: &Ctx) -> Check {
 fn gateway_material_exists(home: &A2aHome) -> bool {
     let dir = home.root().join("mesh").join("gateway");
     match std::fs::read_dir(dir) {
-        Ok(mut entries) => entries.any(|entry| {
-            entry
-                .map(|entry| entry.path().is_file())
-                .unwrap_or(true)
-        }),
+        Ok(mut entries) => {
+            entries.any(|entry| entry.map(|entry| entry.path().is_file()).unwrap_or(true))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
@@ -1356,6 +1355,7 @@ mod tests {
             broker: Default::default(),
             admission: Default::default(),
             sync: Default::default(),
+            update: Default::default(),
             mesh: Default::default(),
         };
         assert_eq!(resolve_codex(&cfg), Some(bin));

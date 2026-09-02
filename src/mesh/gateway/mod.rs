@@ -568,6 +568,70 @@ fn service_reload_skipped() -> bool {
         .is_some_and(|value| value == "1")
 }
 
+pub fn is_running(home: &A2aHome) -> bool {
+    !lock_is_free(&gateway_root(home))
+}
+
+pub fn restart_installed_service() -> Result<bool, AppError> {
+    if !service_is_installed()? {
+        return Ok(false);
+    }
+    if service_reload_skipped() {
+        return Ok(true);
+    }
+    restart_service_for_platform()?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn service_is_installed() -> Result<bool, AppError> {
+    Ok(home_dir()?
+        .join("Library/LaunchAgents/dev.a2a.mesh-gateway.plist")
+        .exists())
+}
+
+#[cfg(target_os = "linux")]
+fn service_is_installed() -> Result<bool, AppError> {
+    Ok(home_dir()?
+        .join(".config/systemd/user/a2a-mesh-gateway.service")
+        .exists())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn service_is_installed() -> Result<bool, AppError> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn restart_service_for_platform() -> Result<(), AppError> {
+    let uid = nix::unistd::Uid::current().as_raw().to_string();
+    let service = format!("gui/{uid}/dev.a2a.mesh-gateway");
+    let status = Command::new("launchctl")
+        .args(["kickstart", "-k", &service])
+        .status()
+        .map_err(|e| service_error(format!("running launchctl kickstart: {e}")))?;
+    if !status.success() {
+        return Err(service_error(format!(
+            "launchctl kickstart exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restart_service_for_platform() -> Result<(), AppError> {
+    run_service_command(Command::new("systemctl").args([
+        "--user",
+        "restart",
+        "a2a-mesh-gateway.service",
+    ]))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn restart_service_for_platform() -> Result<(), AppError> {
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn install_service_for_platform(
     exe: &Path,

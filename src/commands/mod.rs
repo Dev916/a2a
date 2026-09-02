@@ -138,5 +138,6 @@ pub mod spawn;
 pub mod status;
 pub mod sync_cmd;
 pub mod tail;
+pub mod update;
 pub mod verify;
 pub mod wait;

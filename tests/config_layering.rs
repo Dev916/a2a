@@ -574,6 +574,45 @@ fn sync_allowlists_default_to_empty_and_name_their_layer() {
     }
 }
 
+#[test]
+fn update_repo_url_defaults_layers_and_names_unknown_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(
+        v["data"]["update"]["repo_url"],
+        a2a::config::DEFAULT_UPDATE_REPO_URL
+    );
+    assert_eq!(v["data"]["origins"]["update.repo_url"], "default");
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[update]\nrepo_url = \"file:///tmp/a2a.git\"\nreop_url = \"typo\"\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show", "--origin"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("update.reop_url"), "{stderr}");
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["update"]["repo_url"], "file:///tmp/a2a.git");
+    assert_eq!(v["data"]["origins"]["update.repo_url"], "file");
+
+    let v = show(
+        tmp.path(),
+        &[("A2A_UPDATE_REPO_URL", "ssh://example.invalid/a2a.git")],
+        true,
+    );
+    assert_eq!(
+        v["data"]["update"]["repo_url"],
+        "ssh://example.invalid/a2a.git"
+    );
+    assert_eq!(v["data"]["origins"]["update.repo_url"], "env");
+}
+
 /// An unknown key under `[sync]` warns like every other unknown key, and the
 /// allowlist beside it still applies.
 #[test]

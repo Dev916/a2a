@@ -62,6 +62,7 @@ pub const DEFAULT_MESH_GATEWAY_PING_SECS: u64 = 30;
 pub const DEFAULT_MESH_GATEWAY_ANTI_ENTROPY_SECS: u64 = 300;
 pub const DEFAULT_MESH_GATEWAY_FEED_RETAIN_DAYS: u64 = 30;
 pub const DEFAULT_MESH_GATEWAY_SHUTDOWN_GRACE_SECS: u64 = 10;
+pub const DEFAULT_UPDATE_REPO_URL: &str = "git@github.com:Dev916/a2a.git";
 
 /// Every `[broker]` key, in the order `config show --origin` reports them.
 pub const BROKER_FIELDS: [&str; 2] = ["idle_timeout_secs", "events_max_bytes"];
@@ -159,6 +160,9 @@ pub const SYNC_FIELDS: [&str; 3] = [
     "allow_http_header_servers",
     "claude_config_dir",
 ];
+
+/// Every `[update]` key, in the order `config show --origin` reports them.
+pub const UPDATE_FIELDS: [&str; 1] = ["repo_url"];
 
 /// Every `[mesh]` key, in the order `config show --origin` reports them.
 pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
@@ -435,6 +439,20 @@ pub struct SyncConfig {
     pub claude_config_dir: Option<PathBuf>,
 }
 
+/// The `[update]` section: where `a2a update` fetches releases from.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct UpdateConfig {
+    pub repo_url: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig {
+            repo_url: DEFAULT_UPDATE_REPO_URL.to_string(),
+        }
+    }
+}
+
 /// The `[mesh]` section: same-machine agent mesh read/write horizons.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct MeshGatewayConfig {
@@ -513,6 +531,7 @@ pub struct Config {
     pub broker: BrokerConfig,
     pub admission: AdmissionConfig,
     pub sync: SyncConfig,
+    pub update: UpdateConfig,
     pub mesh: MeshConfig,
 }
 
@@ -612,6 +631,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     for field in SYNC_FIELDS {
         origins.insert(format!("sync.{field}"), Origin::Default);
     }
+    for field in UPDATE_FIELDS {
+        origins.insert(format!("update.{field}"), Origin::Default);
+    }
     for field in MESH_FIELDS {
         origins.insert(format!("mesh.{field}"), Origin::Default);
     }
@@ -637,6 +659,7 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
         broker: BrokerConfig::default(),
         admission: AdmissionConfig::default(),
         sync: SyncConfig::default(),
+        update: UpdateConfig::default(),
         mesh: MeshConfig::default(),
     };
 
@@ -816,9 +839,38 @@ fn apply_file(
                 }
             }
             "sync" => apply_sync_file(cfg, origins, warnings, value)?,
+            "update" => apply_update_file(cfg, origins, warnings, value)?,
             "mesh" => apply_mesh_file(cfg, origins, warnings, value)?,
             other => warnings.push(format!("unknown config key: {other}")),
         }
+    }
+    Ok(())
+}
+
+/// `[update]` — self-updater source settings.
+fn apply_update_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value.as_table().ok_or_else(|| {
+        cfg_err(format!(
+            "update: expected a table, got {}",
+            value.type_str()
+        ))
+    })?;
+    for (field, v) in fields {
+        let dotted = format!("update.{field}");
+        if !UPDATE_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        match field.as_str() {
+            "repo_url" => cfg.update.repo_url = want_str(&dotted, v)?.to_string(),
+            _ => unreachable!("field membership fixed by UPDATE_FIELDS"),
+        }
+        origins.insert(dotted, Origin::File);
     }
     Ok(())
 }
@@ -1133,6 +1185,11 @@ pub fn sync_env_key(field: &str) -> String {
     format!("A2A_SYNC_{}", field.to_ascii_uppercase())
 }
 
+/// `A2A_UPDATE_<FIELD>` — the env spelling of one `[update]` key.
+pub fn update_env_key(field: &str) -> String {
+    format!("A2A_UPDATE_{}", field.to_ascii_uppercase())
+}
+
 /// `A2A_MESH_<FIELD>` — the env spelling of one `[mesh]` key.
 pub fn mesh_env_key(field: &str) -> String {
     format!("A2A_MESH_{}", field.to_ascii_uppercase())
@@ -1247,6 +1304,17 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
             _ => unreachable!("field membership fixed by SYNC_FIELDS"),
         }
         origins.insert(format!("sync.{field}"), Origin::Env);
+    }
+    for field in UPDATE_FIELDS {
+        let key = update_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        match field {
+            "repo_url" => cfg.update.repo_url = raw.to_string_lossy().into_owned(),
+            _ => unreachable!("field membership fixed by UPDATE_FIELDS"),
+        }
+        origins.insert(format!("update.{field}"), Origin::Env);
     }
     for field in MESH_FIELDS {
         let key = mesh_env_key(field);
@@ -1452,6 +1520,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
@@ -1551,6 +1620,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
@@ -1614,6 +1684,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
@@ -1668,6 +1739,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
@@ -1706,6 +1778,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
@@ -1766,6 +1839,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
@@ -1803,6 +1877,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
@@ -1832,6 +1907,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();
@@ -1868,6 +1944,7 @@ mod tests {
                 broker: BrokerConfig::default(),
                 admission: AdmissionConfig::default(),
                 sync: SyncConfig::default(),
+                update: UpdateConfig::default(),
                 mesh: MeshConfig::default(),
             };
             let err = apply_file(&mut cfg, &mut BTreeMap::new(), &mut vec![], &table).unwrap_err();
@@ -1929,6 +2006,7 @@ mod tests {
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
             mesh: MeshConfig::default(),
         };
         let mut origins: Origins = BTreeMap::new();

@@ -45,6 +45,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Resume { .. } => "resume",
         Cmd::Gc { .. } => "gc",
         Cmd::Doctor => "doctor",
+        Cmd::Update { .. } => "update",
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { .. } => "config show",
             ConfigCmd::AddRoot { .. } => "config add-root",
@@ -229,6 +230,24 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
             cli.global.json,
             cli.global.quiet,
         ),
+        Cmd::Update { check, channel } => {
+            let home = A2aHome::resolve(cli.global.home.as_deref())?;
+            let (cfg, _, warnings) = a2a::config::load(&home)?;
+            if !cli.global.quiet {
+                for warning in warnings {
+                    eprintln!("a2a: warning: {warning}");
+                }
+            }
+            a2a::commands::update::run(
+                &home,
+                &cfg,
+                *channel,
+                *check,
+                cli.global.json,
+                cli.global.quiet,
+            )
+            .map(Outcome::from)
+        }
         Cmd::Config { cmd } => match cmd {
             ConfigCmd::Show { origin } => {
                 let home = A2aHome::resolve(cli.global.home.as_deref())?;

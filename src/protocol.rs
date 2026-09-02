@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn initialize_params_cover_required_and_suppress_the_delta_stream() {
-        let p = InitializeParams::for_a2a("a2a", "0.1.0");
+        let p = InitializeParams::for_a2a("a2a", env!("CARGO_PKG_VERSION"));
         assert_covers_required(&p, "v1/InitializeParams.json");
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["clientInfo"]["name"], "a2a");

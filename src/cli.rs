@@ -176,6 +176,15 @@ pub enum Cmd {
     /// Check the environment a worker would be spawned into: one line per
     /// check, exit 9 if any of them fails
     Doctor,
+    /// Build and install the latest a2a release
+    Update {
+        /// Report the latest available version and exit without writing
+        #[arg(long)]
+        check: bool,
+        /// Update source: newest release tag or origin/main
+        #[arg(long, value_enum, default_value_t = crate::commands::update::Channel::Tag)]
+        channel: crate::commands::update::Channel,
+    },
     /// Inspect effective configuration
     Config {
         #[command(subcommand)]

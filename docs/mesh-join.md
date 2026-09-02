@@ -34,6 +34,15 @@ a2a mesh gateway identity --json
 Send the `gateway_id` and `pubkey_b64` values to the fleet owner. (This also mints
 your TLS material; nothing secret is printed.)
 
+For later upgrades on an enrolled machine, run:
+
+```sh
+a2a update
+```
+
+That fetches the latest release, installs it atomically, and restarts the gateway
+service when one is installed.
+
 ### 2. Owner: mint the token
 
 ```sh

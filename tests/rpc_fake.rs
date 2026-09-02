@@ -89,7 +89,7 @@ impl Fake {
         self.client
             .call(
                 "initialize",
-                &InitializeParams::for_a2a("a2a", "0.1.0"),
+                &InitializeParams::for_a2a("a2a", env!("CARGO_PKG_VERSION")),
                 RPC,
             )
             .await

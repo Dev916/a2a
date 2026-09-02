@@ -341,16 +341,17 @@ fn gateway_enrollment_warns_on_invalid_gateway_token() {
     std::fs::write(home.join("mesh/gateway/gw.token"), "not a token\n").unwrap();
 
     let (v, code) = checks(&home, tmp.path(), |_| {});
-    assert_eq!(code, 0, "gateway enrollment warnings are not fatal to doctor");
+    assert_eq!(
+        code, 0,
+        "gateway enrollment warnings are not fatal to doctor"
+    );
     assert_eq!(check(&v, "gateway_enrollment")["status"], "warn");
     let d = detail(&v, "gateway_enrollment");
     assert!(d.contains("GATEWAY_TOKEN_INVALID"), "{d}");
-    assert!(
-        check(&v, "gateway_enrollment")["remedy"]
-            .as_str()
-            .unwrap()
-            .contains("a2a mesh fleet enroll")
-    );
+    assert!(check(&v, "gateway_enrollment")["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("a2a mesh fleet enroll"));
 }
 
 fn wait_for_socket(home: &Path) {
@@ -593,7 +594,7 @@ fn a_drifted_manifest_entry_warns_in_sync_state() {
                 "source_hash": "0000",
                 "dest_hash": "not-the-hash-on-disk",
                 "synced_at": "2026-08-18T10:00:00Z",
-                "tool_version": "0.1.0",
+                "tool_version": "0.2.1",
                 "kind": "skill",
                 "account": "default",
             }

@@ -5,6 +5,7 @@
 // hence the blanket dead_code allow (no single test binary uses all of it).
 #![allow(dead_code)]
 use assert_cmd::Command;
+use chrono::{TimeZone, Utc};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -241,6 +242,144 @@ pub async fn wait_until(mut pred: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+pub struct TestMeshWorkFixture {
+    pub _tmp: tempfile::TempDir,
+    pub root: a2a::home::A2aHome,
+    pub home_a: a2a::home::A2aHome,
+    pub home_b: a2a::home::A2aHome,
+    pub gateway_a: String,
+    pub gateway_b: String,
+    pub registry: a2a::mesh::registry::FileRegistry,
+    pub work: PathBuf,
+    pub remote_bare: PathBuf,
+}
+
+pub async fn mesh_work_fixture(name: &str) -> TestMeshWorkFixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = a2a::home::A2aHome::resolve(Some(&tmp.path().join("root"))).unwrap();
+    let home_a = a2a::home::A2aHome::resolve(Some(&tmp.path().join("a"))).unwrap();
+    let home_b = a2a::home::A2aHome::resolve(Some(&tmp.path().join("b"))).unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    a2a::mesh::keys::fleet_init(&root).unwrap();
+    copy_mesh_root_pub(root.root(), home_a.root());
+    copy_mesh_root_pub(root.root(), home_b.root());
+    let gateway_a = enroll_mesh_joiner(&root, &home_a);
+    let gateway_b = enroll_mesh_joiner(&root, &home_b);
+
+    let registry_dir = tmp.path().join("registry");
+    let registry = a2a::mesh::registry::FileRegistry::new(&registry_dir);
+    registry.init_schema().unwrap();
+    let registry_url = format!("file:{}", registry_dir.display());
+    a2a::mesh::registry::write_registry_env(&root, &registry_url).unwrap();
+    a2a::mesh::registry::write_registry_env(&home_a, &registry_url).unwrap();
+    a2a::mesh::registry::write_registry_env(&home_b, &registry_url).unwrap();
+
+    let fleet = a2a::mesh::keys::fleet_id(&home_a).unwrap();
+    use a2a::mesh::registry::Registry;
+    registry
+        .upsert_self(mesh_gateway_row(&home_a, &fleet, &gateway_a))
+        .await
+        .unwrap();
+    registry
+        .upsert_self(mesh_gateway_row(&home_b, &fleet, &gateway_b))
+        .await
+        .unwrap();
+
+    let remote_bare = init_local_bare_repo(tmp.path(), name);
+    TestMeshWorkFixture {
+        _tmp: tmp,
+        root,
+        home_a,
+        home_b,
+        gateway_a,
+        gateway_b,
+        registry,
+        work,
+        remote_bare,
+    }
+}
+
+pub fn local_bare_url(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+pub fn run_git(cwd: &Path, args: &[&str]) {
+    std::fs::create_dir_all(cwd).unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn copy_mesh_root_pub(root: &Path, joiner: &Path) {
+    std::fs::create_dir_all(joiner.join("mesh/fleet")).unwrap();
+    std::fs::copy(
+        root.join("mesh/fleet/root.pub"),
+        joiner.join("mesh/fleet/root.pub"),
+    )
+    .unwrap();
+}
+
+fn enroll_mesh_joiner(root: &a2a::home::A2aHome, joiner: &a2a::home::A2aHome) -> String {
+    let clock = a2a::mesh::keys::SystemClock;
+    let identity = a2a::mesh::keys::gateway_identity(joiner, false).unwrap();
+    let pubkey_b64 = a2a::mesh::keys::gateway_public_key_b64(joiner).unwrap();
+    let token =
+        a2a::mesh::keys::enroll_gateway_token(root, &identity.gateway_id, &pubkey_b64, &clock)
+            .unwrap();
+    a2a::mesh::keys::install_gateway_token(joiner, &token, &clock).unwrap();
+    identity.gateway_id
+}
+
+fn mesh_gateway_row(
+    home: &a2a::home::A2aHome,
+    fleet: &str,
+    gateway_id: &str,
+) -> a2a::mesh::registry::GatewayRow {
+    let identity = a2a::mesh::keys::gateway_identity(home, false).unwrap();
+    a2a::mesh::registry::GatewayRow {
+        fleet_id: fleet.to_string(),
+        gateway_id: gateway_id.to_string(),
+        owner: TEST_OWNER.to_string(),
+        endpoint_url: None,
+        pubkey_fpr: a2a::mesh::keys::gateway_public_key_fingerprint(home).unwrap(),
+        cert_fpr: Some(identity.cert_fpr),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        last_heartbeat: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        revoked_at: None,
+        schema_version: a2a::mesh::registry::REGISTRY_SCHEMA_VERSION,
+    }
+}
+
+fn init_local_bare_repo(tmp: &Path, name: &str) -> PathBuf {
+    let seed = tmp.join(format!("{name}-seed"));
+    let bare = tmp.join(format!("{name}.git"));
+    run_git(tmp, &["init", "--bare", bare.to_str().unwrap()]);
+    run_git(tmp, &["init", "-b", "main", seed.to_str().unwrap()]);
+    run_git(&seed, &["config", "user.email", "test@example.invalid"]);
+    run_git(&seed, &["config", "user.name", "Test User"]);
+    run_git(&seed, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(seed.join("README.md"), format!("{name}\n")).unwrap();
+    run_git(&seed, &["add", "README.md"]);
+    run_git(&seed, &["commit", "-m", "seed"]);
+    run_git(
+        &seed,
+        &["remote", "add", "origin", &local_bare_url(&bare)],
+    );
+    run_git(&seed, &["push", "-u", "origin", "main"]);
+    bare
 }
 
 /// Spawns a general-lane worker with the given STUB_* env; returns (home, tmp_keepalive, worker_id).

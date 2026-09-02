@@ -318,6 +318,7 @@ fn validate_repo_url(url: &str) -> Result<(), AppError> {
         && !url.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
         && (valid_scheme_url(url, "ssh://")
             || valid_scheme_url(url, "https://")
+            || valid_file_url(url)
             || valid_scp_like_url(url));
     if valid {
         Ok(())
@@ -325,7 +326,7 @@ fn validate_repo_url(url: &str) -> Result<(), AppError> {
         Err(AppError::new(
             "WORK_BAD_REPO_URL",
             ExitCode::Precondition,
-            "work envelope repo remote_url must be ssh://, https://, or git@host:path and must not begin with '-'",
+            "work envelope repo remote_url must be ssh://, https://, file://, or git@host:path and must not begin with '-'",
         )
         .remedy("use a canonical git remote URL; git invocation paths pass it after `--`"))
     }
@@ -339,6 +340,11 @@ fn valid_scheme_url(url: &str, scheme: &str) -> bool {
         return false;
     };
     !host.is_empty() && !path.is_empty()
+}
+
+fn valid_file_url(url: &str) -> bool {
+    url.strip_prefix("file://")
+        .is_some_and(|path| path.starts_with('/') && path.len() > 1)
 }
 
 fn valid_scp_like_url(url: &str) -> bool {

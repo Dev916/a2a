@@ -2,10 +2,11 @@ use crate::config::Config;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::{
     feed,
-    keys::SystemClock,
+    keys::{self, SystemClock},
+    registry::{self, Registry, WorkOwner, WorkPatch},
     peer_dir, scan_or_refuse,
     work::{verify_envelope, WorkEnvelope},
-    work_store::{self, WorkSource, WORK_OFFER_KIND},
+    work_store::{self, WorkSource, WORK_OFFER_KIND, WORK_RESULT_KIND},
     Note, PeerId, NOTE_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode};
@@ -194,6 +195,7 @@ pub fn handle_ack(
     match outcome {
         "delivered" => {
             archive(sender, &path, "sent", to_gateway)?;
+            record_result_delivery_ack(sender, &envelope, "delivered");
             log_note_action(
                 sender,
                 &envelope.from_gateway,
@@ -208,6 +210,7 @@ pub fn handle_ack(
         | "WORK_TOKEN_MISMATCH" | "WORK_EXPIRED" | "WORK_TOO_LARGE" | "WORK_BAD_REPO_URL"
         | "WORK_WRONG_FLEET" | "WORK_SCHEMA_MISSING" | "WORK_CONTROL_CHARS" => {
             archive(sender, &path, "rejected", to_gateway)?;
+            record_result_delivery_ack(sender, &envelope, &format!("rejected:{outcome}"));
             log_note_action(
                 sender,
                 &envelope.from_gateway,
@@ -220,6 +223,58 @@ pub fn handle_ack(
         }
         _ => Ok(false),
     }
+}
+
+fn record_result_delivery_ack(sender: &A2aHome, envelope: &SpooledNote, delivery: &str) {
+    if envelope.note.kind != WORK_RESULT_KIND {
+        return;
+    }
+    let Some(work_id) = envelope
+        .note
+        .refs
+        .get("result")
+        .and_then(|result| result.get("work_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let home = sender.clone();
+    let delivery = delivery.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = record_result_delivery_ack_async(home, work_id, delivery).await;
+        });
+    } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let _ = rt.block_on(record_result_delivery_ack_async(home, work_id, delivery));
+    }
+}
+
+async fn record_result_delivery_ack_async(
+    home: A2aHome,
+    work_id: String,
+    delivery: String,
+) -> Result<(), AppError> {
+    let registry_url = registry::read_registry_env(&home)?;
+    let registry = registry::open_registry(&registry_url)?;
+    let fleet_id = keys::fleet_id(&home)?;
+    let Some(row) = registry.work_get(&fleet_id, &work_id).await? else {
+        return Ok(());
+    };
+    let _ = registry
+        .work_transition(
+            &fleet_id,
+            &work_id,
+            row.status,
+            row.status,
+            WorkOwner::Any,
+            WorkPatch {
+                result_delivery: Some(Some(delivery)),
+                ..WorkPatch::default()
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 pub fn receive_note(

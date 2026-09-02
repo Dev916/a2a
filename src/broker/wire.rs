@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 39] = [
+pub const KNOWN_CODES: [&str; 41] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -110,6 +110,8 @@ pub const KNOWN_CODES: [&str; 39] = [
     "BROKER_GONE",
     "WORK_REPO_UNREACHABLE",
     "WORK_DAEMON_DOWN",
+    "WORK_RECONCILE_FAILED",
+    "WORK_PUSH_FAILED",
     "APP_SERVER",
     "APP_SERVER_START",
     "SNAPSHOT_UNREADABLE",

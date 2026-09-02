@@ -68,6 +68,7 @@ pub fn run(
             MeshWorkCmd::Cancel { work_id } => cancel(home, cfg, work_id).await?,
             MeshWorkCmd::Status { work_id } => status(home, work_id.as_deref()).await?,
             MeshWorkCmd::Ack { work_id } => ack(home, work_id).await?,
+            MeshWorkCmd::RetryPush { work_id } => retry_push(home, cfg, work_id).await?,
         };
         Ok(Outcome::from(sanitize_value(out)))
     })
@@ -358,6 +359,31 @@ async fn ack(home: &A2aHome, work_id: &str) -> Result<Value, AppError> {
     }
     write_ack_marker(home, work_id)?;
     Ok(json!({ "work_id": work_id, "status": "acked" }))
+}
+
+async fn retry_push(home: &A2aHome, cfg: &Config, work_id: &str) -> Result<Value, AppError> {
+    let state = work_exec::load_state(home, work_id)?
+        .ok_or_else(|| work_not_found(work_id))?;
+    let registry = registry(home)?;
+    let mut options = work_exec::WorkLoopOptions::for_config(cfg);
+    options.force_push = true;
+    let before = state.push_attempts;
+    let next = work_exec::advance_completion_until(
+        home,
+        cfg,
+        &registry,
+        &work_exec::RealWorkCompletionIo,
+        state,
+        options,
+    )
+    .await?;
+    Ok(json!({
+        "work_id": work_id,
+        "forced": true,
+        "phase": format!("{:?}", next.phase).to_lowercase(),
+        "attempted": next.push_attempts == before || next.push_attempts == before + 1,
+        "result_ref": next.result_ref,
+    }))
 }
 
 pub async fn send_result_note<R: Registry + ?Sized>(

@@ -42,7 +42,7 @@ pub const GATEWAY_PID: &str = "gateway.pid";
 pub const GATEWAY_HEALTH: &str = "gateway-health.json";
 pub const GATEWAY_JSONL: &str = "gateway.jsonl";
 pub const GATEWAY_DAEMON_LOG: &str = "gateway.daemon.log";
-pub const HEALTH_SCHEMA_VERSION: u32 = 1;
+pub const HEALTH_SCHEMA_VERSION: u32 = 2;
 
 pub type DialPeerRowIdentity = (Option<String>, Option<String>);
 
@@ -108,15 +108,17 @@ pub enum LoopSlot {
     Dialer,
     Watcher,
     AntiEntropy,
+    Work,
 }
 
 impl LoopSlot {
-    const ALL: [LoopSlot; 5] = [
+    const ALL: [LoopSlot; 6] = [
         LoopSlot::Registry,
         LoopSlot::Server,
         LoopSlot::Dialer,
         LoopSlot::Watcher,
         LoopSlot::AntiEntropy,
+        LoopSlot::Work,
     ];
 
     fn as_str(self) -> &'static str {
@@ -126,15 +128,18 @@ impl LoopSlot {
             LoopSlot::Dialer => "dialer",
             LoopSlot::Watcher => "watcher",
             LoopSlot::AntiEntropy => "anti-entropy",
+            LoopSlot::Work => "work",
         }
     }
 
     fn policy(self) -> &'static str {
         match self {
             LoopSlot::Dialer => "rest-for-one",
-            LoopSlot::Registry | LoopSlot::Server | LoopSlot::Watcher | LoopSlot::AntiEntropy => {
-                "one-for-one"
-            }
+            LoopSlot::Registry
+            | LoopSlot::Server
+            | LoopSlot::Watcher
+            | LoopSlot::AntiEntropy
+            | LoopSlot::Work => "one-for-one",
         }
     }
 }
@@ -155,6 +160,7 @@ impl std::str::FromStr for LoopSlot {
             "dialer" => Ok(LoopSlot::Dialer),
             "watcher" => Ok(LoopSlot::Watcher),
             "anti-entropy" => Ok(LoopSlot::AntiEntropy),
+            "work" => Ok(LoopSlot::Work),
             _ => Err(()),
         }
     }
@@ -1388,6 +1394,7 @@ async fn run_loop(
         LoopSlot::Dialer => dialer_loop(slot, token, tx, cfg).await,
         LoopSlot::Watcher => watcher_loop(slot, token, tx, cfg).await,
         LoopSlot::AntiEntropy => anti_entropy_loop(slot, token, tx, cfg).await,
+        LoopSlot::Work => work_loop(slot, token, tx, cfg).await,
     }
 }
 
@@ -1936,6 +1943,63 @@ async fn anti_entropy_loop(
                     &mut cursors,
                 )?;
                 tx.send(LoopEvent::Replication(cfg.links.health().await)).await.ok();
+            }
+        }
+    }
+}
+
+async fn work_loop(
+    slot: LoopSlot,
+    token: CancellationToken,
+    tx: mpsc::Sender<LoopEvent>,
+    cfg: GatewayRuntimeConfig,
+) -> Result<(), AppError> {
+    if cfg.panic_slot == Some(slot) {
+        panic!("gateway stub loop {slot} panicked by test hook");
+    }
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut poll = tokio::time::interval(Duration::from_secs(
+        cfg.config.mesh.work.work_poll_secs.max(1),
+    ));
+    let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if cfg.stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(());
+            }
+            _ = heartbeat.tick() => {
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+            }
+            _ = poll.tick() => {
+                let report = super::work_exec::work_loop_tick(
+                    &cfg.home,
+                    &cfg.config,
+                    &cfg.registry.registry,
+                    &super::work_exec::RealWorkCompletionIo,
+                    super::work_exec::WorkLoopOptions::for_config(&cfg.config),
+                ).await;
+                let event = match report.registry_error {
+                    Some(error) => LoopEvent::RegistryError(RegistryErrorReport {
+                        slot,
+                        error: Some(error),
+                        at: Utc::now(),
+                    }),
+                    None => registry_error_recovered(slot),
+                };
+                if tx.send(event).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
+                if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
+                    token.cancel();
+                    return Ok(());
+                }
             }
         }
     }

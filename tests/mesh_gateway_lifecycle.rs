@@ -35,6 +35,17 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
         a2a::config::mesh_gateway_env_key("ping_secs"),
         "A2A_MESH_GATEWAY_PING_SECS"
     );
+    assert_eq!(
+        a2a::config::MESH_WORK_FIELDS,
+        [
+            "max_directed_bytes",
+            "max_pool_bytes",
+            "result_note_max_bytes",
+            "work_poll_secs",
+            "claim_stall_secs",
+            "checkout_retain_days",
+        ]
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -79,6 +90,9 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
     assert_eq!(data["mesh"]["gateway"]["anti_entropy_secs"], 300);
     assert_eq!(data["mesh"]["gateway"]["feed_retain_days"], 30);
     assert_eq!(data["mesh"]["gateway"]["shutdown_grace_secs"], 10);
+    assert_eq!(data["mesh"]["work"]["work_poll_secs"], 15);
+    assert_eq!(data["mesh"]["work"]["claim_stall_secs"], 900);
+    assert_eq!(data["mesh"]["work"]["checkout_retain_days"], 30);
     assert_eq!(data["origins"]["mesh.gateway.listen_port"], "file");
     assert_eq!(data["origins"]["mesh.gateway.ping_secs"], "env");
     for field in a2a::config::MESH_GATEWAY_FIELDS {
@@ -87,6 +101,15 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
                 .as_object()
                 .unwrap()
                 .contains_key(&format!("mesh.gateway.{field}")),
+            "{field} is listed in origins"
+        );
+    }
+    for field in a2a::config::MESH_WORK_FIELDS {
+        assert!(
+            data["origins"]
+                .as_object()
+                .unwrap()
+                .contains_key(&format!("mesh.work.{field}")),
             "{field} is listed in origins"
         );
     }
@@ -114,8 +137,14 @@ fn gateway_status_is_exit_7_until_a_supervisor_writes_health() {
             >= 1
     });
     assert_eq!(health["state"], "running");
+    assert_eq!(
+        health["schema_version"],
+        a2a::mesh::gateway::HEALTH_SCHEMA_VERSION
+    );
     assert_eq!(health["pid"], child.id());
+    assert_eq!(health["loops"].as_object().unwrap().len(), 6);
     assert!(health["loops"]["registry"]["heartbeats"].as_u64().unwrap() >= 1);
+    assert!(health["loops"]["work"]["heartbeats"].as_u64().unwrap() >= 1);
 
     let status = common::a2a(&home, &work)
         .args(["--json", "mesh", "gateway", "status"])
@@ -212,7 +241,7 @@ fn supervisor_escalates_panicking_loop_and_releases_lock() {
         &home,
         &work,
         &[
-            ("A2A_TEST_MESH_GATEWAY_STUB_PANIC", "registry"),
+            ("A2A_TEST_MESH_GATEWAY_STUB_PANIC", "work"),
             ("A2A_MESH_GATEWAY_OUTBOUND_RETRY_MAX_SECS", "1"),
         ],
     );
@@ -220,8 +249,8 @@ fn supervisor_escalates_panicking_loop_and_releases_lock() {
     assert!(!status.success(), "supervisor escalation exits non-zero");
     let health = read_health(&home);
     assert_eq!(health["state"], "escalated");
-    assert_eq!(health["escalation"]["loop"], "registry");
-    assert_eq!(health["loops"]["registry"]["restart_policy"], "one-for-one");
+    assert_eq!(health["escalation"]["loop"], "work");
+    assert_eq!(health["loops"]["work"]["restart_policy"], "one-for-one");
 
     let mut fresh = spawn_gateway(&home, &work, &[]);
     wait_for_health_with(&home, |health| {
@@ -251,7 +280,7 @@ fn shutdown_is_bounded_even_when_a_stub_refuses_to_die() {
     let mut child = spawn_gateway(
         &home,
         &work,
-        &[("A2A_TEST_MESH_GATEWAY_STUB_STALL_SHUTDOWN", "watcher")],
+        &[("A2A_TEST_MESH_GATEWAY_STUB_STALL_SHUTDOWN", "work")],
     );
     wait_for_health(&home, 1);
     nix::sys::signal::kill(
@@ -395,7 +424,7 @@ fn all_real_gateway_slots_boot_with_file_registry_and_shutdown_gracefully() {
 
     let mut child = spawn_gateway(&home, &work, &[]);
     let health = wait_for_health_with(&home, |health| {
-        ["registry", "dialer", "watcher", "anti-entropy"]
+        ["registry", "dialer", "watcher", "anti-entropy", "work"]
             .into_iter()
             .all(|slot| health["loops"][slot]["heartbeats"].as_u64().unwrap_or(0) >= 1)
             && (health["loops"]["server"]["heartbeats"]
@@ -417,6 +446,7 @@ fn all_real_gateway_slots_boot_with_file_registry_and_shutdown_gracefully() {
     assert_eq!(health["loops"]["dialer"]["state"], "running");
     assert_eq!(health["loops"]["watcher"]["state"], "running");
     assert_eq!(health["loops"]["anti-entropy"]["state"], "running");
+    assert_eq!(health["loops"]["work"]["state"], "running");
 
     common::a2a(&home, &work)
         .args(["mesh", "gateway", "stop"])
@@ -443,10 +473,10 @@ fn registry_unreachable_does_not_restart_or_escalate_gateway_loops() {
 
     let mut child = spawn_gateway(&home, &work, &[]);
     let health = wait_for_health_with(&home, |health| {
-        ["registry", "server", "dialer", "watcher", "anti-entropy"]
+        ["registry", "server", "dialer", "watcher", "anti-entropy", "work"]
             .into_iter()
             .all(|slot| health["loops"][slot]["state"] == "running")
-            && ["registry", "server", "dialer", "watcher", "anti-entropy"]
+            && ["registry", "server", "dialer", "watcher", "anti-entropy", "work"]
                 .into_iter()
                 .all(|slot| health["loops"][slot]["restarts"].as_u64() == Some(0))
             && health["registry_error"].is_string()

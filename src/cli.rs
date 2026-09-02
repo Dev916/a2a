@@ -642,6 +642,8 @@ pub enum MeshWorkCmd {
     Status { work_id: Option<String> },
     /// Acknowledge a done or failed item you sent
     Ack { work_id: String },
+    /// Force one result branch push attempt for a completed local work item
+    RetryPush { work_id: String },
 }
 
 #[derive(clap::Args)]

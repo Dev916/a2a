@@ -52,6 +52,7 @@ pub const DEFAULT_EVENTS_MAX_BYTES: u64 = 10_485_760;
 pub const DEFAULT_FEED_MAX_BYTES: u64 = 10_485_760;
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 900;
 pub const DEFAULT_GC_AFTER_DAYS: u64 = 7;
+pub const DEFAULT_MESH_WORK_TTL_DAYS: u64 = 7;
 pub const DEFAULT_MESH_WORK_MAX_DIRECTED_BYTES: u64 = 262_144;
 pub const DEFAULT_MESH_WORK_MAX_POOL_BYTES: u64 = 32_768;
 pub const DEFAULT_MESH_WORK_RESULT_NOTE_MAX_BYTES: u64 = 65_536;
@@ -174,7 +175,8 @@ pub const UPDATE_FIELDS: [&str; 1] = ["repo_url"];
 pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
 
 /// Every `[mesh.work]` key, in the order `config show --origin` reports them.
-pub const MESH_WORK_FIELDS: [&str; 6] = [
+pub const MESH_WORK_FIELDS: [&str; 7] = [
+    "ttl_days",
     "max_directed_bytes",
     "max_pool_bytes",
     "result_note_max_bytes",
@@ -505,6 +507,7 @@ impl Default for MeshGatewayConfig {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct MeshWorkConfig {
+    pub ttl_days: u64,
     pub max_directed_bytes: u64,
     pub max_pool_bytes: u64,
     pub result_note_max_bytes: u64,
@@ -516,6 +519,7 @@ pub struct MeshWorkConfig {
 impl Default for MeshWorkConfig {
     fn default() -> Self {
         MeshWorkConfig {
+            ttl_days: DEFAULT_MESH_WORK_TTL_DAYS,
             max_directed_bytes: DEFAULT_MESH_WORK_MAX_DIRECTED_BYTES,
             max_pool_bytes: DEFAULT_MESH_WORK_MAX_POOL_BYTES,
             result_note_max_bytes: DEFAULT_MESH_WORK_RESULT_NOTE_MAX_BYTES,
@@ -1202,6 +1206,7 @@ fn apply_mesh_work_toml(
     v: &toml::Value,
 ) -> Result<(), AppError> {
     match field {
+        "ttl_days" => work.ttl_days = want_u64(dotted, v)?,
         "max_directed_bytes" => work.max_directed_bytes = want_u64(dotted, v)?,
         "max_pool_bytes" => work.max_pool_bytes = want_u64(dotted, v)?,
         "result_note_max_bytes" => work.result_note_max_bytes = want_u64(dotted, v)?,
@@ -1521,6 +1526,7 @@ fn apply_mesh_work_str(
     s: &str,
 ) -> Result<(), AppError> {
     match field {
+        "ttl_days" => work.ttl_days = parse_u64_str(key, s)?,
         "max_directed_bytes" => work.max_directed_bytes = parse_u64_str(key, s)?,
         "max_pool_bytes" => work.max_pool_bytes = parse_u64_str(key, s)?,
         "result_note_max_bytes" => work.result_note_max_bytes = parse_u64_str(key, s)?,
@@ -2119,6 +2125,7 @@ mod tests {
         assert_eq!(mesh.feed_max_bytes, 10_485_760);
         assert_eq!(mesh.stale_after_secs, 900);
         assert_eq!(mesh.gc_after_days, 7);
+        assert_eq!(mesh.work.ttl_days, 7);
         assert_eq!(mesh.work.max_directed_bytes, 262_144);
         assert_eq!(mesh.work.max_pool_bytes, 32_768);
         assert_eq!(mesh.work.result_note_max_bytes, 65_536);
@@ -2128,6 +2135,7 @@ mod tests {
         assert_eq!(DEFAULT_FEED_MAX_BYTES, 10_485_760);
         assert_eq!(DEFAULT_STALE_AFTER_SECS, 900);
         assert_eq!(DEFAULT_GC_AFTER_DAYS, 7);
+        assert_eq!(DEFAULT_MESH_WORK_TTL_DAYS, 7);
         assert_eq!(
             MESH_FIELDS,
             ["feed_max_bytes", "stale_after_secs", "gc_after_days"]
@@ -2135,6 +2143,7 @@ mod tests {
         assert_eq!(
             MESH_WORK_FIELDS,
             [
+                "ttl_days",
                 "max_directed_bytes",
                 "max_pool_bytes",
                 "result_note_max_bytes",
@@ -2154,7 +2163,7 @@ mod tests {
         );
         assert_eq!(mesh_env_key("gc_after_days"), "A2A_MESH_GC_AFTER_DAYS");
 
-        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n[mesh.work]\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\nresult_note_max_bytes = 2048\nwork_poll_secs = 2\nclaim_stall_secs = 3\ncheckout_retain_days = 4\n"
+        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n[mesh.work]\nttl_days = 6\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\nresult_note_max_bytes = 2048\nwork_poll_secs = 2\nclaim_stall_secs = 3\ncheckout_retain_days = 4\n"
             .parse()
             .unwrap();
         let mut cfg = Config {
@@ -2174,6 +2183,7 @@ mod tests {
         assert_eq!(cfg.mesh.feed_max_bytes, 4096);
         assert_eq!(cfg.mesh.stale_after_secs, 60);
         assert_eq!(cfg.mesh.gc_after_days, 3);
+        assert_eq!(cfg.mesh.work.ttl_days, 6);
         assert_eq!(cfg.mesh.work.max_directed_bytes, 8192);
         assert_eq!(cfg.mesh.work.max_pool_bytes, 4096);
         assert_eq!(cfg.mesh.work.result_note_max_bytes, 2048);

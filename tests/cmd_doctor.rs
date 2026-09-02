@@ -594,7 +594,7 @@ fn a_drifted_manifest_entry_warns_in_sync_state() {
                 "source_hash": "0000",
                 "dest_hash": "not-the-hash-on-disk",
                 "synced_at": "2026-08-18T10:00:00Z",
-                "tool_version": "0.2.1",
+                "tool_version": "0.3.0",
                 "kind": "skill",
                 "account": "default",
             }

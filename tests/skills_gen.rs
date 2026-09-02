@@ -441,6 +441,17 @@ fn the_orchestrate_artifact_carries_every_dispatch_pin() {
         "4.3.4",
         "without an adapter",
         "templates/impl-result.schema.json",
+        // work-handoff: the L3 verbs and milestone convention.
+        "a2a mesh work send",
+        "a2a mesh work offer",
+        "a2a mesh work approve <work_id>",
+        "`--dry-run`",
+        "Result routing",
+        "retry-push <work_id>",
+        "ack <work_id>",
+        "work sent:",
+        "work offered:",
+        "work_result",
     ] {
         assert!(
             body.contains(&flat(needle)),

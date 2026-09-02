@@ -43,6 +43,10 @@ a2a update
 That fetches the latest release, installs it atomically, and restarts the gateway
 service when one is installed.
 
+For the 0.3.0 work-handoff rollout, the fleet owner must run
+`a2a mesh fleet migrate` on the root machine after every member upgrades. Joiners
+do not run fleet migrations; they only upgrade and restart their gateway service.
+
 ### 2. Owner: mint the token
 
 ```sh

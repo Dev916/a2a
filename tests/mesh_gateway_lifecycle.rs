@@ -38,6 +38,7 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
     assert_eq!(
         a2a::config::MESH_WORK_FIELDS,
         [
+            "ttl_days",
             "max_directed_bytes",
             "max_pool_bytes",
             "result_note_max_bytes",

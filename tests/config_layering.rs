@@ -383,6 +383,75 @@ fn mesh_defaults_layer_and_name_bad_values() {
     );
 }
 
+/// The `[mesh.work]` section (work handoff spec §8): every key, including the
+/// envelope TTL, layers through defaults < file < env and reports its origin
+/// under the same dotted path as every other section.
+#[test]
+fn mesh_work_defaults_layer_and_name_bad_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["mesh"]["work"]["ttl_days"], 7);
+    assert_eq!(v["data"]["mesh"]["work"]["max_directed_bytes"], 262_144);
+    assert_eq!(v["data"]["mesh"]["work"]["max_pool_bytes"], 32_768);
+    assert_eq!(
+        v["data"]["mesh"]["work"]["result_note_max_bytes"],
+        65_536
+    );
+    assert_eq!(v["data"]["mesh"]["work"]["work_poll_secs"], 15);
+    assert_eq!(v["data"]["mesh"]["work"]["claim_stall_secs"], 900);
+    assert_eq!(v["data"]["mesh"]["work"]["checkout_retain_days"], 30);
+    assert_eq!(v["data"]["origins"]["mesh.work.ttl_days"], "default");
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[mesh.work]\nttl_days = 3\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\n\
+         result_note_max_bytes = 2048\nwork_poll_secs = 2\nclaim_stall_secs = 4\n\
+         checkout_retain_days = 5\nsurprise = 1\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show", "--origin"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["mesh"]["work"]["ttl_days"], 3);
+    assert_eq!(v["data"]["mesh"]["work"]["max_directed_bytes"], 8192);
+    assert_eq!(v["data"]["origins"]["mesh.work.ttl_days"], "file");
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("mesh.work.surprise"), "{stderr}");
+
+    let v = show(
+        tmp.path(),
+        &[
+            ("A2A_MESH_WORK_TTL_DAYS", "9"),
+            ("A2A_MESH_WORK_MAX_DIRECTED_BYTES", "16384"),
+        ],
+        true,
+    );
+    assert_eq!(v["data"]["mesh"]["work"]["ttl_days"], 9);
+    assert_eq!(v["data"]["mesh"]["work"]["max_directed_bytes"], 16_384);
+    assert_eq!(v["data"]["origins"]["mesh.work.ttl_days"], "env");
+
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .env("A2A_MESH_WORK_TTL_DAYS", "soon")
+        .args(["--json", "config", "show"])
+        .assert()
+        .failure();
+    let e: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(e["error"]["code"], "CONFIG_INVALID");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("A2A_MESH_WORK_TTL_DAYS"),
+        "{e}"
+    );
+}
+
 /// The admission section (spec §4.9): three numbers with the same
 /// defaults < file < env precedence every other key obeys, named in `--origin`
 /// as `admission.global_cap`, `admission.queue_cap` and

@@ -24,8 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const MIN_WORK_PEER_VERSION: &str = "0.3.0";
-const DEFAULT_TTL_DAYS: i64 = 7;
+const MIN_WORK_PEER_VERSION: &str = crate::broker::wire::BINARY_VERSION;
 const RESULT_NOTE_ID_PREFIX: &str = "work-result-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +82,7 @@ async fn send(home: &A2aHome, cfg: &Config, args: &MeshWorkSendArgs) -> Result<V
         home,
         &args.common,
         WorkAddressing::Directed(args.to.clone()),
+        cfg.mesh.work.ttl_days,
         cfg.mesh.work.max_directed_bytes as usize,
     )?;
     insert_work_row(&registry, &env).await?;
@@ -109,6 +109,7 @@ async fn offer(home: &A2aHome, cfg: &Config, args: &MeshWorkOfferArgs) -> Result
         home,
         &args.common,
         WorkAddressing::Pool,
+        cfg.mesh.work.ttl_days,
         cfg.mesh.work.max_pool_bytes as usize,
     )?;
     let refs = json!({ "work": env });
@@ -444,6 +445,7 @@ fn build_envelope(
     home: &A2aHome,
     args: &MeshWorkCreateArgs,
     addressing: WorkAddressing,
+    default_ttl_days: u64,
     max_bytes: usize,
 ) -> Result<WorkEnvelope, AppError> {
     let brief_text = read_brief(&args.brief)?;
@@ -467,7 +469,9 @@ fn build_envelope(
             title: args.title.clone(),
             brief_text,
             acceptance: args.acceptance.clone(),
-            ttl_days: args.ttl_days.unwrap_or(DEFAULT_TTL_DAYS),
+            ttl_days: args
+                .ttl_days
+                .unwrap_or_else(|| i64::try_from(default_ttl_days).unwrap_or(i64::MAX)),
             max_bytes,
         },
         &keys::SystemClock,

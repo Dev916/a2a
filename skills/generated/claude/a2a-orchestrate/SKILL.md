@@ -217,3 +217,26 @@ Never post per-task passes, progress chatter, or anything a peer would not
 act on: ambient injection has a hard budget, and a noisy feed teaches peers
 to ignore it. One line each, with a repo or path reference. Posting must
 never fail the surrounding work — treat `a2a mesh post` errors as no-ops.
+
+## Work handoff
+
+Use `a2a mesh work send` for directed work when a specific gateway should
+claim it, and `a2a mesh work offer` for pool work when any upgraded fleet
+member may take it. Both commands publish a signed work envelope and leave an
+operator-visible milestone: `work sent: <title> -> <gateway> (<work_id>)` for
+directed work and `work offered: <title> (<work_id>)` for pool work.
+
+Before asking a receiver to execute anything, run
+`a2a mesh work approve <work_id> --dry-run`. The dry run prints the verified
+sender, repo, base ref, title, acceptance text, full brief and preflight
+results without touching the registry or filesystem. Approve without
+`--dry-run` only after that output is the work you intended to claim.
+
+Result routing is sender-side and idempotent. Use
+`a2a mesh work status <work_id>` to see whether a result arrived, `a2a mesh
+work retry-push <work_id>` when a completed local item needs another branch
+push attempt, and `a2a mesh work ack <work_id>` after a done or failed item has
+been handled. Completion posts a `work result: <title> (<work_id>)` note back
+been handled. Completion sends a `work_result` note back to the sender with
+text such as `work done: <title> (<work_id>) -> <result_ref>`; treat it as the
+handoff artifact, not as proof that acceptance passed.

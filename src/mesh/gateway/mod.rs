@@ -662,7 +662,7 @@ fn install_service_for_platform(
         let uid = nix::unistd::Uid::current().as_raw().to_string();
         let target = format!("gui/{uid}");
         let service = format!("{target}/dev.a2a.mesh-gateway");
-        let _ = Command::new("launchctl").args(["bootout", &service]).status();
+        bootout_launch_agent_if_loaded(&service)?;
         let bootstrap = Command::new("launchctl")
             .arg("bootstrap")
             .arg(&target)
@@ -694,10 +694,7 @@ fn uninstall_service_for_platform(reload_skipped: bool) -> Result<ServiceInstall
     if !reload_skipped {
         let uid = nix::unistd::Uid::current().as_raw().to_string();
         let service = format!("gui/{uid}/dev.a2a.mesh-gateway");
-        let bootout = Command::new("launchctl").args(["bootout", &service]).status();
-        if bootout.as_ref().is_err() || bootout.as_ref().is_ok_and(|s| !s.success()) {
-            let _ = Command::new("launchctl").args(["unload", "-w"]).arg(&path).status();
-        }
+        bootout_launch_agent_if_loaded(&service)?;
     }
     match std::fs::remove_file(&path) {
         Ok(()) => {}
@@ -708,6 +705,34 @@ fn uninstall_service_for_platform(reload_skipped: bool) -> Result<ServiceInstall
         path,
         status_command: "launchctl print gui/$UID/dev.a2a.mesh-gateway",
     })
+}
+
+#[cfg(target_os = "macos")]
+fn bootout_launch_agent_if_loaded(service: &str) -> Result<(), AppError> {
+    if !launch_agent_is_loaded(service)? {
+        return Ok(());
+    }
+    let status = Command::new("launchctl")
+        .args(["bootout", service])
+        .status()
+        .map_err(|e| service_error(format!("running launchctl bootout: {e}")))?;
+    if !status.success() {
+        return Err(service_error(format!(
+            "launchctl bootout exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_is_loaded(service: &str) -> Result<bool, AppError> {
+    let status = Command::new("launchctl")
+        .args(["print", service])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| service_error(format!("running launchctl print: {e}")))?;
+    Ok(status.success())
 }
 
 #[cfg(target_os = "linux")]

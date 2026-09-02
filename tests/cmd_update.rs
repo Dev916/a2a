@@ -33,7 +33,7 @@ fn tag_resolution_reports_no_releases() {
 fn already_current_short_circuits_before_writes() {
     let tmp = tempfile::tempdir().unwrap();
     let home = A2aHome::resolve(Some(&tmp.path().join("home"))).unwrap();
-    let mut env = FakeEnv::tag("v0.2.1");
+    let mut env = FakeEnv::tag("v0.3.0");
     let out = run_with_env(&home, &mut env, Channel::Tag, false, true).unwrap();
 
     assert_eq!(out["updated"], false);
@@ -148,7 +148,7 @@ fn missing_cargo_is_a_typed_error() {
 fn cli_check_json_envelope_uses_local_repo_tags_without_building() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo.git");
-    init_bare_repo_with_tags(&repo, &["v0.1.0", "v0.2.1"]);
+    init_bare_repo_with_tags(&repo, &["v0.1.0", "v0.3.0"]);
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
     fs::write(
@@ -169,19 +169,19 @@ fn cli_check_json_envelope_uses_local_repo_tags_without_building() {
     assert_eq!(v["command"], "update");
     assert_eq!(v["data"]["updated"], false);
     assert_eq!(v["data"]["from"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["data"]["to"], "0.2.1");
+    assert_eq!(v["data"]["to"], "0.3.0");
     assert_eq!(v["data"]["gateway_restarted"], false);
     assert!(!home.join("update").exists());
 }
 
 #[test]
-fn version_pin_is_021() {
+fn version_pin_is_030() {
     Command::cargo_bin("a2a")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::starts_with("a2a 0.2.1\n"));
+        .stdout(predicate::str::starts_with("a2a 0.3.0\n"));
 }
 
 #[derive(Default)]

@@ -18,6 +18,7 @@ pub fn run(home: &A2aHome, origin: bool, quiet: bool) -> Result<Value, AppError>
         "codex_version_range": cfg.codex_version_range,
         "allowed_roots": cfg.allowed_roots,
         "lanes": lanes,
+        "profiles": serde_json::to_value(&cfg.profiles).map_err(internal)?,
         "broker": serde_json::to_value(cfg.broker).map_err(internal)?,
         "admission": serde_json::to_value(&cfg.admission).map_err(internal)?,
         "sync": serde_json::to_value(&cfg.sync).map_err(internal)?,

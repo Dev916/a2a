@@ -30,6 +30,77 @@ fn defaults_match_spec_lane_table() {
 }
 
 #[test]
+fn profiles_pin_defaults_and_layer_file_then_env_with_custom_names() {
+    use a2a::config::PROFILE_FIELDS;
+
+    assert_eq!(PROFILE_FIELDS, ["model", "effort"]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["profiles"]["quick"]["model"], "gpt-5.5");
+    assert_eq!(v["data"]["profiles"]["quick"]["effort"], "low");
+    assert_eq!(v["data"]["profiles"]["standard"]["model"], "gpt-5.5");
+    assert_eq!(v["data"]["profiles"]["standard"]["effort"], "high");
+    assert_eq!(v["data"]["profiles"]["max"]["model"], "gpt-5.6-sol");
+    assert_eq!(v["data"]["profiles"]["max"]["effort"], "max");
+    assert_eq!(v["data"]["origins"]["profiles.max.model"], "default");
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[profiles.max]\nmodel = \"file-max\"\n\n[profiles.precise]\nmodel = \"custom-model\"\neffort = \"xhigh\"\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["profiles"]["max"]["model"], "file-max");
+    assert_eq!(v["data"]["profiles"]["max"]["effort"], "max");
+    assert_eq!(v["data"]["origins"]["profiles.max.model"], "file");
+    assert_eq!(v["data"]["origins"]["profiles.max.effort"], "default");
+    assert_eq!(v["data"]["profiles"]["precise"]["model"], "custom-model");
+    assert_eq!(v["data"]["profiles"]["precise"]["effort"], "xhigh");
+    assert_eq!(v["data"]["origins"]["profiles.precise.model"], "file");
+    assert_eq!(v["data"]["origins"]["profiles.precise.effort"], "file");
+
+    let v = show(
+        tmp.path(),
+        &[
+            ("A2A_PROFILES_MAX_MODEL", "env-max"),
+            ("A2A_PROFILES_PRECISE_EFFORT", "medium"),
+        ],
+        true,
+    );
+    assert_eq!(v["data"]["profiles"]["max"]["model"], "env-max");
+    assert_eq!(v["data"]["profiles"]["precise"]["effort"], "medium");
+    assert_eq!(v["data"]["origins"]["profiles.max.model"], "env");
+    assert_eq!(v["data"]["origins"]["profiles.precise.effort"], "env");
+}
+
+#[test]
+fn a_new_profile_requires_both_model_and_effort() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[profiles.incomplete]\nmodel = \"gpt-5.5\"\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .code(9);
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(value["error"]["code"], "CONFIG_INVALID");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("profiles.incomplete.effort"),
+        "{value}"
+    );
+}
+
+#[test]
 fn env_beats_file_beats_default() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path()).unwrap();

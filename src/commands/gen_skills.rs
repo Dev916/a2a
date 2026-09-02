@@ -81,7 +81,7 @@ pub const REQUIRED_SECTIONS: [&str; 7] = [
 /// The orchestrator protocol's sections, in render order — spec §4.8's bullets,
 /// one id each. Pinned for the same reason [`REQUIRED_SECTIONS`] is: a dropped
 /// section is a piece of guidance an orchestrator silently stops being given.
-pub const ORCHESTRATE_SECTIONS: [&str; 10] = [
+pub const ORCHESTRATE_SECTIONS: [&str; 11] = [
     "dispatch-choice",
     "brief-writing",
     "monitor-loop",
@@ -92,6 +92,7 @@ pub const ORCHESTRATE_SECTIONS: [&str; 10] = [
     "devloop-dispatch",
     "mesh-milestones",
     "work-handoff",
+    "model-effort-routing",
 ];
 
 /// Relative paths under `--out`, in the order [`render`] returns them.

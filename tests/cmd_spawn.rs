@@ -27,6 +27,113 @@ fn spawn_general_creates_worker_and_runs() {
     assert_eq!(snap["brief_sha"].as_str().unwrap().len(), 64);
 }
 
+fn spawn_profile_case(
+    tmp: &tempfile::TempDir,
+    profile: &str,
+    extra: &[&str],
+) -> (PathBuf, String, serde_json::Value, String) {
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("proj");
+    std::fs::create_dir_all(&work).unwrap();
+    let brief = write_brief(tmp.path(), "do the thing\n");
+    let argv_file = tmp.path().join("argv.txt");
+    let out = a2a(&home, tmp.path())
+        .env("STUB_ARGV_FILE", &argv_file)
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .arg("--profile")
+        .arg(profile)
+        .args(extra)
+        .assert()
+        .success();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let id = payload["data"]["id"].as_str().unwrap().to_string();
+    wait_dead(&home, &id, 30);
+    let argv = std::fs::read_to_string(&argv_file).expect("the stub recorded its argv");
+    (home, id, payload, argv)
+}
+
+#[test]
+fn profile_resolves_model_and_effort_and_is_recorded_everywhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, id, payload, argv) = spawn_profile_case(&tmp, "max", &[]);
+
+    assert_eq!(payload["data"]["profile"], "max");
+    assert_eq!(payload["data"]["model"], "gpt-5.6-sol");
+    assert_eq!(payload["data"]["effort"], "max");
+    assert!(argv.contains("-m gpt-5.6-sol"), "{argv}");
+    assert!(argv.contains("model_reasoning_effort=\"max\""), "{argv}");
+
+    let snap = read_snapshot(&home, &id);
+    assert_eq!(snap["profile"], "max");
+    assert_eq!(snap["model"], "gpt-5.6-sol");
+    assert_eq!(snap["effort"], "max");
+
+    let events = std::fs::read_to_string(home.join("workers").join(&id).join("events.jsonl"))
+        .unwrap();
+    let genesis: serde_json::Value =
+        serde_json::from_str(events.lines().next().unwrap()).unwrap();
+    assert_eq!(genesis["raw"]["profile"], "max");
+
+    let status = a2a(&home, tmp.path())
+        .args(["--json", "status", &id])
+        .assert()
+        .success();
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.get_output().stdout).unwrap();
+    assert_eq!(status["data"]["profile"], "max");
+}
+
+#[test]
+fn explicit_effort_beats_profile_while_profile_model_stays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_home, _id, payload, argv) =
+        spawn_profile_case(&tmp, "quick", &["--effort", "xhigh"]);
+
+    assert_eq!(payload["data"]["profile"], "quick");
+    assert_eq!(payload["data"]["model"], "gpt-5.5");
+    assert_eq!(payload["data"]["effort"], "xhigh");
+    assert!(argv.contains("-m gpt-5.5"), "{argv}");
+    assert!(
+        argv.contains("model_reasoning_effort=\"xhigh\""),
+        "{argv}"
+    );
+}
+
+#[test]
+fn unknown_profile_is_a_precondition_listing_every_known_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("proj");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[profiles.precise]\nmodel = \"custom-model\"\neffort = \"xhigh\"\n",
+    )
+    .unwrap();
+    let brief = write_brief(tmp.path(), "do the thing\n");
+
+    let out = a2a(&home, tmp.path())
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .args(["--profile", "missing"])
+        .assert()
+        .code(9);
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(value["error"]["code"], "PROFILE_UNKNOWN");
+    let rendered = value.to_string();
+    for known in ["max", "precise", "quick", "standard"] {
+        assert!(rendered.contains(known), "missing {known} from {rendered}");
+    }
+}
+
 #[test]
 fn cwd_allowlist_canonicalizes_both_sides() {
     // spawn_with passes the UN-canonicalized tempdir as the allowed root while --cwd

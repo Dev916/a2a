@@ -304,6 +304,9 @@ pub struct SpawnArgs {
     /// JSON schema the worker's result must satisfy
     #[arg(long)]
     pub schema: Option<PathBuf>,
+    /// Named model/effort profile from `[profiles.<name>]`
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
     /// Override the lane's model
     #[arg(long)]
     pub model: Option<String>,

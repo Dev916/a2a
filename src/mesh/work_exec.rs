@@ -196,6 +196,7 @@ impl WorkSpawner for RealSpawner {
             template: None,
             context: Vec::new(),
             schema: None,
+            profile: None,
             model: None,
             effort: None,
             transport: None,

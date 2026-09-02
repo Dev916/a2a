@@ -259,3 +259,21 @@ been handled. Completion sends a `work_result` note back to the sender with
 text such as `work done: <title> (<work_id>) -> <result_ref>`; treat it as the
 handoff artifact, not as proof that acceptance passed.
 <!-- a2a:end work-handoff -->
+
+<!-- a2a:section model-effort-routing -->
+## Model and effort routing
+
+Before each dispatch, assess the task and pass the matching named profile:
+
+* Use **`--profile quick`** for mechanical, fully specified, low-risk work:
+  pin bumps, renames, and single-file edits with exact instructions.
+* Use **`--profile standard`** for routine implementation with clear tests.
+* Use **`--profile max`** for protocol, concurrency, security, or multi-module
+  integration work; anything a plan marks as its hardest task; and **WHENEVER
+  UNSURE**. This fleet's default bias is quality over tokens.
+
+Explicit `--model` and `--effort` flags beat the profile, field by field, when
+a one-off dispatch needs more precise routing. With no profile or explicit
+model/effort flag at all, the lane defaults are the owner's configured
+baseline.
+<!-- a2a:end model-effort-routing -->

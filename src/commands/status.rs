@@ -101,6 +101,7 @@ fn payload(id: &str, snap: &WorkerSnapshot) -> Value {
         // ordinary worker, and the operator's own words for the rest (spec §5).
         "elevation_reason": snap.elevation_reason,
         "network": snap.network,
+        "profile": snap.profile,
         "model": snap.model,
         "effort": snap.effort,
         "cwd": snap.cwd,

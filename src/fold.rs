@@ -161,6 +161,9 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     if let Some(net) = raw.get("network").and_then(|v| v.as_bool()) {
         snap.network = net;
     }
+    if let Some(profile) = s("profile") {
+        snap.profile = Some(profile.to_string());
+    }
     if let Some(model) = s("model") {
         snap.model = model.to_string();
     }

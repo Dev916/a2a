@@ -222,6 +222,11 @@ pub const LANE_FIELDS: [&str; 11] = [
     "auto_review",
 ];
 
+/// Every `[profiles.<name>]` key, in the order `config show --origin` reports
+/// it. Profiles are deliberately only model + effort: every other spawn
+/// setting remains a lane policy or a per-spawn decision.
+pub const PROFILE_FIELDS: [&str; 2] = ["model", "effort"];
+
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Lane {
@@ -350,6 +355,13 @@ pub struct LaneConfig {
     /// the first spends an account's headroom, and that is an opt-in.
     #[serde(default)]
     pub auto_review: bool,
+}
+
+/// One named model/effort routing choice.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct ProfileConfig {
+    pub model: String,
+    pub effort: String,
 }
 
 /// The `[broker]` section: what the daemon does about itself.
@@ -573,6 +585,7 @@ pub struct Config {
     /// CANONICALIZED at load; default `[~/dev]`.
     pub allowed_roots: Vec<PathBuf>,
     pub lanes: BTreeMap<Lane, LaneConfig>,
+    pub profiles: BTreeMap<String, ProfileConfig>,
     pub broker: BrokerConfig,
     pub admission: AdmissionConfig,
     pub sync: SyncConfig,
@@ -632,6 +645,28 @@ fn default_lane(lane: Lane) -> LaneConfig {
         // Nobody's quota is spent on a review nobody asked for.
         auto_review: false,
     }
+}
+
+/// The three routing names available even when no config file exists.
+/// Operators may override either field in `config.toml` or the environment,
+/// while additional file-defined profiles join this map.
+pub(crate) fn default_profiles() -> BTreeMap<String, ProfileConfig> {
+    [
+        ("quick", "gpt-5.5", "low"),
+        ("standard", "gpt-5.5", "high"),
+        ("max", "gpt-5.6-sol", "max"),
+    ]
+    .into_iter()
+    .map(|(name, model, effort)| {
+        (
+            name.to_string(),
+            ProfileConfig {
+                model: model.to_string(),
+                effort: effort.to_string(),
+            },
+        )
+    })
+    .collect()
 }
 
 fn default_allowed_roots() -> Vec<PathBuf> {
@@ -699,11 +734,18 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
             origins.insert(format!("admission.lanes.{lane}.{field}"), Origin::Default);
         }
     }
+    let profiles = default_profiles();
+    for name in profiles.keys() {
+        for field in PROFILE_FIELDS {
+            origins.insert(format!("profiles.{name}.{field}"), Origin::Default);
+        }
+    }
     let mut cfg = Config {
         codex_bin: None,
         codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
         allowed_roots: default_allowed_roots(),
         lanes,
+        profiles,
         broker: BrokerConfig::default(),
         admission: AdmissionConfig::default(),
         sync: SyncConfig::default(),
@@ -872,6 +914,7 @@ fn apply_file(
                 }
             }
             "admission" => apply_admission_file(cfg, origins, warnings, value)?,
+            "profiles" => apply_profiles_file(cfg, origins, warnings, value)?,
             "lanes" => {
                 let lanes = value.as_table().ok_or_else(|| {
                     cfg_err(format!("lanes: expected a table, got {}", value.type_str()))
@@ -907,6 +950,60 @@ fn apply_file(
             "mesh" => apply_mesh_file(cfg, origins, warnings, value)?,
             other => warnings.push(format!("unknown config key: {other}")),
         }
+    }
+    Ok(())
+}
+
+/// `[profiles.<name>]` — a complete model/effort pair for a new name, or a
+/// per-field override for one of the baked profiles.
+fn apply_profiles_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let profiles = value.as_table().ok_or_else(|| {
+        cfg_err(format!(
+            "profiles: expected a table, got {}",
+            value.type_str()
+        ))
+    })?;
+    for (name, profile_value) in profiles {
+        let fields = profile_value.as_table().ok_or_else(|| {
+            cfg_err(format!(
+                "profiles.{name}: expected a table, got {}",
+                profile_value.type_str()
+            ))
+        })?;
+        let existing = cfg.profiles.get(name);
+        let mut model = existing.map(|profile| profile.model.clone());
+        let mut effort = existing.map(|profile| profile.effort.clone());
+        for (field, field_value) in fields {
+            let dotted = format!("profiles.{name}.{field}");
+            if !PROFILE_FIELDS.contains(&field.as_str()) {
+                warnings.push(format!("unknown config key: {dotted}"));
+                continue;
+            }
+            let value = want_str(&dotted, field_value)?.to_string();
+            match field.as_str() {
+                "model" => model = Some(value),
+                "effort" => effort = Some(value),
+                _ => unreachable!("field membership fixed by PROFILE_FIELDS"),
+            }
+            origins.insert(dotted, Origin::File);
+        }
+        let model = model.ok_or_else(|| {
+            cfg_err(format!(
+                "profiles.{name}.model: required for a new profile"
+            ))
+        })?;
+        let effort = effort.ok_or_else(|| {
+            cfg_err(format!(
+                "profiles.{name}.effort: required for a new profile"
+            ))
+        })?;
+        cfg.profiles
+            .insert(name.clone(), ProfileConfig { model, effort });
     }
     Ok(())
 }
@@ -1327,6 +1424,15 @@ pub fn lane_env_key(lane: Lane, field: &str) -> String {
     )
 }
 
+/// `A2A_PROFILES_<NAME>_<FIELD>` — one `[profiles.<name>]` key.
+pub fn profile_env_key(name: &str, field: &str) -> String {
+    format!(
+        "A2A_PROFILES_{}_{}",
+        name.to_ascii_uppercase(),
+        field.to_ascii_uppercase()
+    )
+}
+
 fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
     if let Some(v) = std::env::var_os("A2A_CODEX_BIN") {
         cfg.codex_bin = Some(PathBuf::from(v));
@@ -1395,6 +1501,26 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
             let lc = cfg.lanes.get_mut(&lane).expect("all lanes seeded");
             apply_lane_str(lc, &key, field, raw.trim())?;
             origins.insert(format!("lanes.{lane}.{field}"), Origin::Env);
+        }
+    }
+    let profile_names: Vec<String> = cfg.profiles.keys().cloned().collect();
+    for name in profile_names {
+        for field in PROFILE_FIELDS {
+            let key = profile_env_key(&name, field);
+            let Some(raw) = std::env::var_os(&key) else {
+                continue;
+            };
+            let raw = raw.to_string_lossy().into_owned();
+            let profile = cfg
+                .profiles
+                .get_mut(&name)
+                .expect("profile names were collected from this map");
+            match field {
+                "model" => profile.model = raw.trim().to_string(),
+                "effort" => profile.effort = raw.trim().to_string(),
+                _ => unreachable!("field membership fixed by PROFILE_FIELDS"),
+            }
+            origins.insert(format!("profiles.{name}.{field}"), Origin::Env);
         }
     }
     for field in SYNC_FIELDS {
@@ -1662,6 +1788,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -1762,6 +1889,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -1826,6 +1954,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -1881,6 +2010,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -1920,6 +2050,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -1981,6 +2112,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -2019,6 +2151,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -2049,6 +2182,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),
@@ -2086,6 +2220,7 @@ mod tests {
                 codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
                 allowed_roots: vec![],
                 lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+                profiles: default_profiles(),
                 broker: BrokerConfig::default(),
                 admission: AdmissionConfig::default(),
                 sync: SyncConfig::default(),
@@ -2171,6 +2306,7 @@ mod tests {
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
             broker: BrokerConfig::default(),
             admission: AdmissionConfig::default(),
             sync: SyncConfig::default(),

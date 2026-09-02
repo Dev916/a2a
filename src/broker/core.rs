@@ -1884,6 +1884,7 @@ impl BrokerCore {
             // and therefore what makes `review.json` a findings document
             // instead of a `{"raw": …}` transcript.
             schema: Some(crate::commands::spawn::SchemaChoice::LaneDefault),
+            profile: None,
             model: lane_cfg.model.clone(),
             effort: lane_cfg.effort.clone(),
             owner,

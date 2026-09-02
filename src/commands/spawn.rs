@@ -182,6 +182,8 @@ pub struct SeedPlan {
     /// [`SchemaChoice::LaneDefault`] so it is judged by the review lane's
     /// shipped findings schema, exactly as `a2a spawn --lane review` is.
     pub schema: Option<SchemaChoice>,
+    /// The named model/effort profile selected for this dispatch, if any.
+    pub profile: Option<String>,
     pub model: String,
     pub effort: String,
     pub owner: Option<String>,
@@ -264,6 +266,7 @@ pub fn run_with_lineage(
         .get(&lane)
         .cloned()
         .expect("config::load seeds every lane");
+    let profile_cfg = profile_gate(&cfg, args.profile.as_deref())?;
 
     let cwd_plan = resolve_cwd(
         home,
@@ -348,11 +351,17 @@ pub fn run_with_lineage(
         warn(msg);
     }
 
-    let model = args.model.clone().unwrap_or_else(|| lane_cfg.model.clone());
+    let model = args
+        .model
+        .clone()
+        .or_else(|| profile_cfg.as_ref().map(|profile| profile.model.clone()))
+        .unwrap_or_else(|| lane_cfg.model.clone());
     let effort = args
         .effort
         .clone()
+        .or_else(|| profile_cfg.as_ref().map(|profile| profile.effort.clone()))
         .unwrap_or_else(|| lane_cfg.effort.clone());
+    let profile = args.profile.clone();
     let brief_sha = brief::sha256_hex(&brief_text);
     let owner = owner::resolve(args.owner.as_deref());
     let now = Utc::now();
@@ -476,6 +485,7 @@ pub fn run_with_lineage(
         brief_text: brief_text.clone(),
         context: args.context.clone(),
         schema: schema_choice,
+        profile: profile.clone(),
         model: model.clone(),
         effort: effort.clone(),
         owner: Some(owner.clone()),
@@ -589,6 +599,7 @@ pub fn run_with_lineage(
                 "brief_sha": brief_sha,
                 "sandbox": sandbox.as_str(),
                 "network": lane_cfg.network,
+                "profile": profile,
                 "model": model,
                 "effort": effort,
                 // `null` unless this worker is waiting: the 1-based place in the
@@ -679,6 +690,7 @@ pub fn run_with_lineage(
             "brief_sha": brief_sha,
             "sandbox": sandbox.as_str(),
             "network": lane_cfg.network,
+            "profile": profile,
             "model": model,
             "effort": effort,
             "worktree": worktree_payload,
@@ -783,6 +795,9 @@ pub fn seed_worker(
     if schema_path.is_some() {
         genesis["schema_source"] = json!(schema_source);
     }
+    if let Some(profile) = &plan.profile {
+        genesis["profile"] = json!(profile);
+    }
     // The elevation, in genesis for the same reason the worktree is: a worker
     // that ran with full access must still say so after `state.json` is gone.
     if let Some(reason) = &plan.elevation_reason {
@@ -837,6 +852,31 @@ fn add_lineage(payload: &mut Value, lineage: Option<&Lineage>) {
     };
     obj.insert("parent_id".to_string(), json!(lineage.parent_id));
     obj.insert("attempt".to_string(), json!(lineage.attempt));
+}
+
+/// Resolve a named model/effort pair before any spawn-side filesystem work.
+/// The caller still applies explicit field flags over this value.
+fn profile_gate(
+    cfg: &config::Config,
+    requested: Option<&str>,
+) -> Result<Option<config::ProfileConfig>, AppError> {
+    let Some(name) = requested else {
+        return Ok(None);
+    };
+    if let Some(profile) = cfg.profiles.get(name) {
+        return Ok(Some(profile.clone()));
+    }
+    let known: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
+    Err(AppError::new(
+        "PROFILE_UNKNOWN",
+        ExitCode::Precondition,
+        format!("unknown spawn profile `{name}`"),
+    )
+    .remedy(format!(
+        "choose a configured profile: {}",
+        known.join(", ")
+    ))
+    .data(json!({"profile": name, "known_profiles": known})))
 }
 
 // --------------------------------------------------------------------- gates
@@ -1913,6 +1953,7 @@ mod tests {
             brief_text: brief_text.to_string(),
             context: vec![],
             schema: Some(SchemaChoice::LaneDefault),
+            profile: None,
             model: "gpt-5.5".to_string(),
             effort: "high".to_string(),
             owner: Some("test-owner".to_string()),
@@ -2013,6 +2054,7 @@ mod tests {
                 .to_string(),
             context: vec![],
             schema: Some(SchemaChoice::LaneDefault),
+            profile: None,
             model: "gpt-5.5".to_string(),
             effort: "medium".to_string(),
             owner: Some("test-owner".to_string()),

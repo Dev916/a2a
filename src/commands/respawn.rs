@@ -181,6 +181,10 @@ fn inherited_args(parent: &WorkerSnapshot, parent_dir: &Path, brief: Option<&Pat
         // The parent's OWN copy of the schema, which is what it was judged
         // against — the caller's original may have moved or changed since.
         schema: parent.schema_path.clone(),
+        // The resolved model/effort below are the stable retry contract. A
+        // profile name is a fresh selection request and may have changed or
+        // disappeared since the parent spawned.
+        profile: None,
         model: Some(parent.model.clone()),
         effort: Some(parent.effort.clone()),
         transport: None,

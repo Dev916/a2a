@@ -1352,6 +1352,7 @@ mod tests {
             codex_version_range: crate::config::DEFAULT_CODEX_VERSION_RANGE.to_string(),
             allowed_roots: vec![],
             lanes: Default::default(),
+            profiles: crate::config::default_profiles(),
             broker: Default::default(),
             admission: Default::default(),
             sync: Default::default(),

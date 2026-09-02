@@ -352,6 +352,12 @@ fn the_orchestrate_source_carries_exactly_the_pinned_sections_in_order() {
     use a2a::commands::gen_skills::{parse_sections, ORCHESTRATE_SECTIONS, ORCHESTRATE_SRC};
     let sections = parse_sections(ORCHESTRATE_SRC).expect("the source parses");
     let ids: Vec<&str> = sections.iter().map(|s| s.id).collect();
+    assert_eq!(ORCHESTRATE_SECTIONS.len(), 11, "the routing section is the 11th");
+    assert_eq!(
+        ORCHESTRATE_SECTIONS.last(),
+        Some(&"model-effort-routing"),
+        "new orchestrator guidance is append-only"
+    );
     assert_eq!(
         ids,
         ORCHESTRATE_SECTIONS.to_vec(),
@@ -441,6 +447,19 @@ fn the_orchestrate_artifact_carries_every_dispatch_pin() {
         "4.3.4",
         "without an adapter",
         "templates/impl-result.schema.json",
+        // model-effort-routing: explicit, quality-biased per-dispatch routing.
+        "Model and effort routing",
+        "`--profile quick`",
+        "mechanical, fully specified, low-risk work",
+        "`--profile standard`",
+        "routine implementation with clear tests",
+        "`--profile max`",
+        "protocol, concurrency, security, or multi-module integration",
+        "hardest task",
+        "WHENEVER UNSURE",
+        "quality over tokens",
+        "Explicit `--model` and `--effort` flags beat the profile",
+        "owner's configured baseline",
         // work-handoff: the L3 verbs and milestone convention.
         "a2a mesh work send",
         "a2a mesh work offer",

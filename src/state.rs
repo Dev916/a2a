@@ -120,6 +120,9 @@ pub struct WorkerSnapshot {
     pub rollout_path: Option<PathBuf>,
     pub pid: Option<u32>,
     pub pid_start_witness: Option<String>,
+    /// The named routing profile selected at spawn, if one was requested.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub model: String,
     pub effort: String,
     pub brief_sha: String,
@@ -178,6 +181,7 @@ impl WorkerSnapshot {
             rollout_path: None,
             pid: None,
             pid_start_witness: None,
+            profile: None,
             model: "gpt-5.5".to_string(),
             effort: "medium".to_string(),
             brief_sha: String::new(),

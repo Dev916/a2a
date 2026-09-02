@@ -104,6 +104,7 @@ use crate::ids;
 use crate::mesh::{
     gateway::{presence_wire, replicate},
     notes, presence, PeerId, Presence,
+    work_exec::{self, LocatedWorkState, WorkPhase},
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
@@ -112,10 +113,12 @@ use crate::state::{WorkerSnapshot, WorktreeRef};
 use crate::worktree;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 /// Tombstones: one JSON line per reclaimed worker, at the home root.
@@ -129,6 +132,8 @@ const NON_TERMINAL_REMEDY: &str = "stop it first with `a2a kill <id>` (or let it
 /// the `kept` row has to say what would change the answer.
 const NOT_OWNER_REMEDY: &str =
     "re-run with `--all` to sweep the whole machine, or as that owner (`A2A_OWNER=<owner> a2a gc`)";
+
+const WORK_HOLD_REMEDY: &str = "wait for mesh work completion routing to finish, or inspect it with `a2a mesh work status <work-id>` before re-running gc";
 
 /// How many dirty paths a `kept` row carries. Enough to recognise the work at a
 /// glance; not so many that one forgotten `target/` fills the payload.
@@ -164,6 +169,8 @@ pub fn run(
     let mut reclaimable: Vec<Candidate> = Vec::new();
     let mut kept: Vec<Value> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
+    let work_states = work_exec::load_state_files(home)?;
+    let worker_work_holds = worker_work_holds(&work_states);
 
     for name in entries(home)? {
         let path = home.workers_dir().join(&name);
@@ -229,6 +236,16 @@ pub fn run(
                 "state": snap.state.as_str(),
                 "reason": "not terminal",
                 "remedy": NON_TERMINAL_REMEDY,
+            }));
+            continue;
+        }
+        if let Some(work_id) = worker_work_holds.get(&name) {
+            kept.push(json!({
+                "id": name,
+                "state": snap.state.as_str(),
+                "reason": "work in progress",
+                "work_id": work_id,
+                "remedy": WORK_HOLD_REMEDY,
             }));
             continue;
         }
@@ -315,6 +332,7 @@ pub fn run(
         }
     }
 
+    let work = sweep_work(home, &cfg, &work_states, now, dry_run, &warn)?;
     let mesh = sweep_mesh(home, &cfg, now, dry_run, &warn)?;
 
     if !quiet {
@@ -331,6 +349,7 @@ pub fn run(
             age_secs,
             dry_run,
         );
+        report_work(&work, dry_run);
         report_mesh(&mesh, dry_run);
     }
 
@@ -348,6 +367,7 @@ pub fn run(
             "reclaimed_bytes": reclaimed_bytes,
             "kept": kept,
             "skipped": skipped,
+            "work": work.to_json(),
             "mesh": mesh.to_json(),
         })
     } else {
@@ -366,6 +386,309 @@ pub fn run(
         }
     };
     Ok(Outcome::from(data))
+}
+
+struct WorkSweep {
+    reclaimable: Vec<WorkCandidate>,
+    kept: Vec<Value>,
+    skipped: Vec<Value>,
+    removed: Vec<String>,
+    reclaimed_bytes: u64,
+    retain_secs: i64,
+}
+
+impl WorkSweep {
+    fn empty(retain_secs: i64) -> Self {
+        Self {
+            reclaimable: Vec::new(),
+            kept: Vec::new(),
+            skipped: Vec::new(),
+            removed: Vec::new(),
+            reclaimed_bytes: 0,
+            retain_secs,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let reclaimable_bytes: u64 = self.reclaimable.iter().map(|c| c.bytes).sum();
+        let eligible: Vec<&WorkCandidate> =
+            self.reclaimable.iter().filter(|c| c.eligible).collect();
+        let eligible_bytes: u64 = eligible.iter().map(|c| c.bytes).sum();
+        json!({
+            "retain_secs": self.retain_secs,
+            "reclaimable": self.reclaimable.iter().map(WorkCandidate::to_json).collect::<Vec<_>>(),
+            "reclaimable_bytes": reclaimable_bytes,
+            "eligible": eligible.iter().map(|c| c.work_id.as_str()).collect::<Vec<_>>(),
+            "eligible_bytes": eligible_bytes,
+            "removed": self.removed,
+            "reclaimed_bytes": self.reclaimed_bytes,
+            "kept": self.kept,
+            "skipped": self.skipped,
+        })
+    }
+}
+
+struct WorkCandidate {
+    work_id: String,
+    worker_id: String,
+    phase: String,
+    dir: std::path::PathBuf,
+    checkout: std::path::PathBuf,
+    bytes: u64,
+    idle_secs: i64,
+    eligible: bool,
+}
+
+impl WorkCandidate {
+    fn to_json(&self) -> Value {
+        json!({
+            "work_id": self.work_id,
+            "worker_id": self.worker_id,
+            "phase": self.phase,
+            "dir": self.dir.display().to_string(),
+            "checkout": self.checkout.display().to_string(),
+            "bytes": self.bytes,
+            "idle_secs": self.idle_secs,
+            "eligible": self.eligible,
+        })
+    }
+
+    fn kept(&self, reason: &str, remedy: impl Into<String>) -> Value {
+        json!({
+            "work_id": self.work_id,
+            "worker_id": self.worker_id,
+            "phase": self.phase,
+            "reason": reason,
+            "remedy": remedy.into(),
+        })
+    }
+}
+
+fn worker_work_holds(states: &[LocatedWorkState]) -> BTreeMap<String, String> {
+    let mut held = BTreeMap::new();
+    for entry in states {
+        if !entry.state.phase.is_non_terminal_work_hold() {
+            continue;
+        }
+        let Some(worker_id) = entry.state.worker_id.as_deref() else {
+            continue;
+        };
+        held.entry(worker_id.to_string())
+            .or_insert_with(|| entry.state.work_id.clone());
+    }
+    held
+}
+
+fn sweep_work(
+    home: &A2aHome,
+    cfg: &config::Config,
+    states: &[LocatedWorkState],
+    now: DateTime<Utc>,
+    dry_run: bool,
+    warn: &impl Fn(String),
+) -> Result<WorkSweep, AppError> {
+    let retain_secs = cfg
+        .mesh
+        .work
+        .checkout_retain_days
+        .saturating_mul(86_400)
+        .min(i64::MAX as u64) as i64;
+    let mut sweep = WorkSweep::empty(retain_secs);
+
+    for entry in states {
+        let acked = work_exec::acked_locally(home, &entry.state.work_id);
+        if entry.state.phase != WorkPhase::Reported && !acked {
+            continue;
+        }
+        let Some(worker_id) = entry.state.worker_id.clone() else {
+            sweep.kept.push(json!({
+                "work_id": entry.state.work_id,
+                "phase": format!("{:?}", entry.state.phase).to_lowercase(),
+                "reason": "missing worker",
+                "remedy": "inspect the work state file; gc only removes a work checkout once it can verify the recorded worker is terminal",
+            }));
+            continue;
+        };
+        let snap = match reconcile(home, cfg, &worker_id, now) {
+            Ok(snap) => snap,
+            Err(e) => {
+                warn(format!(
+                    "work {}: worker {}: {}: {} — kept",
+                    entry.state.work_id, worker_id, e.code, e.message
+                ));
+                sweep.kept.push(json!({
+                    "work_id": entry.state.work_id,
+                    "worker_id": worker_id,
+                    "phase": format!("{:?}", entry.state.phase).to_lowercase(),
+                    "reason": "worker unreadable",
+                    "remedy": "inspect the recorded worker with `a2a status <worker-id>` and re-run gc",
+                }));
+                continue;
+            }
+        };
+        if !snap.state.is_terminal() {
+            sweep.kept.push(json!({
+                "work_id": entry.state.work_id,
+                "worker_id": worker_id,
+                "phase": format!("{:?}", entry.state.phase).to_lowercase(),
+                "worker_state": snap.state.as_str(),
+                "reason": "worker not terminal",
+                "remedy": "wait for the recorded worker to finish, then re-run gc",
+            }));
+            continue;
+        }
+
+        let idle_secs = entry
+            .modified_at
+            .map(|ts| (now - ts).num_seconds().max(0))
+            .unwrap_or(0);
+        let candidate = WorkCandidate {
+            work_id: entry.state.work_id.clone(),
+            worker_id,
+            phase: format!("{:?}", entry.state.phase).to_lowercase(),
+            dir: entry.dir.clone(),
+            checkout: entry.state.checkout.clone(),
+            bytes: dir_bytes(&entry.dir),
+            idle_secs,
+            eligible: idle_secs >= retain_secs,
+        };
+        if !candidate.eligible {
+            sweep.reclaimable.push(candidate);
+            continue;
+        }
+        if let Some(hold) = checkout_hold(&candidate)? {
+            sweep.kept.push(hold);
+            sweep.reclaimable.push(candidate);
+            continue;
+        }
+        if dry_run {
+            sweep.reclaimable.push(candidate);
+            continue;
+        }
+        match std::fs::remove_dir_all(&candidate.dir) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(work_exec::ack_marker_path(home, &candidate.work_id));
+                sweep.reclaimed_bytes += candidate.bytes;
+                sweep.removed.push(candidate.work_id.clone());
+                sweep.reclaimable.push(candidate);
+            }
+            Err(e) => {
+                warn(format!("work {}: could not remove: {e}", candidate.work_id));
+                sweep
+                    .skipped
+                    .push(json!({"entry": candidate.work_id, "reason": "remove failed"}));
+                sweep.reclaimable.push(candidate);
+            }
+        }
+    }
+
+    sweep.reclaimable.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+    sweep.removed.sort();
+    Ok(sweep)
+}
+
+fn checkout_hold(candidate: &WorkCandidate) -> Result<Option<Value>, AppError> {
+    if !candidate.checkout.exists() {
+        return Ok(None);
+    }
+    let status = git_output(
+        &candidate.checkout,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?;
+    if !status.status.success() {
+        return Ok(Some(candidate.kept(
+            "checkout status failed",
+            format!(
+                "inspect {} with `git status`; gc only removes checkouts it can prove are clean",
+                candidate.checkout.display()
+            ),
+        )));
+    }
+    let dirty: Vec<String> = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .filter_map(porcelain_checkout_path)
+        .take(DIRTY_SAMPLE)
+        .collect();
+    if !dirty.is_empty() {
+        let mut row = candidate.kept(
+            "checkout dirty",
+            format!(
+                "commit or discard the work in {}, then re-run gc",
+                candidate.checkout.display()
+            ),
+        );
+        row["dirty"] = json!(dirty);
+        return Ok(Some(row));
+    }
+
+    let head = git_output(&candidate.checkout, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    if !head.status.success() {
+        return Ok(Some(candidate.kept(
+            "checkout head missing",
+            format!(
+                "inspect {} with `git rev-parse HEAD`; gc only removes pushed checkouts",
+                candidate.checkout.display()
+            ),
+        )));
+    }
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let remote = git_output(&candidate.checkout, &["ls-remote", "--heads", "origin"])?;
+    if !remote.status.success() {
+        return Ok(Some(candidate.kept(
+            "checkout remote unreachable",
+            "make the checkout's origin reachable, then re-run gc",
+        )));
+    }
+    let remote_heads: BTreeSet<String> = String::from_utf8_lossy(&remote.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    if !remote_heads.iter().any(|sha| sha.eq_ignore_ascii_case(&head)) {
+        let mut row = candidate.kept(
+            "checkout unpushed",
+            "push HEAD to origin, then re-run gc",
+        );
+        row["head"] = json!(head);
+        return Ok(Some(row));
+    }
+    Ok(None)
+}
+
+fn git_output(checkout: &Path, args: &[&str]) -> Result<std::process::Output, AppError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .output()
+        .map_err(|e| io_err("running git for work checkout gc", e))
+}
+
+fn porcelain_checkout_path(line: &str) -> Option<String> {
+    if line.len() < 4 {
+        return None;
+    }
+    Some(line[3..].trim().to_string())
+}
+
+fn report_work(work: &WorkSweep, dry_run: bool) {
+    let eligible = work.reclaimable.iter().filter(|c| c.eligible).count();
+    if dry_run {
+        eprintln!(
+            "a2a: gc --dry-run: {eligible} mesh work checkout(s) eligible under checkout_retain_days — nothing was deleted"
+        );
+    } else if !work.removed.is_empty() {
+        eprintln!(
+            "a2a: gc: removed {} mesh work checkout(s), {} reclaimed",
+            work.removed.len(),
+            human_bytes(work.reclaimed_bytes)
+        );
+    }
+    if !work.kept.is_empty() {
+        eprintln!(
+            "a2a: gc: kept {} mesh work checkout(s) needing operator action",
+            work.kept.len()
+        );
+    }
 }
 
 /// The mesh half of a gc run. It is separate from worker reclaim on purpose:

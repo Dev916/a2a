@@ -38,6 +38,12 @@ pub enum WorkPhase {
     Failed,
 }
 
+impl WorkPhase {
+    pub fn is_non_terminal_work_hold(self) -> bool {
+        !matches!(self, WorkPhase::Reported | WorkPhase::Failed)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkState {
     pub phase: WorkPhase,
@@ -58,6 +64,14 @@ pub struct WorkState {
     pub evidence_excerpt: Option<String>,
     #[serde(default)]
     pub result_status: Option<WorkStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedWorkState {
+    pub state: WorkState,
+    pub dir: PathBuf,
+    pub state_path: PathBuf,
+    pub modified_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1008,6 +1022,13 @@ fn initial_claiming_state_from_verified(
 }
 
 pub fn load_states(home: &A2aHome) -> Result<Vec<WorkState>, AppError> {
+    Ok(load_state_files(home)?
+        .into_iter()
+        .map(|entry| entry.state)
+        .collect())
+}
+
+pub fn load_state_files(home: &A2aHome) -> Result<Vec<LocatedWorkState>, AppError> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(home.work_dir()) {
         Ok(entries) => entries,
@@ -1016,12 +1037,22 @@ pub fn load_states(home: &A2aHome) -> Result<Vec<WorkState>, AppError> {
     };
     for entry in entries {
         let entry = entry.map_err(|e| io_err("reading work states", e))?;
-        let path = entry.path().join("state.json");
+        let dir = entry.path();
+        let path = dir.join("state.json");
         if path.exists() {
-            out.push(read_state_file(&path)?);
+            let modified_at = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(DateTime::<Utc>::from);
+            out.push(LocatedWorkState {
+                state: read_state_file(&path)?,
+                dir,
+                state_path: path,
+                modified_at,
+            });
         }
     }
-    out.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+    out.sort_by(|a, b| a.state.work_id.cmp(&b.state.work_id));
     Ok(out)
 }
 
@@ -1037,6 +1068,16 @@ pub fn save_state(home: &A2aHome, state: &WorkState) -> Result<(), AppError> {
 
 pub fn state_path(home: &A2aHome, work_id: &str) -> PathBuf {
     item_dir(home, work_id).join("state.json")
+}
+
+pub fn ack_marker_path(home: &A2aHome, work_id: &str) -> PathBuf {
+    home.work_dir()
+        .join("acked")
+        .join(format!("{}.json", safe_file_part(work_id)))
+}
+
+pub fn acked_locally(home: &A2aHome, work_id: &str) -> bool {
+    ack_marker_path(home, work_id).exists()
 }
 
 async fn preflight<G, S>(

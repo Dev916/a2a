@@ -3,6 +3,8 @@ mod common;
 use chrono::{Duration as ChronoDuration, Utc};
 use common::*;
 use serde_json::Value;
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -235,6 +237,235 @@ fn tombstones(w: &WtWorker) -> Vec<Value> {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
+}
+
+// ===========================================================================
+// Task 8: mesh work checkout sweep + worker-dir work holds.
+// ===========================================================================
+
+const FAKE_HEAD: &str = "1111111111111111111111111111111111111111";
+
+fn fake_git_bin(tmp: &Path) -> PathBuf {
+    let bin = tmp.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        r#"#!/bin/sh
+if [ "$1" = "-C" ]; then
+  shift
+  shift
+fi
+case "$1" in
+  status)
+    if [ -n "$A2A_FAKE_GIT_DIRTY" ]; then
+      printf '?? scratch.txt\n'
+    fi
+    exit 0
+    ;;
+  rev-parse)
+    printf '%s\n' "${A2A_FAKE_GIT_HEAD:-1111111111111111111111111111111111111111}"
+    exit 0
+    ;;
+  ls-remote)
+    if [ "$A2A_FAKE_GIT_REACHABLE" = "1" ]; then
+      printf '%s\trefs/heads/a2a/work/test\n' "${A2A_FAKE_GIT_HEAD:-1111111111111111111111111111111111111111}"
+    else
+      printf '2222222222222222222222222222222222222222\trefs/heads/main\n'
+    fi
+    exit 0
+    ;;
+esac
+echo "unexpected fake git invocation: $*" >&2
+exit 99
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&git).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&git, perms).unwrap();
+    bin
+}
+
+fn path_with_fake_git(bin: &Path) -> OsString {
+    let mut paths = vec![bin.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(paths).unwrap()
+}
+
+fn save_work_state(
+    home: &Path,
+    work_id: &str,
+    worker_id: &str,
+    phase: a2a::mesh::work_exec::WorkPhase,
+) -> PathBuf {
+    let home = a2a::home::A2aHome::resolve(Some(home)).unwrap();
+    let checkout = home.work_dir().join(work_id).join("repo");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let state = a2a::mesh::work_exec::WorkState {
+        phase,
+        work_id: work_id.to_string(),
+        envelope_digest: "digest".to_string(),
+        result_note_id: format!("fixed-note-{work_id}"),
+        milestone_posted: false,
+        worker_id: Some(worker_id.to_string()),
+        result_ref: Some(format!("a2a/work/{work_id}")),
+        checkout: checkout.clone(),
+        push_attempts: 0,
+        next_push_after: None,
+        result_summary: Some("done".to_string()),
+        evidence_excerpt: Some("ok".to_string()),
+        result_status: Some(a2a::mesh::registry::WorkStatus::Done),
+    };
+    a2a::mesh::work_exec::save_state(&home, &state).unwrap();
+    checkout
+}
+
+fn fake_git_gc(home: &Path, tmp: &Path, bin: &Path, reachable: bool, dirty: bool) -> Value {
+    let mut cmd = a2a(home, tmp);
+    cmd.env("PATH", path_with_fake_git(bin))
+        .env("A2A_MESH_WORK_CHECKOUT_RETAIN_DAYS", "0")
+        .env("A2A_FAKE_GIT_HEAD", FAKE_HEAD);
+    if reachable {
+        cmd.env("A2A_FAKE_GIT_REACHABLE", "1");
+    }
+    if dirty {
+        cmd.env("A2A_FAKE_GIT_DIRTY", "1");
+    }
+    let out = cmd.args(["--json", "gc"]).assert().success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    v["data"].clone()
+}
+
+#[test]
+fn a_reported_work_checkout_reachable_on_remote_is_reclaimed_by_work_leg() {
+    let (home, tmp, worker_id) = spawn_with(&[]);
+    wait_dead(&home, &worker_id, 10);
+    a2a(&home, tmp.path())
+        .args(["status", &worker_id])
+        .assert()
+        .success();
+    let work_id = "01K42A2A2A2A2A2A2A2A2A2A2A";
+    save_work_state(
+        &home,
+        work_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::Reported,
+    );
+    let bin = fake_git_bin(tmp.path());
+
+    let data = fake_git_gc(&home, tmp.path(), &bin, true, false);
+
+    assert_eq!(data["work"]["removed"], serde_json::json!([work_id]), "{data}");
+    assert!(
+        !home.join("work").join(work_id).exists(),
+        "reported, clean, pushed work checkout is reclaimed"
+    );
+}
+
+#[test]
+fn a_dirty_reported_work_checkout_is_kept_with_a_remedy() {
+    let (home, tmp, worker_id) = spawn_with(&[]);
+    wait_dead(&home, &worker_id, 10);
+    a2a(&home, tmp.path())
+        .args(["status", &worker_id])
+        .assert()
+        .success();
+    let work_id = "01K42DIRTYDIRTYDIRTYDIRTY";
+    let checkout = save_work_state(
+        &home,
+        work_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::Reported,
+    );
+    let bin = fake_git_bin(tmp.path());
+
+    let data = fake_git_gc(&home, tmp.path(), &bin, true, true);
+
+    let kept = &data["work"]["kept"][0];
+    assert_eq!(kept["work_id"], work_id, "{data}");
+    assert_eq!(kept["reason"], "checkout dirty", "{kept}");
+    assert_eq!(kept["dirty"][0], "scratch.txt", "{kept}");
+    assert!(
+        kept["remedy"].as_str().unwrap().contains(&checkout.display().to_string()),
+        "{kept}"
+    );
+    assert!(home.join("work").join(work_id).exists());
+}
+
+#[test]
+fn an_unpushed_reported_work_checkout_is_kept_with_a_remedy() {
+    let (home, tmp, worker_id) = spawn_with(&[]);
+    wait_dead(&home, &worker_id, 10);
+    a2a(&home, tmp.path())
+        .args(["status", &worker_id])
+        .assert()
+        .success();
+    let work_id = "01K42UNPUSHEDUNPUSHEDUNP";
+    save_work_state(
+        &home,
+        work_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::Reported,
+    );
+    let bin = fake_git_bin(tmp.path());
+
+    let data = fake_git_gc(&home, tmp.path(), &bin, false, false);
+
+    let kept = &data["work"]["kept"][0];
+    assert_eq!(kept["work_id"], work_id, "{data}");
+    assert_eq!(kept["reason"], "checkout unpushed", "{kept}");
+    assert_eq!(kept["head"], FAKE_HEAD, "{kept}");
+    assert!(
+        kept["remedy"].as_str().unwrap().contains("push HEAD to origin"),
+        "{kept}"
+    );
+    assert!(home.join("work").join(work_id).exists());
+}
+
+#[test]
+fn a_worker_referenced_by_non_terminal_work_state_is_held_by_worker_gc() {
+    let (home, tmp, worker_id) = spawn_with(&[]);
+    wait_dead(&home, &worker_id, 10);
+    a2a(&home, tmp.path())
+        .args(["status", &worker_id])
+        .assert()
+        .success();
+    let work_id = "01K42HOLDSHOLDSHOLDSHOLD";
+    save_work_state(
+        &home,
+        work_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::Running,
+    );
+
+    let out = a2a(&home, tmp.path())
+        .args(["--json", "gc", "--age", "0s"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let data = &v["data"];
+
+    assert!(home.join("workers").join(&worker_id).exists(), "{data}");
+    let held = data["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == worker_id)
+        .unwrap_or_else(|| panic!("worker hold missing from kept rows: {data}"));
+    assert_eq!(held["reason"], "work in progress", "{held}");
+    assert_eq!(held["work_id"], work_id, "{held}");
+}
+
+#[test]
+fn gc_command_path_stays_registry_free() {
+    let gc =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/gc.rs"))
+            .unwrap();
+    assert!(!gc.contains("Registry"), "gc must not take a Registry handle");
+    assert!(!gc.contains("open_registry"), "gc must not open the registry");
 }
 
 /// Uncommitted work in the tree stops gc dead — and `--force` takes the tree

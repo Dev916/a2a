@@ -79,6 +79,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Roster { .. } => "mesh roster",
             MeshCmd::Inject { .. } => "mesh inject",
             MeshCmd::Hooks { .. } => "mesh hooks",
+            MeshCmd::Links => "mesh links",
             MeshCmd::Fleet { cmd } => match cmd {
                 MeshFleetCmd::Init { .. } => "mesh fleet init",
                 MeshFleetCmd::Ls { .. } => "mesh fleet ls",

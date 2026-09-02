@@ -143,6 +143,7 @@ fn gateway_status_is_exit_7_until_a_supervisor_writes_health() {
     );
     assert_eq!(health["pid"], child.id());
     assert_eq!(health["loops"].as_object().unwrap().len(), 6);
+    assert_eq!(health["links"].as_array().unwrap().len(), 0);
     assert!(health["loops"]["registry"]["heartbeats"].as_u64().unwrap() >= 1);
     assert!(health["loops"]["work"]["heartbeats"].as_u64().unwrap() >= 1);
 
@@ -159,6 +160,12 @@ fn gateway_status_is_exit_7_until_a_supervisor_writes_health() {
         status["data"]["health"]["health_seq"].as_u64().unwrap()
             >= health["health_seq"].as_u64().unwrap()
     );
+
+    common::a2a(&home, &work)
+        .args(["mesh", "gateway", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("links 0"));
 
     common::a2a(&home, &work)
         .args(["mesh", "gateway", "stop"])

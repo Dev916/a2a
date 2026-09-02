@@ -526,6 +526,8 @@ pub enum MeshCmd {
         #[arg(long)]
         print: bool,
     },
+    /// Show live mesh gateway links
+    Links,
     /// Manage the layer-2 mesh fleet registry
     Fleet {
         #[command(subcommand)]

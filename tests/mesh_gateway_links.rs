@@ -1,7 +1,10 @@
+mod common;
+
 use a2a::mesh::gateway::link::{
     accept_once_io, dial_gateway_io, discover_outbound_peers, jittered_redial_backoff,
-    LinkDirection, LinkLiveness, LinkRuntimeEvent, LinkSessionParams, LinkStateHandle, LinkTaskSet,
-    LinkWriteOp, OutboundQueue, PeerDamping, PRESENCE_MAILBOX_CAPACITY,
+    LinkDirection, LinkHealthEvent, LinkLiveness, LinkObserver, LinkRuntimeEvent,
+    LinkSessionParams, LinkStateHandle, LinkTaskSet, LinkWriteOp, OutboundQueue, PeerDamping,
+    PRESENCE_MAILBOX_CAPACITY,
 };
 use a2a::mesh::keys::{fleet_init, sign_token, RootSet, TestClock, TokenClaims};
 use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
@@ -12,12 +15,14 @@ use a2a::mesh::FeedEntry;
 use a2a::{config, mesh};
 use chrono::{TimeZone, Utc};
 use ed25519_dalek::SigningKey;
+use nix::fcntl::{Flock, FlockArg};
+use predicates::prelude::*;
 use rand::RngCore;
 use rand::{rngs::StdRng, SeedableRng};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -135,6 +140,113 @@ async fn wait_for(mut pred: impl FnMut() -> bool) {
     }
 }
 
+async fn recv_link_event(
+    events: &mut mpsc::Receiver<LinkHealthEvent>,
+    mut pred: impl FnMut(&LinkHealthEvent) -> bool,
+) -> LinkHealthEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let event = tokio::time::timeout(Duration::from_millis(250), events.recv())
+            .await
+            .unwrap_or(None)
+            .expect("link event channel stayed open");
+        if pred(&event) {
+            return event;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected link event was not emitted; last event was {event:?}"
+        );
+    }
+}
+
+fn lock_gateway(home: &Path) -> Flock<std::fs::File> {
+    let mesh = home.join("mesh");
+    fs::create_dir_all(&mesh).unwrap();
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(mesh.join("gateway.lock"))
+        .unwrap();
+    Flock::lock(file, FlockArg::LockExclusive).unwrap()
+}
+
+fn write_health_with_link(home: &Path) {
+    let mesh = home.join("mesh");
+    fs::create_dir_all(&mesh).unwrap();
+    fs::write(
+        mesh.join("gateway-health.json"),
+        r#"{
+          "schema_version": 2,
+          "pid": 4242,
+          "health_seq": 7,
+          "written_at": "2026-09-02T00:00:00Z",
+          "state": "running",
+          "listen_port": 7787,
+          "expose": "none",
+          "endpoint_url": null,
+          "exposure_error": null,
+          "exposure_error_since": null,
+          "registry_error": null,
+          "registry_error_since": null,
+          "loops": {},
+          "replication": {"per_origin_lag": {}, "last_anti_entropy": null},
+          "links": [{
+            "peer": "gw-b",
+            "direction": "outbound",
+            "established_at": "2026-09-02T00:00:01Z",
+            "last_rx": "2026-09-02T00:00:02Z",
+            "last_tx": "2026-09-02T00:00:03Z",
+            "frames_rx": 2,
+            "frames_tx": 3
+          }],
+          "escalation": null,
+          "shutdown": null
+        }"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn mesh_links_cli_renders_health_and_empty_down_daemon_with_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+
+    common::a2a(&home, &work)
+        .args(["mesh", "links"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("[]\n"))
+        .stderr(predicate::str::contains("mesh gateway is not running"));
+
+    write_health_with_link(&home);
+    let _lock = lock_gateway(&home);
+    let out = common::a2a(&home, &work)
+        .args(["--json", "mesh", "links"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["data"][0]["peer"], "gw-b");
+    assert_eq!(v["data"][0]["direction"], "outbound");
+    assert_eq!(v["data"][0]["frames_rx"], 2);
+    assert_eq!(v["data"][0]["frames_tx"], 3);
+
+    common::a2a(&home, &work)
+        .args(["mesh", "links"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gw-b"))
+        .stdout(predicate::str::contains("outbound"))
+        .stdout(predicate::str::contains("frames_tx=3"));
+}
+
 #[tokio::test]
 async fn discovery_orders_deduped_links_and_damped_side_still_accepts_inbound() {
     let tmp = tempfile::tempdir().unwrap();
@@ -196,6 +308,81 @@ async fn discovery_orders_deduped_links_and_damped_side_still_accepts_inbound() 
         damping.health(now + chrono::Duration::seconds(121))["gw-b"]["state"],
         "cooldown"
     );
+}
+
+#[tokio::test]
+async fn link_session_emits_up_stat_and_down_events_for_gateway_health() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(tmp.path());
+    write_gateway_key(home.root(), "gw-a");
+    let cfg = cfg_for(&home);
+    let state = LinkStateHandle::new(&home, Duration::from_secs(60)).unwrap();
+    let clock = TestClock::new(Utc::now());
+    let (mut peer, side) = test_link(&clock).await;
+    let token = CancellationToken::new();
+    let (observer, mut events) = LinkObserver::channel(16);
+    let task = tokio::spawn(a2a::mesh::gateway::link::run_link_session(
+        side,
+        LinkSessionParams::new(
+            home,
+            cfg,
+            "gw-a",
+            "gw-b",
+            LinkDirection::Outbound,
+            state,
+            token.child_token(),
+        )
+        .with_observer(observer),
+    ));
+
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        LinkHealthEvent::Up {
+            peer,
+            direction: LinkDirection::Outbound,
+            ..
+        } if peer == "gw-b"
+    ));
+    peer.recv().await.unwrap().expect("initial digest frame");
+    recv_link_event(&mut events, |event| {
+        matches!(
+            event,
+            LinkHealthEvent::Stat {
+                peer,
+                direction: LinkDirection::Outbound,
+                frames_tx: 1,
+                ..
+            } if peer == "gw-b"
+        )
+    })
+    .await;
+
+    peer.send(&Frame::Presence { peers: Vec::new() }).await.unwrap();
+    recv_link_event(&mut events, |event| {
+        matches!(
+            event,
+            LinkHealthEvent::Stat {
+                peer,
+                direction: LinkDirection::Outbound,
+                frames_rx: 1,
+                ..
+            } if peer == "gw-b"
+        )
+    })
+    .await;
+
+    token.cancel();
+    task.await.unwrap().unwrap();
+    recv_link_event(&mut events, |event| {
+        matches!(
+            event,
+            LinkHealthEvent::Down {
+                peer,
+                direction: LinkDirection::Outbound
+            } if peer == "gw-b"
+        )
+    })
+    .await;
 }
 
 #[test]

@@ -5,7 +5,7 @@ use crate::mesh::{
     registry::{self, Registry, RegistryHandle},
 };
 use crate::output::{AppError, ExitCode, Outcome};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use expose::{Exposure, ExposureErrorChange, ExposureProvider, ExposurePublisher, ExposureRow};
 use futures_util::FutureExt;
 use link::{LinkDirection, LinkSessionParams, LinkStateHandle};
@@ -207,6 +207,8 @@ pub struct GatewayHealth {
     pub registry_error_since: Option<DateTime<Utc>>,
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
     pub replication: replicate::ReplicationHealth,
+    #[serde(default)]
+    pub links: Vec<link::LinkHealth>,
     pub escalation: Option<Value>,
     pub shutdown: Option<Value>,
 }
@@ -231,6 +233,7 @@ impl GatewayHealth {
                 .map(|slot| (slot, LoopHealth::new(slot)))
                 .collect(),
             replication: replicate::ReplicationHealth::default(),
+            links: Vec::new(),
             escalation: None,
             shutdown: None,
         }
@@ -283,6 +286,7 @@ struct GatewayRuntimeConfig {
     server_bind_optional: bool,
     registry: Arc<GatewayRegistryRuntime>,
     links: LinkStateHandle,
+    link_observer: link::LinkObserver,
 }
 
 impl GatewayRuntimeConfig {
@@ -291,6 +295,7 @@ impl GatewayRuntimeConfig {
         cfg: &Config,
         registry: Arc<GatewayRegistryRuntime>,
         links: LinkStateHandle,
+        link_observer: link::LinkObserver,
     ) -> Self {
         GatewayRuntimeConfig {
             home: home.clone(),
@@ -308,6 +313,7 @@ impl GatewayRuntimeConfig {
                 .is_some_and(|value| value == "1"),
             registry,
             links,
+            link_observer,
         }
     }
 }
@@ -318,6 +324,7 @@ enum LoopEvent {
     ExposureError(ExposureErrorChange),
     RegistryError(RegistryErrorReport),
     Replication(replicate::ReplicationHealth),
+    Link(link::LinkHealthEvent),
     SessionEnd { slot: LoopSlot, detail: String },
 }
 
@@ -899,9 +906,63 @@ pub fn status(home: &A2aHome, json_mode: bool) -> Result<Outcome, AppError> {
         return Ok(Outcome::from(json!({"running": true, "health": health})));
     }
     Ok(Outcome::from(Value::String(format!(
-        "mesh gateway up (pid {}, state {}, health_seq {}, listen_port {}, expose {})",
-        health.pid, health.state, health.health_seq, health.listen_port, health.expose
+        "mesh gateway up (pid {}, state {}, health_seq {}, listen_port {}, expose {}, links {})",
+        health.pid,
+        health.state,
+        health.health_seq,
+        health.listen_port,
+        health.expose,
+        health.links.len()
     ))))
+}
+
+pub fn links(home: &A2aHome, json_mode: bool, quiet: bool) -> Result<Outcome, AppError> {
+    let root = gateway_root(home);
+    if lock_is_free(&root) {
+        if !quiet {
+            eprintln!("a2a: mesh gateway is not running; showing []");
+            eprintln!("a2a: hint: run `a2a mesh gateway run`");
+        }
+        return Ok(Outcome::from(json!([])));
+    }
+    let Some(health) = GatewayHealth::read(home) else {
+        if !quiet {
+            eprintln!("a2a: mesh gateway health is not available yet; showing []");
+        }
+        return Ok(Outcome::from(json!([])));
+    };
+    if json_mode {
+        return Ok(Outcome::from(json!(health.links)));
+    }
+    if health.links.is_empty() {
+        return Ok(Outcome::from(json!([])));
+    }
+    Ok(Outcome::from(Value::String(
+        health
+            .links
+            .iter()
+            .map(format_link_health)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )))
+}
+
+fn format_link_health(link: &link::LinkHealth) -> String {
+    format!(
+        "{} {} established_at={} last_rx={} last_tx={} frames_rx={} frames_tx={}",
+        link.peer,
+        link.direction.as_str(),
+        link.established_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        format_link_time(link.last_rx),
+        format_link_time(link.last_tx),
+        link.frames_rx,
+        link.frames_tx
+    )
+}
+
+fn format_link_time(ts: Option<DateTime<Utc>>) -> String {
+    ts.map(|ts| ts.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 pub fn stop(home: &A2aHome) -> Result<Outcome, AppError> {
@@ -963,7 +1024,9 @@ async fn supervise(
         home,
         Duration::from_secs(cfg.mesh.gateway.outbound_retry_max_secs),
     )?;
-    let runtime_cfg = GatewayRuntimeConfig::from_config(home, &cfg, registry_runtime, link_state);
+    let (link_observer, mut link_events_rx) = link::LinkObserver::channel(LOG_CAPACITY);
+    let runtime_cfg =
+        GatewayRuntimeConfig::from_config(home, &cfg, registry_runtime, link_state, link_observer);
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| {
             AppError::new(
@@ -981,6 +1044,14 @@ async fn supervise(
         .await;
 
     let (events_tx, mut events_rx) = mpsc::channel::<LoopEvent>(LOG_CAPACITY);
+    let link_loop_tx = events_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = link_events_rx.recv().await {
+            if link_loop_tx.send(LoopEvent::Link(event)).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut loops = JoinSet::new();
     let loop_tx = events_tx.clone();
     for slot in LoopSlot::ALL {
@@ -1046,6 +1117,11 @@ async fn supervise(
                     }
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
+                        write_health(&root, &mut health).await?;
+                        last_health_flush = Instant::now();
+                    }
+                    LoopEvent::Link(event) => {
+                        apply_link_health_event(&mut health, event);
                         write_health(&root, &mut health).await?;
                         last_health_flush = Instant::now();
                     }
@@ -1188,6 +1264,67 @@ fn apply_exposure_error_change(health: &mut GatewayHealth, change: &ExposureErro
     health.exposure_error_since = change.error.as_ref().and(change.since);
 }
 
+fn apply_link_health_event(health: &mut GatewayHealth, event: link::LinkHealthEvent) {
+    match event {
+        link::LinkHealthEvent::Up {
+            peer,
+            direction,
+            established_at,
+        } => {
+            let live = link::LinkHealth {
+                peer,
+                direction,
+                established_at,
+                last_rx: None,
+                last_tx: None,
+                frames_rx: 0,
+                frames_tx: 0,
+            };
+            match health
+                .links
+                .iter_mut()
+                .find(|link| link.peer == live.peer && link.direction == live.direction)
+            {
+                Some(link) => *link = live,
+                None => health.links.push(live),
+            }
+            health.links.sort_by(|a, b| {
+                a.peer
+                    .cmp(&b.peer)
+                    .then(a.direction.as_str().cmp(b.direction.as_str()))
+            });
+        }
+        link::LinkHealthEvent::Stat {
+            peer,
+            direction,
+            last_rx,
+            last_tx,
+            frames_rx,
+            frames_tx,
+        } => {
+            if let Some(link) = health
+                .links
+                .iter_mut()
+                .find(|link| link.peer == peer && link.direction == direction)
+            {
+                if frames_rx > 0 {
+                    link.frames_rx = link.frames_rx.saturating_add(frames_rx);
+                    link.last_rx = last_rx;
+                }
+                if frames_tx > 0 {
+                    link.frames_tx = link.frames_tx.saturating_add(frames_tx);
+                    link.last_tx = last_tx;
+                }
+            }
+        }
+        link::LinkHealthEvent::Down { peer, direction } => {
+            health
+                .links
+                .retain(|link| link.peer != peer || link.direction != direction);
+        }
+    }
+}
+
 fn exposure_error_log_value(slot: LoopSlot, change: &ExposureErrorChange) -> Value {
     match &change.error {
         Some(error) => json!({
@@ -1306,19 +1443,21 @@ async fn shutdown(
         eprintln!("a2a mesh gateway: shutting down");
     }
     health.state = "shutting-down".to_string();
-    health.shutdown = Some(json!({"phase": "stop_accepting", "links": 0}));
+    let links = health.links.len();
+    health.links.clear();
+    health.shutdown = Some(json!({"phase": "stop_accepting", "links": links}));
     write_health(&root, health).await?;
     log.line(json!({
         "ts": Utc::now(),
         "kind": "stop_accepting",
-        "links": 0
+        "links": links
     }))
     .await;
     log.line(json!({
         "ts": Utc::now(),
         "kind": "link_close",
         "err": {"code": "SHUTTING_DOWN"},
-        "links": 0
+        "links": links
     }))
     .await;
 
@@ -1567,6 +1706,10 @@ where
                         health.replication = replication;
                         write_health(root, &mut health).await?;
                     }
+                    LoopEvent::Link(event) => {
+                        apply_link_health_event(&mut health, event);
+                        write_health(root, &mut health).await?;
+                    }
                 }
             }
         }
@@ -1644,10 +1787,17 @@ async fn server_loop(
                 let params_cfg = cfg.config.clone();
                 let local = cfg.registry.row.gateway_id.clone();
                 let state = cfg.links.clone();
+                let observer = cfg.link_observer.clone();
                 let child = token.child_token();
                 sessions.spawn(async move {
                     let mut side = link::accept_once_io(stream, tls).await?;
-                    let peer = crate::mesh::wire::handshake_acceptor(&mut side, &identity, &roots, &SystemClock).await?;
+                    let peer = crate::mesh::wire::handshake_acceptor(
+                        &mut side,
+                        &identity,
+                        &roots,
+                        &SystemClock,
+                    )
+                    .await?;
                     let params = LinkSessionParams::new(
                         params_home,
                         params_cfg,
@@ -1656,7 +1806,8 @@ async fn server_loop(
                         LinkDirection::Inbound,
                         state,
                         child,
-                    );
+                    )
+                    .with_observer(observer);
                     link::run_link_session(side, params).await
                 });
             }
@@ -1842,7 +1993,8 @@ async fn dial_and_spawn(
         LinkDirection::Outbound,
         cfg.links.clone(),
         token.child_token(),
-    );
+    )
+    .with_observer(cfg.link_observer.clone());
     sessions.spawn(link::run_link_session(side, params));
     Ok(())
 }

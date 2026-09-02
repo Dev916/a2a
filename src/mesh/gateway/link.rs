@@ -25,10 +25,68 @@ pub const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 pub const SHED_LOG_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 pub const LINK_OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkDirection {
     Inbound,
     Outbound,
+}
+
+impl LinkDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkDirection::Inbound => "inbound",
+            LinkDirection::Outbound => "outbound",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkHealth {
+    pub peer: String,
+    pub direction: LinkDirection,
+    pub established_at: DateTime<Utc>,
+    pub last_rx: Option<DateTime<Utc>>,
+    pub last_tx: Option<DateTime<Utc>>,
+    pub frames_rx: u64,
+    pub frames_tx: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkHealthEvent {
+    Up {
+        peer: String,
+        direction: LinkDirection,
+        established_at: DateTime<Utc>,
+    },
+    Stat {
+        peer: String,
+        direction: LinkDirection,
+        last_rx: Option<DateTime<Utc>>,
+        last_tx: Option<DateTime<Utc>>,
+        frames_rx: u64,
+        frames_tx: u64,
+    },
+    Down {
+        peer: String,
+        direction: LinkDirection,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct LinkObserver {
+    tx: mpsc::Sender<LinkHealthEvent>,
+}
+
+impl LinkObserver {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<LinkHealthEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    pub async fn send(&self, event: LinkHealthEvent) {
+        let _ = self.tx.send(event).await;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +446,7 @@ pub struct LinkSessionParams {
     pub direction: LinkDirection,
     pub state: LinkStateHandle,
     pub token: CancellationToken,
+    pub observer: Option<LinkObserver>,
     pub ping_every: Duration,
     pub mailbox_payload_cap: usize,
     pub mailbox_backpressure_window: Duration,
@@ -412,10 +471,16 @@ impl LinkSessionParams {
             direction,
             state,
             token,
+            observer: None,
             ping_every,
             mailbox_payload_cap: 64,
             mailbox_backpressure_window: ping_every.saturating_mul(2),
         }
+    }
+
+    pub fn with_observer(mut self, observer: LinkObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 }
 
@@ -428,9 +493,10 @@ where
         cfg,
         local_gateway_id,
         peer_gateway_id,
-        direction: _,
+        direction,
         state,
         token,
+        observer,
         ping_every,
         mailbox_payload_cap,
         mailbox_backpressure_window,
@@ -440,6 +506,15 @@ where
     state
         .register(peer_gateway_id.clone(), out_tx.clone())
         .await;
+    if let Some(observer) = &observer {
+        observer
+            .send(LinkHealthEvent::Up {
+                peer: peer_gateway_id.clone(),
+                direction,
+                established_at: Utc::now(),
+            })
+            .await;
+    }
 
     let (activity_tx, activity_rx) = mpsc::channel(32);
     let (write_op_tx, mut write_op_rx) = mpsc::channel(32);
@@ -454,6 +529,8 @@ where
     ));
 
     let writer_token = token.child_token();
+    let writer_observer = observer.clone();
+    let writer_peer = peer_gateway_id.clone();
     let mut writer_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -463,12 +540,33 @@ where
                 }
                 Some(frame) = out_rx.recv() => {
                     writer.send(&frame).await?;
+                    if let Some(observer) = &writer_observer {
+                        observer.send(LinkHealthEvent::Stat {
+                            peer: writer_peer.clone(),
+                            direction,
+                            last_rx: None,
+                            last_tx: Some(Utc::now()),
+                            frames_rx: 0,
+                            frames_tx: 1,
+                        }).await;
+                    }
                 }
                 Some(op) = write_op_rx.recv() => {
                     match op {
                         LinkWriteOp::Ping(payload) => writer.ping(payload).await?,
                         LinkWriteOp::Close(frame) => {
-                            let _ = writer.send(&frame).await;
+                            if writer.send(&frame).await.is_ok() {
+                                if let Some(observer) = &writer_observer {
+                                    observer.send(LinkHealthEvent::Stat {
+                                        peer: writer_peer.clone(),
+                                        direction,
+                                        last_rx: None,
+                                        last_tx: Some(Utc::now()),
+                                        frames_rx: 0,
+                                        frames_tx: 1,
+                                    }).await;
+                                }
+                            }
                             let _ = writer.close().await;
                             return Ok(());
                         }
@@ -508,6 +606,16 @@ where
                 let Some(frame) = frame? else {
                     break Ok(());
                 };
+                if let Some(observer) = &observer {
+                    observer.send(LinkHealthEvent::Stat {
+                        peer: peer_gateway_id.clone(),
+                        direction,
+                        last_rx: Some(Utc::now()),
+                        last_tx: None,
+                        frames_rx: 1,
+                        frames_tx: 0,
+                    }).await;
+                }
                 let _ = activity_tx.send(()).await;
                 if let Some(err) = admit_frame(&mut mailboxes, &frame).await {
                     let _ = close_tx.send(LinkWriteOp::Close(err)).await;
@@ -537,6 +645,14 @@ where
     token.cancel();
     liveness.abort();
     state.deregister(&peer_gateway_id).await;
+    if let Some(observer) = &observer {
+        observer
+            .send(LinkHealthEvent::Down {
+                peer: peer_gateway_id.clone(),
+                direction,
+            })
+            .await;
+    }
     let _ = state
         .record_drop(
             &peer_gateway_id,

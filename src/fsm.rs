@@ -86,6 +86,7 @@ pub enum FailureClass {
     SchemaViolation,
     NoResult,
     BudgetExhausted,
+    TurnStalled,
     NeverStarted,
     InternalPanic,
     SessionMissing,

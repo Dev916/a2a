@@ -753,6 +753,7 @@ fn assert_phase5_keys_default() {
         "A2A_ADMISSION_BREAKER_WINDOW_SECS",
         "A2A_ADMISSION_MAX_ATTEMPTS",
         "A2A_BROKER_EVENTS_MAX_BYTES",
+        "A2A_BROKER_TURN_STALL_SECS",
     ] {
         cmd.env_remove(key);
     }
@@ -772,6 +773,7 @@ fn assert_phase5_keys_default() {
         "admission.breaker_window_secs".into(),
         "admission.max_attempts".into(),
         "broker.events_max_bytes".into(),
+        "broker.turn_stall_secs".into(),
     ];
     for lane in ["impl", "review", "research", "general"] {
         keys.push(format!("lanes.{lane}.max_turns"));
@@ -808,6 +810,12 @@ fn assert_phase5_keys_default() {
     assert_eq!(
         data["broker"]["events_max_bytes"],
         json!(10_485_760),
+        "{}",
+        ran.stdout
+    );
+    assert_eq!(
+        data["broker"]["turn_stall_secs"],
+        json!(600),
         "{}",
         ran.stdout
     );

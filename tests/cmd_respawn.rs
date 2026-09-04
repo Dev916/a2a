@@ -194,6 +194,32 @@ fn a_respawn_records_lineage_and_inherits_the_parents_identity() {
     assert_eq!(csnap["attempt"], 2);
 }
 
+#[test]
+fn a_turn_stalled_parent_is_respawnable() {
+    let f = fixture();
+    let parent = f.spawn(None);
+    wait_dead(&f.home, &parent, 10);
+    f.cmd().args(["status", &parent]).assert().code(0);
+
+    let dir = f.home.join("workers").join(&parent);
+    let mut snap = read_snapshot(&f.home, &parent);
+    snap["state"] = serde_json::json!("failed");
+    snap["state_reason"] = Value::Null;
+    snap["failure_class"] = serde_json::json!("turn_stalled");
+    a2a::store::write_atomic(&dir.join("state.json"), snap.to_string().as_bytes()).unwrap();
+
+    let out = f
+        .cmd()
+        .args(["--json", "respawn", &parent])
+        .assert()
+        .success();
+    let data = json_of(&out)["data"].clone();
+    let child = data["id"].as_str().unwrap();
+    assert_ne!(child, parent);
+    assert_eq!(data["parent_id"], parent);
+    assert_eq!(data["attempt"], 2);
+}
+
 /// A parent spawned with `--no-worktree` must retry in the same directory, even
 /// when its lane would normally create a worktree.
 #[test]

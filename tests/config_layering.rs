@@ -364,6 +364,27 @@ fn broker_events_max_bytes_defaults_to_ten_mebibytes_and_names_its_layer() {
     assert_eq!(v["data"]["origins"]["broker.events_max_bytes"], "env");
 }
 
+#[test]
+fn broker_turn_stall_defaults_to_600_and_zero_is_a_layered_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["broker"]["turn_stall_secs"], 600);
+    assert_eq!(v["data"]["origins"]["broker.turn_stall_secs"], "default");
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[broker]\nturn_stall_secs = 45\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["broker"]["turn_stall_secs"], 45);
+    assert_eq!(v["data"]["origins"]["broker.turn_stall_secs"], "file");
+
+    let v = show(tmp.path(), &[("A2A_BROKER_TURN_STALL_SECS", "0")], true);
+    assert_eq!(v["data"]["broker"]["turn_stall_secs"], 0);
+    assert_eq!(v["data"]["origins"]["broker.turn_stall_secs"], "env");
+}
+
 /// The mesh section (spec §10): the feed cap, staleness window and gc horizon
 /// report default origins, layer through file/env, reject malformed values with
 /// the dotted key, and warn on unknown siblings.

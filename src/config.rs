@@ -33,6 +33,10 @@ pub const DEFAULT_BLOCKED_TIMEOUT_SECS: u64 = 1800;
 /// mysterious. `0` disables the timer entirely.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// How long an open app-server turn may emit no events before the broker fails
+/// it as stalled. Every event resets the window; `0` disables the watchdog.
+pub const DEFAULT_TURN_STALL_SECS: u64 = 600;
+
 /// How large `events.jsonl` may grow before [`crate::store::EventLog`] rotates
 /// it to `events.jsonl.1` (spec §4.5).
 ///
@@ -72,7 +76,11 @@ pub const DEFAULT_MESH_GATEWAY_SHUTDOWN_GRACE_SECS: u64 = 10;
 pub const DEFAULT_UPDATE_REPO_URL: &str = "git@github.com:Dev916/a2a.git";
 
 /// Every `[broker]` key, in the order `config show --origin` reports them.
-pub const BROKER_FIELDS: [&str; 2] = ["idle_timeout_secs", "events_max_bytes"];
+pub const BROKER_FIELDS: [&str; 3] = [
+    "idle_timeout_secs",
+    "events_max_bytes",
+    "turn_stall_secs",
+];
 
 /// How many workers one broker will run at once (spec §4.9 admission control).
 ///
@@ -373,6 +381,9 @@ pub struct BrokerConfig {
     /// Bytes of `events.jsonl` before it rotates; `0` disables rotation.
     /// See [`DEFAULT_EVENTS_MAX_BYTES`].
     pub events_max_bytes: u64,
+    /// Seconds without a worker event before an open turn is failed; `0`
+    /// disables the watchdog. See [`DEFAULT_TURN_STALL_SECS`].
+    pub turn_stall_secs: u64,
 }
 
 impl Default for BrokerConfig {
@@ -380,6 +391,7 @@ impl Default for BrokerConfig {
         BrokerConfig {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             events_max_bytes: DEFAULT_EVENTS_MAX_BYTES,
+            turn_stall_secs: DEFAULT_TURN_STALL_SECS,
         }
     }
 }
@@ -1276,6 +1288,7 @@ fn apply_broker_toml(
     match field {
         "idle_timeout_secs" => bc.idle_timeout_secs = want_u64(dotted, v)?,
         "events_max_bytes" => bc.events_max_bytes = want_u64(dotted, v)?,
+        "turn_stall_secs" => bc.turn_stall_secs = want_u64(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -1460,6 +1473,7 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         match field {
             "idle_timeout_secs" => cfg.broker.idle_timeout_secs = parse_u64_str(&key, raw.trim())?,
             "events_max_bytes" => cfg.broker.events_max_bytes = parse_u64_str(&key, raw.trim())?,
+            "turn_stall_secs" => cfg.broker.turn_stall_secs = parse_u64_str(&key, raw.trim())?,
             _ => unreachable!("field membership fixed by BROKER_FIELDS"),
         }
         origins.insert(format!("broker.{field}"), Origin::Env);
@@ -1774,15 +1788,28 @@ mod tests {
         );
         // Appended, not inserted: `config show --origin` reports `[broker]` in
         // this order and an operator's eye is the only index into it.
-        assert_eq!(BROKER_FIELDS, ["idle_timeout_secs", "events_max_bytes"]);
+        assert_eq!(
+            BROKER_FIELDS,
+            ["idle_timeout_secs", "events_max_bytes", "turn_stall_secs"]
+        );
+    }
+
+    #[test]
+    fn the_turn_stall_watchdog_defaults_to_ten_minutes() {
+        assert_eq!(DEFAULT_TURN_STALL_SECS, 600);
+        assert_eq!(BrokerConfig::default().turn_stall_secs, 600);
+        assert_eq!(
+            broker_env_key("turn_stall_secs"),
+            "A2A_BROKER_TURN_STALL_SECS"
+        );
     }
 
     #[test]
     fn the_broker_section_walks_its_keys_and_warns_on_unknown() {
-        let table: toml::Table =
-            "[broker]\nidle_timeout_secs = 45\nevents_max_bytes = 4096\nbogus = 1\n"
-                .parse()
-                .unwrap();
+        let table: toml::Table = "[broker]\nidle_timeout_secs = 45\nevents_max_bytes = 4096\n\
+                                  turn_stall_secs = 7\nbogus = 1\n"
+            .parse()
+            .unwrap();
         let mut cfg = Config {
             codex_bin: None,
             codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
@@ -1800,8 +1827,10 @@ mod tests {
         apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
         assert_eq!(cfg.broker.idle_timeout_secs, 45);
         assert_eq!(cfg.broker.events_max_bytes, 4096);
+        assert_eq!(cfg.broker.turn_stall_secs, 7);
         assert_eq!(origins.get("broker.idle_timeout_secs"), Some(&Origin::File));
         assert_eq!(origins.get("broker.events_max_bytes"), Some(&Origin::File));
+        assert_eq!(origins.get("broker.turn_stall_secs"), Some(&Origin::File));
         assert!(
             warnings.iter().any(|w| w.contains("broker.bogus")),
             "{warnings:?}"

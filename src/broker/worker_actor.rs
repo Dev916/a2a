@@ -290,6 +290,7 @@ pub fn build_worker_actor(
         trace: TraceBuffer::new(TRACE_BUFFER_CAPACITY),
         turn_messages: Vec::new(),
         open_turn: None,
+        turn_last_event_at: None,
         settled: None,
     };
     (WorkerHandle { id, tx }, actor.run())
@@ -322,6 +323,9 @@ pub struct WorkerActor {
     /// is what makes the next `Deliver` a `turn/start` instead of a `turn/steer`
     /// that is guaranteed to lose its precondition race.
     open_turn: Option<String>,
+    /// Monotonic receipt time of the most recent app-server event while a turn
+    /// is open. `None` means no turn is currently watched.
+    turn_last_event_at: Option<tokio::time::Instant>,
     /// `--schema`, re-supplied on EVERY `turn/start` (it is per-turn, not
     /// sticky).
     output_schema: Option<Value>,
@@ -341,6 +345,7 @@ impl WorkerActor {
         let cancel = self.cancel.clone();
         loop {
             let deadline = self.deadline_instant();
+            let turn_stall_deadline = self.turn_stall_deadline();
             let msg = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
@@ -349,6 +354,10 @@ impl WorkerActor {
                     continue;
                 }
                 msg = self.rx.recv() => msg,
+                _ = wait_until(turn_stall_deadline) => {
+                    self.fire_turn_stall().await;
+                    continue;
+                }
             };
             match msg {
                 // Every handle was dropped: nobody can reach this worker again.
@@ -369,6 +378,7 @@ impl WorkerActor {
                 method,
                 disposition,
             } => {
+                self.touch_turn_event();
                 self.flush_trace().await;
                 let mut env = self.envelope(
                     EventClass::Lifecycle,
@@ -557,6 +567,7 @@ impl WorkerActor {
         // closes the window in which a `send` arriving first would open a second
         // turn against a thread that already has one.
         self.open_turn = Some(started.turn_id);
+        self.turn_last_event_at = Some(tokio::time::Instant::now());
         Ok(())
     }
 
@@ -591,6 +602,9 @@ impl WorkerActor {
         // resumed worker (epoch 2) would silently fence every envelope the core
         // built while it still believed the epoch was 1.
         env.epoch = self.snap.epoch;
+        if env.kind == EventKind::TurnStarted || self.open_turn.is_some() {
+            self.turn_last_event_at = Some(tokio::time::Instant::now());
+        }
         if env.class != EventClass::Lifecycle {
             self.trace.push(env);
             if self.trace.len() >= TRACE_FLUSH_THRESHOLD {
@@ -614,7 +628,9 @@ impl WorkerActor {
             // the new child has never heard of would fail its precondition at
             // best — and at worst succeed against a stale turn while the
             // per-turn sandbox overrides went unre-supplied.
-            EventKind::TransportRestarted => self.open_turn = None,
+            EventKind::TransportRestarted => {
+                self.clear_open_turn();
+            }
             _ => {}
         }
         // A turn only concludes from `running`: an interrupted or killed worker
@@ -675,7 +691,7 @@ impl WorkerActor {
     async fn trip_budget(&mut self) {
         let turns_this_epoch = self.snap.turns_this_epoch.unwrap_or(0);
         let max_turns = self.budget();
-        if let Some(turn_id) = self.open_turn.take() {
+        if let Some(turn_id) = self.clear_open_turn() {
             if let Ok(thread_id) = self.thread_id() {
                 let _ = self
                     .adapter()
@@ -732,7 +748,7 @@ impl WorkerActor {
     /// The turn ended: publish its result, then conclude it through the very
     /// same code the exec transport concludes with.
     async fn conclude_turn(&mut self) {
-        self.open_turn = None;
+        self.clear_open_turn();
         let messages = std::mem::take(&mut self.turn_messages);
 
         // The app-server has no `--output-last-message`: the turn's final agent
@@ -851,6 +867,9 @@ impl WorkerActor {
             .await
             .map_err(|e| rpc_err("turn/steer", e))?;
         self.open_turn = Some(sent.turn_id.clone());
+        if sent.path != SendPath::Steered {
+            self.turn_last_event_at = Some(tokio::time::Instant::now());
+        }
 
         // Acknowledged only after the transport took it: the queue is
         // at-least-once, and this watermark is what dedupes a re-delivery —
@@ -892,7 +911,7 @@ impl WorkerActor {
             .turn_interrupt(&thread_id, &turn_id, RPC_TIMEOUT)
             .await
             .map_err(|e| rpc_err("turn/interrupt", e))?;
-        self.open_turn = None;
+        self.clear_open_turn();
 
         self.flush_trace().await;
         self.persist("interrupt", move |log, dir, snap| {
@@ -916,7 +935,7 @@ impl WorkerActor {
     /// (The FSM's `KillProcess` action is exec's; the actor performs no
     /// actions, which is what makes that structural rather than remembered.)
     async fn kill(&mut self) -> Result<(), AppError> {
-        if let Some(turn_id) = self.open_turn.take() {
+        if let Some(turn_id) = self.clear_open_turn() {
             if let Ok(thread_id) = self.thread_id() {
                 // Best effort: a turn we could not interrupt must not stop us
                 // from recording that the operator cancelled the worker.
@@ -959,6 +978,59 @@ impl WorkerActor {
         Some(tokio::time::Instant::now() + remaining)
     }
 
+    fn turn_stall_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.cfg.broker.turn_stall_secs == 0
+            || self.snap.state != WorkerState::Running
+            || self.open_turn.is_none()
+        {
+            return None;
+        }
+        self.turn_last_event_at?.checked_add(Duration::from_secs(
+            self.cfg.broker.turn_stall_secs,
+        ))
+    }
+
+    async fn fire_turn_stall(&mut self) {
+        let stall_secs = self.cfg.broker.turn_stall_secs;
+        let Some(last_event_at) = self.turn_last_event_at else {
+            return;
+        };
+        if stall_secs == 0
+            || self.snap.state != WorkerState::Running
+            || self.open_turn.is_none()
+            || last_event_at.elapsed() < Duration::from_secs(stall_secs)
+        {
+            return;
+        }
+        if let Some(turn_id) = self.clear_open_turn() {
+            if let Ok(thread_id) = self.thread_id() {
+                let _ = self
+                    .adapter()
+                    .turn_interrupt(&thread_id, &turn_id, RPC_TIMEOUT)
+                    .await;
+            }
+        }
+        self.flush_trace().await;
+        let outcome = self
+            .persist("turn_stalled", move |log, dir, snap| {
+                let snap = fold::append_and_fold(
+                    log,
+                    dir,
+                    snap,
+                    EventKind::TurnStalled,
+                    json!({"fsm": "Timeout", "kind": "task",
+                           "failure_class": "turn_stalled",
+                           "turn_stall_secs": stall_secs}),
+                    Utc::now(),
+                )?;
+                Ok((snap, ()))
+            })
+            .await;
+        if let Err(e) = outcome {
+            self.warn("failing a stalled turn", &e);
+        }
+    }
+
     /// Fire the lane deadline this state is guarded by, through the WAL — a
     /// timeout is an event (spec §4.6), not a special case.
     async fn fire_deadline(&mut self) {
@@ -970,7 +1042,7 @@ impl WorkerActor {
         // `KillProcess` would signal a process group; here that group is the
         // shared child, so the equivalent is an interrupt.
         if kind == TimeoutKind::Task {
-            if let Some(turn_id) = self.open_turn.take() {
+            if let Some(turn_id) = self.clear_open_turn() {
                 if let Ok(thread_id) = self.thread_id() {
                     let _ = self
                         .adapter()
@@ -1185,6 +1257,17 @@ impl WorkerActor {
             raw,
             Utc::now(),
         )
+    }
+
+    fn touch_turn_event(&mut self) {
+        if self.open_turn.is_some() {
+            self.turn_last_event_at = Some(tokio::time::Instant::now());
+        }
+    }
+
+    fn clear_open_turn(&mut self) -> Option<String> {
+        self.turn_last_event_at = None;
+        self.open_turn.take()
     }
 
     /// The daemon's stderr is `broker.log`; a persistence failure is an
@@ -1945,6 +2028,151 @@ mod tests {
         assert!(
             h.child.try_wait().unwrap().is_none(),
             "the shared app-server child was signalled"
+        );
+        h.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_open_turn_fails_with_the_stall_reason() {
+        let mut h = start(
+            Lane::General,
+            WorkerState::Spawned,
+            "hang-turn",
+            &[],
+            |cfg| cfg.broker.turn_stall_secs = 1,
+        )
+        .await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
+        h.handle.deliver("work forever").await.unwrap();
+
+        let failed = h
+            .until("the turn stall watchdog to fire", |s| {
+                s.state == WorkerState::Failed
+            })
+            .await;
+        assert_eq!(failed.failure_class, Some(FailureClass::TurnStalled));
+        assert_no_rejections(&failed);
+        let stalls: Vec<Envelope> = h
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == EventKind::TurnStalled)
+            .collect();
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(stalls[0].raw["turn_stall_secs"], json!(1));
+        assert_eq!(h.settled().await.state, WorkerState::Failed);
+        h.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regular_turn_events_reset_the_stall_window() {
+        let h = start(
+            Lane::General,
+            WorkerState::Spawned,
+            "pulse-turn",
+            &[("FAKE_PULSE_SECS", "0.2")],
+            |cfg| cfg.broker.turn_stall_secs = 1,
+        )
+        .await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
+        h.handle.deliver("keep working").await.unwrap();
+
+        let pulse_deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let pulses = h
+                .events()
+                .iter()
+                .filter(|e| e.kind == EventKind::AgentMessage)
+                .count();
+            if pulses >= 3 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < pulse_deadline,
+                "timed out waiting for periodic events (saw {pulses})"
+            );
+            tokio::time::sleep(POLL).await;
+        }
+
+        let observe_until = tokio::time::Instant::now() + Duration::from_millis(2_200);
+        while tokio::time::Instant::now() < observe_until {
+            let snap = h.handle.snapshot().await.unwrap();
+            assert_eq!(snap.state, WorkerState::Running);
+            tokio::time::sleep(POLL).await;
+        }
+        assert!(
+            h.events()
+                .iter()
+                .all(|e| e.kind != EventKind::TurnStalled),
+            "periodic events must keep the turn alive"
+        );
+
+        h.handle.kill().await.unwrap();
+        let cancelled = h
+            .until("the worker to be cancelled", |s| {
+                s.state == WorkerState::Cancelled
+            })
+            .await;
+        assert_eq!(cancelled.failure_class, None);
+        h.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_disables_the_turn_stall_watchdog() {
+        let h = start(
+            Lane::General,
+            WorkerState::Spawned,
+            "hang-turn",
+            &[],
+            |cfg| cfg.broker.turn_stall_secs = 0,
+        )
+        .await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
+        h.handle.deliver("work forever").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let snap = h.handle.snapshot().await.unwrap();
+        assert_eq!(snap.state, WorkerState::Running);
+        assert!(
+            h.events()
+                .iter()
+                .all(|e| e.kind != EventKind::TurnStalled)
+        );
+
+        h.handle.kill().await.unwrap();
+        h.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_events_do_not_extend_the_lane_task_timeout() {
+        let h = start(
+            Lane::General,
+            WorkerState::Spawned,
+            "pulse-turn",
+            &[("FAKE_PULSE_SECS", "0.2")],
+            |cfg| {
+                cfg.broker.turn_stall_secs = 1;
+                cfg.lanes.get_mut(&Lane::General).unwrap().task_timeout_secs = 2;
+            },
+        )
+        .await;
+        h.until("the thread to start", |s| s.state == WorkerState::Running)
+            .await;
+        h.handle.deliver("keep working").await.unwrap();
+
+        let failed = h
+            .until("the unchanged lane task timeout to fire", |s| {
+                s.state == WorkerState::Failed
+            })
+            .await;
+        assert_eq!(failed.failure_class, Some(FailureClass::Timeout));
+        assert!(
+            h.events()
+                .iter()
+                .all(|e| e.kind != EventKind::TurnStalled),
+            "events reset only the stall clock, never the full-turn deadline"
         );
         h.stop().await;
     }

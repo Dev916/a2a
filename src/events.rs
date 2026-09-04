@@ -87,6 +87,10 @@ pub enum EventKind {
     /// vocabulary grows so `a2a tail` can name what happened, the machine does
     /// not.
     BudgetExhausted,
+    /// An open app-server turn emitted no events for the broker's configured
+    /// stall window. Like [`EventKind::BudgetExhausted`], this names a refined
+    /// `Timeout{task}` diagnosis without adding an FSM edge.
+    TurnStalled,
     /// `events.jsonl` was rotated to `events.jsonl.1` and this is the first
     /// line of the fresh file (spec §4.5). Bookkeeping only: it carries **no**
     /// `fsm` key, so the fold consumes its seq and changes nothing — the split
@@ -849,9 +853,9 @@ mod tests {
     /// Every post-Phase-1 kind crosses the file layer: a Phase-1 binary reading
     /// a newer `events.jsonl` must degrade to `Unknown`, not fail the read.
     ///
-    /// `budget_exhausted` and `events_rotated` are here for exactly that reason
-    /// and are deliberately absent from [`Phase1EventKind`] below — the mirror
-    /// is the frozen
+    /// `budget_exhausted`, `turn_stalled`, and `events_rotated` are here for
+    /// exactly that reason and are deliberately absent from
+    /// [`Phase1EventKind`] below — the mirror is the frozen
     /// vocabulary of a deployed older binary, and adding to it would assert the
     /// opposite of what this test exists to prove.
     #[test]
@@ -861,6 +865,7 @@ mod tests {
             (EventKind::ModelRerouted, "model_rerouted"),
             (EventKind::TransportDegraded, "transport_degraded"),
             (EventKind::BudgetExhausted, "budget_exhausted"),
+            (EventKind::TurnStalled, "turn_stalled"),
             (EventKind::EventsRotated, "events_rotated"),
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), json!(wire));

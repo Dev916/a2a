@@ -154,8 +154,9 @@ renders as `unknown` for any verdict other than valid-signed:
 `hardening-status` and `rotation-status` count ONLY verified rows and
 print the unverified/unknown count alongside (a member must not be able to
 APPEAR to enforce by writing bytes). The reader clamps a row's declared
-row_resign_secs to a locally configured maximum (default 7 days) before
-computing STALE_ROW, so a writer cannot declare itself never-stale.
+row_resign_secs to `[mesh.gateway] max_accepted_row_resign_secs` (default
+604800 — 7 days) before computing STALE_ROW, so a writer cannot declare
+itself never-stale.
 
 Signing `row_token_sha256` (not the token bytes) binds the signature to the
 exact token, so swapping in an archived older token for the same key is
@@ -318,32 +319,53 @@ key_epoch strictly greater than the record's).
    forgery.
 4. Verdict + visibility (below).
 
-**Verdict table.** The inputs: signature {absent | ok | bad} × token
-{missing | unverifiable under local RootSet | valid} × the reader's OWN
-first-signature bit {unset | set} × require_signed_rows {false | true} —
-writer capability is ALWAYS derived from the local first-signature bit,
-NEVER from the row's own `version` or any other unverified content (an
-attacker sets columns freely on a row whose signature already fails).
-"Unsigned" is DEFINED: row_msg, row_token, row_sig and signed_at ALL NULL;
-any other combination is NOT unsigned — the verdicts below grade it. The
-full enumerated table ships in mesh-join.md; §8 tests every cell. The
-verdicts:
-- `UNSIGNED` (all four NULL, first-signature bit unset): usable + warn
-  under flag=false; refused under flag=true.
-- `UNSIGNED-STALE` (all four NULL is impossible here — this is a bad or
-  absent signature where the first-signature bit is UNSET, i.e. the reader
-  has never seen this gateway signed; the honest cause is a rollback or a
-  pre-L4 writer): warn-only + usable under false; refused under true.
-- `UNVERIFIED` (token present but verifies under NO local root): warn-only
-  under false; refused under true; the log names the unknown root fpr — an
-  unknown root is a rotation-in-progress signal, not forgery.
-- `ROW_SIG_INCOMPLETE` (any partial-NULL combination of the four signature
-  columns): refused under BOTH flags, like BAD_SIG — unreachable for a
-  compliant writer, since §2.2's upsert always sets all four together.
-- `BAD_SIG` (first-signature bit SET and the signature fails; or
-  column-binding mismatch, token-digest mismatch, key_epoch mismatch,
-  duplicate-key row_msg, pubkey-pin violation): ALWAYS refused, both flag
-  states. This is the tamper alarm.
+**Verdict table.** Inputs: signature-column shape {all four NULL |
+partial NULL | present-and-verifies | present-and-fails} × token {missing
+| unverifiable under local RootSet | valid} × the reader's OWN
+first-signature bit {unset | set} × require_signed_rows {false | true}.
+Writer capability is ALWAYS derived from the local first-signature bit,
+NEVER from the row's own `version` or any other unverified content.
+Verdicts are DISJOINT via an explicit precedence order — the first
+matching rule wins:
+
+```
+REVOKED > ROW_REVOCATION_MISPLACED > ROW_SIG_UNKNOWN_VERSION
+  > ROW_SIG_INCOMPLETE > malformation-BAD_SIG > ROW_KEY_SUPERSEDED
+  > ROW_REPLAYED / ROW_CLOCK_AHEAD > disagreement (BAD_SIG or
+  UNSIGNED-STALE, by the bit) > UNVERIFIED > UNSIGNED > valid-signed
+```
+
+The full enumerated table ships in mesh-join.md; §8 tests every cell. The
+verdicts, defined by shape ALONE with the bit as a DISPOSITION input:
+- `UNSIGNED` (all four NULL): with the bit UNSET, usable + warn under
+  flag=false and refused under flag=true; with the bit SET, refused under
+  BOTH flags — `fleet ls` renders it "UNSIGNED (stripped)", the
+  strip-to-unsigned attack.
+- `ROW_SIG_INCOMPLETE` (any partial-NULL combination of the four): a
+  malformation — refused under BOTH flags regardless of the bit;
+  unreachable for a compliant writer, since §2.2's upsert always sets all
+  four together.
+- **Malformation ⇒ `BAD_SIG` regardless of the bit**: duplicate-key
+  row_msg, token-digest mismatch, key_epoch mismatch, pubkey-pin
+  violation (the pin only exists once the bit is set). These shapes have
+  no honest producer. ALWAYS refused, both flags. This is the tamper
+  alarm.
+- **Content/signature DISAGREEMENT, graded by the bit**: all four columns
+  present but the ed25519 check fails over the stored bytes, OR the
+  signature verifies and the column binding mismatches (the one honest
+  producer: a rolled-back or pre-L4 writer updating projected columns
+  under a stale signature). Bit SET ⇒ `BAD_SIG` (always refused). Bit
+  UNSET ⇒ `UNSIGNED-STALE`: usable + warn under false, refused under
+  true. (A cold reader under flag=false grants nothing new here — the
+  attacker could equally present a fully-UNSIGNED row to it.)
+- `UNVERIFIED` (all four present, signature verifies, token verifies
+  under NO local root): warn-only + usable under false; refused under
+  true; the log names the unknown root fpr — an unknown root is a
+  rotation-in-progress signal, not forgery. When the bit is SET, the
+  signature check at step 2 runs against the PINNED pubkey even though
+  the token is unverifiable — a failure there is BAD_SIG, and
+  UNVERIFIED's permissive disposition applies only when the pinned-key
+  check passes (token-unverifiable never short-circuits step 2).
 - `ROW_REPLAYED`, `ROW_CLOCK_AHEAD`, `ROW_KEY_SUPERSEDED`,
   `ROW_SIG_UNKNOWN_VERSION`, `REVOKED`, `ROW_REVOCATION_MISPLACED`:
   refused under both flags, per steps 0-3. `STALE_ROW`,
@@ -352,10 +374,10 @@ verdicts:
   warn/display labels as defined at their sections.
 
 **Trust on first signature.** Once the first-signature bit is set for a
-gateway_id, UNSIGNED and UNSIGNED-STALE rows for it are refused regardless
-of the flag — stripping or downgrading the signature columns is not a
-usable path (ROW_SIG_UNKNOWN_VERSION is already refused independently, so
-no verdict escapes the bit). The escape lever ships in the same release:
+gateway_id, every signature-degraded shape for it is refused regardless of
+the flag — UNSIGNED becomes "stripped", disagreement becomes BAD_SIG, and
+ROW_SIG_UNKNOWN_VERSION / ROW_SIG_INCOMPLETE are refused independently —
+so no shape escapes the bit. The escape lever ships in the same release:
 `clear-signature` as above, named in the BAD_SIG remedy and §7 step 6.
 
 **Verdict vs visibility.** The verifier returns (row, verdict); ONLY the
@@ -393,14 +415,23 @@ it.
 
 **Envelope corroboration** is NEW work, not a call-site edit: it runs at
 work ingest (after envelope signature verification) and at `approve`,
-reads the CACHED verified rows (no live query per note). It refuses a
-sender whose row verdict is anything other than valid-signed, whose row is
-REVOKED (from the local cache), or whose row_msg.pubkey_fpr — read from a
-VERIFIED row only, never from the bare column — disagrees with the
-envelope key. Degrade split (applies to both registry-unreachable and
-present-but-invalid): warn-and-proceed at ingest, refuse at `approve`; row
-ABSENCE follows the same split. Revocation is the exception — refused at
-BOTH, from the cache.
+reads the CACHED verified rows (no live query per note). Its refusal set —
+like the work-send preflight's — is the FLAG-RESOLVED disposition, not the
+literal verdict: it refuses a sender whose row is REFUSED under the
+reader's effective require_signed_rows (REVOKED always, from the cache).
+For a valid-signed sender row it additionally requires row_msg.pubkey_fpr
+— read from the VERIFIED row only, never from the bare column — to equal
+the envelope key. For a usable-but-unverified row (UNSIGNED /
+UNSIGNED-STALE / UNVERIFIED under flag=false — e.g. every row during §7
+steps 2-3, and any 0.3.0-floor peer) that check is SKIPPED with a warning:
+there is no verified row_msg to read, and refusing would break §7 step 2's
+cross-version contract. Degrade split (applies to both
+registry-unreachable and refused-disposition rows): warn-and-proceed at
+ingest, refuse at `approve`; row ABSENCE follows the same split.
+Revocation is the exception — refused at BOTH, from the cache. The same
+disposition rule governs `WORK_PEER_ROW_INVALID` at `work send`: it fires
+only for rows refused under the sender's effective flag, never for
+usable-with-warning rows.
 
 ### 2.4 Work rows: constrained, still unsigned
 
@@ -478,8 +509,13 @@ convenience posture — the push-time scan below runs regardless.)
   exactly the committed work that ships.) `work diff` renders a
   --stat/--numstat summary ahead of the full patch, under the same pinned
   flags (§3.2).
-- Refuse any commit with a parent unreachable from base_sha (defeats
-  `-s ours` merge smuggling) and any non-ancestor base.
+- Require a LINEAR result: every commit in `<base_sha>..HEAD` has exactly
+  one parent, and following parents from HEAD terminates at base_sha —
+  any merge commit in the range is refused (this is what actually defeats
+  `-s ours` smuggling: the smuggled side branch necessarily arrives via a
+  merge), as is any non-ancestor base. The object closure of
+  `git rev-list --objects <base_sha>..HEAD` must equal the closure of
+  that linear chain.
 - Scan BLOBS via `git cat-file`, never rendered diff text. A non-UTF-8
   added blob is an automatic hold (`WORK_BINARY_IN_RESULT`), never an
   implicit pass. An added/modified `.gitattributes` touching diff/textconv
@@ -712,15 +748,18 @@ covers it.
 **What ships enabled vs disabled.** Two enabled-at-release groups, neither
 of which emits a protocol ack (so mixed-version safety is structural):
 - **Pre-auth bounds**, keyed on source address, active before any
-  identity exists: a cap on un-handshaken inbound sessions, a handshake
-  deadline, a connections-per-minute bucket. Refusal = the socket is
-  closed; a health counter records each.
+  identity exists: `[mesh.limits] max_unauthenticated_sessions` (default
+  32), `handshake_deadline_secs` (default 10), and
+  `connects_per_min_per_source` (default 60). Refusal = the socket is
+  closed; a health counter records each. These ship with deliberately
+  permissive defaults (an honest reconnect storm must not self-DoS) and
+  are tightened, not turned on, by the step-5 calibration pass.
 - **Post-handshake session bounds**, keyed on the authenticated peer: a
   concurrent-session cap (1 inbound + 1 outbound; a surplus session is
   refused with the locally-logged code `SESSION_LIMIT` and a closed
   connection — never a silent registration overwrite; an older peer
   simply observes the close, which every shipped version already
-  tolerates) and a per-peer handshake-rate bucket.
+  tolerates) and `handshakes_per_min_per_peer` (default 12).
 
 The six METERED buckets ship with **shipped default 0 (off)**; §7 step 5
 flips them to their calibrated enabled values only after every member
@@ -729,10 +768,12 @@ RATE_LIMITED to a peer whose version predates it.
 
 **Bucket mechanics.** Metered-bucket state lives on the shared link-state
 handle keyed by peer gateway_id — explicitly NOT per session — beginning
-after handshake. Depth = one minute's rate (reconnect bursts absorb).
-Config under `[mesh.limits]`: `notes_per_min`, `feed_entries_per_min`,
-`feed_bytes_per_min`, `work_offers_per_hour`, `wants_per_min`,
-`digests_per_min`.
+after handshake. Depth is per denomination: one minute's allowance for
+the `*_per_min` buckets (reconnect bursts absorb), and the FULL hourly
+allowance for `work_offers_per_hour` (a rate/60 depth could never admit a
+single offer). Config under `[mesh.limits]`: `notes_per_min`,
+`feed_entries_per_min`, `feed_bytes_per_min`, `work_offers_per_hour`,
+`wants_per_min`, `digests_per_min`.
 
 **Over-limit is DEFERRAL, not rejection.** RATE_LIMITED gets its own ack
 class (`Deferred`) — L3's Rejected is terminal and must not be overloaded.
@@ -786,12 +827,10 @@ Health exposes per-peer drop/defer counters.
 ## 6. Third member
 
 Enroll a third machine (Mike's spare or a small VM) via mesh-join.md — now
-a DELIVERABLE, not "unchanged": version floor, migrate ordering, both
-posture flags, install-root-next, the verdict table, the gateway_id
-derivation, and what UNSIGNED/BAD_SIG mean to a joiner. The exercise
-proves the docs, 3-way pool claims, and gives the rotation drill a quorum.
-Its §7 position is explicit: before the flag flip. Any code gaps get
-filed.
+a DELIVERABLE, not "unchanged" (the authoritative content list lives in
+§7's docs paragraph). The exercise proves the docs, 3-way pool claims,
+and gives the rotation drill a quorum. Its §7 position is explicit:
+before the flag flip. Any code gaps get filed.
 
 ## 7. Rollout
 
@@ -813,9 +852,10 @@ filed.
    `fleet ls`, notes and feed ingest, pool offers, and directed work
    send + result return MUST keep working against a 0.3.0-floor peer;
    the permitted degradations are exactly: metered limits off, unsigned
-   rows warn-only under flag=false. (Any future msg_ver bump rides the
-   same mechanism: readers that understand it deploy fleet-wide first —
-   §2.1 Versioning.)
+   rows warn-only under flag=false, and envelope corroboration's
+   pubkey-fpr check skipped-with-warning against usable-unsigned rows
+   (§2.3). (Any future msg_ver bump rides the same mechanism: readers
+   that understand it deploy fleet-wide first — §2.1 Versioning.)
 3. Daemon restarts publish signed rows; `fleet ls` shows signature state.
    Token-expiry precondition: no member's token inside T-14 (renew first —
    both live members' tokens currently expire within a day of each other).
@@ -838,11 +878,16 @@ filed.
    `fleet clear-signature` before any deliberate member downgrade.
 7. Rotation drill (§4), then registry-credential drill (§4.5).
 
-Docs deliverables ride the train: mesh-join.md (floor, ordering, flags,
-verdict table, gateway_id derivation, limits table), mesh-work.md (new
-codes in the remedy table; decline/reject boundary; §security), new
-mesh-rotation.md, and the a2a-orchestrate skill's work-handoff section
-regenerated with diff/release/reject/awaiting_release.
+Docs deliverables ride the train. mesh-join.md — this list is THE
+authoritative one; §1/§4.2/§6 point here: version floor, migrate
+ordering, both posture flags, install-root-next (and the corrected
+"never overwrite root.pub / never install a bare root.pub.next" text),
+the full verdict table with per-cell remedies, the gateway_id derivation,
+the limits table, and the caveat that `fleet revoke` does not remove
+registry access (§4.5 does). mesh-work.md: new codes in the remedy table;
+decline/reject boundary; §security. New mesh-rotation.md (§4.4). The
+a2a-orchestrate skill's work-handoff section regenerated with
+diff/release/reject/awaiting_release.
 
 ## 8. Testing tiers
 
@@ -874,7 +919,12 @@ regenerated with diff/release/reject/awaiting_release.
 - **Unit — gate, scanner, limits, holds**: scanner corpus —
   registry.env/root.key/gw.key shapes as TRUE positives, documented misses
   asserted AS misses, benign fixtures clean; secret-hold entry under
-  auto_push=true → release --allow-secrets / reject; rendering
+  auto_push=true → release --allow-secrets / reject; the four fail-closed
+  gate holds each asserted (non-UTF-8 added blob ⇒ WORK_BINARY_IN_RESULT;
+  added/modified .gitattributes touching diff/textconv ⇒ hold; scan input
+  over diff_scan_max_bytes ⇒ hold, never pass; release refused after HEAD
+  moved past the recorded sha); a merge commit in base_sha..HEAD refused
+  (the linearity rule); rendering
   (CR-overwrite line, U+202E line, a confusable non-ASCII line and an
   over-clamp line each FLAGGED, a row whose endpoint_url contains ESC/CR
   still prints its BAD_SIG flag first); metered-bucket mechanics incl.
@@ -903,8 +953,10 @@ regenerated with diff/release/reject/awaiting_release.
   key refused, pre-L4 reader re-admits after --rebind clears the mirror);
   full work flow with auto_push=false through diff → release AND diff →
   reject; a work row whose sender_gw is tampered — the result note still
-  derives from the verified envelope; an invalid-verdict sender row —
-  warn at ingest, refused at approve; two work_ids colliding under
+  derives from the verified envelope; a sender row REFUSED under the
+  effective flag — warn at ingest, refused at approve — while a
+  usable-unsigned sender row under flag=false proceeds with the fpr check
+  skipped-and-warned; two work_ids colliding under
   safe_file_part resolve in exactly one bucket, and a non-ULID work_id is
   refused WORK_ID_INVALID at send and ingest; a cancelled row flipped
   back to offered is refused at approve WHEN the local terminal-state

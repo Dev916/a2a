@@ -144,6 +144,17 @@ Every mesh work spawn pins `network_access=false`, even if the impl lane
 normally enables network access. The approve dry run prints the resolved
 sandbox (normally `workspace-write`) and network posture before the brief.
 
+**Worker READ scoping is not confined in v1** (spec §3.7 finding,
+codex 0.152.1): the documented `sandbox_permissions` config key is rejected
+by actual config resolution (`unknown configuration field`), and the only
+working read-narrowing route — beta permission profiles — would replace the
+entire `-s workspace-write` spawn path rather than compose with it. A worker
+can therefore READ anything the operating user can; the effective
+mitigations are exactly the gates above: exfiltration must transit the
+reviewed push (linear-range diff gate, blob-level secret scan, note-payload
+scan, network=false), and `--allow-secrets` is out-of-band. Revisit when
+permission profiles leave beta (tracked as a follow-up issue).
+
 `release --allow-secrets` never treats text inside the reviewed diff as
 authorization. It requires the one-time token printed only by an interactive
 `work diff`; the token is bound to the current hit-set digest, single-use,

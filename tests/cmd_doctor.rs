@@ -5,11 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The fifteen checks, in report order: Phase 1's six (unchanged ids,
-/// unchanged order), then Phase 2's four, then Phase 3's three. This list IS
-/// the contract `doctor --json` publishes — a phase that adds a check adds it
-/// here in the same commit.
-const CHECK_IDS: [&str; 15] = [
+/// The sixteen checks, in report order: Phase 1's six (unchanged ids,
+/// unchanged order), then Phase 2's four, the two mesh checks, and Phase 3's
+/// three. This list IS the contract `doctor --json` publishes — a phase that
+/// adds a check adds it here in the same commit.
+const CHECK_IDS: [&str; 16] = [
     "codex_present",
     "codex_version",
     "layout_version",
@@ -21,6 +21,7 @@ const CHECK_IDS: [&str; 15] = [
     "codex_home_match",
     "broker_status",
     "gateway_enrollment",
+    "mesh_hardening",
     "auth_mode",
     "context_canon",
     "codex_config_secrets",
@@ -61,7 +62,7 @@ fn detail(v: &serde_json::Value, id: &str) -> String {
 }
 
 #[test]
-fn all_ok_with_stub_exits_zero_and_lists_fifteen_checks() {
+fn all_ok_with_stub_exits_zero_and_lists_sixteen_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |_| {});
     assert_eq!(code, 0);
@@ -92,7 +93,57 @@ fn all_ok_with_stub_exits_zero_and_lists_fifteen_checks() {
     // no auth.json under the temp CODEX_HOME
     assert_eq!(check(&v, "gateway_enrollment")["status"], "ok");
     assert!(detail(&v, "gateway_enrollment").contains("no mesh gateway material"));
+    assert_eq!(check(&v, "mesh_hardening")["status"], "ok");
+    assert!(detail(&v, "mesh_hardening").contains("no mesh gateway material"));
     assert_eq!(check(&v, "auth_mode")["status"], "warn");
+}
+
+#[test]
+fn mesh_hardening_names_the_roots_held_and_the_local_token_issuer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_path = tmp.path().join("h");
+    let home = a2a::home::A2aHome::resolve(Some(&home_path)).unwrap();
+    a2a::mesh::keys::fleet_init(&home).unwrap();
+    a2a::mesh::keys::gateway_identity(&home, false).unwrap();
+    a2a::mesh::keys::ensure_gateway_token(&home, &a2a::mesh::keys::SystemClock).unwrap();
+    a2a::mesh::keys::stage_root(&home, &a2a::mesh::keys::SystemClock, false).unwrap();
+    let roots = a2a::mesh::keys::RootSet::load(&home).unwrap();
+    let token = a2a::mesh::keys::gateway_token(&home).unwrap();
+    let (_claims, issuer) = a2a::mesh::keys::verify_token_with_issuer(
+        &token,
+        &roots,
+        &a2a::mesh::keys::SystemClock,
+    )
+    .unwrap();
+
+    let (v, code) = checks(&home_path, tmp.path(), |_| {});
+    assert_eq!(code, 0);
+    let hardening = check(&v, "mesh_hardening");
+    assert_eq!(hardening["status"], "ok", "{hardening}");
+    let hardening_detail = detail(&v, "mesh_hardening");
+    for root in roots.entries() {
+        assert!(
+            hardening_detail.contains(&root.fpr),
+            "held root {} is named: {hardening_detail}",
+            root.fpr
+        );
+    }
+    assert!(
+        hardening_detail.contains(&format!("token_issuer={issuer}")),
+        "{hardening_detail}"
+    );
+    assert!(
+        hardening_detail.contains("token_issuer_installed=true"),
+        "{hardening_detail}"
+    );
+    assert!(
+        hardening_detail.contains("require_signed_rows="),
+        "{hardening_detail}"
+    );
+    assert!(
+        !hardening_detail.contains("awaiting_release="),
+        "the W3/F1 release-backlog field is intentionally deferred: {hardening_detail}"
+    );
 }
 
 #[test]

@@ -11,6 +11,9 @@ use crate::mesh::{
         write_registry_env, GatewayRow, Registry, RegistryHandle,
         DEFAULT_REGISTRY_HEARTBEAT_SECS,
     },
+    rotation::{
+        self, RotationEvidence, RotationPhase, RotationState, RotationStatus, SoakState,
+    },
     row_mark::RowMarkStore,
     row_sig::{
         endpoint_conflicts, row_flags, RowFlag, RowVerdict, RowVerifyCfg, StoredRowColumns,
@@ -651,6 +654,7 @@ fn run_fleet(
             pubkey,
             out,
             rebind,
+            sign_with,
         } => {
             require_fleet_root_key(home)?;
             let roots = reader_roots(home)?;
@@ -682,11 +686,12 @@ fn run_fleet(
                 &roots,
             )?;
             let (token, claims, issuing_root_fpr) =
-                crate::mesh::keys::enroll_gateway_token_at_epoch(
+                crate::mesh::keys::enroll_gateway_token_at_epoch_with(
                     home,
                     gateway_id,
                     pubkey,
                     key_epoch,
+                    *sign_with,
                     &crate::mesh::keys::SystemClock,
                 )?;
             if *rebind {
@@ -723,13 +728,199 @@ fn run_fleet(
                 "reminder": reminder
             })))
         }
-        MeshFleetCmd::RotateRoot => {
-            let rotation = crate::mesh::keys::rotate_root(home, &crate::mesh::keys::SystemClock)?;
-            Ok(Outcome::from(json!({
-                "fleet_id": rotation.fleet_id,
-                "current_root_fingerprint": rotation.current_fingerprint,
-                "next_root_fingerprint": rotation.next_fingerprint,
-                "gateway_token_rotated": rotation.gateway_token_rotated
+        MeshFleetCmd::RotateRoot {
+            stage,
+            abort,
+            promote,
+            retire,
+            force,
+            out,
+        } => {
+            if *stage {
+                let staged = crate::mesh::keys::stage_root(
+                    home,
+                    &crate::mesh::keys::SystemClock,
+                    *force,
+                )?;
+                if let Some(path) = out.as_deref().filter(|path| *path != "-") {
+                    write_file_0600(Path::new(path), &(staged.announcement.clone() + "\n"))?;
+                    return Ok(Outcome::from(json!({
+                        "fleet_id": staged.fleet_id,
+                        "current_fingerprint": staged.current_fingerprint,
+                        "next_fingerprint": staged.next_fingerprint,
+                        "announcement_path": path,
+                    })));
+                }
+                if !json_mode {
+                    return Ok(Outcome::from(Value::String(format!(
+                        "staged next root {}\n{}",
+                        staged.next_fingerprint, staged.announcement
+                    ))));
+                }
+                return Ok(Outcome::from(json!({
+                    "fleet_id": staged.fleet_id,
+                    "current_fingerprint": staged.current_fingerprint,
+                    "next_fingerprint": staged.next_fingerprint,
+                    "announcement": staged.announcement,
+                })));
+            }
+            if *abort {
+                let ledger = EnrollLedger::load(home)?;
+                let next_fingerprint =
+                    crate::mesh::keys::abort_root_stage(home, *force, &ledger)?;
+                return Ok(Outcome::from(json!({
+                    "aborted": true,
+                    "next_fingerprint": next_fingerprint,
+                })));
+            }
+            if *promote {
+                let now = Utc::now();
+                let evidence = gather_rotation_evidence(home, cfg, &rt, now)?;
+                let phase = rotation::phase(&evidence);
+                if phase != RotationPhase::Phase2 {
+                    return Err(rotation_phase_unmet(&evidence, phase));
+                }
+                let promoted_from_fpr = evidence.current_fpr.clone();
+                let promoted_to_fpr = evidence
+                    .next_fpr
+                    .clone()
+                    .expect("phase 2 before promote has a next root");
+                crate::mesh::keys::promote_root(
+                    home,
+                    &crate::mesh::keys::SystemClock,
+                )?;
+                if !json_mode {
+                    return Ok(Outcome::from(Value::String(format!(
+                        "promoted root {promoted_to_fpr}; previous root {promoted_from_fpr} remains held for soak"
+                    ))));
+                }
+                return Ok(Outcome::from(json!({
+                    "promoted": true,
+                    "promoted_from_fpr": promoted_from_fpr,
+                    "promoted_to_fpr": promoted_to_fpr,
+                    "phase": phase,
+                })));
+            }
+            if *retire {
+                let now = Utc::now();
+                let evidence = gather_rotation_evidence(home, cfg, &rt, now)?;
+                let phase = rotation::phase(&evidence);
+                if phase != RotationPhase::Phase2 {
+                    return Err(rotation_phase_unmet(&evidence, phase));
+                }
+                let soak = rotation::soak_state(
+                    &evidence,
+                    now.timestamp(),
+                    cfg.mesh.gateway.rotation_soak_secs,
+                );
+                if !*force && soak != SoakState::Satisfied {
+                    return Err(rotation_soak_unmet(&soak));
+                }
+                let retired_fpr = crate::mesh::keys::retire_root(home)?;
+                if !json_mode {
+                    let force_note = if *force {
+                        "; soak skipped by --force"
+                    } else {
+                        ""
+                    };
+                    return Ok(Outcome::from(Value::String(format!(
+                        "retired previous root {retired_fpr}{force_note}"
+                    ))));
+                }
+                return Ok(Outcome::from(json!({
+                    "retired": true,
+                    "retired_fpr": retired_fpr,
+                    "phase": phase,
+                    "soak": soak,
+                    "soak_skipped": *force,
+                    "message": if *force { Some("soak skipped by --force") } else { None },
+                })));
+            }
+            unreachable!("clap requires one root rotation operation")
+        }
+        MeshFleetCmd::RotationStatus { json } => {
+            let ledger_path = home.root().join("mesh/fleet/enrollments.json");
+            if !ledger_path.is_file() || !registry_env_path(home).is_file() {
+                return Err(rotation_status_unavailable(home));
+            }
+            let roots = crate::mesh::keys::RootSet::load(home)?;
+            let fleet_id = crate::mesh::keys::fleet_id(home)?;
+            let ledger = EnrollLedger::load(home)?;
+            let state = RotationState::load(home)?;
+            let url = read_registry_env(home)?;
+            let now = Utc::now();
+            let rows = rt.block_on(async {
+                open_registry(&url, roots.clone(), fleet_id.clone())?
+                    .with_reader_state(
+                        RowMarkStore::open(home)?,
+                        RowVerifyCfg::from_config(now, cfg),
+                    )
+                    .discover()
+                    .await
+            })?;
+            let evidence = rotation::gather_evidence(
+                home,
+                &roots,
+                &rows,
+                &ledger,
+                &state,
+                now.timestamp(),
+            )?;
+            let status = RotationStatus::from_evidence(
+                fleet_id,
+                &roots,
+                &rows,
+                evidence,
+                now.timestamp(),
+                cfg.mesh.gateway.rotation_soak_secs,
+            );
+            if json_mode || *json {
+                return Ok(Outcome::from(serde_json::to_value(&status).map_err(
+                    |error| AppError::new("SERIALIZE", ExitCode::Internal, error.to_string()),
+                )?));
+            }
+            Ok(Outcome::from(Value::String(status.render_human())))
+        }
+        MeshFleetCmd::SetRegistry { url } => {
+            let url = registry_input(url)?;
+            let roots = reader_roots(home)?;
+            let fleet_id = crate::mesh::keys::fleet_id(home)?;
+            let now = Utc::now();
+            let marks = RowMarkStore::open(home)?;
+            let verify_cfg = RowVerifyCfg::from_config(now, cfg);
+            let rows = rt.block_on(async {
+                let registry = open_registry(&url, roots, fleet_id.clone())?
+                    .with_reader_state(marks.clone(), verify_cfg.clone());
+                let fleet_ids = registry.fleet_ids().await?;
+                if let Some(other) = fleet_ids.iter().find(|seen| *seen != &fleet_id) {
+                    return Err(registry_set_refused(&fleet_id, other));
+                }
+                let rows = registry.discover().await?;
+                if let Some((row, _verdict)) =
+                    rows.iter().find(|(row, _verdict)| row.fleet_id != fleet_id)
+                {
+                    return Err(registry_set_refused(&fleet_id, &row.fleet_id));
+                }
+                Ok(rows)
+            })?;
+            write_registry_env(home, &url)?;
+            let conflicts = endpoint_conflicts(&rows);
+            if json_mode {
+                let data = rows
+                    .iter()
+                    .map(|row| fleet_row_json(row, now, &marks, &verify_cfg, &conflicts))
+                    .collect::<Vec<_>>();
+                return Ok(Outcome::from(json!({
+                    "fleet_id": fleet_id,
+                    "rows": data,
+                })));
+            }
+            let rendered = human_fleet_rows(&rows, now, &marks, &verify_cfg, &conflicts);
+            let summary = format!("fleet={fleet_id} rows={}", rows.len());
+            Ok(Outcome::from(Value::String(if rendered.is_empty() {
+                summary
+            } else {
+                format!("{rendered}\n{summary}")
             })))
         }
         MeshFleetCmd::HardeningStatus { json } => {
@@ -767,6 +958,130 @@ fn run_fleet(
             ))))
         }
     }
+}
+
+fn gather_rotation_evidence(
+    home: &A2aHome,
+    cfg: &Config,
+    runtime: &tokio::runtime::Runtime,
+    now: DateTime<Utc>,
+) -> Result<RotationEvidence, AppError> {
+    let roots = crate::mesh::keys::RootSet::load(home)?;
+    let ledger = EnrollLedger::load(home)?;
+    let state = RotationState::load(home)?;
+    let rows = if registry_env_path(home).exists() {
+        let url = read_registry_env(home)?;
+        runtime.block_on(async {
+            open_registry(
+                &url,
+                roots.clone(),
+                crate::mesh::keys::fleet_id(home)?,
+            )?
+            .with_reader_state(
+                RowMarkStore::open(home)?,
+                RowVerifyCfg::from_config(now, cfg),
+            )
+            .discover()
+            .await
+        })?
+    } else {
+        Vec::new()
+    };
+    rotation::gather_evidence(
+        home,
+        &roots,
+        &rows,
+        &ledger,
+        &state,
+        now.timestamp(),
+    )
+}
+
+fn rotation_status_unavailable(home: &A2aHome) -> AppError {
+    AppError::new(
+        "ROTATION_STATUS_UNAVAILABLE",
+        ExitCode::Precondition,
+        format!(
+            "rotation status needs both {} and {}",
+            home.root().join("mesh/fleet/enrollments.json").display(),
+            registry_env_path(home).display(),
+        ),
+    )
+    .remedy(
+        "run fleet enrollment from this owner home and install a registry credential before retrying rotation-status",
+    )
+}
+
+fn registry_set_refused(local_fleet_id: &str, observed_fleet_id: &str) -> AppError {
+    let observed_display = crate::mesh::render::escape_untrusted(observed_fleet_id, 128).text;
+    AppError::new(
+        "REGISTRY_SET_REFUSED",
+        ExitCode::Precondition,
+        format!(
+            "the new registry exposes fleet {observed_display}, but this machine holds roots for fleet {local_fleet_id}"
+        ),
+    )
+    .remedy(
+        "use a credential scoped to this machine's existing fleet; set-registry never re-homes a machine",
+    )
+    .data(json!({
+        "local_fleet_id": local_fleet_id,
+        "observed_fleet_id": observed_fleet_id,
+    }))
+}
+
+fn rotation_phase_unmet(evidence: &RotationEvidence, phase: RotationPhase) -> AppError {
+    let target = evidence
+        .next_fpr
+        .as_deref()
+        .unwrap_or(&evidence.current_fpr);
+    let mut blockers = evidence.unaccounted.clone();
+    blockers.extend(
+        evidence
+            .members
+            .iter()
+            .filter(|member| member.verified_issuer_fpr.as_deref() != Some(target))
+            .map(|member| member.gateway_id.clone()),
+    );
+    blockers.sort();
+    blockers.dedup();
+    let detail = if blockers.is_empty() {
+        "no complete ledgered member evidence is available".to_string()
+    } else {
+        format!("members not proven on the target root: {}", blockers.join(", "))
+    };
+    AppError::new(
+        "ROTATION_PHASE_UNMET",
+        ExitCode::Precondition,
+        format!("root rotation is {phase:?}; {detail}"),
+    )
+    .remedy(
+        "re-enroll members with `a2a mesh fleet enroll --sign-with next`, install the announcement, restart and re-sign their rows, then retry",
+    )
+    .data(json!({"phase": phase, "members": blockers}))
+}
+
+fn rotation_soak_unmet(soak: &SoakState) -> AppError {
+    let detail = match soak {
+        SoakState::NotPromoted => "the staged root has not been promoted".to_string(),
+        SoakState::Pending {
+            missing,
+            seconds_remaining,
+        } => format!(
+            "handshake evidence missing for [{}]; {seconds_remaining} soak seconds remain",
+            missing.join(", ")
+        ),
+        SoakState::Satisfied => "the soak predicate is satisfied".to_string(),
+    };
+    AppError::new(
+        "ROTATION_SOAK_UNMET",
+        ExitCode::Precondition,
+        detail,
+    )
+    .remedy(
+        "wait for every member to handshake under the promoted root and for the configured soak interval, or use --force to skip only the soak",
+    )
+    .data(json!({"soak": soak}))
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -912,6 +1227,28 @@ fn run_gateway(
                 "exp": claims.exp,
                 "signed_at": resigned.as_ref().map(|row| row.signed_at),
                 "row_msg_sha256": resigned.as_ref().map(|row| row.row_msg_sha256.as_str()),
+            })))
+        }
+        MeshGatewayCmd::InstallRootNext { file } => {
+            let announcement = token_input(file)?;
+            let installed = crate::mesh::keys::install_root_next(
+                home,
+                announcement.trim(),
+                &crate::mesh::keys::SystemClock,
+            )?;
+            let reminder = "restart the gateway to load the staged root";
+            if !json_mode {
+                return Ok(Outcome::from(Value::String(format!(
+                    "installed next root {} for {}; token reverified={}; {reminder}",
+                    installed.next_fpr, installed.fleet_id, installed.token_reverified
+                ))));
+            }
+            Ok(Outcome::from(json!({
+                "fleet_id": installed.fleet_id,
+                "next_fpr": installed.next_fpr,
+                "token_reverified": installed.token_reverified,
+                "restart_required": true,
+                "reminder": reminder,
             })))
         }
         MeshGatewayCmd::Resign => {

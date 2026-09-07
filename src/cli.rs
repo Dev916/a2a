@@ -589,17 +589,48 @@ pub enum MeshFleetCmd {
         /// Authorize a new public key for this stable gateway id and advance its key epoch
         #[arg(long)]
         rebind: bool,
+        /// Select the current or staged next fleet root as enrollment signer
+        #[arg(long, value_enum, default_value = "current")]
+        sign_with: crate::mesh::keys::RootSigner,
     },
-    /// Mint root.pub.next and re-sign this machine's gateway token
+    /// Stage, abort, promote, or retire a fleet root rotation
     #[command(
-        after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation."
+        group = clap::ArgGroup::new("rotate_op")
+            .required(true)
+            .args(["stage", "abort", "promote", "retire"])
     )]
-    RotateRoot,
+    RotateRoot {
+        #[arg(long)]
+        stage: bool,
+        #[arg(long)]
+        abort: bool,
+        #[arg(long)]
+        promote: bool,
+        #[arg(long)]
+        retire: bool,
+        #[arg(long)]
+        force: bool,
+        /// Write the signed announcement to FILE; - keeps it in command output
+        #[arg(long, value_name = "FILE")]
+        out: Option<String>,
+    },
     /// Report fleet-wide enforcement state from verified rows only
     HardeningStatus {
         /// Emit the fleet enforcement report as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Report verified fleet root-rotation readiness and soak state
+    RotationStatus {
+        /// Emit the rotation report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify and replace this machine's fleet registry credential
+    SetRegistry {
+        /// Registry connection string source; use `-` to read from stdin
+        #[arg(long, value_name = "SOURCE")]
+        url: String,
     },
 }
 
@@ -627,6 +658,12 @@ pub enum MeshGatewayCmd {
     /// Install a root-signed gateway enrollment token
     InstallToken {
         /// Token envelope file, or - to read stdin
+        #[arg(long, value_name = "FILE")]
+        file: String,
+    },
+    /// Verify and install a current-root-signed staged root announcement
+    InstallRootNext {
+        /// Signed rotation announcement file, or - to read stdin
         #[arg(long, value_name = "FILE")]
         file: String,
     },

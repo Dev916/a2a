@@ -1,4 +1,5 @@
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::mesh::enroll_ledger::EnrollLedger;
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -20,8 +21,10 @@ pub const SKEW_TOLERANCE_SECS: i64 = 300;
 
 pub const ROOT_KEY: &str = "root.key";
 const ROOT_KEY_NEXT: &str = "root.key.next";
+const ROOT_KEY_PREV: &str = "root.key.prev";
 const ROOT_PUB: &str = "root.pub";
 const ROOT_PUB_NEXT: &str = "root.pub.next";
+const ROOT_PUB_PREV: &str = "root.pub.prev";
 const GW_KEY: &str = "gw.key";
 pub const GW_TOKEN: &str = "gw.token";
 const TLS_CERT: &str = "gw.crt";
@@ -103,34 +106,96 @@ pub struct RevocationClaims {
     pub revoked_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRole {
+    Current,
+    Next,
+    Prev,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootEntry {
+    pub role: RootRole,
+    pub fleet_id: String,
+    pub pubkey_b64: String,
+    pub fpr: String,
+}
+
 #[derive(Clone, Debug)]
-pub struct RootSet(Vec<RootPubFile>);
+pub struct RootSet(Vec<RootEntry>);
 
 impl RootSet {
     pub fn load(home: &A2aHome) -> Result<Self, AppError> {
         let dir = fleet_dir(home)?;
-        let mut roots = vec![read_root_pub(&dir.join(ROOT_PUB))?];
-        let next = dir.join(ROOT_PUB_NEXT);
-        if next.exists() {
-            roots.push(read_root_pub(&next)?);
+        let current = read_root_pub(&dir.join(ROOT_PUB))?;
+        let fleet_id = current.fleet_id.clone();
+        let mut roots = vec![root_entry(current, RootRole::Current)?];
+        for (name, role) in [
+            (ROOT_PUB_NEXT, RootRole::Next),
+            (ROOT_PUB_PREV, RootRole::Prev),
+        ] {
+            let path = dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let root = read_root_pub(&path)?;
+            if root.fleet_id != fleet_id {
+                return Err(root_next_fleet_mismatch(
+                    role,
+                    &fleet_id,
+                    &root.fleet_id,
+                ));
+            }
+            roots.push(root_entry(root, role)?);
         }
         Ok(Self(roots))
     }
 
+    pub fn entries(&self) -> &[RootEntry] {
+        &self.0
+    }
+
     pub fn fingerprints(&self) -> Vec<String> {
+        self.0.iter().map(|root| root.fpr.clone()).collect()
+    }
+
+    pub fn role_of(&self, fpr: &str) -> Option<RootRole> {
         self.0
             .iter()
-            .filter_map(|root| root_fingerprint(root).ok())
-            .collect()
+            .find(|entry| entry.fpr == fpr)
+            .map(|entry| entry.role)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RootRotation {
+pub struct RootStage {
     pub fleet_id: String,
     pub current_fingerprint: String,
     pub next_fingerprint: String,
-    pub gateway_token_rotated: bool,
+    pub announcement: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationAnnouncement {
+    pub fleet_id: String,
+    pub next_pubkey_b64: String,
+    pub next_fpr: String,
+    pub issued_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledRootNext {
+    pub fleet_id: String,
+    pub next_fpr: String,
+    pub token_reverified: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RootSigner {
+    Current,
+    Next,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,25 +285,141 @@ pub fn fleet_root_fingerprint(home: &A2aHome) -> Result<String, AppError> {
     root_fingerprint(&root)
 }
 
-pub fn rotate_root(home: &A2aHome, clock: &dyn Clock) -> Result<RootRotation, AppError> {
+pub fn stage_root(
+    home: &A2aHome,
+    clock: &dyn Clock,
+    force: bool,
+) -> Result<RootStage, AppError> {
     let current = fleet_init(home)?;
     let dir = fleet_dir(home)?;
     let current_pub = read_root_pub(&dir.join(ROOT_PUB))?;
+    let next_key_path = dir.join(ROOT_KEY_NEXT);
+    let next_pub_path = dir.join(ROOT_PUB_NEXT);
+    if (next_key_path.exists() || next_pub_path.exists()) && !force {
+        return Err(root_rotation_staged());
+    }
+    if force {
+        remove_file_if_present(&next_key_path, "removing staged fleet root key")?;
+        remove_file_if_present(&next_pub_path, "removing staged fleet root public key")?;
+    }
     let signing = new_signing_key();
     let next_key = RootKeyFile {
         fleet_id: current.fleet_id.clone(),
         secret_b64: b64_encode(&signing.to_bytes()),
     };
-    write_json_0600(&dir.join(ROOT_KEY_NEXT), &next_key)?;
-    write_root_pub(&dir.join(ROOT_PUB_NEXT), &next_key)?;
-    let next_pub = read_root_pub(&dir.join(ROOT_PUB_NEXT))?;
-    let gateway_token_rotated = resign_gateway_token_with_next(home, clock)?.is_some();
-    Ok(RootRotation {
+    write_json_0600(&next_key_path, &next_key)?;
+    write_root_pub(&next_pub_path, &next_key)?;
+    let next_pub = read_root_pub(&next_pub_path)?;
+    let next_fingerprint = root_fingerprint(&next_pub)?;
+    let staged_at = clock.now().timestamp();
+    let ann = RotationAnnouncement {
+        fleet_id: current.fleet_id.clone(),
+        next_pubkey_b64: next_pub.pubkey_b64.clone(),
+        next_fpr: next_fingerprint.clone(),
+        issued_at: staged_at,
+    };
+    let announcement = sign_announcement(&ann, &dir.join(ROOT_KEY))?;
+    crate::mesh::rotation::RotationState {
+        staged_at: Some(staged_at),
+        ..crate::mesh::rotation::RotationState::default()
+    }
+    .save(home)?;
+    Ok(RootStage {
         fleet_id: current.fleet_id,
         current_fingerprint: root_fingerprint(&current_pub)?,
-        next_fingerprint: root_fingerprint(&next_pub)?,
-        gateway_token_rotated,
+        next_fingerprint,
+        announcement,
     })
+}
+
+pub fn abort_root_stage(
+    home: &A2aHome,
+    force: bool,
+    ledger: &EnrollLedger,
+) -> Result<String, AppError> {
+    let dir = fleet_dir(home)?;
+    let next_key_path = dir.join(ROOT_KEY_NEXT);
+    let next_pub_path = dir.join(ROOT_PUB_NEXT);
+    if !next_key_path.exists() || !next_pub_path.exists() {
+        return Err(root_next_missing());
+    }
+    let staged_fpr = root_fingerprint(&read_root_pub(&next_pub_path)?)?;
+    let mut enrolled = ledger
+        .entries()
+        .iter()
+        .filter(|entry| entry.issuing_root_fpr == staged_fpr)
+        .map(|entry| entry.gateway_id.clone())
+        .collect::<Vec<_>>();
+    enrolled.sort();
+    enrolled.dedup();
+    if !force && !enrolled.is_empty() {
+        return Err(root_rotation_abort_refused(&staged_fpr, &enrolled));
+    }
+    remove_file_if_present(&next_key_path, "removing staged fleet root key")?;
+    remove_file_if_present(&next_pub_path, "removing staged fleet root public key")?;
+    Ok(staged_fpr)
+}
+
+pub fn promote_root(home: &A2aHome, clock: &dyn Clock) -> Result<(), AppError> {
+    let dir = fleet_dir(home)?;
+    let next_key_path = dir.join(ROOT_KEY_NEXT);
+    let next_pub_path = dir.join(ROOT_PUB_NEXT);
+    if !next_key_path.exists() || !next_pub_path.exists() {
+        return Err(root_next_missing());
+    }
+    let roots = RootSet::load(home)?;
+    let current_fpr = roots
+        .entries()
+        .iter()
+        .find(|entry| entry.role == RootRole::Current)
+        .map(|entry| entry.fpr.clone())
+        .ok_or_else(root_next_missing)?;
+    let next_fpr = roots
+        .entries()
+        .iter()
+        .find(|entry| entry.role == RootRole::Next)
+        .map(|entry| entry.fpr.clone())
+        .ok_or_else(root_next_missing)?;
+    let mut state = crate::mesh::rotation::RotationState::load(home)?;
+
+    rename_file(
+        &dir.join(ROOT_PUB),
+        &dir.join(ROOT_PUB_PREV),
+        "promoting fleet root public key",
+    )?;
+    rename_file(
+        &dir.join(ROOT_KEY),
+        &dir.join(ROOT_KEY_PREV),
+        "promoting fleet root private key",
+    )?;
+    rename_file(
+        &next_pub_path,
+        &dir.join(ROOT_PUB),
+        "installing promoted fleet root public key",
+    )?;
+    rename_file(
+        &next_key_path,
+        &dir.join(ROOT_KEY),
+        "installing promoted fleet root private key",
+    )?;
+
+    state.promoted_at = Some(clock.now().timestamp());
+    state.promoted_from_fpr = Some(current_fpr);
+    state.promoted_to_fpr = Some(next_fpr);
+    state.save(home)
+}
+
+pub fn retire_root(home: &A2aHome) -> Result<String, AppError> {
+    let dir = fleet_dir(home)?;
+    let prev_key_path = dir.join(ROOT_KEY_PREV);
+    let prev_pub_path = dir.join(ROOT_PUB_PREV);
+    if !prev_key_path.exists() || !prev_pub_path.exists() {
+        return Err(root_prev_missing());
+    }
+    let retired_fpr = root_fingerprint(&read_root_pub(&prev_pub_path)?)?;
+    remove_file_if_present(&prev_key_path, "retiring previous fleet root key")?;
+    remove_file_if_present(&prev_pub_path, "retiring previous fleet root public key")?;
+    Ok(retired_fpr)
 }
 
 pub fn gateway_identity(home: &A2aHome, fresh: bool) -> Result<GatewayIdentity, AppError> {
@@ -427,6 +608,17 @@ pub fn enroll_gateway_token(
         .map(|(token, _claims, _issuer)| token)
 }
 
+pub fn enroll_gateway_token_with(
+    home: &A2aHome,
+    gateway_id: &str,
+    pubkey_b64: &str,
+    signer: RootSigner,
+    clock: &dyn Clock,
+) -> Result<(String, String), AppError> {
+    enroll_gateway_token_at_epoch_with(home, gateway_id, pubkey_b64, 0, signer, clock)
+        .map(|(token, _claims, issuer)| (token, issuer))
+}
+
 pub fn enroll_gateway_token_at_epoch(
     home: &A2aHome,
     gateway_id: &str,
@@ -434,9 +626,35 @@ pub fn enroll_gateway_token_at_epoch(
     key_epoch: u64,
     clock: &dyn Clock,
 ) -> Result<(String, TokenClaims, String), AppError> {
+    enroll_gateway_token_at_epoch_with(
+        home,
+        gateway_id,
+        pubkey_b64,
+        key_epoch,
+        RootSigner::Current,
+        clock,
+    )
+}
+
+pub fn enroll_gateway_token_at_epoch_with(
+    home: &A2aHome,
+    gateway_id: &str,
+    pubkey_b64: &str,
+    key_epoch: u64,
+    signer: RootSigner,
+    clock: &dyn Clock,
+) -> Result<(String, TokenClaims, String), AppError> {
     validate_gateway_pubkey_b64(pubkey_b64)?;
-    let root_key_path = fleet_dir(home)?.join(ROOT_KEY);
+    let dir = fleet_dir(home)?;
+    let (key_name, pub_name) = match signer {
+        RootSigner::Current => (ROOT_KEY, ROOT_PUB),
+        RootSigner::Next => (ROOT_KEY_NEXT, ROOT_PUB_NEXT),
+    };
+    let root_key_path = dir.join(key_name);
     if !root_key_path.exists() {
+        if signer == RootSigner::Next {
+            return Err(root_next_missing());
+        }
         return Err(AppError::new(
             "FLEET_ROOT_KEY_MISSING",
             ExitCode::Precondition,
@@ -444,8 +662,18 @@ pub fn enroll_gateway_token_at_epoch(
         )
         .remedy("run this command on the fleet root machine that holds mesh/fleet/root.key"));
     }
-    let root_pub_path = root_key_path.with_file_name(ROOT_PUB);
+    let root_pub_path = dir.join(pub_name);
     let root = read_root_key(&root_key_path)?;
+    if signer == RootSigner::Next {
+        let current_fleet = fleet_id(home)?;
+        if root.fleet_id != current_fleet {
+            return Err(root_next_fleet_mismatch(
+                RootRole::Next,
+                &current_fleet,
+                &root.fleet_id,
+            ));
+        }
+    }
     if !root_pub_path.exists() {
         write_root_pub(&root_pub_path, &root)?;
     }
@@ -502,6 +730,55 @@ pub fn install_gateway_token(
     Ok(claims)
 }
 
+pub fn install_root_next(
+    home: &A2aHome,
+    announcement_text: &str,
+    clock: &dyn Clock,
+) -> Result<InstalledRootNext, AppError> {
+    let roots = RootSet::load(home)?;
+    let (announcement, issuer_fpr) = verify_announcement(announcement_text.trim(), &roots)?;
+    if roots.role_of(&issuer_fpr) != Some(RootRole::Current) {
+        return Err(root_announcement_invalid(
+            "rotation announcement was not signed by the current root",
+        ));
+    }
+    let local_fleet_id = fleet_id(home)?;
+    if announcement.fleet_id != local_fleet_id {
+        return Err(root_announcement_fleet_mismatch(
+            &local_fleet_id,
+            &announcement.fleet_id,
+        ));
+    }
+    let next_key = verifying_key_from_b64(&announcement.next_pubkey_b64)
+        .map_err(|_| root_announcement_invalid("announced next root public key is invalid"))?;
+    let computed_fpr = hex(&Sha256::digest(next_key.to_bytes()));
+    if computed_fpr != announcement.next_fpr {
+        return Err(root_announcement_invalid(
+            "announced next root fingerprint does not match its public key",
+        ));
+    }
+    let next_pub = RootPubFile {
+        fleet_id: announcement.fleet_id.clone(),
+        pubkey_b64: announcement.next_pubkey_b64,
+    };
+    write_root_pub_file(&fleet_dir(home)?.join(ROOT_PUB_NEXT), &next_pub)?;
+
+    let token_path = gateway_dir(home)?.join(GW_TOKEN);
+    let token_reverified = if token_path.exists() {
+        let gateway_id = gateway_id(home)?;
+        let pubkey_b64 = gateway_public_key_b64(home)?;
+        verify_gateway_token(home, &gateway_id, &pubkey_b64, clock)?;
+        true
+    } else {
+        false
+    };
+    Ok(InstalledRootNext {
+        fleet_id: announcement.fleet_id,
+        next_fpr: computed_fpr,
+        token_reverified,
+    })
+}
+
 pub fn sign_token(claims: &TokenClaims, home: &A2aHome) -> Result<String, AppError> {
     let root = fleet_init(home)?;
     let mut claims = claims.clone();
@@ -510,40 +787,54 @@ pub fn sign_token(claims: &TokenClaims, home: &A2aHome) -> Result<String, AppErr
     sign_claim_bytes(&claims_bytes, home)
 }
 
-fn resign_gateway_token_with_next(
-    home: &A2aHome,
-    clock: &dyn Clock,
-) -> Result<Option<String>, AppError> {
-    let gateway_path = gateway_dir(home)?.join(GW_KEY);
-    if !gateway_path.exists() {
-        return Ok(None);
+pub fn sign_announcement(
+    announcement: &RotationAnnouncement,
+    key_path: &Path,
+) -> Result<String, AppError> {
+    sign_claim_bytes_with_key(&canonical_announcement(announcement)?, key_path)
+}
+
+pub fn verify_announcement(
+    text: &str,
+    roots: &RootSet,
+) -> Result<(RotationAnnouncement, String), AppError> {
+    let encoded = b64_decode(text)
+        .map_err(|_| root_announcement_invalid("rotation announcement is not base64"))?;
+    let envelope: TokenEnvelope = serde_json::from_slice(&encoded)
+        .map_err(|_| root_announcement_invalid("rotation announcement envelope is invalid"))?;
+    if envelope.v != TOKEN_VERSION {
+        return Err(root_announcement_invalid(
+            "rotation announcement version is unsupported",
+        ));
     }
-    let next_key_path = fleet_dir(home)?.join(ROOT_KEY_NEXT);
-    if !next_key_path.exists() {
-        return Ok(None);
-    }
-    let root = read_root_key(&next_key_path)?;
-    let gateway = read_gateway_key(&gateway_path)?;
-    let signing = signing_key_from_b64(&gateway.secret_b64).map_err(|_| {
-        AppError::new(
-            "GATEWAY_KEY_INVALID",
-            ExitCode::Precondition,
-            "gateway key file is invalid",
-        )
+    let claims_bytes = b64_decode(&envelope.claims_b64)
+        .map_err(|_| root_announcement_invalid("announcement claims are not base64"))?;
+    let sig_bytes = b64_decode(&envelope.sig_b64)
+        .map_err(|_| root_announcement_invalid("announcement signature is not base64"))?;
+    let sig: [u8; 64] = sig_bytes.try_into().map_err(|_| {
+        root_announcement_invalid("announcement signature has invalid length")
     })?;
-    let issued_at = clock.now().timestamp();
-    let claims = TokenClaims {
-        fleet_id: root.fleet_id.clone(),
-        gateway_id: gateway.gateway_id,
-        pubkey_b64: b64_encode(&signing.verifying_key().to_bytes()),
-        key_epoch: 0,
-        issued_at,
-        exp: issued_at + 90 * 24 * 60 * 60,
-    };
-    let claims_bytes = canonical_claims(&claims)?;
-    let token = sign_claim_bytes_with_key(&claims_bytes, &next_key_path)?;
-    write_string_0600(&gateway_dir(home)?.join(GW_TOKEN), &(token.clone() + "\n"))?;
-    Ok(Some(token))
+    let signature = Signature::from_bytes(&sig);
+    let announcement: RotationAnnouncement = serde_json::from_slice(&claims_bytes).map_err(|_| {
+        root_announcement_invalid("announcement claims are invalid or contain unknown fields")
+    })?;
+    let canonical = canonical_announcement(&announcement)?;
+    if canonical != claims_bytes {
+        return Err(root_announcement_invalid(
+            "rotation announcement claims are not canonical",
+        ));
+    }
+    for root in roots.entries() {
+        let key = verifying_key_from_b64(&root.pubkey_b64).map_err(|_| {
+            root_announcement_invalid("trusted root public key is invalid")
+        })?;
+        if key.verify(&claims_bytes, &signature).is_ok() {
+            return Ok((announcement, root.fpr.clone()));
+        }
+    }
+    Err(root_announcement_invalid(
+        "announcement signature does not verify against trusted roots",
+    ))
 }
 
 pub fn verify_token(
@@ -551,9 +842,17 @@ pub fn verify_token(
     roots: &RootSet,
     clock: &dyn Clock,
 ) -> Result<TokenClaims, AppError> {
-    let (claims, _) = verify_token_no_clock(token_b64, roots)?;
+    verify_token_with_issuer(token_b64, roots, clock).map(|(claims, _issuer)| claims)
+}
+
+pub fn verify_token_with_issuer(
+    token_b64: &str,
+    roots: &RootSet,
+    clock: &dyn Clock,
+) -> Result<(TokenClaims, String), AppError> {
+    let (claims, issuer) = verify_token_no_clock(token_b64, roots)?;
     check_claim_clock(&claims, clock.now().timestamp())?;
-    Ok(claims)
+    Ok((claims, issuer))
 }
 
 pub fn verify_token_no_clock(
@@ -582,11 +881,11 @@ pub fn verify_token_no_clock(
         return Err(claims_invalid("claims are not canonical"));
     }
 
-    for root in &roots.0 {
+    for root in roots.entries() {
         let key = verifying_key_from_b64(&root.pubkey_b64)
             .map_err(|_| token_invalid("root public key is invalid"))?;
         if key.verify(&claims_bytes, &signature).is_ok() {
-            return Ok((claims, root_fingerprint(root)?));
+            return Ok((claims, root.fpr.clone()));
         }
     }
     Err(token_invalid(
@@ -638,7 +937,7 @@ pub fn verify_revocation(
     if canonical != claims_bytes {
         return Err(revocation_invalid("revocation claims are not canonical"));
     }
-    for root in &roots.0 {
+    for root in roots.entries() {
         let key = verifying_key_from_b64(&root.pubkey_b64)
             .map_err(|_| revocation_invalid("root public key is invalid"))?;
         if key.verify(&claims_bytes, &signature).is_ok() {
@@ -670,7 +969,10 @@ fn sign_claim_bytes(claims_bytes: &[u8], home: &A2aHome) -> Result<String, AppEr
     sign_claim_bytes_with_key(claims_bytes, &fleet_dir(home)?.join(ROOT_KEY))
 }
 
-fn sign_claim_bytes_with_key(claims_bytes: &[u8], key_path: &Path) -> Result<String, AppError> {
+pub(crate) fn sign_claim_bytes_with_key(
+    claims_bytes: &[u8],
+    key_path: &Path,
+) -> Result<String, AppError> {
     let root = read_root_key(key_path)?;
     let signing = signing_key_from_b64(&root.secret_b64).map_err(|_| root_key_invalid())?;
     let sig = signing.sign(claims_bytes);
@@ -697,6 +999,16 @@ fn root_fingerprint(root: &RootPubFile) -> Result<String, AppError> {
     Ok(hex(&Sha256::digest(key)))
 }
 
+fn root_entry(root: RootPubFile, role: RootRole) -> Result<RootEntry, AppError> {
+    let fpr = root_fingerprint(&root)?;
+    Ok(RootEntry {
+        role,
+        fleet_id: root.fleet_id,
+        pubkey_b64: root.pubkey_b64,
+        fpr,
+    })
+}
+
 fn canonical_claims(claims: &TokenClaims) -> Result<Vec<u8>, AppError> {
     let mut fields: BTreeMap<&str, Value> = BTreeMap::from([
         ("exp", json!(claims.exp)),
@@ -709,6 +1021,17 @@ fn canonical_claims(claims: &TokenClaims) -> Result<Vec<u8>, AppError> {
         fields.insert("key_epoch", json!(claims.key_epoch));
     }
     canonical_json_fields(fields)
+}
+
+fn canonical_announcement(
+    announcement: &RotationAnnouncement,
+) -> Result<Vec<u8>, AppError> {
+    canonical_json_fields(BTreeMap::from([
+        ("fleet_id", json!(&announcement.fleet_id)),
+        ("issued_at", json!(announcement.issued_at)),
+        ("next_fpr", json!(&announcement.next_fpr)),
+        ("next_pubkey_b64", json!(&announcement.next_pubkey_b64)),
+    ]))
 }
 
 fn canonical_revocation_claims(claims: &RevocationClaims) -> Result<Vec<u8>, AppError> {
@@ -778,6 +1101,10 @@ fn write_root_pub(path: &Path, root: &RootKeyFile) -> Result<(), AppError> {
     write_json_0644(path, &pub_file)
 }
 
+fn write_root_pub_file(path: &Path, root: &RootPubFile) -> Result<(), AppError> {
+    write_json_0644(path, root)
+}
+
 fn read_root_key(path: &Path) -> Result<RootKeyFile, AppError> {
     let bytes = fs::read(path).map_err(|e| io_err("reading fleet root key", e))?;
     serde_json::from_slice(&bytes).map_err(|_| root_key_invalid())
@@ -839,6 +1166,18 @@ fn validate_gateway_pubkey_b64(pubkey_b64: &str) -> Result<(), AppError> {
             "gateway public key must be a base64-encoded ed25519 verifying key",
         )
     })
+}
+
+fn remove_file_if_present(path: &Path, context: &'static str) -> Result<(), AppError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_err(context, error)),
+    }
+}
+
+fn rename_file(from: &Path, to: &Path, context: &'static str) -> Result<(), AppError> {
+    fs::rename(from, to).map_err(|error| io_err(context, error))
 }
 
 fn token_mismatch(field: &'static str, expected: &str, actual: &str) -> AppError {
@@ -967,6 +1306,94 @@ fn claims_invalid(message: &'static str) -> AppError {
 fn revocation_invalid(message: &'static str) -> AppError {
     AppError::new("REVOCATION_INVALID", ExitCode::Precondition, message)
         .remedy("discard the record and mint a fresh revocation on the fleet root machine")
+}
+
+fn root_rotation_staged() -> AppError {
+    AppError::new(
+        "ROOT_ROTATION_STAGED",
+        ExitCode::Precondition,
+        "a staged fleet root already exists",
+    )
+    .remedy(
+        "run `a2a mesh fleet rotate-root --abort` after confirming it is unused, or restage deliberately with --force",
+    )
+}
+
+fn root_rotation_abort_refused(staged_fpr: &str, gateway_ids: &[String]) -> AppError {
+    AppError::new(
+        "ROOT_ROTATION_ABORT_REFUSED",
+        ExitCode::Precondition,
+        format!(
+            "staged root {staged_fpr} issued enrollment tokens for {}; refusing to strand those gateways",
+            gateway_ids.join(", ")
+        ),
+    )
+    .remedy(
+        "re-enroll the named gateways under the current root, or use --force only after confirming the staged enrollments will be discarded",
+    )
+}
+
+fn root_next_missing() -> AppError {
+    AppError::new(
+        "ROOT_NEXT_MISSING",
+        ExitCode::Precondition,
+        "the staged fleet root key pair is missing",
+    )
+    .remedy("run `a2a mesh fleet rotate-root --stage` on the fleet root machine")
+}
+
+fn root_prev_missing() -> AppError {
+    AppError::new(
+        "ROOT_PREV_MISSING",
+        ExitCode::Precondition,
+        "the previous fleet root key pair is missing",
+    )
+    .remedy("promote a staged root before attempting to retire the previous root")
+}
+
+fn root_next_fleet_mismatch(
+    role: RootRole,
+    current_fleet_id: &str,
+    other_fleet_id: &str,
+) -> AppError {
+    let held = match role {
+        RootRole::Current => "current",
+        RootRole::Next => "next",
+        RootRole::Prev => "previous",
+    };
+    AppError::new(
+        "ROOT_NEXT_FLEET_MISMATCH",
+        ExitCode::Precondition,
+        format!(
+            "{held} root belongs to {other_fleet_id}, but the current root belongs to {current_fleet_id}"
+        ),
+    )
+    .remedy("remove the mismatched staged/previous root and install only roots for this fleet")
+}
+
+fn root_announcement_invalid(message: &'static str) -> AppError {
+    AppError::new(
+        "ROOT_ANNOUNCEMENT_INVALID",
+        ExitCode::Precondition,
+        message,
+    )
+    .remedy(
+        "install only the current-root-signed rotation announcement; a bare root.pub.next is never installed",
+    )
+}
+
+fn root_announcement_fleet_mismatch(
+    local_fleet_id: &str,
+    announced_fleet_id: &str,
+) -> AppError {
+    AppError::new(
+        "ROOT_ANNOUNCEMENT_FLEET_MISMATCH",
+        ExitCode::Precondition,
+        format!(
+            "rotation announcement belongs to {announced_fleet_id}, but this gateway belongs to {local_fleet_id}"
+        ),
+    )
+    .remedy("obtain the signed rotation announcement for this gateway's fleet")
 }
 
 fn root_key_invalid() -> AppError {

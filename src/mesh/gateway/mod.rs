@@ -220,6 +220,8 @@ pub struct GatewayHealth {
     pub days_remaining: Option<i64>,
     #[serde(default)]
     pub token_expiry_warning: Option<String>,
+    #[serde(default)]
+    pub root_mismatch_suspected: Option<Value>,
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
     pub replication: replicate::ReplicationHealth,
     #[serde(default)]
@@ -252,6 +254,7 @@ impl GatewayHealth {
             token_expires_at: None,
             days_remaining: None,
             token_expiry_warning: None,
+            root_mismatch_suspected: None,
             loops: LoopSlot::ALL
                 .into_iter()
                 .map(|slot| (slot, LoopHealth::new(slot)))
@@ -370,6 +373,10 @@ enum LoopEvent {
     RowSelfTamper { gateway_id: String, verdict: String },
     Replication(replicate::ReplicationHealth),
     Link(link::LinkHealthEvent),
+    HandshakeResult {
+        peer: String,
+        refusal_code: Option<String>,
+    },
     SessionEnd { slot: LoopSlot, detail: String },
 }
 
@@ -1154,6 +1161,7 @@ async fn supervise(
     drop(events_tx);
     let mut restarts: BTreeMap<LoopSlot, VecDeque<Instant>> = BTreeMap::new();
     let mut registry_error = None;
+    let mut root_mismatch = link::RootMismatchWatch::default();
     let mut last_health_flush = Instant::now();
 
     let outcome = loop {
@@ -1219,6 +1227,30 @@ async fn supervise(
                         apply_link_health_event(&mut health, event);
                         write_health(&root, &mut health).await?;
                         last_health_flush = Instant::now();
+                    }
+                    LoopEvent::HandshakeResult { peer, refusal_code } => {
+                        let transition = match refusal_code.as_deref() {
+                            Some(code) => root_mismatch.observe(&peer, code, Utc::now()),
+                            None => {
+                                root_mismatch.clear(&peer);
+                                None
+                            }
+                        };
+                        let mismatch_health = root_mismatch.health(Utc::now());
+                        health.root_mismatch_suspected = mismatch_health
+                            .as_object()
+                            .is_some_and(|peers| !peers.is_empty())
+                            .then_some(mismatch_health);
+                        write_health(&root, &mut health).await?;
+                        last_health_flush = Instant::now();
+                        if let Some(event) = transition {
+                            log.line(json!({
+                                "ts": event.observed_at,
+                                "kind": event.kind,
+                                "peer": event.peer,
+                                "count": event.count,
+                            })).await;
+                        }
                     }
                     LoopEvent::SessionEnd { slot, detail } => {
                         log.line(json!({
@@ -1829,7 +1861,7 @@ where
                             "verdict": verdict,
                         }));
                     }
-                    LoopEvent::SessionEnd { .. } => {}
+                    LoopEvent::HandshakeResult { .. } | LoopEvent::SessionEnd { .. } => {}
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
                         write_health(root, &mut health).await?;
@@ -1903,7 +1935,7 @@ async fn server_loop(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| AppError::new(
+                let (stream, addr) = accepted.map_err(|e| AppError::new(
                     "GATEWAY_ACCEPT",
                     ExitCode::BrokerUnavailable,
                     format!("accepting gateway link: {e}"),
@@ -1917,16 +1949,38 @@ async fn server_loop(
                 let state = cfg.links.clone();
                 let observer = cfg.link_observer.clone();
                 let child = token.child_token();
+                let session_events = tx.clone();
+                let peer_hint = addr.ip().to_string();
                 sessions.spawn(async move {
-                    let mut side = link::accept_once_io(stream, tls).await?;
-                    let peer = crate::mesh::wire::handshake_acceptor(
-                        &mut side,
-                        &identity,
-                        &roots,
-                        &SystemClock,
-                    )
-                    .await?;
-                    ensure_peer_not_revoked(&params_home, &peer)?;
+                    let handshake = async {
+                        let mut side = link::accept_once_io(stream, tls).await?;
+                        let peer = crate::mesh::wire::handshake_acceptor(
+                            &mut side,
+                            &identity,
+                            &roots,
+                            &SystemClock,
+                        )
+                        .await?;
+                        ensure_peer_not_revoked(&params_home, &peer)?;
+                        Ok::<_, AppError>((side, peer))
+                    }
+                    .await;
+                    let (side, peer) = match handshake {
+                        Ok(established) => established,
+                        Err(error) => return (peer_hint, false, Err(error)),
+                    };
+                    let _ = session_events
+                        .send(LoopEvent::HandshakeResult {
+                            peer: peer_hint.clone(),
+                            refusal_code: None,
+                        })
+                        .await;
+                    let _ = session_events
+                        .send(LoopEvent::HandshakeResult {
+                            peer: peer.gateway_id.clone(),
+                            refusal_code: None,
+                        })
+                        .await;
                     let params = LinkSessionParams::new(
                         params_home,
                         params_cfg,
@@ -1937,15 +1991,28 @@ async fn server_loop(
                         child,
                     )
                     .with_observer(observer);
-                    link::run_link_session(side, params).await
+                    (
+                        peer_hint,
+                        true,
+                        link::run_link_session(side, params).await,
+                    )
                 });
             }
             Some(joined) = sessions.join_next(), if !sessions.is_empty() => {
                 // One bad connection (port scan, TLS garbage, peer crash) must
                 // not kill the whole loop; log it and keep serving.
                 let detail = match joined {
-                    Ok(Ok(())) => None,
-                    Ok(Err(err)) => Some(format!("{}: {}", err.code, err.message)),
+                    Ok((_peer, _handshake_succeeded, Ok(()))) => None,
+                    Ok((peer, false, Err(err))) => {
+                        let _ = tx.send(LoopEvent::HandshakeResult {
+                            peer,
+                            refusal_code: Some(handshake_refusal_code(&err).to_string()),
+                        }).await;
+                        Some(format!("{}: {}", err.code, err.message))
+                    }
+                    Ok((_peer, true, Err(err))) => {
+                        Some(format!("{}: {}", err.code, err.message))
+                    }
                     Err(err) => Some(join_to_app_err(err).message),
                 };
                 if let Some(detail) = detail {
@@ -2066,8 +2133,22 @@ async fn dialer_loop(
                     match dial_and_spawn(row.clone(), &cfg, &token, &mut sessions).await {
                         Ok(()) => {
                             attempts.remove(&row.gateway_id);
+                            let _ = tx
+                                .send(LoopEvent::HandshakeResult {
+                                    peer: row.gateway_id.clone(),
+                                    refusal_code: None,
+                                })
+                                .await;
                         }
                         Err(err) => {
+                            let _ = tx
+                                .send(LoopEvent::HandshakeResult {
+                                    peer: row.gateway_id.clone(),
+                                    refusal_code: Some(
+                                        handshake_refusal_code(&err).to_string(),
+                                    ),
+                                })
+                                .await;
                             let _ = tx
                                 .send(LoopEvent::SessionEnd {
                                     slot,
@@ -2151,6 +2232,24 @@ async fn dial_and_spawn(
     .with_observer(cfg.link_observer.clone());
     sessions.spawn(link::run_link_session(side, params));
     Ok(())
+}
+
+fn handshake_refusal_code(error: &AppError) -> &'static str {
+    if matches!(error.code, "TOKEN_INVALID" | "GATEWAY_TOKEN_INVALID") {
+        return error.code;
+    }
+    if error.code == "WIRE_PEER_ERR" {
+        for code in ["TOKEN_INVALID", "GATEWAY_TOKEN_INVALID"] {
+            if error
+                .message
+                .strip_prefix("peer refused handshake: ")
+                .is_some_and(|detail| detail.starts_with(&format!("{code}:")))
+            {
+                return code;
+            }
+        }
+    }
+    error.code
 }
 
 fn ensure_peer_not_revoked(home: &A2aHome, peer: &keys::TokenClaims) -> Result<(), AppError> {
@@ -2546,5 +2645,24 @@ mod tests {
         assert_eq!(LoopSlot::Dialer.policy(), "rest-for-one");
         assert_eq!(MAX_RESTARTS, 5);
         assert_eq!(RESTART_WINDOW, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn peer_token_refusal_code_is_recovered_without_changing_the_wire_api() {
+        let peer_error = AppError::new(
+            "WIRE_PEER_ERR",
+            ExitCode::Precondition,
+            "peer refused handshake: TOKEN_INVALID: signature does not verify",
+        );
+        assert_eq!(handshake_refusal_code(&peer_error), "TOKEN_INVALID");
+        let local_error = AppError::new(
+            "GATEWAY_TOKEN_INVALID",
+            ExitCode::Precondition,
+            "revoked",
+        );
+        assert_eq!(
+            handshake_refusal_code(&local_error),
+            "GATEWAY_TOKEN_INVALID"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::home::{create_dir_0700, A2aHome};
 use crate::mesh::keys::RootSet;
 use crate::mesh::row_mark::{RevocationCache, RowMarkStore};
 use crate::mesh::row_sig::{
@@ -12,8 +12,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Acquire, PgPool, Row};
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -257,6 +256,11 @@ pub trait Registry {
     /// Raw gateway-row read. Public consumers use [`RegistryHandle::discover`], which applies the
     /// row verifier; verification helpers in this module are the only callers of this method.
     async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError>;
+    /// Fleet ids visible to this credential. Adapters that cannot enumerate
+    /// them retain the empty default; concrete built-in adapters override it.
+    async fn fleet_ids(&self) -> Result<Vec<String>, AppError> {
+        Ok(Vec::new())
+    }
     async fn revoke(
         &self,
         fleet_id: &str,
@@ -540,6 +544,17 @@ impl Registry for FileRegistry {
             .into_iter()
             .filter(|r| r.fleet_id == fleet_id)
             .collect())
+    }
+
+    async fn fleet_ids(&self) -> Result<Vec<String>, AppError> {
+        let mut fleet_ids = self
+            .read_rows()?
+            .into_iter()
+            .map(|row| row.fleet_id)
+            .collect::<Vec<_>>();
+        fleet_ids.sort();
+        fleet_ids.dedup();
+        Ok(fleet_ids)
     }
 
     async fn revoke(
@@ -873,6 +888,13 @@ impl RegistryHandle {
         Ok(rows)
     }
 
+    pub async fn fleet_ids(&self) -> Result<Vec<String>, AppError> {
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.fleet_ids().await,
+            RegistryBackend::Pg(registry) => registry.fleet_ids().await,
+        }
+    }
+
     pub fn is_file_backend(&self) -> bool {
         matches!(self.backend, RegistryBackend::File(_))
     }
@@ -1177,25 +1199,11 @@ pub fn write_registry_env(home: &A2aHome, url: &str) -> Result<(), AppError> {
             AppError::new("IO", ExitCode::Internal, format!("creating fleet dir: {e}"))
         })?;
     }
-    let mut f = write_new_0600(&path).map_err(|e| {
+    crate::store::write_atomic(&path, format!("{url}\n").as_bytes()).map_err(|e| {
         AppError::new(
             "IO",
             ExitCode::Internal,
             format!("writing registry env: {e}"),
-        )
-    })?;
-    f.write_all(format!("{url}\n").as_bytes()).map_err(|e| {
-        AppError::new(
-            "IO",
-            ExitCode::Internal,
-            format!("writing registry env: {e}"),
-        )
-    })?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-        AppError::new(
-            "IO",
-            ExitCode::Internal,
-            format!("setting registry env mode: {e}"),
         )
     })
 }
@@ -1380,6 +1388,26 @@ impl Registry for PgRegistry {
             .collect::<Result<Vec<_>, _>>()?;
             tx.commit().await.map_err(registry_unreachable)?;
             Ok(rows)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn fleet_ids(&self) -> Result<Vec<String>, AppError> {
+        let mut conn = self.acquire().await?;
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let fleet_ids = sqlx::query("SELECT DISTINCT fleet_id FROM mesh_gateways ORDER BY fleet_id")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(registry_gateway_error)?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>("fleet_id").map_err(registry_gateway_error))
+                .collect::<Result<Vec<_>, _>>()?;
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(fleet_ids)
         })
         .await
         .map_err(|_| registry_unreachable_timeout())?

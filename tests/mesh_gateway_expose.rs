@@ -250,8 +250,8 @@ async fn publisher_reloads_the_gateway_token_and_held_roots_each_tick() {
         .await
         .unwrap();
     let old_token = keys::gateway_token(&fixture.home).unwrap();
-    let rotation = keys::rotate_root(&fixture.home, &SystemClock).unwrap();
-    assert!(rotation.gateway_token_rotated);
+    let rotation = keys::stage_root(&fixture.home, &SystemClock, false).unwrap();
+    assert_eq!(keys::gateway_token(&fixture.home).unwrap(), old_token);
 
     let tick = publisher
         .tick(
@@ -263,7 +263,7 @@ async fn publisher_reloads_the_gateway_token_and_held_roots_each_tick() {
         .unwrap();
     assert!(tick.resigned);
     let row = fixture.registry.discover_unverified(&fixture.fleet_id).await.unwrap().remove(0);
-    assert_ne!(row.row_token.as_deref(), Some(old_token.as_str()));
+    assert_eq!(row.row_token.as_deref(), Some(old_token.as_str()));
     let parsed = writer_verdict(&fixture.home, &row).1.unwrap();
     let held: Vec<String> = serde_json::from_str(&parsed.roots_held).unwrap();
     assert_eq!(held.len(), 2);

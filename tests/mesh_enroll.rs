@@ -171,7 +171,7 @@ fn fleet_rotate_root_on_a_joiner_home_refuses_instead_of_minting() {
     joiner_home_on_fleet(root_tmp.path(), join_tmp.path());
 
     let rotate = cmd(join_tmp.path())
-        .args(["--json", "mesh", "fleet", "rotate-root"])
+        .args(["--json", "mesh", "fleet", "rotate-root", "--stage"])
         .assert()
         .failure();
     let out = json_out(&rotate);

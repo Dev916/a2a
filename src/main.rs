@@ -88,7 +88,9 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshFleetCmd::Migrate => "mesh fleet migrate",
                 MeshFleetCmd::Revoke { .. } => "mesh fleet revoke",
                 MeshFleetCmd::Enroll { .. } => "mesh fleet enroll",
-                MeshFleetCmd::RotateRoot => "mesh fleet rotate-root",
+                MeshFleetCmd::RotateRoot { .. } => "mesh fleet rotate-root",
+                MeshFleetCmd::RotationStatus { .. } => "mesh fleet rotation-status",
+                MeshFleetCmd::SetRegistry { .. } => "mesh fleet set-registry",
                 MeshFleetCmd::HardeningStatus { .. } => "mesh fleet hardening-status",
             },
             MeshCmd::Gateway { cmd } => match cmd {
@@ -99,6 +101,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshGatewayCmd::UninstallService => "mesh gateway uninstall-service",
                 MeshGatewayCmd::Identity => "mesh gateway identity",
                 MeshGatewayCmd::InstallToken { .. } => "mesh gateway install-token",
+                MeshGatewayCmd::InstallRootNext { .. } => "mesh gateway install-root-next",
                 MeshGatewayCmd::Resign => "mesh gateway resign",
             },
             MeshCmd::Work { cmd } => match cmd {

@@ -1,7 +1,7 @@
 mod common;
 
 use a2a::home::A2aHome;
-use a2a::mesh::gateway::presence_wire;
+use a2a::mesh::gateway::{notes_wire, presence_wire};
 use a2a::mesh::keys::{
     enroll_gateway_token, fleet_id, fleet_init, gateway_identity, gateway_public_key_b64,
     install_gateway_token, SystemClock,
@@ -19,6 +19,7 @@ use a2a::mesh::work_exec::{
 };
 use a2a::mesh::work_store::{self, WorkSource};
 use a2a::mesh::row_sig::RowVerdict;
+use a2a::mesh::{Note};
 use a2a::output::{AppError, ExitCode};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -80,7 +81,7 @@ fn fixture() -> Fixture {
     let env = sign_envelope(
         &sender,
         UnsignedWorkEnvelope {
-            work_id: "work-approve-1".to_string(),
+            work_id: "01K4ABCDEFGHJKMNPQRSTVWXYZ".to_string(),
             session: "user:test".to_string(),
             addressing: WorkAddressing::Pool,
             repo: WorkRepo {
@@ -236,6 +237,9 @@ impl Registry for CountingRegistry {
     }
     async fn work_sweep_abandoned(&self, fleet_id: &str, claimer_gw: &str, stall: Duration) -> Result<Vec<WorkRow>, AppError> {
         self.inner.work_sweep_abandoned(fleet_id, claimer_gw, stall).await
+    }
+    async fn work_sweep_release_stalled(&self, fleet_id: &str, claimer_gw: &str, horizon: Duration) -> Result<Vec<WorkRow>, AppError> {
+        self.inner.work_sweep_release_stalled(fleet_id, claimer_gw, horizon).await
     }
 }
 
@@ -436,6 +440,116 @@ async fn dry_run_and_preflight_failures_happen_before_local_or_registry_writes()
         .unwrap_err();
     assert_eq!(err.code, "CWD_NOT_ALLOWED");
     assert!(err.message.contains("broker restart"), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_fails_closed_after_a_locally_observed_cancellation() {
+    let f = fixture();
+    let fleet = fleet_id(&f.receiver).unwrap();
+    f.registry
+        .work_transition(
+            &fleet,
+            &f.work_id,
+            WorkStatus::Offered,
+            WorkStatus::Cancelled,
+            WorkOwner::Any,
+            WorkPatch::default(),
+        )
+        .await
+        .unwrap();
+    let note_id = ulid::Ulid::new().to_string();
+    let cancelled = notes_wire::SpooledNote {
+        schema_version: 1,
+        trace_id: note_id.clone(),
+        from_gateway: "gw-sender".to_string(),
+        to_gateway: f.receiver_gw.clone(),
+        to_peer: "user:mesh-work".to_string(),
+        attempts: 0,
+        next_attempt_after: None,
+        note: Note {
+            note_id: Some(note_id),
+            from: "user:mesh-work".to_string(),
+            to: "user:mesh-work".to_string(),
+            ts: Utc::now(),
+            kind: work_store::WORK_CANCELLED_KIND.to_string(),
+            text: format!("work cancelled: {}", f.work_id),
+            refs: json!({ "work_id": f.work_id }),
+            extra: serde_json::Map::new(),
+        },
+    };
+    let cfg = a2a::config::load(&f.receiver).unwrap().0;
+    assert_eq!(
+        notes_wire::receive_note(&f.receiver, &cfg, &cancelled).unwrap(),
+        notes_wire::NoteAck::Delivered
+    );
+    f.registry
+        .work_transition(
+            &fleet,
+            &f.work_id,
+            WorkStatus::Cancelled,
+            WorkStatus::Offered,
+            WorkOwner::Any,
+            WorkPatch::default(),
+        )
+        .await
+        .unwrap();
+    let state = work_exec::initial_claiming_state(&f.receiver, &f.work_id).unwrap();
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let err = advance_approve(
+        &f.receiver,
+        &f.registry,
+        &FakeGit::default(),
+        &FakeSpawner::default(),
+        &f.work_id,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "WORK_TERMINAL_OBSERVED", "{err:?}");
+    assert!(work_exec::load_state(&f.receiver, &f.work_id)
+        .unwrap()
+        .unwrap()
+        .observed_terminal
+        .is_some());
+
+    // Stated residual risk: a row cancellation that was never observed locally can be flipped
+    // back to offered and remains approvable.
+    let unobserved = fixture();
+    let fleet = fleet_id(&unobserved.receiver).unwrap();
+    unobserved
+        .registry
+        .work_transition(
+            &fleet,
+            &unobserved.work_id,
+            WorkStatus::Offered,
+            WorkStatus::Cancelled,
+            WorkOwner::Any,
+            WorkPatch::default(),
+        )
+        .await
+        .unwrap();
+    unobserved
+        .registry
+        .work_transition(
+            &fleet,
+            &unobserved.work_id,
+            WorkStatus::Cancelled,
+            WorkStatus::Offered,
+            WorkOwner::Any,
+            WorkPatch::default(),
+        )
+        .await
+        .unwrap();
+    let outcome = advance_approve(
+        &unobserved.receiver,
+        &unobserved.registry,
+        &FakeGit::default(),
+        &FakeSpawner::default(),
+        &unobserved.work_id,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ApproveOutcome::Running { .. }));
 }
 
 #[test]

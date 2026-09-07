@@ -59,7 +59,9 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 fn cfg_for(home: &A2aHome) -> Config {
-    a2a::config::load(home).unwrap().0
+    let mut cfg = a2a::config::load(home).unwrap().0;
+    cfg.mesh.work.auto_push = true;
+    cfg
 }
 
 #[derive(Clone)]
@@ -73,7 +75,7 @@ struct Fixture {
     receiver_gw: String,
 }
 
-fn fixture(work_id: &str) -> Fixture {
+fn fixture(_case: &str) -> Fixture {
     let tmp = Arc::new(tempfile::tempdir().unwrap());
     let root = home_at(&tmp.path().join("root"));
     let sender = home_at(&tmp.path().join("sender"));
@@ -83,11 +85,12 @@ fn fixture(work_id: &str) -> Fixture {
     copy_root_pub(root.root(), receiver.root());
     let sender_gw = enroll_joiner(&root, &sender);
     let receiver_gw = enroll_joiner(&root, &receiver);
+    let work_id = ulid::Ulid::new().to_string();
 
     let env = sign_envelope(
         &sender,
         UnsignedWorkEnvelope {
-            work_id: work_id.to_string(),
+            work_id: work_id.clone(),
             session: "user:test".to_string(),
             addressing: WorkAddressing::Pool,
             repo: WorkRepo {
@@ -113,7 +116,7 @@ fn fixture(work_id: &str) -> Fixture {
         .unwrap();
     let row = WorkRow {
         fleet_id: fleet_id(&receiver).unwrap(),
-        work_id: work_id.to_string(),
+        work_id: work_id.clone(),
         sender_gw: sender_gw.clone(),
         addressing: "pool".to_string(),
         status: WorkStatus::Running,
@@ -129,7 +132,7 @@ fn fixture(work_id: &str) -> Fixture {
     block_on(inner.work_insert(row)).unwrap();
     let registry = CountingRegistry::new(inner);
 
-    let checkout = receiver.work_dir().join(work_id).join("repo");
+    let checkout = receiver.work_dir().join(&work_id).join("repo");
     run_git(&checkout, &["init", "-b", "main"]);
     run_git(&checkout, &["config", "user.email", "test@example.invalid"]);
     run_git(&checkout, &["config", "user.name", "Test User"]);
@@ -141,7 +144,7 @@ fn fixture(work_id: &str) -> Fixture {
 
     let mut state = WorkState {
         phase: WorkPhase::Running,
-        work_id: work_id.to_string(),
+        work_id: work_id.clone(),
         envelope_digest: "digest".to_string(),
         result_note_id: format!("fixed-note-{work_id}"),
         milestone_posted: false,
@@ -158,16 +161,23 @@ fn fixture(work_id: &str) -> Fixture {
         closure_digest: None,
         base_ref: Some("main".to_string()),
         remote_url: Some("file:///tmp/a2a-work-loop.git".to_string()),
+        held_since: None,
+        hold_note_id: None,
+        hold_hit_count: None,
+        observed_terminal: None,
     };
     work_exec::save_state(&receiver, &state).unwrap();
-    state.checkout = work_exec::load_state(&receiver, work_id).unwrap().unwrap().checkout;
+    state.checkout = work_exec::load_state(&receiver, &work_id)
+        .unwrap()
+        .unwrap()
+        .checkout;
 
     Fixture {
         _tmp: tmp,
         sender,
         receiver,
         registry,
-        work_id: work_id.to_string(),
+        work_id,
         sender_gw,
         receiver_gw,
     }
@@ -180,6 +190,7 @@ struct Counts {
     failed_transitions: usize,
     expired_sweeps: usize,
     abandoned_sweeps: usize,
+    release_stalled_sweeps: usize,
 }
 
 #[derive(Clone)]
@@ -263,6 +274,10 @@ impl Registry for CountingRegistry {
         self.counts.lock().unwrap().abandoned_sweeps += 1;
         self.inner.work_sweep_abandoned(fleet_id, claimer_gw, stall).await
     }
+    async fn work_sweep_release_stalled(&self, fleet_id: &str, claimer_gw: &str, horizon: Duration) -> Result<Vec<WorkRow>, AppError> {
+        self.counts.lock().unwrap().release_stalled_sweeps += 1;
+        self.inner.work_sweep_release_stalled(fleet_id, claimer_gw, horizon).await
+    }
 }
 
 #[derive(Clone)]
@@ -278,7 +293,7 @@ impl FakeIo {
         Self {
             completion: WorkCompletion::Done {
                 summary: "finished".to_string(),
-                evidence_excerpt: "Authorization: Bearer sk-testtesttesttesttesttesttesttesttest".to_string(),
+                evidence_excerpt: "focused verification passed".to_string(),
             },
             pushes: Arc::new(Mutex::new(0)),
             pushed_refs: Arc::new(Mutex::new(BTreeSet::new())),
@@ -378,11 +393,154 @@ async fn completion_tick_is_idempotent_across_every_phase_boundary() {
         let evidence = outbound[0]["note"]["refs"]["result"]["evidence_excerpt"]
             .as_str()
             .unwrap();
-        assert!(evidence.contains("[REDACTED:"), "{evidence}");
-        assert!(!evidence.contains("sk-testtesttesttesttesttesttesttesttest"), "{evidence}");
+        assert_eq!(evidence, "focused verification passed");
         assert_eq!(count_feed_milestones(&f.receiver, &f.work_id), 1);
         assert_eq!(*io.pushes.lock().unwrap(), 1, "push side effect count after {stop_after:?}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_worker_halts_at_awaiting_release_and_announces_it_once() {
+    let f = fixture("work-loop-held");
+    let mut cfg = cfg_for(&f.receiver);
+    cfg.mesh.work.auto_push = false;
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    let bare = f._tmp.path().join("held-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    std::fs::write(checkout.join("result.txt"), "review me\n").unwrap();
+    run_git(&checkout, &["add", "result.txt"]);
+    run_git(&checkout, &["commit", "-m", "held result"]);
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let report = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &FakeIo::terminal(),
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(report.registry_error, None, "{report:?}");
+    let state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    assert_eq!(state.phase, WorkPhase::AwaitingRelease);
+    assert!(state.held_since.is_some());
+    assert_eq!(state.hold_hit_count, Some(0));
+    let row = f
+        .registry
+        .row(&fleet_id(&f.receiver).unwrap(), &f.work_id)
+        .await;
+    assert_eq!(row.status, WorkStatus::AwaitingRelease);
+
+    let pushed = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            &format!("refs/heads/a2a/work/{}", f.work_id),
+        ])
+        .output()
+        .unwrap();
+    assert!(!pushed.status.success(), "held work must not be pushed");
+
+    let held = spooled_notes_of_kind(&f.receiver, &f.sender_gw, work_store::WORK_HELD_KIND);
+    assert_eq!(held.len(), 1, "one hold announcement: {held:?}");
+    let note_id = held[0]["trace_id"].as_str().unwrap();
+    assert_ne!(note_id, state.result_note_id);
+    ulid::Ulid::from_string(note_id).unwrap();
+    assert_eq!(held[0]["note"]["kind"], work_store::WORK_HELD_KIND);
+    let refs = held[0]["note"]["refs"].as_object().unwrap();
+    assert_eq!(refs.keys().collect::<Vec<_>>(), vec!["held"]);
+    let held_ref = refs["held"].as_object().unwrap();
+    let keys = held_ref.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["held_since", "hit_count", "status", "work_id"])
+    );
+    assert_eq!(held_ref["work_id"], f.work_id);
+    assert_eq!(held_ref["status"], "held");
+
+    let second = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &FakeIo::terminal(),
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(second.registry_error, None, "{second:?}");
+    assert_eq!(
+        spooled_notes_of_kind(&f.receiver, &f.sender_gw, work_store::WORK_HELD_KIND).len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_pushes_transitions_notes_and_posts_the_milestone_and_is_idempotent() {
+    let f = fixture("work-loop-release");
+    let mut cfg = cfg_for(&f.receiver);
+    cfg.mesh.work.auto_push = false;
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    let bare = f._tmp.path().join("release-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    std::fs::write(checkout.join("released.txt"), "released\n").unwrap();
+    run_git(&checkout, &["add", "released.txt"]);
+    run_git(&checkout, &["commit", "-m", "release result"]);
+    let expected_sha = git_stdout(&checkout, &["rev-parse", "HEAD"]);
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let held = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &FakeIo::terminal(),
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(held.registry_error, None, "{held:?}");
+    assert_eq!(
+        work_exec::load_state(&f.receiver, &f.work_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        WorkPhase::AwaitingRelease
+    );
+
+    common::a2a(f.receiver.root(), f._tmp.path())
+        .args(["--json", "mesh", "work", "release", &f.work_id])
+        .assert()
+        .success();
+
+    let remote = git_stdout(
+        f._tmp.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/a2a/work/{}", f.work_id),
+        ],
+    );
+    assert_eq!(remote, expected_sha);
+    let state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    assert_eq!(state.phase, WorkPhase::Reported);
+    let row = f
+        .registry
+        .row(&fleet_id(&f.receiver).unwrap(), &f.work_id)
+        .await;
+    assert_eq!(row.status, WorkStatus::Done);
+    assert_eq!(row.result_ref.as_deref(), Some(format!("a2a/work/{}", f.work_id).as_str()));
+    assert_eq!(spooled_result_notes(&f.receiver, &f.sender_gw).len(), 1);
+    assert_eq!(count_feed_milestones(&f.receiver, &f.work_id), 1);
+
+    common::a2a(f.receiver.root(), f._tmp.path())
+        .args(["--json", "mesh", "work", "release", &f.work_id])
+        .assert()
+        .success();
+    assert_eq!(spooled_result_notes(&f.receiver, &f.sender_gw).len(), 1);
+    assert_eq!(count_feed_milestones(&f.receiver, &f.work_id), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -417,10 +575,11 @@ async fn tick_materializes_pool_feed_and_runs_expiry_and_abandoned_sweeps() {
     let f = fixture("work-loop-sweeps");
     let cfg = cfg_for(&f.receiver);
     let fleet = fleet_id(&f.receiver).unwrap();
+    let pool_work_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let pool_env = sign_envelope(
         &f.sender,
         UnsignedWorkEnvelope {
-            work_id: "pool-from-feed".to_string(),
+            work_id: pool_work_id.to_string(),
             session: "user:test".to_string(),
             addressing: WorkAddressing::Pool,
             repo: WorkRepo {
@@ -443,7 +602,7 @@ async fn tick_materializes_pool_feed_and_runs_expiry_and_abandoned_sweeps() {
             provider: a2a::mesh::Provider::User,
             uuid: "mesh-work".to_string(),
         },
-        "work offered: Pool materialization (pool-from-feed)",
+        &format!("work offered: Pool materialization ({pool_work_id})"),
         json!({"work": pool_env}),
     )
     .unwrap();
@@ -506,13 +665,123 @@ async fn tick_materializes_pool_feed_and_runs_expiry_and_abandoned_sweeps() {
 
     let report = work_exec::work_loop_tick(&f.receiver, &cfg, &f.registry, &FakeIo::terminal(), WorkLoopOptions::for_config(&cfg)).await;
     assert!(report.pool_materialized >= 1, "{report:?}");
-    assert!(work_store::load(&f.receiver, "pool-from-feed").unwrap().is_some());
+    assert!(work_store::load(&f.receiver, pool_work_id)
+        .unwrap()
+        .is_some());
     assert_eq!(f.registry.row(&fleet, "expired-offer").await.status, WorkStatus::Expired);
     assert_eq!(f.registry.row(&fleet, "abandoned-mine").await.status, WorkStatus::Failed);
     assert_eq!(f.registry.row(&fleet, "abandoned-foreign").await.status, WorkStatus::Running);
     let counts = f.registry.counts();
     assert_eq!(counts.expired_sweeps, 1);
     assert_eq!(counts.abandoned_sweeps, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn awaiting_release_survives_the_abandoned_sweep_and_is_swept_only_by_release_stall() {
+    let f = fixture("work-loop-release-sweep");
+    let fleet = fleet_id(&f.receiver).unwrap();
+    let work_id = "release-stall-row";
+    let now = Utc::now();
+    f.registry
+        .work_insert(WorkRow {
+            fleet_id: fleet.clone(),
+            work_id: work_id.to_string(),
+            sender_gw: f.sender_gw.clone(),
+            addressing: "pool".to_string(),
+            status: WorkStatus::AwaitingRelease,
+            claimed_by: Some(f.receiver_gw.clone()),
+            result_ref: None,
+            result_delivery: None,
+            swept_by: None,
+            created_at: now - chrono::Duration::hours(3),
+            updated_at: now - chrono::Duration::hours(2),
+            expires_at: now + chrono::Duration::days(1),
+            schema_version: REGISTRY_SCHEMA_VERSION,
+        })
+        .await
+        .unwrap();
+
+    let abandoned = f
+        .registry
+        .work_sweep_abandoned(&fleet, &f.receiver_gw, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(abandoned.iter().all(|row| row.work_id != work_id));
+    assert_eq!(
+        f.registry.row(&fleet, work_id).await.status,
+        WorkStatus::AwaitingRelease
+    );
+
+    let stalled = f
+        .registry
+        .work_sweep_release_stalled(&fleet, &f.receiver_gw, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(stalled.len(), 1);
+    let row = f.registry.row(&fleet, work_id).await;
+    assert_eq!(row.status, WorkStatus::Failed);
+    assert_eq!(row.swept_by.as_deref(), Some(f.receiver_gw.as_str()));
+    assert_eq!(row.result_delivery.as_deref(), Some("release_stalled"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reopen_restores_a_release_stalled_item_from_failed() {
+    let f = fixture("work-loop-reopen");
+    let mut cfg = cfg_for(&f.receiver);
+    cfg.mesh.work.auto_push = false;
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    std::fs::write(checkout.join("result.txt"), "held\n").unwrap();
+    run_git(&checkout, &["add", "result.txt"]);
+    run_git(&checkout, &["commit", "-m", "held before stall"]);
+    work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &FakeIo::terminal(),
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+
+    let fleet = fleet_id(&f.receiver).unwrap();
+    let aged = f
+        .registry
+        .work_transition(
+            &fleet,
+            &f.work_id,
+            WorkStatus::AwaitingRelease,
+            WorkStatus::AwaitingRelease,
+            WorkOwner::Claimer(f.receiver_gw.clone()),
+            WorkPatch {
+                updated_at: Some(Utc::now() - chrono::Duration::hours(2)),
+                ..WorkPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(aged, TransitionOutcome::Applied);
+    let swept = f
+        .registry
+        .work_sweep_release_stalled(&fleet, &f.receiver_gw, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(swept.len(), 1);
+    assert_eq!(f.registry.row(&fleet, &f.work_id).await.status, WorkStatus::Failed);
+
+    common::a2a(f.receiver.root(), f._tmp.path())
+        .args(["--json", "mesh", "work", "reopen", &f.work_id])
+        .assert()
+        .success();
+    let row = f.registry.row(&fleet, &f.work_id).await;
+    assert_eq!(row.status, WorkStatus::AwaitingRelease);
+    assert_eq!(row.swept_by, None);
+    assert_eq!(row.result_delivery, None);
+    assert_eq!(
+        work_exec::load_state(&f.receiver, &f.work_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        WorkPhase::AwaitingRelease
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -523,6 +792,94 @@ async fn registry_errors_are_health_events_not_loop_errors() {
         work_exec::work_loop_tick(&f.receiver, &cfg, &AlwaysErrRegistry, &FakeIo::terminal(), WorkLoopOptions::for_config(&cfg)).await;
     assert!(report.registry_error.as_deref().unwrap_or("").contains("REGISTRY_ALWAYS_ERR"), "{report:?}");
     assert_eq!(report.restarts_requested, 0);
+}
+
+#[test]
+fn two_work_ids_colliding_under_safe_file_part_resolve_in_exactly_one_bucket() {
+    let f = fixture("work-loop-store-collision");
+    let make = |work_id: &str, title: &str| {
+        let env = sign_envelope(
+            &f.sender,
+            UnsignedWorkEnvelope {
+                work_id: work_id.to_string(),
+                session: "user:test".to_string(),
+                addressing: WorkAddressing::Pool,
+                repo: WorkRepo {
+                    remote_url: "file:///tmp/collision.git".to_string(),
+                    base_ref: "main".to_string(),
+                },
+                title: title.to_string(),
+                brief_text: "---\nlane: impl\nacceptance_criteria:\n  - pass\nverify:\n  - true\n---\n# Test\n".to_string(),
+                acceptance: "pass".to_string(),
+                ttl_days: 7,
+                max_bytes: 262_144,
+            },
+            &SystemClock,
+        )
+        .unwrap();
+        verify_envelope(&f.receiver, &env, &SystemClock).unwrap()
+    };
+    let first_id = "same/path";
+    let second_id = "samepath";
+    work_store::store_offer(
+        &f.receiver,
+        make(first_id, "first"),
+        WorkSource::Pool,
+    )
+    .unwrap();
+    work_store::store_offer(
+        &f.receiver,
+        make(second_id, "second"),
+        WorkSource::Pool,
+    )
+    .unwrap();
+    assert_eq!(
+        work_store::load(&f.receiver, first_id)
+            .unwrap()
+            .unwrap()
+            .verified
+            .envelope
+            .title,
+        "first"
+    );
+    assert_eq!(
+        work_store::load(&f.receiver, second_id)
+            .unwrap()
+            .unwrap()
+            .verified
+            .envelope
+            .title,
+        "second"
+    );
+
+    let duplicate_id = "duplicate/bucket";
+    work_store::store_offer(
+        &f.receiver,
+        make(duplicate_id, "directed"),
+        WorkSource::Directed,
+    )
+    .unwrap();
+    work_store::store_offer(
+        &f.receiver,
+        make(duplicate_id, "pool"),
+        WorkSource::Pool,
+    )
+    .unwrap();
+    let err = work_store::load(&f.receiver, duplicate_id).unwrap_err();
+    assert_eq!(err.code, "WORK_STATE_CONFLICT");
+}
+
+#[test]
+fn load_state_files_skips_an_unparseable_item_and_keeps_scanning() {
+    let f = fixture("work-loop-bad-state");
+    let bad_id = ulid::Ulid::new().to_string();
+    let bad_dir = f.receiver.work_dir().join(&bad_id);
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(bad_dir.join("state.json"), b"{not-json\n").unwrap();
+
+    let states = work_exec::load_state_files(&f.receiver).unwrap();
+    assert!(states.iter().any(|entry| entry.state.work_id == f.work_id));
+    assert!(!states.iter().any(|entry| entry.state.work_id == bad_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -604,7 +961,8 @@ fn push_uses_recorded_sha_and_remote_url_and_ignores_hooks_and_pushurl() {
         WorkLoopOptions::for_config(&cfg),
     ));
     let heads = Command::new("git")
-        .args(["--git-dir", bare.to_str().unwrap(), "show-ref", "refs/heads/a2a/work/work-loop-real-git"])
+        .args(["--git-dir", bare.to_str().unwrap(), "show-ref"])
+        .arg(format!("refs/heads/a2a/work/{}", f.work_id))
         .output()
         .unwrap();
     assert!(heads.status.success(), "{}", String::from_utf8_lossy(&heads.stderr));
@@ -662,7 +1020,7 @@ async fn push_is_refused_when_the_result_carries_a_credential() {
         WorkLoopOptions::for_config(&cfg),
     )
     .await;
-    assert_eq!(report.item_errors, 1, "{report:?}");
+    assert_eq!(report.item_errors, 0, "{report:?}");
 
     let pushed = Command::new("git")
         .args([
@@ -677,6 +1035,7 @@ async fn push_is_refused_when_the_result_carries_a_credential() {
     let saved = work_exec::load_state(&f.receiver, &f.work_id)
         .unwrap()
         .unwrap();
+    assert_eq!(saved.phase, WorkPhase::AwaitingRelease);
     let summary = saved.result_summary.as_deref().unwrap_or_default();
     assert!(summary.contains("WORK_SECRET_IN_RESULT"), "{saved:?}");
     assert!(!summary.contains("push-only-secret"), "{saved:?}");
@@ -734,12 +1093,16 @@ async fn push_refuses_after_head_moves_past_the_recorded_sha() {
 }
 
 fn spooled_result_notes(home: &A2aHome, to_gateway: &str) -> Vec<Value> {
+    spooled_notes_of_kind(home, to_gateway, work_store::WORK_RESULT_KIND)
+}
+
+fn spooled_notes_of_kind(home: &A2aHome, to_gateway: &str, kind: &str) -> Vec<Value> {
     let dir = home.root().join("mesh").join("outbound").join(to_gateway);
     let mut notes = std::fs::read_dir(dir)
         .unwrap()
         .flatten()
         .map(|entry| serde_json::from_str::<Value>(&std::fs::read_to_string(entry.path()).unwrap()).unwrap())
-        .filter(|value| value["note"]["kind"] == work_store::WORK_RESULT_KIND)
+        .filter(|value| value["note"]["kind"] == kind)
         .collect::<Vec<_>>();
     notes.sort_by(|a, b| a["trace_id"].as_str().cmp(&b["trace_id"].as_str()));
     notes
@@ -791,6 +1154,7 @@ impl Registry for AlwaysErrRegistry {
     async fn work_touch_running(&self, _fleet_id: &str, _work_id: &str, _claimer: &str) -> Result<(), AppError> { Err(always_err()) }
     async fn work_sweep_expired(&self, _fleet_id: &str, _swept_by: &str) -> Result<Vec<String>, AppError> { Err(always_err()) }
     async fn work_sweep_abandoned(&self, _fleet_id: &str, _claimer_gw: &str, _stall: Duration) -> Result<Vec<WorkRow>, AppError> { Err(always_err()) }
+    async fn work_sweep_release_stalled(&self, _fleet_id: &str, _claimer_gw: &str, _horizon: Duration) -> Result<Vec<WorkRow>, AppError> { Err(always_err()) }
 }
 
 fn always_err() -> AppError {

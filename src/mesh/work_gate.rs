@@ -1,9 +1,16 @@
+use crate::commands::owner;
 use crate::config::Config;
-use crate::home::A2aHome;
+use crate::home::{create_dir_0700, A2aHome};
 use crate::mesh::registry;
 use crate::mesh::render;
+use crate::mesh::work_exec::{self, WorkState};
+use crate::mesh::work_store;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
+use chrono::{DateTime, Timelike, Utc};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -12,6 +19,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const HOME_DIGEST_MAX_FILE_BYTES: u64 = 1_048_576;
+const ALLOW_SECRETS_FILE: &str = "allow-secrets.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResultRange {
@@ -31,6 +39,109 @@ pub struct GateHit {
 pub struct ScanReport {
     pub hits: Vec<GateHit>,
     pub scanned_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowSecretsToken {
+    pub work_id: String,
+    pub hit_set_digest: String,
+    pub minted_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredAllowSecretsToken {
+    #[serde(flatten)]
+    grant: AllowSecretsToken,
+    handle_sha256: String,
+    principal: String,
+}
+
+impl AllowSecretsToken {
+    /// Mint the one-time handle used by `work release --allow-secrets`.
+    ///
+    /// The fallible command path uses [`Self::try_mint`]. This exact infallible
+    /// interface is also useful to focused callers: an empty handle means the
+    /// durable grant could not be written and therefore cannot authorize a push.
+    pub fn mint(state: &WorkState, digest: &str) -> String {
+        Self::try_mint(state, digest).unwrap_or_default()
+    }
+
+    pub fn try_mint(state: &WorkState, digest: &str) -> Result<String, AppError> {
+        let item_dir = state.checkout.parent().ok_or_else(|| {
+            AppError::new(
+                "WORK_STATE_INVALID",
+                ExitCode::Precondition,
+                format!("work item {} has no item directory", state.work_id),
+            )
+            .remedy("re-approve the item before requesting an allow-secrets token")
+        })?;
+        create_dir_0700(item_dir).map_err(|err| token_io("creating work item directory", err))?;
+
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let handle = hex_lower(&random);
+        let minted_at = truncate_to_micros(Utc::now());
+        let stored = StoredAllowSecretsToken {
+            grant: AllowSecretsToken {
+                work_id: state.work_id.clone(),
+                hit_set_digest: digest.to_string(),
+                minted_at,
+            },
+            handle_sha256: hex_lower(&Sha256::digest(handle.as_bytes())),
+            principal: owner::caller(),
+        };
+        let mut bytes = serde_json::to_vec_pretty(&stored).map_err(|err| {
+            AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("serializing allow-secrets token: {err}"),
+            )
+        })?;
+        bytes.push(b'\n');
+        crate::store::write_atomic(&item_dir.join(ALLOW_SECRETS_FILE), &bytes)
+            .map_err(|err| token_io("writing allow-secrets token", err))?;
+        Ok(handle)
+    }
+
+    /// Verify and consume a one-time token. A matching handle is consumed
+    /// before either the principal or digest decision, so it cannot be retried
+    /// after a stale/non-delegable refusal.
+    pub fn verify(
+        home: &A2aHome,
+        work_id: &str,
+        token: &str,
+        digest: &str,
+    ) -> Result<(), AppError> {
+        work_store::validate_work_id(work_id)?;
+        let path = home.work_dir().join(work_id).join(ALLOW_SECRETS_FILE);
+        let bytes = fs::read(&path).map_err(|_| allow_secrets_required(work_id))?;
+        let stored: StoredAllowSecretsToken =
+            serde_json::from_slice(&bytes).map_err(|_| allow_secrets_required(work_id))?;
+        let candidate = hex_lower(&Sha256::digest(token.as_bytes()));
+        if !constant_time_eq(candidate.as_bytes(), stored.handle_sha256.as_bytes()) {
+            return Err(allow_secrets_required(work_id));
+        }
+
+        fs::remove_file(&path).map_err(|err| token_io("consuming allow-secrets token", err))?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|err| token_io("syncing consumed allow-secrets token", err))?;
+        }
+
+        if stored.grant.work_id != work_id || stored.principal != owner::caller() {
+            return Err(allow_secrets_required(work_id));
+        }
+        if stored.grant.hit_set_digest != digest {
+            return Err(AppError::new(
+                "WORK_ALLOW_SECRETS_STALE",
+                ExitCode::Precondition,
+                format!("the allow-secrets token for work item {work_id} names a stale hit set"),
+            )
+            .remedy("rerun `a2a mesh work diff <id>` in a terminal and review the current hit set"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -113,6 +224,87 @@ impl ScanReport {
         }
         hex_lower(&digest.finalize())
     }
+}
+
+/// Build the exact `refs.result` object sent after release and scan the two
+/// worker-authored text fields before masking/capping them for transmission.
+pub fn render_note_payload(
+    state: &WorkState,
+    cfg: &Config,
+) -> Result<(Value, Vec<GateHit>), AppError> {
+    let status = state.result_status.unwrap_or(registry::WorkStatus::Done);
+    let status_text = work_exec::status_name(status);
+    let summary = state.result_summary.as_deref().unwrap_or(status_text);
+    let evidence_excerpt = state.evidence_excerpt.as_deref().unwrap_or_default();
+    let mut hits = Vec::new();
+    for (path, text) in [
+        ("note:summary", summary),
+        ("note:evidence_excerpt", evidence_excerpt),
+    ] {
+        hits.extend(redact::scan_text(text).into_iter().map(|hit| GateHit {
+            path: path.to_string(),
+            line: hit.line,
+            rule: hit.rule,
+        }));
+    }
+
+    let result_ref = state
+        .result_ref
+        .clone()
+        .unwrap_or_else(|| format!("a2a/work/{}", state.work_id));
+    let payload = json!({
+        "work_id": state.work_id,
+        "status": status_text,
+        "result_ref": result_ref,
+        "summary": work_exec::capped_result_text(
+            summary,
+            cfg.mesh.work.result_note_max_bytes,
+        ),
+        "evidence_excerpt": work_exec::capped_result_text(
+            evidence_excerpt,
+            cfg.mesh.work.result_note_max_bytes,
+        ),
+    });
+    Ok((payload, hits))
+}
+
+/// Scan the complete reviewed unit: committed blobs plus the exact outgoing
+/// result-note text. The returned report has one digest for both channels.
+pub fn scan_review_unit(
+    home: &A2aHome,
+    cfg: &Config,
+    checkout: &Path,
+    range: &ResultRange,
+    state: &WorkState,
+) -> Result<ScanReport, AppError> {
+    let mut report = scan_added_blobs(home, cfg, checkout, range)?;
+    let (_, note_hits) = render_note_payload(state, cfg)?;
+    report.hits.extend(note_hits);
+    let note_bytes = state
+        .result_summary
+        .as_deref()
+        .unwrap_or_default()
+        .len()
+        .saturating_add(
+            state
+                .evidence_excerpt
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        ) as u64;
+    report.scanned_bytes = report.scanned_bytes.saturating_add(note_bytes);
+    if report.scanned_bytes > cfg.mesh.work.diff_scan_max_bytes {
+        return Err(AppError::new(
+            "WORK_SCAN_OVERSIZE",
+            ExitCode::Precondition,
+            format!(
+                "result scan exceeded mesh.work.diff_scan_max_bytes={} while scanning the outgoing note payload",
+                cfg.mesh.work.diff_scan_max_bytes
+            ),
+        )
+        .remedy("reduce the committed result or outgoing summary, then rescan"));
+    }
+    Ok(report)
 }
 
 /// Build a git command whose process-wide and repository-local execution hooks are inert.
@@ -431,13 +623,15 @@ pub async fn gate_push(
     cfg: &Config,
     checkout: &Path,
     range: &ResultRange,
+    state: &WorkState,
 ) -> Result<ScanReport, AppError> {
     let home = home.clone();
     let cfg = cfg.clone();
     let checkout = checkout.to_path_buf();
     let range = range.clone();
+    let state = state.clone();
     tokio::task::spawn_blocking(move || {
-        let report = scan_added_blobs(&home, &cfg, &checkout, &range)?;
+        let report = scan_review_unit(&home, &cfg, &checkout, &range, &state)?;
         if report.hits.is_empty() {
             return Ok(report);
         }
@@ -738,6 +932,38 @@ fn fence_worker_output(body: &str) -> String {
     }
     fenced.push_str(END);
     fenced
+}
+
+pub(crate) fn allow_secrets_required(work_id: &str) -> AppError {
+    AppError::new(
+        "WORK_ALLOW_SECRETS_REQUIRED",
+        ExitCode::Precondition,
+        format!("work item {work_id} requires an out-of-band allow-secrets confirmation"),
+    )
+    .remedy(
+        "review `a2a mesh work diff <id>` in a terminal, then pass its one-time token with `--confirm-token`",
+    )
+}
+
+fn token_io(operation: &str, err: std::io::Error) -> AppError {
+    AppError::new("IO", ExitCode::Internal, format!("{operation}: {err}"))
+        .remedy("rerun `a2a mesh work diff <id>` to mint a fresh confirmation token")
+}
+
+fn truncate_to_micros(value: DateTime<Utc>) -> DateTime<Utc> {
+    value
+        .with_nanosecond(value.nanosecond() / 1_000 * 1_000)
+        .unwrap_or(value)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |different, (left, right)| different | (left ^ right))
+        == 0
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

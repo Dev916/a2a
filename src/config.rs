@@ -64,6 +64,8 @@ pub const DEFAULT_MESH_WORK_DIFF_SCAN_MAX_BYTES: u64 = 5_242_880;
 pub const DEFAULT_MESH_WORK_WORK_POLL_SECS: u64 = 15;
 pub const DEFAULT_MESH_WORK_CLAIM_STALL_SECS: u64 = 900;
 pub const DEFAULT_MESH_WORK_CHECKOUT_RETAIN_DAYS: u64 = 30;
+pub const DEFAULT_MESH_WORK_AUTO_PUSH: bool = false;
+pub const DEFAULT_MESH_WORK_RELEASE_STALL_DAYS: u64 = 7;
 pub const DEFAULT_MESH_GATEWAY_LISTEN_PORT: u64 = 7787;
 pub const DEFAULT_MESH_GATEWAY_EXPOSE: &str = "none";
 pub const DEFAULT_MESH_GATEWAY_REGISTRY_HEARTBEAT_SECS: u64 = 180;
@@ -188,7 +190,7 @@ pub const UPDATE_FIELDS: [&str; 1] = ["repo_url"];
 pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
 
 /// Every `[mesh.work]` key, in the order `config show --origin` reports them.
-pub const MESH_WORK_FIELDS: [&str; 8] = [
+pub const MESH_WORK_FIELDS: [&str; 10] = [
     "ttl_days",
     "max_directed_bytes",
     "max_pool_bytes",
@@ -197,6 +199,8 @@ pub const MESH_WORK_FIELDS: [&str; 8] = [
     "claim_stall_secs",
     "checkout_retain_days",
     "diff_scan_max_bytes",
+    "auto_push",
+    "release_stall_days",
 ];
 
 /// Every `[mesh.gateway]` key, in the order `config show --origin` reports them.
@@ -558,6 +562,8 @@ pub struct MeshWorkConfig {
     pub work_poll_secs: u64,
     pub claim_stall_secs: u64,
     pub checkout_retain_days: u64,
+    pub auto_push: bool,
+    pub release_stall_days: u64,
 }
 
 impl Default for MeshWorkConfig {
@@ -571,6 +577,8 @@ impl Default for MeshWorkConfig {
             work_poll_secs: DEFAULT_MESH_WORK_WORK_POLL_SECS,
             claim_stall_secs: DEFAULT_MESH_WORK_CLAIM_STALL_SECS,
             checkout_retain_days: DEFAULT_MESH_WORK_CHECKOUT_RETAIN_DAYS,
+            auto_push: DEFAULT_MESH_WORK_AUTO_PUSH,
+            release_stall_days: DEFAULT_MESH_WORK_RELEASE_STALL_DAYS,
         }
     }
 }
@@ -1345,6 +1353,8 @@ fn apply_mesh_work_toml(
         "work_poll_secs" => work.work_poll_secs = want_u64(dotted, v)?,
         "claim_stall_secs" => work.claim_stall_secs = want_u64(dotted, v)?,
         "checkout_retain_days" => work.checkout_retain_days = want_u64(dotted, v)?,
+        "auto_push" => work.auto_push = want_bool(dotted, v)?,
+        "release_stall_days" => work.release_stall_days = want_u64(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -1702,6 +1712,8 @@ fn apply_mesh_work_str(
         "work_poll_secs" => work.work_poll_secs = parse_u64_str(key, s)?,
         "claim_stall_secs" => work.claim_stall_secs = parse_u64_str(key, s)?,
         "checkout_retain_days" => work.checkout_retain_days = parse_u64_str(key, s)?,
+        "auto_push" => work.auto_push = parse_bool_str(key, s)?,
+        "release_stall_days" => work.release_stall_days = parse_u64_str(key, s)?,
         _ => unreachable!("field membership fixed by MESH_WORK_FIELDS"),
     }
     Ok(())
@@ -2332,6 +2344,8 @@ mod tests {
         assert_eq!(mesh.work.work_poll_secs, 15);
         assert_eq!(mesh.work.claim_stall_secs, 900);
         assert_eq!(mesh.work.checkout_retain_days, 30);
+        assert!(!mesh.work.auto_push);
+        assert_eq!(mesh.work.release_stall_days, 7);
         assert_eq!(DEFAULT_FEED_MAX_BYTES, 10_485_760);
         assert_eq!(DEFAULT_STALE_AFTER_SECS, 900);
         assert_eq!(DEFAULT_GC_AFTER_DAYS, 7);
@@ -2352,6 +2366,8 @@ mod tests {
                 "claim_stall_secs",
                 "checkout_retain_days",
                 "diff_scan_max_bytes",
+                "auto_push",
+                "release_stall_days",
             ]
         );
         assert_eq!(mesh_env_key("feed_max_bytes"), "A2A_MESH_FEED_MAX_BYTES");

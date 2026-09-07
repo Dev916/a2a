@@ -49,6 +49,8 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
             "claim_stall_secs",
             "checkout_retain_days",
             "diff_scan_max_bytes",
+            "auto_push",
+            "release_stall_days",
         ]
     );
 

@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 fn cfg_for(home: &A2aHome) -> Config {
-    a2a::config::load(home).unwrap().0
+    let mut cfg = a2a::config::load(home).unwrap().0;
+    cfg.mesh.work.auto_push = true;
+    cfg
 }
 
 fn cmd(home: &A2aHome, work: &Path) -> assert_cmd::Command {
@@ -459,8 +461,9 @@ async fn declined_with_reason_round_trips_to_sender() {
         result_notes(&f.home_a).iter().any(|note| {
             note["refs"]["result"]
                 == json!({
+                    "work_id": work_id,
                     "status": "declined",
-                    "result_ref": format!("a2a/work/{work_id}"),
+                    "result_ref": null,
                     "summary": "No capacity this week",
                     "evidence_excerpt": ""
                 })

@@ -215,13 +215,29 @@ pub struct SeedPlan {
 
 /// The ordinary spawn: no parent, and therefore a genesis row of exactly the
 /// shape Phase 1 wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpawnOverrides {
+    pub network: Option<bool>,
+}
+
+pub fn effective_network(lane_network: bool, overrides: &SpawnOverrides) -> bool {
+    overrides.network.unwrap_or(lane_network)
+}
+
 pub fn run(
     home: &A2aHome,
     args: &SpawnArgs,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Value, AppError> {
-    run_with_lineage(home, args, None, json_mode, quiet)
+    run_with_overrides(
+        home,
+        args,
+        None,
+        SpawnOverrides::default(),
+        json_mode,
+        quiet,
+    )
 }
 
 /// [`run`], plus the retry lineage `a2a respawn` supplies.
@@ -234,6 +250,24 @@ pub fn run_with_lineage(
     home: &A2aHome,
     args: &SpawnArgs,
     lineage: Option<Lineage>,
+    json_mode: bool,
+    quiet: bool,
+) -> Result<Value, AppError> {
+    run_with_overrides(
+        home,
+        args,
+        lineage,
+        SpawnOverrides::default(),
+        json_mode,
+        quiet,
+    )
+}
+
+pub fn run_with_overrides(
+    home: &A2aHome,
+    args: &SpawnArgs,
+    lineage: Option<Lineage>,
+    overrides: SpawnOverrides,
     json_mode: bool,
     quiet: bool,
 ) -> Result<Value, AppError> {
@@ -263,9 +297,10 @@ pub fn run_with_lineage(
     let lane = args.require_lane();
     let lane_cfg = cfg
         .lanes
-        .get(&lane)
-        .cloned()
+        .get_mut(&lane)
         .expect("config::load seeds every lane");
+    lane_cfg.network = effective_network(lane_cfg.network, &overrides);
+    let lane_cfg = lane_cfg.clone();
     let profile_cfg = profile_gate(&cfg, args.profile.as_deref())?;
 
     let cwd_plan = resolve_cwd(
@@ -1928,6 +1963,42 @@ fn io_err(ctx: &str, e: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_work_spawn_pins_network_off_regardless_of_the_lane() {
+        assert!(!effective_network(
+            true,
+            &SpawnOverrides {
+                network: Some(false),
+            }
+        ));
+        assert!(effective_network(true, &SpawnOverrides::default()));
+
+        let cwd = Path::new("/repo");
+        let worker = Path::new("/worker");
+        let prompt = Path::new("/worker/prompt.md");
+        let spec = exec::SpawnSpec {
+            codex_bin: Path::new("codex"),
+            cwd,
+            worker_dir: worker,
+            epoch: 0,
+            sandbox: SandboxMode::WorkspaceWrite,
+            network: effective_network(
+                true,
+                &SpawnOverrides {
+                    network: Some(false),
+                },
+            ),
+            model: "gpt-5.5",
+            effort: "high",
+            schema_path: None,
+            prompt_file: prompt,
+            resume_session: None,
+            env: &[],
+        };
+        assert!(exec::build_argv(&spec)
+            .contains(&"sandbox_workspace_write.network_access=false".to_string()));
+    }
 
     /// A fixed [`SeedPlan`] produces a genesis row with EXACTLY these keys and
     /// values — the pin behind the `auto_review` refactor's central claim, that

@@ -213,7 +213,9 @@ pub fn run(
         MeshCmd::Links => crate::mesh::gateway::links(home, json_mode, quiet),
         MeshCmd::Fleet { cmd } => run_fleet(home, cfg, cmd, json_mode),
         MeshCmd::Gateway { cmd } => run_gateway(home, cfg, home_arg, cmd, json_mode, quiet),
-        MeshCmd::Work { cmd } => crate::commands::work_cmd::run(home, cfg, cmd, quiet),
+        MeshCmd::Work { cmd } => {
+            crate::commands::work_cmd::run(home, cfg, cmd, json_mode, quiet)
+        }
     }
 }
 

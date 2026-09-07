@@ -4,8 +4,9 @@ use a2a::mesh::gateway::link::{
     accept_once_io, dial_gateway_io, discover_outbound_peers, jittered_redial_backoff,
     LinkDirection, LinkHealthEvent, LinkLiveness, LinkObserver, LinkRuntimeEvent,
     LinkSessionParams, LinkStateHandle, LinkTaskSet, LinkWriteOp, OutboundQueue, PeerDamping,
-    PRESENCE_MAILBOX_CAPACITY,
+    RootMismatchWatch, PRESENCE_MAILBOX_CAPACITY,
 };
+use a2a::mesh::gateway::GatewayHealth;
 use a2a::mesh::keys::{fleet_init, sign_token, RootSet, TestClock, TokenClaims};
 use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
 use a2a::mesh::row_sig::RowVerdict;
@@ -252,6 +253,77 @@ fn mesh_links_cli_renders_health_and_empty_down_daemon_with_hint() {
         .stdout(predicate::str::contains("gw-b"))
         .stdout(predicate::str::contains("outbound"))
         .stdout(predicate::str::contains("frames_tx=3"));
+}
+
+#[test]
+fn root_mismatch_is_suspected_after_three_token_invalid_refusals_and_clears_on_success() {
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let mut watch = RootMismatchWatch::default();
+
+    assert!(watch.observe("gw-b", "TOKEN_INVALID", now).is_none());
+    assert!(watch.observe("gw-b", "TOKEN_INVALID", now).is_none());
+    let event = watch
+        .observe("gw-b", "GATEWAY_TOKEN_INVALID", now)
+        .expect("the third consecutive token refusal changes state");
+    assert_eq!(event.peer, "gw-b");
+    assert_eq!(event.count, 3);
+    assert!(
+        watch.observe("gw-b", "TOKEN_INVALID", now).is_none(),
+        "a suspected peer emits only one transition event"
+    );
+    assert_eq!(watch.health(now)["gw-b"]["count"], 4);
+
+    watch.clear("gw-b");
+    assert_eq!(watch.health(now), json!({}));
+    assert!(watch.observe("gw-b", "TOKEN_INVALID", now).is_none());
+    assert_eq!(watch.health(now), json!({}));
+}
+
+#[test]
+fn gateway_health_without_root_mismatch_field_still_deserializes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    write_health_with_link(&home);
+
+    let health: GatewayHealth = serde_json::from_slice(
+        &fs::read(home.join("mesh/gateway-health.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(health.root_mismatch_suspected.is_none());
+}
+
+#[test]
+fn gateway_status_surfaces_root_mismatch_peer_and_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    write_health_with_link(&home);
+    let path = home.join("mesh/gateway-health.json");
+    let mut health: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    health["root_mismatch_suspected"] = json!({
+        "gw-b": {
+            "count": 3,
+            "last_refusal_at": "2026-09-02T00:00:04Z",
+            "seconds_since_last": 0
+        }
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&health).unwrap()).unwrap();
+    let _lock = lock_gateway(&home);
+
+    let out = common::a2a(&home, &work)
+        .args(["--json", "mesh", "gateway", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        out["data"]["health"]["root_mismatch_suspected"]["gw-b"]["count"],
+        3
+    );
 }
 
 #[tokio::test]

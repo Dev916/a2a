@@ -109,6 +109,87 @@ pub struct PeerDamping {
     peers: BTreeMap<String, PeerFlapState>,
 }
 
+const ROOT_MISMATCH_THRESHOLD: u32 = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootMismatchEvent {
+    pub kind: &'static str,
+    pub peer: String,
+    pub count: u32,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct RootMismatchPeer {
+    count: u32,
+    last_refusal_at: DateTime<Utc>,
+    suspected: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RootMismatchWatch {
+    peers: BTreeMap<String, RootMismatchPeer>,
+}
+
+impl RootMismatchWatch {
+    pub fn observe(
+        &mut self,
+        peer: &str,
+        code: &str,
+        now: DateTime<Utc>,
+    ) -> Option<RootMismatchEvent> {
+        if !matches!(code, "TOKEN_INVALID" | "GATEWAY_TOKEN_INVALID") {
+            self.clear(peer);
+            return None;
+        }
+        let state = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert(RootMismatchPeer {
+                count: 0,
+                last_refusal_at: now,
+                suspected: false,
+            });
+        state.count = state.count.saturating_add(1);
+        state.last_refusal_at = now;
+        if state.suspected || state.count < ROOT_MISMATCH_THRESHOLD {
+            return None;
+        }
+        state.suspected = true;
+        Some(RootMismatchEvent {
+            kind: "root_mismatch_suspected",
+            peer: peer.to_string(),
+            count: state.count,
+            observed_at: now,
+        })
+    }
+
+    pub fn clear(&mut self, peer: &str) {
+        self.peers.remove(peer);
+    }
+
+    pub fn health(&self, now: DateTime<Utc>) -> Value {
+        let mut peers = Map::new();
+        for (peer, state) in &self.peers {
+            if !state.suspected {
+                continue;
+            }
+            peers.insert(
+                peer.clone(),
+                json!({
+                    "count": state.count,
+                    "last_refusal_at": state.last_refusal_at,
+                    "seconds_since_last": now
+                        .signed_duration_since(state.last_refusal_at)
+                        .num_seconds()
+                        .max(0),
+                }),
+            );
+        }
+        Value::Object(peers)
+    }
+}
+
 impl PeerDamping {
     pub fn new(window: Duration) -> Self {
         Self {

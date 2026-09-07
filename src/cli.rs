@@ -620,6 +620,18 @@ pub enum MeshFleetCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report verified fleet root-rotation readiness and soak state
+    RotationStatus {
+        /// Emit the rotation report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify and replace this machine's fleet registry credential
+    SetRegistry {
+        /// Registry connection string source; use `-` to read from stdin
+        #[arg(long, value_name = "SOURCE")]
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]

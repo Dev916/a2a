@@ -137,3 +137,5 @@ a2a mesh gateway status # loops all "running", endpoint_url populated
 | `ROOT_ANNOUNCEMENT_FLEET_MISMATCH` | A validly signed announcement names a different fleet. | Obtain the announcement for the fleet named by this gateway's `root.pub`. |
 | `ROTATION_PHASE_UNMET` | Verified member rows do not yet prove every ledgered gateway is on the target root. | Re-enroll, install, restart, and re-sign the named members before retrying promotion or retirement. |
 | `ROTATION_SOAK_UNMET` | Post-promotion handshakes or the configured soak interval are incomplete. | Wait for the missing gateways and interval; `--retire --force` skips only this soak check. |
+| `ROTATION_STATUS_UNAVAILABLE` | The owner enrollment ledger or fleet registry credential is absent. | Restore `enrollments.json` and `registry.env` in the fleet owner home before inspecting rotation state. |
+| `REGISTRY_SET_REFUSED` | The proposed registry credential exposes a fleet id different from the locally installed root. | Use a credential scoped to the existing fleet; `set-registry` deliberately never re-homes a machine. |

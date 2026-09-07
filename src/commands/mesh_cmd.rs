@@ -11,7 +11,9 @@ use crate::mesh::{
         write_registry_env, GatewayRow, Registry, RegistryHandle,
         DEFAULT_REGISTRY_HEARTBEAT_SECS,
     },
-    rotation::{self, RotationEvidence, RotationPhase, RotationState, SoakState},
+    rotation::{
+        self, RotationEvidence, RotationPhase, RotationState, RotationStatus, SoakState,
+    },
     row_mark::RowMarkStore,
     row_sig::{
         endpoint_conflicts, row_flags, RowFlag, RowVerdict, RowVerifyCfg, StoredRowColumns,
@@ -834,6 +836,91 @@ fn run_fleet(
             }
             unreachable!("clap requires one root rotation operation")
         }
+        MeshFleetCmd::RotationStatus { json } => {
+            let ledger_path = home.root().join("mesh/fleet/enrollments.json");
+            if !ledger_path.is_file() || !registry_env_path(home).is_file() {
+                return Err(rotation_status_unavailable(home));
+            }
+            let roots = crate::mesh::keys::RootSet::load(home)?;
+            let fleet_id = crate::mesh::keys::fleet_id(home)?;
+            let ledger = EnrollLedger::load(home)?;
+            let state = RotationState::load(home)?;
+            let url = read_registry_env(home)?;
+            let now = Utc::now();
+            let rows = rt.block_on(async {
+                open_registry(&url, roots.clone(), fleet_id.clone())?
+                    .with_reader_state(
+                        RowMarkStore::open(home)?,
+                        RowVerifyCfg::from_config(now, cfg),
+                    )
+                    .discover()
+                    .await
+            })?;
+            let evidence = rotation::gather_evidence(
+                home,
+                &roots,
+                &rows,
+                &ledger,
+                &state,
+                now.timestamp(),
+            )?;
+            let status = RotationStatus::from_evidence(
+                fleet_id,
+                &roots,
+                &rows,
+                evidence,
+                now.timestamp(),
+                cfg.mesh.gateway.rotation_soak_secs,
+            );
+            if json_mode || *json {
+                return Ok(Outcome::from(serde_json::to_value(&status).map_err(
+                    |error| AppError::new("SERIALIZE", ExitCode::Internal, error.to_string()),
+                )?));
+            }
+            Ok(Outcome::from(Value::String(status.render_human())))
+        }
+        MeshFleetCmd::SetRegistry { url } => {
+            let url = registry_input(url)?;
+            let roots = reader_roots(home)?;
+            let fleet_id = crate::mesh::keys::fleet_id(home)?;
+            let now = Utc::now();
+            let marks = RowMarkStore::open(home)?;
+            let verify_cfg = RowVerifyCfg::from_config(now, cfg);
+            let rows = rt.block_on(async {
+                let registry = open_registry(&url, roots, fleet_id.clone())?
+                    .with_reader_state(marks.clone(), verify_cfg.clone());
+                let fleet_ids = registry.fleet_ids().await?;
+                if let Some(other) = fleet_ids.iter().find(|seen| *seen != &fleet_id) {
+                    return Err(registry_set_refused(&fleet_id, other));
+                }
+                let rows = registry.discover().await?;
+                if let Some((row, _verdict)) =
+                    rows.iter().find(|(row, _verdict)| row.fleet_id != fleet_id)
+                {
+                    return Err(registry_set_refused(&fleet_id, &row.fleet_id));
+                }
+                Ok(rows)
+            })?;
+            write_registry_env(home, &url)?;
+            let conflicts = endpoint_conflicts(&rows);
+            if json_mode {
+                let data = rows
+                    .iter()
+                    .map(|row| fleet_row_json(row, now, &marks, &verify_cfg, &conflicts))
+                    .collect::<Vec<_>>();
+                return Ok(Outcome::from(json!({
+                    "fleet_id": fleet_id,
+                    "rows": data,
+                })));
+            }
+            let rendered = human_fleet_rows(&rows, now, &marks, &verify_cfg, &conflicts);
+            let summary = format!("fleet={fleet_id} rows={}", rows.len());
+            Ok(Outcome::from(Value::String(if rendered.is_empty() {
+                summary
+            } else {
+                format!("{rendered}\n{summary}")
+            })))
+        }
         MeshFleetCmd::HardeningStatus { json } => {
             let url = read_registry_env(home)?;
             let now = Utc::now();
@@ -906,6 +993,39 @@ fn gather_rotation_evidence(
         &state,
         now.timestamp(),
     )
+}
+
+fn rotation_status_unavailable(home: &A2aHome) -> AppError {
+    AppError::new(
+        "ROTATION_STATUS_UNAVAILABLE",
+        ExitCode::Precondition,
+        format!(
+            "rotation status needs both {} and {}",
+            home.root().join("mesh/fleet/enrollments.json").display(),
+            registry_env_path(home).display(),
+        ),
+    )
+    .remedy(
+        "run fleet enrollment from this owner home and install a registry credential before retrying rotation-status",
+    )
+}
+
+fn registry_set_refused(local_fleet_id: &str, observed_fleet_id: &str) -> AppError {
+    let observed_display = crate::mesh::render::escape_untrusted(observed_fleet_id, 128).text;
+    AppError::new(
+        "REGISTRY_SET_REFUSED",
+        ExitCode::Precondition,
+        format!(
+            "the new registry exposes fleet {observed_display}, but this machine holds roots for fleet {local_fleet_id}"
+        ),
+    )
+    .remedy(
+        "use a credential scoped to this machine's existing fleet; set-registry never re-homes a machine",
+    )
+    .data(json!({
+        "local_fleet_id": local_fleet_id,
+        "observed_fleet_id": observed_fleet_id,
+    }))
 }
 
 fn rotation_phase_unmet(evidence: &RotationEvidence, phase: RotationPhase) -> AppError {

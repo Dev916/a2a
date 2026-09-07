@@ -89,6 +89,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshFleetCmd::Revoke { .. } => "mesh fleet revoke",
                 MeshFleetCmd::Enroll { .. } => "mesh fleet enroll",
                 MeshFleetCmd::RotateRoot { .. } => "mesh fleet rotate-root",
+                MeshFleetCmd::RotationStatus { .. } => "mesh fleet rotation-status",
+                MeshFleetCmd::SetRegistry { .. } => "mesh fleet set-registry",
                 MeshFleetCmd::HardeningStatus { .. } => "mesh fleet hardening-status",
             },
             MeshCmd::Gateway { cmd } => match cmd {

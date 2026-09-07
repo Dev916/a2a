@@ -9,9 +9,9 @@
 //! `fn(&Ctx) -> Check`; the runner maps over it and knows nothing about any
 //! individual check. Phase 2's four (app-server handshake, codex-home
 //! agreement, broker status, auth mode) were appended to that slice and the
-//! runner was not touched. The mesh enrollment check and Phase 3's three
+//! runner was not touched. The mesh enrollment and hardening checks and Phase 3's three
 //! (context canon, the allowed-roots check, tracked-secret check, sync state)
-//! were appended the same way. Phase 1's six, Phase 2's four, mesh enrollment,
+//! were appended the same way. Phase 1's six, Phase 2's four, both mesh checks,
 //! Phase 3's three — and it is pinned by a test.
 //!
 //! **Only `fail` is fatal.** `fail` means "a worker spawned right now would
@@ -149,7 +149,7 @@ pub struct Ctx {
 }
 
 /// The check list, in report order. Append-only across phases: Phase 1's six,
-/// the allowed-roots first-run check, Phase 2's four, mesh enrollment, then
+/// the allowed-roots first-run check, Phase 2's four, both mesh checks, then
 /// Phase 3's three.
 const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_present,
@@ -163,6 +163,7 @@ const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_home_match,
     broker_status,
     gateway_enrollment,
+    mesh_hardening,
     auth_mode,
     context_canon,
     codex_config_secrets,
@@ -819,6 +820,96 @@ fn gateway_enrollment_verdict(ctx: &Ctx) -> Result<Check, AppError> {
     ))
 }
 
+fn mesh_hardening(ctx: &Ctx) -> Check {
+    const ID: &str = "mesh_hardening";
+    if !gateway_material_exists(&ctx.home) {
+        return Check::ok(
+            ID,
+            "no mesh gateway material present — mesh hardening check skipped",
+        );
+    }
+    let roots = match keys::RootSet::load(&ctx.home) {
+        Ok(roots) => roots,
+        Err(err) => {
+            let fleet_dir = ctx.home.root().join("mesh/fleet");
+            return Check::warn(
+                ID,
+                format!(
+                    "LOCAL root files {}/root.pub, {}/root.pub.next, and {}/root.pub.prev could not be loaded: {}: {}; require_signed_rows={}",
+                    fleet_dir.display(),
+                    fleet_dir.display(),
+                    fleet_dir.display(),
+                    err.code,
+                    err.message,
+                    ctx.cfg.mesh.gateway.require_signed_rows,
+                ),
+            )
+            .remedy("repair the LOCAL fleet root files and permissions, then rerun doctor");
+        }
+    };
+    let roots_held = roots
+        .entries()
+        .iter()
+        .map(|root| format!("{}:{}", root_role_name(root.role), root.fpr))
+        .collect::<Vec<_>>()
+        .join(",");
+    let token = match keys::gateway_token(&ctx.home) {
+        Ok(token) => token,
+        Err(err) => {
+            return Check::warn(
+                ID,
+                format!(
+                    "roots_held=[{roots_held}] token_issuer=unknown token_issuer_installed=false require_signed_rows={}: {}: {}",
+                    ctx.cfg.mesh.gateway.require_signed_rows, err.code, err.message,
+                ),
+            )
+            .remedy("install the fleet root that signed this token");
+        }
+    };
+    let clock = FixedClock(ctx.now);
+    match keys::verify_token_with_issuer(&token, &roots, &clock) {
+        Ok((_claims, issuer_fpr)) => {
+            let issuer_installed = roots.fingerprints().iter().any(|fpr| fpr == &issuer_fpr);
+            let detail = format!(
+                "roots_held=[{roots_held}] token_issuer={issuer_fpr} token_issuer_installed={issuer_installed} require_signed_rows={}",
+                ctx.cfg.mesh.gateway.require_signed_rows,
+            );
+            if issuer_installed {
+                Check::ok(ID, detail)
+            } else {
+                Check::warn(ID, detail).remedy("install the fleet root that signed this token")
+            }
+        }
+        Err(err) => {
+            let issuer_fpr = keys::verify_token_no_clock(&token, &roots)
+                .ok()
+                .map(|(_claims, issuer)| issuer);
+            let issuer_installed = issuer_fpr
+                .as_ref()
+                .is_some_and(|issuer| roots.fingerprints().iter().any(|fpr| fpr == issuer));
+            Check::warn(
+                ID,
+                format!(
+                    "roots_held=[{roots_held}] token_issuer={} token_issuer_installed={issuer_installed} require_signed_rows={}: {}: {}",
+                    issuer_fpr.as_deref().unwrap_or("unknown"),
+                    ctx.cfg.mesh.gateway.require_signed_rows,
+                    err.code,
+                    err.message,
+                ),
+            )
+            .remedy("install the fleet root that signed this token")
+        }
+    }
+}
+
+fn root_role_name(role: keys::RootRole) -> &'static str {
+    match role {
+        keys::RootRole::Current => "current",
+        keys::RootRole::Next => "next",
+        keys::RootRole::Prev => "prev",
+    }
+}
+
 /// Which plan the fleet bills to, from the two facts that decide it — and only
 /// from facts this process can read without touching the network.
 ///
@@ -1249,14 +1340,14 @@ mod tests {
     use crate::sync::manifest::DriftSummary;
 
     #[test]
-    fn the_check_list_is_exactly_fifteen_named_checks() {
+    fn the_check_list_is_exactly_sixteen_named_checks() {
         // The list is the contract `doctor --json` publishes; a phase that adds
         // a check adds it here and to the acceptance test in the same commit.
         // Six in Phase 1, the allowed-roots check, four in Phase 2, the mesh
-        // enrollment check, and three in Phase 3 — the ids and their order are
+        // enrollment + hardening checks, and three in Phase 3 — the ids and their order are
         // pinned end-to-end by
         // `tests/cmd_doctor.rs`.
-        assert_eq!(CHECKS.len(), 15);
+        assert_eq!(CHECKS.len(), 16);
     }
 
     #[test]

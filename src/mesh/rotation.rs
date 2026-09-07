@@ -1,9 +1,11 @@
 use crate::home::{create_dir_0700, A2aHome};
 use crate::mesh::enroll_ledger::EnrollLedger;
+use crate::mesh::gateway::GatewayHealth;
 use crate::mesh::keys::{self, RootRole, RootSet};
 use crate::mesh::registry::GatewayRow;
 use crate::mesh::row_sig::{parse_row_msg_strict, RowVerdict};
 use crate::output::{AppError, ExitCode};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,6 +88,177 @@ impl RotationState {
         bytes.push(b'\n');
         crate::store::write_atomic(&path, &bytes)
             .map_err(|error| io_error("writing root rotation state", error))
+    }
+
+    pub fn record_handshake(
+        home: &A2aHome,
+        gateway_id: &str,
+        mark: HandshakeMark,
+    ) -> Result<(), AppError> {
+        let mut state = Self::load(home)?;
+        let should_write = state.handshakes.get(gateway_id).is_none_or(|stored| {
+            stored.issuer_fpr != mark.issuer_fpr || mark.at.saturating_sub(stored.at) > 60
+        });
+        if !should_write {
+            return Ok(());
+        }
+        state.handshakes.insert(gateway_id.to_string(), mark);
+        state.save(home)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationStatus {
+    pub fleet_id: String,
+    pub current_fpr: String,
+    pub staged_fpr: Option<String>,
+    pub prev_fpr: Option<String>,
+    pub phase: RotationPhase,
+    pub soak: SoakState,
+    pub members: Vec<RotationMemberStatus>,
+    pub unaccounted: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationMemberStatus {
+    pub gateway_id: String,
+    pub verified_issuer_fpr: Option<String>,
+    pub issuer_role: Option<RootRole>,
+    /// A valid row signature authenticates this self-report, but possession is
+    /// not independently provable; this field never gates a rotation phase.
+    pub roots_held_advisory: Vec<String>,
+    pub verdict: String,
+    pub soak: MemberSoak,
+    pub token_expires_at: Option<DateTime<Utc>>,
+    pub days_remaining: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MemberSoak {
+    NotPromoted,
+    Pending,
+    Satisfied { observed_at: i64 },
+}
+
+impl RotationStatus {
+    pub fn from_evidence(
+        fleet_id: String,
+        roots: &RootSet,
+        rows: &[(GatewayRow, RowVerdict)],
+        evidence: RotationEvidence,
+        now: i64,
+        soak_secs: u64,
+    ) -> Self {
+        let phase = phase(&evidence);
+        let soak = soak_state(&evidence, now, soak_secs);
+        let rows_by_gateway = rows
+            .iter()
+            .map(|pair| (pair.0.gateway_id.as_str(), pair))
+            .collect::<BTreeMap<_, _>>();
+        let members = evidence
+            .members
+            .iter()
+            .map(|member| {
+                let row_pair = rows_by_gateway.get(member.gateway_id.as_str()).copied();
+                let verdict = row_pair
+                    .map(|(_row, verdict)| verdict.label().to_string())
+                    .unwrap_or_else(|| "MISSING".to_string());
+                let token_expires_at = row_pair
+                    .filter(|(_row, verdict)| *verdict == RowVerdict::ValidSigned)
+                    .and_then(|(row, _verdict)| verified_row_token_claims(row, roots))
+                    .and_then(|claims| DateTime::from_timestamp(claims.exp, 0));
+                let days_remaining = token_expires_at
+                    .map(|expires_at| token_days_remaining(expires_at.timestamp(), now));
+                let issuer_role = member
+                    .verified_issuer_fpr
+                    .as_deref()
+                    .and_then(|fingerprint| roots.role_of(fingerprint));
+                RotationMemberStatus {
+                    gateway_id: member.gateway_id.clone(),
+                    verified_issuer_fpr: member.verified_issuer_fpr.clone(),
+                    issuer_role,
+                    roots_held_advisory: member.roots_held.clone(),
+                    verdict,
+                    soak: member_soak(member, evidence.promoted_at, &evidence.current_fpr),
+                    token_expires_at,
+                    days_remaining,
+                }
+            })
+            .collect();
+        Self {
+            fleet_id,
+            current_fpr: evidence.current_fpr,
+            staged_fpr: evidence.next_fpr,
+            prev_fpr: evidence.prev_fpr,
+            phase,
+            soak,
+            members,
+            unaccounted: evidence.unaccounted,
+        }
+    }
+
+    pub fn render_human(&self) -> String {
+        let mut lines = self
+            .members
+            .iter()
+            .map(|member| {
+                let gateway_id =
+                    crate::mesh::render::escape_untrusted(&member.gateway_id, 128).text;
+                let issuer = member
+                    .verified_issuer_fpr
+                    .as_deref()
+                    .map(short_fingerprint)
+                    .unwrap_or("unknown");
+                let role = member
+                    .issuer_role
+                    .map(root_role_label)
+                    .unwrap_or("unknown");
+                let token_expires_at = member
+                    .token_expires_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let days_remaining = member
+                    .days_remaining
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!(
+                    "{} issuer={} role={} soak={} token_expires_at={} days_remaining={}",
+                    gateway_id,
+                    issuer,
+                    role,
+                    member.soak.label(),
+                    token_expires_at,
+                    days_remaining,
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "phase={} soak={}",
+            phase_label(self.phase),
+            self.soak.label()
+        ));
+        lines.join("\n")
+    }
+}
+
+impl MemberSoak {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::NotPromoted => "not_promoted",
+            Self::Pending => "pending",
+            Self::Satisfied { .. } => "satisfied",
+        }
+    }
+}
+
+impl SoakState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::NotPromoted => "not_promoted",
+            Self::Pending { .. } => "pending",
+            Self::Satisfied => "satisfied",
+        }
     }
 }
 
@@ -196,7 +369,7 @@ pub fn soak_state(evidence: &RotationEvidence, now: i64, soak_secs: u64) -> Soak
 }
 
 pub fn gather_evidence(
-    _home: &A2aHome,
+    home: &A2aHome,
     roots: &RootSet,
     rows: &[(GatewayRow, RowVerdict)],
     ledger: &EnrollLedger,
@@ -235,9 +408,15 @@ pub fn gather_evidence(
         }
         members.push(MemberEvidence {
             gateway_id: (*gateway_id).to_string(),
+            last_handshake: member_soak_evidence(
+                home,
+                state,
+                gateway_id,
+                verified_issuer_fpr.as_deref(),
+                &current_fpr,
+            ),
             verified_issuer_fpr,
             roots_held,
-            last_handshake: state.handshakes.get(*gateway_id).cloned(),
         });
     }
     Ok(RotationEvidence {
@@ -247,6 +426,36 @@ pub fn gather_evidence(
         promoted_at: state.promoted_at,
         members,
         unaccounted,
+    })
+}
+
+/// V1's replaceable soak-evidence predicate. Until the wire reports the
+/// verified issuer, a link counts only when the member's current signed row is
+/// independently attested by the promoted root and the link was established
+/// after promotion. L2 can replace this body with persisted handshake marks
+/// without changing evidence-gathering callers.
+pub fn member_soak_evidence(
+    home: &A2aHome,
+    state: &RotationState,
+    gateway_id: &str,
+    verified_issuer_fpr: Option<&str>,
+    current_fpr: &str,
+) -> Option<HandshakeMark> {
+    let promoted_at = state.promoted_at?;
+    if state.promoted_to_fpr.as_deref() != Some(current_fpr)
+        || verified_issuer_fpr != Some(current_fpr)
+    {
+        return None;
+    }
+    let established_at = GatewayHealth::read(home)?
+        .links
+        .into_iter()
+        .filter(|link| link.peer == gateway_id && link.established_at.timestamp() > promoted_at)
+        .map(|link| link.established_at.timestamp())
+        .max()?;
+    Some(HandshakeMark {
+        issuer_fpr: current_fpr.to_string(),
+        at: established_at,
     })
 }
 
@@ -268,6 +477,63 @@ fn verified_row_evidence(row: &GatewayRow, roots: &RootSet) -> (Option<String>, 
     roots_held.sort();
     roots_held.dedup();
     (issuer, roots_held)
+}
+
+fn verified_row_token_claims(
+    row: &GatewayRow,
+    roots: &RootSet,
+) -> Option<keys::TokenClaims> {
+    let (claims, _issuer) = keys::verify_token_no_clock(row.row_token.as_deref()?, roots).ok()?;
+    (claims.fleet_id == row.fleet_id && claims.gateway_id == row.gateway_id).then_some(claims)
+}
+
+fn member_soak(
+    member: &MemberEvidence,
+    promoted_at: Option<i64>,
+    current_fpr: &str,
+) -> MemberSoak {
+    let Some(promoted_at) = promoted_at else {
+        return MemberSoak::NotPromoted;
+    };
+    match member.last_handshake.as_ref() {
+        Some(mark) if mark.issuer_fpr == current_fpr && mark.at >= promoted_at => {
+            MemberSoak::Satisfied {
+                observed_at: mark.at,
+            }
+        }
+        _ => MemberSoak::Pending,
+    }
+}
+
+fn token_days_remaining(expires_at: i64, now: i64) -> i64 {
+    let seconds = expires_at.saturating_sub(now);
+    if seconds >= 0 {
+        seconds.saturating_add(86_399) / 86_400
+    } else {
+        seconds.div_euclid(86_400)
+    }
+}
+
+fn short_fingerprint(fingerprint: &str) -> &str {
+    fingerprint.get(..12).unwrap_or(fingerprint)
+}
+
+fn root_role_label(role: RootRole) -> &'static str {
+    match role {
+        RootRole::Current => "current",
+        RootRole::Next => "next",
+        RootRole::Prev => "prev",
+    }
+}
+
+fn phase_label(phase: RotationPhase) -> &'static str {
+    match phase {
+        RotationPhase::NotStaged => "not_staged",
+        RotationPhase::Phase1Incomplete => "phase1_incomplete",
+        RotationPhase::Phase1 => "phase1",
+        RotationPhase::Phase2 => "phase2",
+        RotationPhase::Unknown => "unknown",
+    }
 }
 
 fn root_fpr(roots: &RootSet, role: RootRole) -> Option<String> {

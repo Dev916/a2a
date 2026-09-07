@@ -256,6 +256,14 @@ if [ "$1" = "-C" ]; then
   shift
   shift
 fi
+while [ "$1" = "--no-pager" ] || [ "$1" = "-c" ]; do
+  if [ "$1" = "-c" ]; then
+    shift
+    shift
+  else
+    shift
+  fi
+done
 case "$1" in
   status)
     if [ -n "$A2A_FAKE_GIT_DIRTY" ]; then
@@ -318,6 +326,11 @@ fn save_work_state(
         result_summary: Some("done".to_string()),
         evidence_excerpt: Some("ok".to_string()),
         result_status: Some(a2a::mesh::registry::WorkStatus::Done),
+        base_sha: None,
+        held_commit_sha: None,
+        closure_digest: None,
+        base_ref: None,
+        remote_url: None,
     };
     a2a::mesh::work_exec::save_state(&home, &state).unwrap();
     checkout

@@ -105,6 +105,7 @@ use crate::mesh::{
     gateway::{presence_wire, replicate},
     notes, presence, PeerId, Presence,
     work_exec::{self, LocatedWorkState, WorkPhase},
+    work_gate,
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
@@ -118,7 +119,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 /// Tombstones: one JSON line per reclaimed worker, at the home root.
@@ -655,9 +655,7 @@ fn checkout_hold(candidate: &WorkCandidate) -> Result<Option<Value>, AppError> {
 }
 
 fn git_output(checkout: &Path, args: &[&str]) -> Result<std::process::Output, AppError> {
-    Command::new("git")
-        .arg("-C")
-        .arg(checkout)
+    work_gate::git_pinned(checkout)
         .args(args)
         .output()
         .map_err(|e| io_err("running git for work checkout gc", e))

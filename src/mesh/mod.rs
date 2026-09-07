@@ -191,6 +191,7 @@ pub mod routing;
 pub mod wire;
 pub mod work;
 pub mod work_exec;
+pub mod work_gate;
 pub mod work_store;
 
 fn default_note_kind() -> String {

@@ -107,6 +107,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshWorkCmd::Cancel { .. } => "mesh work cancel",
                 MeshWorkCmd::Status { .. } => "mesh work status",
                 MeshWorkCmd::Ack { .. } => "mesh work ack",
+                MeshWorkCmd::Diff { .. } => "mesh work diff",
                 MeshWorkCmd::RetryPush { .. } => "mesh work retry-push",
             },
         },

@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 75] = [
+pub const KNOWN_CODES: [&str; 76] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -167,6 +167,7 @@ pub const KNOWN_CODES: [&str; 75] = [
     "SESSION_LIMIT",
     "PREAUTH_LIMIT",
     "WORK_POOL_FULL",
+    "FEED_ORIGIN_UNBOUND",
 ];
 
 /// This process's protocol version.

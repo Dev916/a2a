@@ -669,6 +669,16 @@ impl LinkStateHandle {
     }
 
     pub async fn peer_buckets(&self, peer_gateway_id: &str) -> Arc<Mutex<limits::PeerBuckets>> {
+        if let Some(buckets) = self
+            .inner
+            .peers
+            .lock()
+            .await
+            .get(peer_gateway_id)
+            .map(|peer| peer.buckets.clone())
+        {
+            return buckets;
+        }
         let candidate = self.new_peer_state(peer_gateway_id);
         self.inner
             .peers
@@ -684,6 +694,16 @@ impl LinkStateHandle {
         &self,
         peer_gateway_id: &str,
     ) -> Arc<Mutex<replicate::CursorStore>> {
+        if let Some(cursors) = self
+            .inner
+            .peers
+            .lock()
+            .await
+            .get(peer_gateway_id)
+            .map(|peer| peer.cursors.clone())
+        {
+            return cursors;
+        }
         let candidate = self.new_peer_state(peer_gateway_id);
         self.inner
             .peers
@@ -898,14 +918,21 @@ where
         }
     });
 
-    let initial_digest = replicate::digest_for_home(&home)?;
+    let mut initial_digest = replicate::digest_for_home(&home)?;
+    // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+    initial_digest.retain(|origin| origin.origin == local_gateway_id);
     let _ = out_tx
         .send(Frame::Digest {
             origins: initial_digest,
         })
         .await;
     let mut mailboxes = InboundMailboxes::new(mailbox_payload_cap, mailbox_backpressure_window);
-    let mut reorder = replicate::FeedReorderBuffers::default();
+    // Both bounds are per-link; evicted gap work is deferred to bounded anti-entropy repair.
+    let mut reorder = replicate::FeedReorderBuffers::new_with_total(
+        replicate::DEFAULT_REORDER_BUFFER_CAP,
+        replicate::DEFAULT_REORDER_TOTAL_CAP,
+        1,
+    );
     let result = loop {
         tokio::select! {
             _ = token.cancelled() => break Ok(()),
@@ -1058,17 +1085,11 @@ async fn handle_inbound_frame(
                 &mut buckets,
                 &mut deferred_ack,
             ) {
+                // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
                 let origins = origins
                     .into_iter()
                     .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
-                    .filter(|origin| {
-                        is_known_origin(
-                            home,
-                            local_gateway_id,
-                            peer_gateway_id,
-                            &origin.origin,
-                        )
-                    })
+                    .filter(|origin| origin.origin == peer_gateway_id)
                     .collect::<Vec<_>>();
                 let wants = replicate::wants_from_digest(home, &cursors, &origins)?;
                 if !wants.is_empty() {
@@ -1089,17 +1110,11 @@ async fn handle_inbound_frame(
                 &mut buckets,
                 &mut deferred_ack,
             ) {
+                // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
                 for want in origins
                     .into_iter()
                     .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
-                    .filter(|want| {
-                        is_known_origin(
-                            home,
-                            local_gateway_id,
-                            peer_gateway_id,
-                            &want.origin,
-                        )
-                    })
+                    .filter(|want| want.origin == local_gateway_id)
                 {
                     match replicate::entries_for_want_capped(
                         home,
@@ -1125,6 +1140,11 @@ async fn handle_inbound_frame(
             }
         }
         Frame::Feed { origin, entries } => {
+            // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+            if origin != peer_gateway_id {
+                limits::log_origin_unbound(home, peer_gateway_id, &origin);
+                return Ok(());
+            }
             let bytes_outcome = buckets.charge(limits::BucketKind::FeedBytes, feed_bytes, now);
             if !observe_limit_outcome(
                 home,
@@ -1136,13 +1156,6 @@ async fn handle_inbound_frame(
                 &mut deferred_ack,
             ) {
                 deferred = true;
-            } else if origin != peer_gateway_id {
-                outbound.push(Frame::Err {
-                    code: "FEED_ORIGIN_INVALID".to_string(),
-                    detail: format!(
-                        "feed origin {origin} does not match authenticated peer {peer_gateway_id}"
-                    ),
-                });
             } else {
                 let mut frame_deferred = false;
                 let report = replicate::receive_feed_entries_metered(
@@ -1300,20 +1313,6 @@ fn observe_limit_outcome(
     false
 }
 
-fn is_known_origin(
-    home: &A2aHome,
-    local_gateway_id: &str,
-    peer_gateway_id: &str,
-    origin: &str,
-) -> bool {
-    origin == local_gateway_id
-        || origin == peer_gateway_id
-        || presence_wire::cached_gateway(home, origin)
-            .ok()
-            .flatten()
-            .is_some()
-}
-
 pub async fn push_watcher_deltas(
     home: &A2aHome,
     cfg: &Config,
@@ -1330,7 +1329,11 @@ pub async fn push_watcher_deltas(
             };
             (link.tx.clone(), link.sent_cursors.clone())
         };
-        let entries = replicate::deltas_for_link(home, local_gateway_id, &cursors)?;
+        // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+        let entries = replicate::deltas_for_link(home, local_gateway_id, &cursors)?
+            .into_iter()
+            .filter(|entry| entry.origin.as_deref() == Some(local_gateway_id))
+            .collect::<Vec<_>>();
         if entries.is_empty() {
             continue;
         }
@@ -1475,7 +1478,12 @@ pub async fn push_anti_entropy_digest(
     home: &A2aHome,
     state: &LinkStateHandle,
 ) -> Result<(), AppError> {
-    let origins = replicate::digest_for_home(home)?;
+    let local_gateway_id = crate::mesh::feed::existing_gateway_id(home);
+    // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+    let origins = replicate::digest_for_home(home)?
+        .into_iter()
+        .filter(|origin| local_gateway_id.as_deref() == Some(origin.origin.as_str()))
+        .collect::<Vec<_>>();
     state
         .broadcast(Frame::Digest {
             origins: origins.clone(),

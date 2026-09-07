@@ -9,6 +9,7 @@ use std::net::IpAddr;
 
 pub const MIN_DEFERRED_PEER_VERSION: &str = "0.4.0";
 pub const MAX_ORIGINS_PER_REQUEST_FRAME: usize = 64;
+pub const FEED_ORIGIN_UNBOUND_REMEDY: &str = "the peer sent entries for another member's origin; v1 pins feed origin to the authenticated link peer — relay is deferred until entries are signed end-to-end";
 
 pub fn peer_supports_deferred(peer_version: Option<&str>) -> bool {
     peer_version.is_some_and(|version| {
@@ -369,6 +370,32 @@ pub(crate) fn log_deferral_received(
             "action": "deferral_received",
             "code": code,
             "retry_after_secs": retry_after_secs,
+        });
+        if let Ok(mut bytes) = serde_json::to_vec(&line) {
+            bytes.push(b'\n');
+            let _ = std::io::Write::write_all(&mut file, &bytes);
+        }
+    }
+}
+
+pub(crate) fn log_origin_unbound(
+    home: &A2aHome,
+    peer_gateway_id: &str,
+    frame_origin: &str,
+) {
+    let dir = home.root().join("mesh").join("gateway");
+    if create_dir_0700(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = crate::exec::open_append_0600(&dir.join(super::GATEWAY_JSONL)) {
+        let line = json!({
+            "ts": Utc::now(),
+            "kind": "feed",
+            "action": "origin_unbound_refused",
+            "code": "FEED_ORIGIN_UNBOUND",
+            "frame_origin": frame_origin,
+            "peer_gateway_id": peer_gateway_id,
+            "remedy": FEED_ORIGIN_UNBOUND_REMEDY,
         });
         if let Ok(mut bytes) = serde_json::to_vec(&line) {
             bytes.push(b'\n');

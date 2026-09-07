@@ -16,12 +16,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Mutex as StdMutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex as StdMutex,
+};
 
 const CURSORS_FILE: &str = "cursors.json";
 static CURSOR_PERSIST_LOCK: StdMutex<()> = StdMutex::new(());
+static FEED_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_WANT_ENTRY_CAP: usize = 128;
 pub const DEFAULT_REORDER_BUFFER_CAP: usize = 1024;
+pub const DEFAULT_REORDER_TOTAL_CAP: usize = 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginCursor {
@@ -40,6 +45,8 @@ struct CursorFile {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CursorStore {
     origins: BTreeMap<String, OriginCursor>,
+    seqs: BTreeMap<String, BTreeSet<u64>>,
+    seqs_loaded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +119,8 @@ pub struct MeteredFeedReceiveReport {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedReorderBuffers {
     cap_per_origin: usize,
+    total_cap: usize,
+    max_origins: usize,
     origins: BTreeMap<String, BTreeMap<u64, FeedEntry>>,
 }
 
@@ -164,6 +173,8 @@ impl CursorStore {
                 let file: CursorFile = serde_json::from_slice(&bytes).map_err(data_err)?;
                 Ok(CursorStore {
                     origins: file.origins,
+                    seqs: BTreeMap::new(),
+                    seqs_loaded: false,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -178,6 +189,8 @@ impl CursorStore {
             Ok(bytes) => match serde_json::from_slice::<CursorFile>(&bytes) {
                 Ok(file) => CursorStore {
                     origins: file.origins,
+                    seqs: BTreeMap::new(),
+                    seqs_loaded: false,
                 },
                 Err(_) => return Ok(Self::from_scan(scanned)),
             },
@@ -195,34 +208,42 @@ impl CursorStore {
                 cursor.last_seq = prefix;
             }
         }
-        for (origin, seqs) in scanned {
-            store.origins.entry(origin).or_insert_with(|| OriginCursor {
-                last_seq: contiguous_prefix(&seqs, 0),
-                compacted_before_seq: 0,
-            });
+        for (origin, seqs) in &scanned {
+            store
+                .origins
+                .entry(origin.clone())
+                .or_insert_with(|| OriginCursor {
+                    last_seq: contiguous_prefix(seqs, 0),
+                    compacted_before_seq: 0,
+                });
         }
         for cursor in store.origins.values_mut() {
             cursor.last_seq = cursor
                 .last_seq
                 .max(cursor.compacted_before_seq.saturating_sub(1));
         }
+        store.seqs = scanned;
+        store.seqs_loaded = true;
         Ok(store)
     }
 
     fn from_scan(scanned: BTreeMap<String, BTreeSet<u64>>) -> Self {
+        let origins = scanned
+            .iter()
+            .map(|(origin, seqs)| {
+                (
+                    origin.clone(),
+                    OriginCursor {
+                        last_seq: contiguous_prefix(seqs, 0),
+                        compacted_before_seq: 0,
+                    },
+                )
+            })
+            .collect();
         CursorStore {
-            origins: scanned
-                .into_iter()
-                .map(|(origin, seqs)| {
-                    (
-                        origin,
-                        OriginCursor {
-                            last_seq: contiguous_prefix(&seqs, 0),
-                            compacted_before_seq: 0,
-                        },
-                    )
-                })
-                .collect(),
+            origins,
+            seqs: scanned,
+            seqs_loaded: true,
         }
     }
 
@@ -254,6 +275,8 @@ impl CursorStore {
                 let file: CursorFile = serde_json::from_slice(&bytes).map_err(data_err)?;
                 CursorStore {
                     origins: file.origins,
+                    seqs: BTreeMap::new(),
+                    seqs_loaded: false,
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => CursorStore::default(),
@@ -274,6 +297,8 @@ impl CursorStore {
 
     pub(crate) fn retain_origins(&mut self, owned_origins: &[String]) {
         self.origins
+            .retain(|origin, _| owned_origins.iter().any(|owned| owned == origin));
+        self.seqs
             .retain(|origin, _| owned_origins.iter().any(|owned| owned == origin));
     }
 
@@ -302,7 +327,30 @@ impl CursorStore {
     }
 
     pub fn drop_origin(&mut self, origin: &str) -> bool {
+        self.seqs.remove(origin);
         self.origins.remove(origin).is_some()
+    }
+
+    pub fn seqs_for(
+        &mut self,
+        home: &A2aHome,
+        origin: &str,
+    ) -> Result<&BTreeSet<u64>, AppError> {
+        // load_or_rebuild already pays for one full scan, so retaining that set is free there.
+        // Lazy caching also keeps ingest O(1) across 128-entry want-reply frames; hoisting only
+        // per batch would still rescan the entire feed for every catch-up frame.
+        if !self.seqs_loaded {
+            self.seqs = scan_origin_sequences(home)?;
+            self.seqs_loaded = true;
+        }
+        Ok(self.seqs.entry(origin.to_string()).or_default())
+    }
+
+    pub fn note_appended(&mut self, origin: &str, origin_seq: u64) {
+        self.seqs
+            .entry(origin.to_string())
+            .or_default()
+            .insert(origin_seq);
     }
 
     fn set_last_seq(&mut self, origin: impl Into<String>, origin_seq: u64) {
@@ -333,12 +381,24 @@ impl CursorStore {
         let cursor = self.origins.entry(origin.into()).or_default();
         cursor.compacted_before_seq = cursor.compacted_before_seq.max(seq);
     }
+
+    fn prune_seqs_before(&mut self, origin: &str, compacted_before: u64) {
+        if let Some(seqs) = self.seqs.get_mut(origin) {
+            seqs.retain(|origin_seq| *origin_seq >= compacted_before);
+        }
+    }
 }
 
 impl FeedReorderBuffers {
     pub fn new(cap_per_origin: usize) -> Self {
+        Self::new_with_total(cap_per_origin, cap_per_origin, 1)
+    }
+
+    pub fn new_with_total(cap_per_origin: usize, total_cap: usize, max_origins: usize) -> Self {
         Self {
             cap_per_origin,
+            total_cap,
+            max_origins,
             origins: BTreeMap::new(),
         }
     }
@@ -349,12 +409,27 @@ impl FeedReorderBuffers {
         origin_seq: u64,
         entry: FeedEntry,
     ) -> (bool, Option<ReorderEviction>) {
-        let pending = self.origins.entry(origin.to_string()).or_default();
-        if pending.contains_key(&origin_seq) {
+        if self
+            .origins
+            .get(origin)
+            .is_some_and(|pending| pending.contains_key(&origin_seq))
+        {
             return (false, None);
         }
+        if !self.origins.contains_key(origin) && self.origins.len() >= self.max_origins {
+            return (
+                false,
+                Some(ReorderEviction {
+                    origin: origin.to_string(),
+                    origin_seq,
+                }),
+            );
+        }
+
+        let total_before = self.origins.values().map(BTreeMap::len).sum::<usize>();
+        let pending = self.origins.entry(origin.to_string()).or_default();
         pending.insert(origin_seq, entry);
-        if pending.len() <= self.cap_per_origin {
+        if pending.len() <= self.cap_per_origin && total_before < self.total_cap {
             return (true, None);
         }
         let evicted_seq = pending
@@ -363,8 +438,12 @@ impl FeedReorderBuffers {
             .copied()
             .expect("pending is non-empty");
         pending.remove(&evicted_seq);
+        let remove_origin = pending.is_empty();
+        if remove_origin {
+            self.origins.remove(origin);
+        }
         (
-            true,
+            false,
             Some(ReorderEviction {
                 origin: origin.to_string(),
                 origin_seq: evicted_seq,
@@ -384,7 +463,11 @@ impl FeedReorderBuffers {
 
 impl Default for FeedReorderBuffers {
     fn default() -> Self {
-        Self::new(DEFAULT_REORDER_BUFFER_CAP)
+        Self::new_with_total(
+            DEFAULT_REORDER_BUFFER_CAP,
+            DEFAULT_REORDER_TOTAL_CAP,
+            1,
+        )
     }
 }
 
@@ -534,10 +617,13 @@ fn append_remote_entry_with_prepared_work(
             from_seq: compacted_before,
         });
     }
-    let mut scanned = scan_origin_sequences(home)?;
-    let present = scanned.entry(frame_origin.to_string()).or_default();
-    if present.contains(&origin_seq) {
-        let prefix = contiguous_prefix(present, compacted_before);
+    let duplicate_prefix = {
+        let present = cursors.seqs_for(home, frame_origin)?;
+        present
+            .contains(&origin_seq)
+            .then(|| contiguous_prefix(present, compacted_before))
+    };
+    if let Some(prefix) = duplicate_prefix {
         cursors.set_last_seq(frame_origin, prefix);
         return Ok(IngestDecision::Duplicate);
     }
@@ -567,8 +653,8 @@ fn append_remote_entry_with_prepared_work(
     entry.origin = Some(frame_origin.to_string());
     entry.origin_seq = Some(origin_seq);
     let local_seq = feed::append_entry(home, cfg, entry)?;
-    present.insert(origin_seq);
-    let prefix = contiguous_prefix(present, compacted_before);
+    cursors.note_appended(frame_origin, origin_seq);
+    let prefix = contiguous_prefix(cursors.seqs_for(home, frame_origin)?, compacted_before);
     if origin_seq <= previous.saturating_add(1) {
         cursors.set_last_seq(frame_origin, previous.max(origin_seq).max(prefix));
     } else {
@@ -938,6 +1024,7 @@ pub fn compact_feed(
 
     for (origin, seq) in &compacted_before {
         cursors.raise_compacted_before_seq(origin.clone(), *seq);
+        cursors.prune_seqs_before(origin, *seq);
     }
     if removed > 0 {
         if max_kept_seq < max_seq {
@@ -1027,7 +1114,7 @@ where
 
 fn entry_reaches_append(
     home: &A2aHome,
-    cursors: &CursorStore,
+    cursors: &mut CursorStore,
     frame_origin: &str,
     entry: &FeedEntry,
 ) -> Result<bool, AppError> {
@@ -1038,9 +1125,7 @@ fn entry_reaches_append(
     if origin_seq < cursors.compacted_before_seq(frame_origin) {
         return Ok(false);
     }
-    Ok(!scan_origin_sequences(home)?
-        .get(frame_origin)
-        .is_some_and(|present| present.contains(&origin_seq)))
+    Ok(!cursors.seqs_for(home, frame_origin)?.contains(&origin_seq))
 }
 
 fn drain_contiguous_buffer(
@@ -1127,6 +1212,7 @@ fn log_feed_ingest_refused(
 }
 
 fn scan_origin_sequences(home: &A2aHome) -> Result<BTreeMap<String, BTreeSet<u64>>, AppError> {
+    FEED_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
     let root = home.root().join("mesh");
     if !root.exists() {
         return Ok(BTreeMap::new());
@@ -1146,6 +1232,10 @@ fn scan_origin_sequences(home: &A2aHome) -> Result<BTreeMap<String, BTreeSet<u64
         }
     }
     Ok(out)
+}
+
+pub fn feed_scan_count() -> u64 {
+    FEED_SCAN_COUNT.load(Ordering::Relaxed)
 }
 
 fn contiguous_prefix(seqs: &BTreeSet<u64>, compacted_before: u64) -> u64 {

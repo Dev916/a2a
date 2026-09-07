@@ -23,6 +23,16 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+static FEED_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn serialize_feed_test() -> tokio::sync::MutexGuard<'static, ()> {
+    FEED_TEST_LOCK.blocking_lock()
+}
+
+async fn serialize_feed_test_async() -> tokio::sync::MutexGuard<'static, ()> {
+    FEED_TEST_LOCK.lock().await
+}
+
 fn home_at(path: &Path) -> A2aHome {
     A2aHome::resolve(Some(path)).unwrap()
 }
@@ -129,6 +139,10 @@ fn feed_json(home: &Path, work: &Path) -> Vec<Value> {
     serde_json::from_value(v["data"].clone()).unwrap()
 }
 
+fn gateway_jsonl(home: &A2aHome) -> String {
+    fs::read_to_string(home.root().join("mesh/gateway/gateway.jsonl")).unwrap_or_default()
+}
+
 fn entry(origin: &str, origin_seq: u64, text: &str) -> FeedEntry {
     FeedEntry {
         seq: origin_seq,
@@ -159,6 +173,7 @@ fn local_entry(text: &str) -> FeedEntry {
 
 #[test]
 fn feed_entries_are_layer1_compatible_and_render_canonical_origin_citations() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let work = tmp.path().join("work");
@@ -219,6 +234,7 @@ fn feed_entries_are_layer1_compatible_and_render_canonical_origin_citations() {
 
 #[tokio::test]
 async fn watcher_deltas_push_feed_through_live_session_and_peer_applies() {
+    let _serial = serialize_feed_test_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let home_a = home_at(&tmp.path().join("a"));
     let home_b = home_at(&tmp.path().join("b"));
@@ -253,7 +269,135 @@ async fn watcher_deltas_push_feed_through_live_session_and_peer_applies() {
 }
 
 #[tokio::test]
+async fn a_reconnecting_peer_with_a_300_entry_backlog_receives_every_entry() {
+    let _serial = serialize_feed_test_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    write_gateway_key(home_a.root(), "gw-a");
+    write_gateway_key(home_b.root(), "gw-b");
+    let cfg_a = cfg_for(&home_a);
+    let cfg_b = cfg_for(&home_b);
+    for seq in 1..=300u64 {
+        a2a::mesh::feed::append_entry(
+            &home_a,
+            &cfg_a,
+            local_entry(&format!("backlog entry {seq}")),
+        )
+        .unwrap();
+    }
+
+    let link = common::start_mesh_link(
+        home_a.clone(),
+        cfg_a.clone(),
+        "gw-a",
+        home_b.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        a2a::mesh::gateway::link::push_watcher_deltas(
+            &home_a,
+            &cfg_a,
+            "gw-a",
+            &link.a_state,
+        )
+        .await
+        .unwrap();
+        a2a::mesh::gateway::link::push_anti_entropy_digest(&home_a, &link.a_state)
+            .await
+            .unwrap();
+        let received = a2a::mesh::feed::read(&home_b, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.origin.as_deref() == Some("gw-a"))
+            .count();
+        if received == 300 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "receiver reached only {received} of 300 backlog entries"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    common::wait_until(|| feed_json(home_b.root(), tmp.path()).len() == 300).await;
+
+    let rows = feed_json(home_b.root(), tmp.path());
+    let origin_seqs = rows
+        .iter()
+        .filter(|row| row["origin"] == "gw-a")
+        .map(|row| row["origin_seq"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(origin_seqs, (1..=300u64).collect::<Vec<_>>());
+    assert_eq!(CursorStore::load_cached(&home_b).unwrap().last_seq("gw-a"), 300);
+    link.stop().await;
+}
+
+#[tokio::test]
+async fn spoofed_feed_origin_is_refused_and_never_touches_the_victims_cursor() {
+    let _serial = serialize_feed_test_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home_a = home_at(&tmp.path().join("a"));
+    let home_b = home_at(&tmp.path().join("b"));
+    write_gateway_key(home_a.root(), "gw-a");
+    write_gateway_key(home_b.root(), "gw-b");
+    let cfg_a = cfg_for(&home_a);
+    let cfg_b = cfg_for(&home_b);
+    let cursors_before = CursorStore::load_cached(&home_b)
+        .unwrap()
+        .starting_cursors();
+    let link = common::start_mesh_link(
+        home_a,
+        cfg_a,
+        "gw-a",
+        home_b.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+
+    assert!(
+        link.a_state
+            .send(
+                "gw-b",
+                Frame::Feed {
+                    origin: "gw-victim".to_string(),
+                    entries: vec![entry("gw-victim", 99, "spoof")],
+                },
+            )
+            .await
+    );
+    common::wait_until(|| gateway_jsonl(&home_b).contains("FEED_ORIGIN_UNBOUND")).await;
+
+    let cursors = CursorStore::load_cached(&home_b).unwrap();
+    assert_eq!(cursors.last_seq("gw-victim"), 0);
+    assert!(
+        !cursors.starting_cursors().contains_key("gw-victim"),
+        "no cursor is created for an unknown origin"
+    );
+    assert_eq!(
+        cursors.starting_cursors(),
+        cursors_before,
+        "a fabricated origin must not change the persisted origin keys"
+    );
+    assert!(
+        feed_json(home_b.root(), tmp.path())
+            .iter()
+            .all(|row| row["origin"] != "gw-victim")
+    );
+    let log = gateway_jsonl(&home_b);
+    assert!(log.contains("FEED_ORIGIN_UNBOUND"), "{log}");
+    assert!(log.contains("gw-victim"), "{log}");
+    assert!(log.contains("gw-a"), "{log}");
+    link.stop().await;
+}
+
+#[tokio::test]
 async fn anti_entropy_digest_over_session_repairs_frame_gap() {
+    let _serial = serialize_feed_test_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let home_a = home_at(&tmp.path().join("a"));
     let home_b = home_at(&tmp.path().join("b"));
@@ -283,6 +427,7 @@ async fn anti_entropy_digest_over_session_repairs_frame_gap() {
 
 #[test]
 fn remote_ingress_appends_before_advancing_and_rebuilds_or_repairs_cursors_by_scan() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_at(tmp.path());
     let cfg = cfg_for(&home);
@@ -334,6 +479,7 @@ fn remote_ingress_appends_before_advancing_and_rebuilds_or_repairs_cursors_by_sc
 
 #[test]
 fn feed_work_refs_materialize_pool_work_and_rejected_refs_advance_cursor() {
+    let _serial = serialize_feed_test();
     let (_tmp, _sender, receiver, env) = pool_work_fixture("01HZ7P7Q0V0V7G01J4J8R8M2Q4");
     let mut cfg = cfg_for(&receiver);
     let mut cursors = CursorStore::load_or_rebuild(&receiver).unwrap();
@@ -379,6 +525,7 @@ fn feed_work_refs_materialize_pool_work_and_rejected_refs_advance_cursor() {
 
 #[test]
 fn supervisor_cursor_advances_never_regress_and_compaction_watermarks_reject_old_replays() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_at(tmp.path());
     let cfg = cfg_for(&home);
@@ -410,6 +557,16 @@ fn supervisor_cursor_advances_never_regress_and_compaction_watermarks_reject_old
     .unwrap();
     assert_eq!(sweep.removed, 2);
     assert_eq!(cursors.compacted_before_seq("gw-origin"), 3);
+    assert_eq!(
+        cursors
+            .seqs_for(&home, "gw-origin")
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![3],
+        "the in-memory sequence index is pruned with the compacted feed"
+    );
     assert_eq!(a2a::mesh::feed::read(&home, 0).unwrap().len(), 1);
 
     let mut stale = CursorStore::load_or_rebuild(&home).unwrap();
@@ -433,6 +590,7 @@ fn supervisor_cursor_advances_never_regress_and_compaction_watermarks_reject_old
 
 #[test]
 fn loopback_feed_replication_pushes_local_deltas_with_attribution() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home_a = tmp.path().join("a");
     let home_b = tmp.path().join("b");
@@ -499,6 +657,7 @@ fn loopback_feed_replication_pushes_local_deltas_with_attribution() {
 
 #[test]
 fn want_catchup_buffers_gaps_and_streams_contiguous_ranges_oldest_first() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home_sender = home_at(&tmp.path().join("sender"));
     let home_receiver = home_at(&tmp.path().join("receiver"));
@@ -573,6 +732,7 @@ fn want_catchup_buffers_gaps_and_streams_contiguous_ranges_oldest_first() {
 
 #[test]
 fn reorder_buffer_cap_eviction_is_reported() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_at(tmp.path());
     let cfg = cfg_for(&home);
@@ -592,14 +752,98 @@ fn reorder_buffer_cap_eviction_is_reported() {
     )
     .unwrap();
     assert_eq!(report.accepted, 0);
-    assert_eq!(report.buffered, 2);
+    assert_eq!(report.buffered, 1);
     assert_eq!(report.evictions.len(), 1);
     assert_eq!(report.evictions[0].origin, "gw-origin");
     assert_eq!(report.evictions[0].origin_seq, 3);
 }
 
 #[test]
-fn transitive_relay_pushes_every_origin_verbatim_in_both_directions() {
+fn unknown_and_excess_reorder_entries_are_capped_per_link() {
+    let _serial = serialize_feed_test();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(tmp.path());
+    let cfg = cfg_for(&home);
+    let mut cursors = CursorStore::load_or_rebuild(&home).unwrap();
+    let mut reorder = FeedReorderBuffers::new_with_total(8, 8, 1);
+
+    let report = replicate::receive_feed_entries(
+        &home,
+        &cfg,
+        &mut cursors,
+        &mut reorder,
+        "gw-a",
+        (10..30)
+            .map(|seq| entry("gw-a", seq, "gap"))
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(report.buffered, 8);
+    assert_eq!(
+        report.evictions.len(),
+        12,
+        "the total cap evicts, it never grows"
+    );
+
+    let refused_origin = replicate::receive_feed_entries(
+        &home,
+        &cfg,
+        &mut cursors,
+        &mut reorder,
+        "gw-b",
+        vec![entry("gw-b", 10, "unknown origin gap")],
+    )
+    .unwrap();
+    assert_eq!(refused_origin.buffered, 0);
+    assert_eq!(refused_origin.evictions.len(), 1);
+    let gap_fill = replicate::receive_feed_entries(
+        &home,
+        &cfg,
+        &mut cursors,
+        &mut reorder,
+        "gw-b",
+        vec![entry("gw-b", 1, "first")],
+    )
+    .unwrap();
+    assert_eq!(gap_fill.accepted, 1);
+    assert_eq!(cursors.last_seq("gw-b"), 1, "no refused reorder slot exists");
+}
+
+#[test]
+fn feed_ingest_scans_the_feed_once_per_origin_not_once_per_entry() {
+    let _serial = serialize_feed_test();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(tmp.path());
+    let cfg = cfg_for(&home);
+    let mut cursors = CursorStore::load_cached(&home).unwrap();
+    let mut reorder = FeedReorderBuffers::default();
+    let before = replicate::feed_scan_count();
+
+    for chunk in (1..=300u64).collect::<Vec<_>>().chunks(128) {
+        replicate::receive_feed_entries(
+            &home,
+            &cfg,
+            &mut cursors,
+            &mut reorder,
+            "gw-a",
+            chunk
+                .iter()
+                .map(|seq| entry("gw-a", *seq, "e"))
+                .collect(),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(cursors.last_seq("gw-a"), 300);
+    assert!(
+        replicate::feed_scan_count() - before <= 1,
+        "300 entries must cost at most one full feed scan, not 300"
+    );
+}
+
+#[tokio::test]
+async fn loopback_replication_copies_every_origin_but_the_wire_refuses_relay() {
+    let _serial = serialize_feed_test_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let cfg = cfg_for(&home_at(tmp.path()));
     let home_a = home_at(&tmp.path().join("a"));
@@ -651,10 +895,63 @@ fn transitive_relay_pushes_every_origin_verbatim_in_both_directions() {
     assert!(c_rows
         .iter()
         .any(|row| row["origin"] == "gw-a" && row["origin_seq"] == 1));
+
+    let home_wire_c = home_at(&tmp.path().join("wire-c"));
+    write_gateway_key(home_b.root(), "gw-b");
+    write_gateway_key(home_wire_c.root(), "gw-c");
+    let cfg_b = cfg_for(&home_b);
+    let link = common::start_mesh_link(
+        home_b.clone(),
+        cfg_b.clone(),
+        "gw-b",
+        home_wire_c.clone(),
+        cfg_for(&home_wire_c),
+        "gw-c",
+    )
+    .await;
+    assert_eq!(
+        a2a::mesh::gateway::link::push_watcher_deltas(
+            &home_b,
+            &cfg_b,
+            "gw-b",
+            &link.a_state,
+        )
+        .await
+        .unwrap(),
+        0,
+        "the ordinary wire push does not relay a foreign origin"
+    );
+    let forwarded = a2a::mesh::feed::read(&home_b, 0)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.origin.as_deref() == Some("gw-a"))
+        .unwrap();
+    assert!(
+        link.a_state
+            .send(
+                "gw-c",
+                Frame::Feed {
+                    origin: "gw-a".to_string(),
+                    entries: vec![forwarded],
+                },
+            )
+            .await
+    );
+    common::wait_until(|| gateway_jsonl(&home_wire_c).contains("FEED_ORIGIN_UNBOUND")).await;
+    let wire_cursors = CursorStore::load_cached(&home_wire_c).unwrap();
+    assert_eq!(wire_cursors.last_seq("gw-a"), 0);
+    assert!(!wire_cursors.starting_cursors().contains_key("gw-a"));
+    assert!(
+        feed_json(home_wire_c.root(), tmp.path())
+            .iter()
+            .all(|row| row["origin"] != "gw-a")
+    );
+    link.stop().await;
 }
 
 #[test]
 fn anti_entropy_digest_repairs_mid_log_delete_and_updates_health_shape() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let cfg = cfg_for(&home_at(tmp.path()));
     let home_a = home_at(&tmp.path().join("a"));
@@ -708,6 +1005,7 @@ fn anti_entropy_digest_repairs_mid_log_delete_and_updates_health_shape() {
 
 #[tokio::test]
 async fn legacy_revoked_at_does_not_make_a_present_peer_look_missing() {
+    let _serial = serialize_feed_test_async().await;
     let tmp = tempfile::tempdir().unwrap();
     let registry = FileRegistry::new(tmp.path());
     registry.init_schema().unwrap();
@@ -769,6 +1067,7 @@ fn silently_delete_origin_seq(home: &A2aHome, origin: &str, origin_seq: u64) {
 
 #[test]
 fn local_posts_interleaved_with_replicated_entries_advertise_dense_origin_seqs() {
+    let _serial = serialize_feed_test();
     // Live-fleet regression (a2a-ch7): a replicated entry at feed seq 1 pushed
     // the first LOCAL post to feed seq 2; seq-based claiming advertised the
     // local origin at origin_seq 2, peers wanted from 1, and the contiguity
@@ -806,6 +1105,7 @@ fn local_posts_interleaved_with_replicated_entries_advertise_dense_origin_seqs()
 
 #[test]
 fn compaction_persists_dense_claims_so_numbering_survives_generation_drops() {
+    let _serial = serialize_feed_test();
     let tmp = tempfile::tempdir().unwrap();
     let home = home_at(&tmp.path().join("home"));
     let cfg = cfg_for(&home);
@@ -840,6 +1140,7 @@ fn compaction_persists_dense_claims_so_numbering_survives_generation_drops() {
 
 #[tokio::test]
 async fn rejected_work_refs_over_live_link_advance_cursor_and_session_survives() {
+    let _serial = serialize_feed_test_async().await;
     let (_tmp, _sender, receiver, _env) = pool_work_fixture("01HZ7P7Q0V0V7G01J4J8R8M2Q5");
     let home_a = home_at(&receiver.root().join("peer-a"));
     let home_b = receiver;

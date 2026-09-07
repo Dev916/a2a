@@ -818,6 +818,7 @@ fn inbound_mailboxes_apply_class_specific_capacity_backpressure_and_busy() {
     assert_eq!(present.last(), Some(&99));
 }
 
+/// Pins the standalone `OutboundQueue`; the live delivery path uses link channels and anti-entropy.
 #[test]
 fn outbound_queue_sheds_feed_and_presence_newest_with_rate_limited_visibility() {
     let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();

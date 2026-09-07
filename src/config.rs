@@ -80,6 +80,16 @@ pub const DEFAULT_MESH_GATEWAY_PING_SECS: u64 = 30;
 pub const DEFAULT_MESH_GATEWAY_ANTI_ENTROPY_SECS: u64 = 300;
 pub const DEFAULT_MESH_GATEWAY_FEED_RETAIN_DAYS: u64 = 30;
 pub const DEFAULT_MESH_GATEWAY_SHUTDOWN_GRACE_SECS: u64 = 10;
+pub const DEFAULT_MESH_LIMITS_NOTES_PER_MIN: u64 = 0;
+pub const DEFAULT_MESH_LIMITS_FEED_ENTRIES_PER_MIN: u64 = 0;
+pub const DEFAULT_MESH_LIMITS_FEED_BYTES_PER_MIN: u64 = 0;
+pub const DEFAULT_MESH_LIMITS_WORK_OFFERS_PER_HOUR: u64 = 0;
+pub const DEFAULT_MESH_LIMITS_WANTS_PER_MIN: u64 = 0;
+pub const DEFAULT_MESH_LIMITS_DIGESTS_PER_MIN: u64 = 0;
+pub const DEFAULT_MESH_LIMITS_MAX_UNAUTHENTICATED_SESSIONS: u64 = 32;
+pub const DEFAULT_MESH_LIMITS_HANDSHAKE_DEADLINE_SECS: u64 = 10;
+pub const DEFAULT_MESH_LIMITS_CONNECTS_PER_MIN_PER_SOURCE: u64 = 60;
+pub const DEFAULT_MESH_LIMITS_HANDSHAKES_PER_MIN_PER_PEER: u64 = 12;
 pub const DEFAULT_UPDATE_REPO_URL: &str = "git@github.com:Dev916/a2a.git";
 
 /// Every `[broker]` key, in the order `config show --origin` reports them.
@@ -220,6 +230,20 @@ pub const MESH_GATEWAY_FIELDS: [&str; 15] = [
     "row_resign_secs",
     "max_accepted_row_resign_secs",
     "rotation_soak_secs",
+];
+
+/// Every `[mesh.limits]` key, in the order `config show --origin` reports them.
+pub const MESH_LIMITS_FIELDS: [&str; 10] = [
+    "notes_per_min",
+    "feed_entries_per_min",
+    "feed_bytes_per_min",
+    "work_offers_per_hour",
+    "wants_per_min",
+    "digests_per_min",
+    "max_unauthenticated_sessions",
+    "handshake_deadline_secs",
+    "connects_per_min_per_source",
+    "handshakes_per_min_per_peer",
 ];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
@@ -552,6 +576,42 @@ impl Default for MeshGatewayConfig {
     }
 }
 
+/// The `[mesh.limits]` ingress bounds.
+///
+/// `0` means the bucket is OFF, not "deny"; §7 step 5 flips the six metered
+/// buckets to calibrated values after every member reports a version that
+/// understands `Frame::Deferred`.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
+pub struct MeshLimitsConfig {
+    pub notes_per_min: u64,
+    pub feed_entries_per_min: u64,
+    pub feed_bytes_per_min: u64,
+    pub work_offers_per_hour: u64,
+    pub wants_per_min: u64,
+    pub digests_per_min: u64,
+    pub max_unauthenticated_sessions: u64,
+    pub handshake_deadline_secs: u64,
+    pub connects_per_min_per_source: u64,
+    pub handshakes_per_min_per_peer: u64,
+}
+
+impl Default for MeshLimitsConfig {
+    fn default() -> Self {
+        Self {
+            notes_per_min: DEFAULT_MESH_LIMITS_NOTES_PER_MIN,
+            feed_entries_per_min: DEFAULT_MESH_LIMITS_FEED_ENTRIES_PER_MIN,
+            feed_bytes_per_min: DEFAULT_MESH_LIMITS_FEED_BYTES_PER_MIN,
+            work_offers_per_hour: DEFAULT_MESH_LIMITS_WORK_OFFERS_PER_HOUR,
+            wants_per_min: DEFAULT_MESH_LIMITS_WANTS_PER_MIN,
+            digests_per_min: DEFAULT_MESH_LIMITS_DIGESTS_PER_MIN,
+            max_unauthenticated_sessions: DEFAULT_MESH_LIMITS_MAX_UNAUTHENTICATED_SESSIONS,
+            handshake_deadline_secs: DEFAULT_MESH_LIMITS_HANDSHAKE_DEADLINE_SECS,
+            connects_per_min_per_source: DEFAULT_MESH_LIMITS_CONNECTS_PER_MIN_PER_SOURCE,
+            handshakes_per_min_per_peer: DEFAULT_MESH_LIMITS_HANDSHAKES_PER_MIN_PER_PEER,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct MeshWorkConfig {
     pub ttl_days: u64,
@@ -594,6 +654,7 @@ pub struct MeshConfig {
     pub gc_after_days: u64,
     pub work: MeshWorkConfig,
     pub gateway: MeshGatewayConfig,
+    pub limits: MeshLimitsConfig,
 }
 
 impl Default for MeshConfig {
@@ -604,6 +665,7 @@ impl Default for MeshConfig {
             gc_after_days: DEFAULT_GC_AFTER_DAYS,
             work: MeshWorkConfig::default(),
             gateway: MeshGatewayConfig::default(),
+            limits: MeshLimitsConfig::default(),
         }
     }
 }
@@ -763,6 +825,9 @@ pub fn load(home: &A2aHome) -> Result<(Config, Origins, Vec<String>), AppError> 
     }
     for field in MESH_GATEWAY_FIELDS {
         origins.insert(format!("mesh.gateway.{field}"), Origin::Default);
+    }
+    for field in MESH_LIMITS_FIELDS {
+        origins.insert(format!("mesh.limits.{field}"), Origin::Default);
     }
 
     let mut lanes = BTreeMap::new();
@@ -1092,6 +1157,10 @@ fn apply_mesh_file(
             apply_mesh_gateway_file(cfg, origins, warnings, v)?;
             continue;
         }
+        if field == "limits" {
+            apply_mesh_limits_file(cfg, origins, warnings, v)?;
+            continue;
+        }
         if field == "work" {
             apply_mesh_work_file(cfg, origins, warnings, v)?;
             continue;
@@ -1152,6 +1221,31 @@ fn apply_mesh_gateway_file(
             continue;
         }
         apply_mesh_gateway_toml(&mut cfg.mesh.gateway, &dotted, field, v)?;
+        origins.insert(dotted, Origin::File);
+    }
+    Ok(())
+}
+
+/// `[mesh.limits]` — pre-auth, session, and metered ingest bounds.
+fn apply_mesh_limits_file(
+    cfg: &mut Config,
+    origins: &mut Origins,
+    warnings: &mut Vec<String>,
+    value: &toml::Value,
+) -> Result<(), AppError> {
+    let fields = value.as_table().ok_or_else(|| {
+        cfg_err(format!(
+            "mesh.limits: expected a table, got {}",
+            value.type_str()
+        ))
+    })?;
+    for (field, v) in fields {
+        let dotted = format!("mesh.limits.{field}");
+        if !MESH_LIMITS_FIELDS.contains(&field.as_str()) {
+            warnings.push(format!("unknown config key: {dotted}"));
+            continue;
+        }
+        apply_mesh_limits_toml(&mut cfg.mesh.limits, &dotted, field, v)?;
         origins.insert(dotted, Origin::File);
     }
     Ok(())
@@ -1389,6 +1483,34 @@ fn apply_mesh_gateway_toml(
     Ok(())
 }
 
+fn apply_mesh_limits_toml(
+    limits: &mut MeshLimitsConfig,
+    dotted: &str,
+    field: &str,
+    v: &toml::Value,
+) -> Result<(), AppError> {
+    match field {
+        "notes_per_min" => limits.notes_per_min = want_u64(dotted, v)?,
+        "feed_entries_per_min" => limits.feed_entries_per_min = want_u64(dotted, v)?,
+        "feed_bytes_per_min" => limits.feed_bytes_per_min = want_u64(dotted, v)?,
+        "work_offers_per_hour" => limits.work_offers_per_hour = want_u64(dotted, v)?,
+        "wants_per_min" => limits.wants_per_min = want_u64(dotted, v)?,
+        "digests_per_min" => limits.digests_per_min = want_u64(dotted, v)?,
+        "max_unauthenticated_sessions" => {
+            limits.max_unauthenticated_sessions = want_u64(dotted, v)?
+        }
+        "handshake_deadline_secs" => limits.handshake_deadline_secs = want_u64(dotted, v)?,
+        "connects_per_min_per_source" => {
+            limits.connects_per_min_per_source = want_u64(dotted, v)?
+        }
+        "handshakes_per_min_per_peer" => {
+            limits.handshakes_per_min_per_peer = want_u64(dotted, v)?
+        }
+        _ => unreachable!("field membership checked by caller"),
+    }
+    Ok(())
+}
+
 fn apply_lane_toml(
     lc: &mut LaneConfig,
     dotted: &str,
@@ -1463,6 +1585,11 @@ pub fn mesh_work_env_key(field: &str) -> String {
 /// `A2A_MESH_GATEWAY_<FIELD>` — one `[mesh.gateway]` key.
 pub fn mesh_gateway_env_key(field: &str) -> String {
     format!("A2A_MESH_GATEWAY_{}", field.to_ascii_uppercase())
+}
+
+/// `A2A_MESH_LIMITS_<FIELD>` — one `[mesh.limits]` key.
+pub fn mesh_limits_env_key(field: &str) -> String {
+    format!("A2A_MESH_LIMITS_{}", field.to_ascii_uppercase())
 }
 
 /// `A2A_LANES_<LANE>_<FIELD>` (upper-cased) plus top-level `A2A_ALLOWED_ROOTS`
@@ -1645,6 +1772,15 @@ fn apply_env(cfg: &mut Config, origins: &mut Origins) -> Result<(), AppError> {
         apply_mesh_gateway_str(&mut cfg.mesh.gateway, &key, field, raw.trim())?;
         origins.insert(format!("mesh.gateway.{field}"), Origin::Env);
     }
+    for field in MESH_LIMITS_FIELDS {
+        let key = mesh_limits_env_key(field);
+        let Some(raw) = std::env::var_os(&key) else {
+            continue;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        apply_mesh_limits_str(&mut cfg.mesh.limits, &key, field, raw.trim())?;
+        origins.insert(format!("mesh.limits.{field}"), Origin::Env);
+    }
     Ok(())
 }
 
@@ -1750,6 +1886,29 @@ fn apply_mesh_gateway_str(
         }
         "rotation_soak_secs" => gw.rotation_soak_secs = parse_u64_str(key, s)?,
         _ => unreachable!("field membership fixed by MESH_GATEWAY_FIELDS"),
+    }
+    Ok(())
+}
+
+fn apply_mesh_limits_str(
+    limits: &mut MeshLimitsConfig,
+    key: &str,
+    field: &str,
+    s: &str,
+) -> Result<(), AppError> {
+    let value = parse_u64_str(key, s)?;
+    match field {
+        "notes_per_min" => limits.notes_per_min = value,
+        "feed_entries_per_min" => limits.feed_entries_per_min = value,
+        "feed_bytes_per_min" => limits.feed_bytes_per_min = value,
+        "work_offers_per_hour" => limits.work_offers_per_hour = value,
+        "wants_per_min" => limits.wants_per_min = value,
+        "digests_per_min" => limits.digests_per_min = value,
+        "max_unauthenticated_sessions" => limits.max_unauthenticated_sessions = value,
+        "handshake_deadline_secs" => limits.handshake_deadline_secs = value,
+        "connects_per_min_per_source" => limits.connects_per_min_per_source = value,
+        "handshakes_per_min_per_peer" => limits.handshakes_per_min_per_peer = value,
+        _ => unreachable!("field membership fixed by MESH_LIMITS_FIELDS"),
     }
     Ok(())
 }

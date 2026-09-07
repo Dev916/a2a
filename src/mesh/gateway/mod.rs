@@ -226,6 +226,8 @@ pub struct GatewayHealth {
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
     pub replication: replicate::ReplicationHealth,
     #[serde(default)]
+    pub limits: BTreeMap<String, limits::PeerLimitHealth>,
+    #[serde(default)]
     pub links: Vec<link::LinkHealth>,
     pub escalation: Option<Value>,
     pub shutdown: Option<Value>,
@@ -261,6 +263,7 @@ impl GatewayHealth {
                 .map(|slot| (slot, LoopHealth::new(slot)))
                 .collect(),
             replication: replicate::ReplicationHealth::default(),
+            limits: BTreeMap::new(),
             links: Vec::new(),
             escalation: None,
             shutdown: None,
@@ -373,6 +376,7 @@ enum LoopEvent {
     RegistryError(RegistryErrorReport),
     RowSelfTamper { gateway_id: String, verdict: String },
     Replication(replicate::ReplicationHealth),
+    Limits(BTreeMap<String, limits::PeerLimitHealth>),
     Link(link::LinkHealthEvent),
     HandshakeResult {
         peer: String,
@@ -1224,6 +1228,11 @@ async fn supervise(
                         write_health(&root, &mut health).await?;
                         last_health_flush = Instant::now();
                     }
+                    LoopEvent::Limits(limits) => {
+                        health.limits = limits;
+                        write_health(&root, &mut health).await?;
+                        last_health_flush = Instant::now();
+                    }
                     LoopEvent::Link(event) => {
                         apply_link_health_event(&mut health, event);
                         write_health(&root, &mut health).await?;
@@ -1867,6 +1876,10 @@ where
                         health.replication = replication;
                         write_health(root, &mut health).await?;
                     }
+                    LoopEvent::Limits(limits) => {
+                        health.limits = limits;
+                        write_health(root, &mut health).await?;
+                    }
                     LoopEvent::Link(event) => {
                         apply_link_health_event(&mut health, event);
                         write_health(root, &mut health).await?;
@@ -1913,6 +1926,9 @@ async fn server_loop(
     let tls = load_tls_identity(&cfg.home)?;
     let identity = load_handshake_identity(&cfg.home)?;
     let roots = keys::RootSet::load(&cfg.home)?;
+    let pre_auth_gate = Arc::new(tokio::sync::Mutex::new(limits::PreAuthGate::new(
+        &cfg.config.mesh.limits,
+    )));
     let mut sessions = JoinSet::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
@@ -1941,6 +1957,31 @@ async fn server_loop(
                     ExitCode::BrokerUnavailable,
                     format!("accepting gateway link: {e}"),
                 ))?;
+                let source = addr.ip();
+                let admission = pre_auth_gate.lock().await.admit(source, Utc::now());
+                if admission != limits::PreAuthAdmission::Admitted {
+                    let reason = match admission {
+                        limits::PreAuthAdmission::TooManyUnauthenticated => {
+                            "too many live unauthenticated sessions"
+                        }
+                        limits::PreAuthAdmission::SourceRateLimited => {
+                            "source connection rate exceeded"
+                        }
+                        limits::PreAuthAdmission::Admitted => unreachable!(),
+                    };
+                    limits::log_limit_refusal(
+                        &cfg.home,
+                        &source.to_string(),
+                        "PREAUTH_LIMIT",
+                        reason,
+                    );
+                    drop(stream);
+                    let _ = tx.try_send(LoopEvent::SessionEnd {
+                        slot,
+                        detail: format!("PREAUTH_LIMIT: {source}: {reason}"),
+                    });
+                    continue;
+                }
                 let tls = tls.clone();
                 let identity = identity.clone();
                 let roots = roots.clone();
@@ -1952,20 +1993,25 @@ async fn server_loop(
                 let child = token.child_token();
                 let session_events = tx.clone();
                 let peer_hint = addr.ip().to_string();
+                let gate = Arc::clone(&pre_auth_gate);
+                let handshake_deadline = Duration::from_secs(
+                    cfg.config.mesh.limits.handshake_deadline_secs.max(1),
+                );
                 sessions.spawn(async move {
-                    let handshake = async {
-                        let mut side = link::accept_once_io(stream, tls).await?;
-                        let peer = crate::mesh::wire::handshake_acceptor(
-                            &mut side,
-                            &identity,
-                            &roots,
-                            &SystemClock,
-                        )
-                        .await?;
-                        ensure_peer_not_revoked(&params_home, &peer)?;
-                        Ok::<_, AppError>((side, peer))
-                    }
+                    let handshake = link::accept_and_handshake(
+                        stream,
+                        tls,
+                        identity,
+                        roots,
+                        &SystemClock,
+                        handshake_deadline,
+                    )
                     .await;
+                    gate.lock().await.release(source);
+                    let handshake = handshake.and_then(|(side, peer)| {
+                        ensure_peer_not_revoked(&params_home, &peer)?;
+                        Ok((side, peer))
+                    });
                     let (side, peer) = match handshake {
                         Ok(established) => established,
                         Err(error) => return (peer_hint, false, Err(error)),
@@ -2378,6 +2424,7 @@ async fn anti_entropy_loop(
                     &mut cursors,
                 )?;
                 tx.send(LoopEvent::Replication(cfg.links.health().await)).await.ok();
+                tx.send(LoopEvent::Limits(cfg.links.limits_health().await)).await.ok();
             }
         }
     }

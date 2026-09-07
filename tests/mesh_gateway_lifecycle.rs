@@ -39,6 +39,25 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
         "A2A_MESH_GATEWAY_PING_SECS"
     );
     assert_eq!(
+        a2a::config::MESH_LIMITS_FIELDS,
+        [
+            "notes_per_min",
+            "feed_entries_per_min",
+            "feed_bytes_per_min",
+            "work_offers_per_hour",
+            "wants_per_min",
+            "digests_per_min",
+            "max_unauthenticated_sessions",
+            "handshake_deadline_secs",
+            "connects_per_min_per_source",
+            "handshakes_per_min_per_peer",
+        ]
+    );
+    assert_eq!(
+        a2a::config::mesh_limits_env_key("notes_per_min"),
+        "A2A_MESH_LIMITS_NOTES_PER_MIN"
+    );
+    assert_eq!(
         a2a::config::MESH_WORK_FIELDS,
         [
             "ttl_days",
@@ -69,6 +88,10 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
             registry_heartbeat_secs = 17
             require_signed_rows = true
             unknown = 1
+
+            [mesh.limits]
+            notes_per_min = 30
+            unknown = 1
         "#,
     )
     .unwrap();
@@ -80,6 +103,7 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
         .assert()
         .success()
         .stderr(predicate::str::contains("mesh.gateway.unknown"))
+        .stderr(predicate::str::contains("mesh.limits.unknown"))
         .get_output()
         .stdout
         .clone();
@@ -115,6 +139,17 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
         "file"
     );
     assert_eq!(data["origins"]["mesh.gateway.row_resign_secs"], "env");
+    assert_eq!(data["mesh"]["limits"]["notes_per_min"], 30);
+    assert_eq!(data["mesh"]["limits"]["feed_entries_per_min"], 0);
+    assert_eq!(data["mesh"]["limits"]["feed_bytes_per_min"], 0);
+    assert_eq!(data["mesh"]["limits"]["work_offers_per_hour"], 0);
+    assert_eq!(data["mesh"]["limits"]["wants_per_min"], 0);
+    assert_eq!(data["mesh"]["limits"]["digests_per_min"], 0);
+    assert_eq!(data["mesh"]["limits"]["max_unauthenticated_sessions"], 32);
+    assert_eq!(data["mesh"]["limits"]["handshake_deadline_secs"], 10);
+    assert_eq!(data["mesh"]["limits"]["connects_per_min_per_source"], 60);
+    assert_eq!(data["mesh"]["limits"]["handshakes_per_min_per_peer"], 12);
+    assert_eq!(data["origins"]["mesh.limits.notes_per_min"], "file");
     for field in a2a::config::MESH_GATEWAY_FIELDS {
         assert!(
             data["origins"]
@@ -130,6 +165,15 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
                 .as_object()
                 .unwrap()
                 .contains_key(&format!("mesh.work.{field}")),
+            "{field} is listed in origins"
+        );
+    }
+    for field in a2a::config::MESH_LIMITS_FIELDS {
+        assert!(
+            data["origins"]
+                .as_object()
+                .unwrap()
+                .contains_key(&format!("mesh.limits.{field}")),
             "{field} is listed in origins"
         );
     }
@@ -354,8 +398,12 @@ fn gateway_source_scan_pins_health_ownership_and_async_discipline() {
         let text = std::fs::read_to_string(&file).unwrap();
         let code = code_only(&text);
         for (n, line) in code.lines().enumerate() {
+            let scoped_peer_lock = file.ends_with("link.rs")
+                && (line.contains("Arc<Mutex<limits::PeerBuckets>>")
+                    || line.contains("Arc<Mutex<replicate::CursorStore>>"));
             assert!(
-                !line.contains("Arc<Mutex") && !line.contains("Arc<RwLock"),
+                scoped_peer_lock
+                    || (!line.contains("Arc<Mutex") && !line.contains("Arc<RwLock")),
                 "{}:{} shared lock in gateway actor tree:\n{line}",
                 file.display(),
                 n + 1

@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
 
 pub const WORK_OFFER_KIND: &str = "work_offer";
 pub const WORK_RESULT_KIND: &str = "work_result";
 pub const WORK_CANCELLED_KIND: &str = "work_cancelled";
 pub const WORK_HELD_KIND: &str = "work_held";
+pub const MAX_POOL_OFFERS: usize = 512;
+static POOL_STORE_LOCK: StdMutex<()> = StdMutex::new(());
 
 const RESERVED_WORK_IDS: [&str; 4] = ["inbox", "pool", "acked", "terminal"];
 
@@ -67,10 +70,48 @@ pub fn store_offer(
     verified: VerifiedEnvelope,
     source: WorkSource,
 ) -> Result<PathBuf, AppError> {
+    let _pool_guard = if source == WorkSource::Pool {
+        Some(POOL_STORE_LOCK.lock().map_err(|_| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                "pool work-store lock is poisoned",
+            )
+        })?)
+    } else {
+        None
+    };
     let work_id = verified.envelope.work_id.clone();
     let path = path_for(home, source, &work_id);
     if let Some(parent) = path.parent() {
         create_dir_0700(parent).map_err(|e| io_err("creating work store", e))?;
+        if source == WorkSource::Pool && !path.exists() {
+            let mut count = 0usize;
+            for entry in
+                fs::read_dir(parent).map_err(|e| io_err("reading pool work store", e))?
+            {
+                let entry = entry.map_err(|e| io_err("reading pool work store", e))?;
+                if entry
+                    .file_type()
+                    .map_err(|e| io_err("reading pool work store", e))?
+                    .is_file()
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                {
+                    count = count.saturating_add(1);
+                    if count == MAX_POOL_OFFERS {
+                        break;
+                    }
+                }
+            }
+            if count >= MAX_POOL_OFFERS {
+                return Err(AppError::new(
+                    "WORK_POOL_FULL",
+                    ExitCode::Precondition,
+                    format!("pool work store already contains {MAX_POOL_OFFERS} offers"),
+                )
+                .remedy("approve, decline, or expire a pool offer before accepting another"));
+            }
+        }
     }
     let stored = StoredWorkFile {
         work_id,

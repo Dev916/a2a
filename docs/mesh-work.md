@@ -178,6 +178,9 @@ set is empty.
 | Code | Meaning | Remedy |
 |---|---|---|
 | `RATE_LIMITED` | The peer is over an ingest limit. | Nothing to do — the note stays spooled and retries with backoff; check `a2a mesh gateway status --json` for their limit counters if it persists. |
+| `SESSION_LIMIT` | An authenticated peer already has a session in that direction, or exceeded its handshake rate. | Keep the incumbent link, close surplus clients, and retry after the one-minute handshake window. |
+| `PREAUTH_LIMIT` | A source exceeded the pre-auth connection bounds or did not finish its handshake before the deadline. | Verify the peer can complete TLS and mesh authentication, then retry after the source window clears. |
+| `WORK_POOL_FULL` | The local pool already holds 512 work offers. | Approve, decline, or expire a pool offer before accepting another. |
 | `WORK_PEER_ROW_INVALID` | The target gateway row's flag-resolved disposition refuses directed work. | Capture the row for evidence first with `a2a mesh fleet ls --json`; do not ask the peer to restart or republish. |
 | `WORK_SENDER_ROW_INVALID` | The sender's cached row is absent, refused, revoked, or its verified key binding differs from the work envelope. | Capture the sender row with `a2a mesh fleet ls --json`; approve only after its disposition and verified key binding are usable. |
 | `WORK_PEER_TOO_OLD` | Target gateway has no version or records a version below 0.3.0. | Ask the operator to upgrade and restart the gateway; the registry version refreshes on restart. |

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -362,6 +362,43 @@ where
     accept_pinned_io(stream, tls).await
 }
 
+pub async fn accept_and_handshake<S>(
+    stream: S,
+    tls: TlsIdentity,
+    identity: crate::mesh::wire::HandshakeIdentity,
+    roots: crate::mesh::keys::RootSet,
+    clock: &dyn crate::mesh::keys::Clock,
+    deadline: Duration,
+) -> Result<
+    (
+        Side<tokio_rustls::server::TlsStream<S>>,
+        crate::mesh::keys::TokenClaims,
+    ),
+    AppError,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let handshake = async move {
+        let mut side = accept_once_io(stream, tls).await?;
+        let peer = crate::mesh::wire::handshake_acceptor(&mut side, &identity, &roots, clock).await?;
+        Ok::<_, AppError>((side, peer))
+    };
+    tokio::time::timeout(deadline, handshake)
+        .await
+        .map_err(|_| {
+            AppError::new(
+                "PREAUTH_LIMIT",
+                ExitCode::Precondition,
+                format!(
+                    "inbound gateway handshake did not finish within {}ms",
+                    deadline.as_millis()
+                ),
+            )
+            .remedy("retry after the peer can complete TLS and mesh authentication promptly")
+        })?
+}
+
 pub async fn accept_loop(
     listener: TcpListener,
     tls: TlsIdentity,
@@ -407,11 +444,21 @@ pub struct LinkStateHandle {
 }
 
 struct LinkStateInner {
-    links: Mutex<BTreeMap<String, LiveLink>>,
+    peers: Mutex<BTreeMap<String, PeerLinkState>>,
     damping: Mutex<PeerDamping>,
-    receive_cursors: Mutex<replicate::CursorStore>,
     health: Mutex<replicate::ReplicationHealth>,
     registry_cache: Mutex<()>,
+    home: A2aHome,
+    limits_cfg: StdRwLock<crate::config::MeshLimitsConfig>,
+}
+
+struct PeerLinkState {
+    inbound: Option<LiveLink>,
+    outbound: Option<LiveLink>,
+    buckets: Arc<Mutex<limits::PeerBuckets>>,
+    cursors: Arc<Mutex<replicate::CursorStore>>,
+    peer_version: Option<String>,
+    handshakes: VecDeque<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -420,47 +467,152 @@ struct LiveLink {
     sent_cursors: BTreeMap<String, u64>,
 }
 
+impl PeerLinkState {
+    fn selected(&self) -> Option<&LiveLink> {
+        self.outbound.as_ref().or(self.inbound.as_ref())
+    }
+
+    fn selected_mut(&mut self) -> Option<&mut LiveLink> {
+        if self.outbound.is_some() {
+            self.outbound.as_mut()
+        } else {
+            self.inbound.as_mut()
+        }
+    }
+
+    fn slot_mut(&mut self, direction: LinkDirection) -> &mut Option<LiveLink> {
+        match direction {
+            LinkDirection::Inbound => &mut self.inbound,
+            LinkDirection::Outbound => &mut self.outbound,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.inbound.is_some() || self.outbound.is_some()
+    }
+}
+
 impl LinkStateHandle {
     pub fn new(home: &A2aHome, damping_window: Duration) -> Result<Self, AppError> {
+        replicate::CursorStore::load_or_rebuild(home)?;
         Ok(Self {
             inner: Arc::new(LinkStateInner {
-                links: Mutex::new(BTreeMap::new()),
+                peers: Mutex::new(BTreeMap::new()),
                 damping: Mutex::new(PeerDamping::new(damping_window)),
-                receive_cursors: Mutex::new(replicate::CursorStore::load_or_rebuild(home)?),
                 health: Mutex::new(replicate::ReplicationHealth::default()),
                 registry_cache: Mutex::new(()),
+                home: home.clone(),
+                limits_cfg: StdRwLock::new(crate::config::MeshLimitsConfig::default()),
             }),
         })
     }
 
-    pub async fn register(&self, peer_gateway_id: String, tx: mpsc::Sender<Frame>) {
-        self.inner.links.lock().await.insert(
-            peer_gateway_id,
-            LiveLink {
-                tx,
-                sent_cursors: BTreeMap::new(),
-            },
-        );
+    fn configure_limits(&self, cfg: &crate::config::MeshLimitsConfig) {
+        *self
+            .inner
+            .limits_cfg
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = cfg.clone();
     }
 
-    pub async fn deregister(&self, peer_gateway_id: &str) {
-        self.inner.links.lock().await.remove(peer_gateway_id);
+    fn new_peer_state(&self, peer_gateway_id: &str) -> PeerLinkState {
+        let cfg = self
+            .inner
+            .limits_cfg
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let owned = vec![peer_gateway_id.to_string()];
+        let mut cursors = replicate::CursorStore::load_or_rebuild(&self.inner.home)
+            .unwrap_or_else(|_| replicate::CursorStore::default());
+        cursors.retain_origins(&owned);
+        PeerLinkState {
+            inbound: None,
+            outbound: None,
+            buckets: Arc::new(Mutex::new(limits::PeerBuckets::new(&cfg))),
+            cursors: Arc::new(Mutex::new(cursors)),
+            peer_version: presence_wire::cached_peer_version(&self.inner.home, peer_gateway_id),
+            handshakes: VecDeque::new(),
+        }
+    }
+
+    pub async fn register(
+        &self,
+        peer_gateway_id: String,
+        direction: LinkDirection,
+        tx: mpsc::Sender<Frame>,
+    ) -> Result<(), AppError> {
+        let candidate = self.new_peer_state(&peer_gateway_id);
+        let handshake_limit = self
+            .inner
+            .limits_cfg
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handshakes_per_min_per_peer;
+        let now = Utc::now();
+        let mut peers = self.inner.peers.lock().await;
+        let peer = peers.entry(peer_gateway_id.clone()).or_insert(candidate);
+        while peer
+            .handshakes
+            .front()
+            .is_some_and(|at| now.signed_duration_since(*at) >= chrono::Duration::minutes(1))
+        {
+            peer.handshakes.pop_front();
+        }
+        if peer.handshakes.len() as u64 >= handshake_limit {
+            return Err(session_limit_error(
+                &peer_gateway_id,
+                "authenticated handshake rate exceeded",
+            ));
+        }
+        peer.handshakes.push_back(now);
+        let slot = peer.slot_mut(direction);
+        if slot.is_some() {
+            return Err(session_limit_error(
+                &peer_gateway_id,
+                &format!("an incumbent {} session is already registered", direction.as_str()),
+            ));
+        }
+        *slot = Some(LiveLink {
+            tx,
+            sent_cursors: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    pub async fn deregister(&self, peer_gateway_id: &str, direction: LinkDirection) {
+        if let Some(peer) = self.inner.peers.lock().await.get_mut(peer_gateway_id) {
+            *peer.slot_mut(direction) = None;
+        }
     }
 
     pub async fn is_live(&self, peer_gateway_id: &str) -> bool {
-        self.inner.links.lock().await.contains_key(peer_gateway_id)
+        self.inner
+            .peers
+            .lock()
+            .await
+            .get(peer_gateway_id)
+            .is_some_and(PeerLinkState::is_live)
     }
 
     pub async fn live_peers(&self) -> Vec<String> {
-        self.inner.links.lock().await.keys().cloned().collect()
+        self.inner
+            .peers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, peer)| peer.is_live())
+            .map(|(gateway_id, _)| gateway_id.clone())
+            .collect()
     }
 
     pub async fn sender(&self, peer_gateway_id: &str) -> Option<mpsc::Sender<Frame>> {
         self.inner
-            .links
+            .peers
             .lock()
             .await
             .get(peer_gateway_id)
+            .and_then(PeerLinkState::selected)
             .map(|link| link.tx.clone())
     }
 
@@ -475,10 +627,11 @@ impl LinkStateHandle {
     pub async fn broadcast(&self, frame: Frame) {
         let senders = self
             .inner
-            .links
+            .peers
             .lock()
             .await
             .values()
+            .filter_map(PeerLinkState::selected)
             .map(|link| link.tx.clone())
             .collect::<Vec<_>>();
         for tx in senders {
@@ -515,6 +668,58 @@ impl LinkStateHandle {
         self.inner.health.lock().await.clone()
     }
 
+    pub async fn peer_buckets(&self, peer_gateway_id: &str) -> Arc<Mutex<limits::PeerBuckets>> {
+        let candidate = self.new_peer_state(peer_gateway_id);
+        self.inner
+            .peers
+            .lock()
+            .await
+            .entry(peer_gateway_id.to_string())
+            .or_insert(candidate)
+            .buckets
+            .clone()
+    }
+
+    pub async fn peer_cursors(
+        &self,
+        peer_gateway_id: &str,
+    ) -> Arc<Mutex<replicate::CursorStore>> {
+        let candidate = self.new_peer_state(peer_gateway_id);
+        self.inner
+            .peers
+            .lock()
+            .await
+            .entry(peer_gateway_id.to_string())
+            .or_insert(candidate)
+            .cursors
+            .clone()
+    }
+
+    async fn peer_version(&self, peer_gateway_id: &str) -> Option<String> {
+        self.inner
+            .peers
+            .lock()
+            .await
+            .get(peer_gateway_id)
+            .and_then(|peer| peer.peer_version.clone())
+    }
+
+    pub async fn limits_health(&self) -> BTreeMap<String, limits::PeerLimitHealth> {
+        let buckets = self
+            .inner
+            .peers
+            .lock()
+            .await
+            .iter()
+            .map(|(peer, state)| (peer.clone(), state.buckets.clone()))
+            .collect::<Vec<_>>();
+        let mut health = BTreeMap::new();
+        for (peer, buckets) in buckets {
+            health.insert(peer, buckets.lock().await.health());
+        }
+        health
+    }
+
     pub async fn refresh_registry_cache(
         &self,
         home: &A2aHome,
@@ -522,8 +727,26 @@ impl LinkStateHandle {
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let _guard = self.inner.registry_cache.lock().await;
-        presence_wire::refresh_registry_cache(home, rows, now)
+        presence_wire::refresh_registry_cache(home, rows, now)?;
+        let versions = rows
+            .iter()
+            .map(|(row, _)| (row.gateway_id.clone(), row.version.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut peers = self.inner.peers.lock().await;
+        for (gateway_id, peer) in peers.iter_mut() {
+            peer.peer_version = versions.get(gateway_id).cloned();
+        }
+        Ok(())
     }
+}
+
+fn session_limit_error(peer_gateway_id: &str, detail: &str) -> AppError {
+    AppError::new(
+        "SESSION_LIMIT",
+        ExitCode::Precondition,
+        format!("refusing surplus session for {peer_gateway_id}: {detail}"),
+    )
+    .remedy("keep at most one inbound and one outbound session per authenticated gateway")
 }
 
 #[derive(Clone)]
@@ -590,11 +813,17 @@ where
         mailbox_payload_cap,
         mailbox_backpressure_window,
     } = params;
+    state.configure_limits(&cfg.mesh.limits);
     let (mut writer, mut reader) = side.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(LINK_OUTBOUND_CHANNEL_CAPACITY);
-    state
-        .register(peer_gateway_id.clone(), out_tx.clone())
-        .await;
+    if let Err(error) = state
+        .register(peer_gateway_id.clone(), direction, out_tx.clone())
+        .await
+    {
+        limits::log_limit_refusal(&home, &peer_gateway_id, error.code, &error.message);
+        let _ = writer.close().await;
+        return Err(error);
+    }
     if let Some(observer) = &observer {
         observer
             .send(LinkHealthEvent::Up {
@@ -733,7 +962,7 @@ where
 
     token.cancel();
     liveness.abort();
-    state.deregister(&peer_gateway_id).await;
+    state.deregister(&peer_gateway_id, direction).await;
     if let Some(observer) = &observer {
         observer
             .send(LinkHealthEvent::Down {
@@ -794,76 +1023,225 @@ async fn handle_inbound_frame(
         local_gateway_id,
         peer_gateway_id,
     } = ctx;
+    let feed_bytes = if matches!(&frame, Frame::Feed { .. }) {
+        serde_json::to_vec(&frame)
+            .map_err(|error| {
+                AppError::new(
+                    "DATA",
+                    ExitCode::Internal,
+                    format!("serializing feed frame for metering: {error}"),
+                )
+            })?
+            .len() as u64
+    } else {
+        0
+    };
+    let peer_version = state.peer_version(peer_gateway_id).await;
+    let peer_supports_deferred = limits::peer_supports_deferred(peer_version.as_deref());
+    let cursor_handle = state.peer_cursors(peer_gateway_id).await;
+    let bucket_handle = state.peer_buckets(peer_gateway_id).await;
+    let mut cursors = cursor_handle.lock().await;
+    let mut buckets = bucket_handle.lock().await;
+    let now = Utc::now();
+    let mut deferred = false;
+    let mut deferred_ack = None;
+    let mut outbound = Vec::new();
     match frame {
         Frame::Digest { origins } => {
-            let cursors = state.inner.receive_cursors.lock().await;
-            let wants = replicate::wants_from_digest(home, &cursors, &origins)?;
-            if !wants.is_empty() {
-                let _ = out_tx.send(Frame::Want { origins: wants }).await;
+            let outcome = buckets.allow(limits::BucketKind::Digests, now);
+            if observe_limit_outcome(
+                home,
+                peer_gateway_id,
+                limits::BucketKind::Digests,
+                outcome,
+                peer_supports_deferred,
+                &mut buckets,
+                &mut deferred_ack,
+            ) {
+                let origins = origins
+                    .into_iter()
+                    .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
+                    .filter(|origin| {
+                        is_known_origin(
+                            home,
+                            local_gateway_id,
+                            peer_gateway_id,
+                            &origin.origin,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let wants = replicate::wants_from_digest(home, &cursors, &origins)?;
+                if !wants.is_empty() {
+                    outbound.push(Frame::Want { origins: wants });
+                }
+            } else {
+                deferred = true;
             }
         }
         Frame::Want { origins } => {
-            let cursors = state.inner.receive_cursors.lock().await;
-            for want in origins {
-                match replicate::entries_for_want_capped(
-                    home,
-                    &want.origin,
-                    want.from_seq,
-                    &cursors,
-                    replicate::DEFAULT_WANT_ENTRY_CAP,
-                )? {
-                    replicate::WantReply::Entries(entries) if !entries.is_empty() => {
-                        let _ = out_tx
-                            .send(Frame::Feed {
+            let outcome = buckets.allow(limits::BucketKind::Wants, now);
+            if observe_limit_outcome(
+                home,
+                peer_gateway_id,
+                limits::BucketKind::Wants,
+                outcome,
+                peer_supports_deferred,
+                &mut buckets,
+                &mut deferred_ack,
+            ) {
+                for want in origins
+                    .into_iter()
+                    .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
+                    .filter(|want| {
+                        is_known_origin(
+                            home,
+                            local_gateway_id,
+                            peer_gateway_id,
+                            &want.origin,
+                        )
+                    })
+                {
+                    match replicate::entries_for_want_capped(
+                        home,
+                        &want.origin,
+                        want.from_seq,
+                        &cursors,
+                        replicate::DEFAULT_WANT_ENTRY_CAP,
+                    )? {
+                        replicate::WantReply::Entries(entries) if !entries.is_empty() => {
+                            outbound.push(Frame::Feed {
                                 origin: want.origin,
                                 entries,
-                            })
-                            .await;
-                    }
-                    replicate::WantReply::Entries(_) => {}
-                    replicate::WantReply::Compacted { from_seq } => {
-                        let _ = out_tx.send(replicate::compacted_err(from_seq)).await;
+                            });
+                        }
+                        replicate::WantReply::Entries(_) => {}
+                        replicate::WantReply::Compacted { from_seq } => {
+                            outbound.push(replicate::compacted_err(from_seq));
+                        }
                     }
                 }
+            } else {
+                deferred = true;
             }
         }
         Frame::Feed { origin, entries } => {
-            let mut cursors = state.inner.receive_cursors.lock().await;
-            if replicate::receive_feed_entries(home, cfg, &mut cursors, reorder, &origin, entries)
-                .is_ok()
-            {
-                cursors.persist(home)?;
+            let bytes_outcome = buckets.charge(limits::BucketKind::FeedBytes, feed_bytes, now);
+            if !observe_limit_outcome(
+                home,
+                peer_gateway_id,
+                limits::BucketKind::FeedBytes,
+                bytes_outcome,
+                peer_supports_deferred,
+                &mut buckets,
+                &mut deferred_ack,
+            ) {
+                deferred = true;
+            } else if origin != peer_gateway_id {
+                outbound.push(Frame::Err {
+                    code: "FEED_ORIGIN_INVALID".to_string(),
+                    detail: format!(
+                        "feed origin {origin} does not match authenticated peer {peer_gateway_id}"
+                    ),
+                });
+            } else {
+                let mut frame_deferred = false;
+                let report = replicate::receive_feed_entries_metered(
+                    home,
+                    cfg,
+                    &mut cursors,
+                    reorder,
+                    &origin,
+                    entries,
+                    |entry, reaches_append| {
+                        if entry.refs.get("work").is_some() {
+                            let outcome = buckets.allow(limits::BucketKind::WorkOffers, now);
+                            if !observe_limit_outcome(
+                                home,
+                                peer_gateway_id,
+                                limits::BucketKind::WorkOffers,
+                                outcome,
+                                peer_supports_deferred,
+                                &mut buckets,
+                                &mut deferred_ack,
+                            ) {
+                                frame_deferred = true;
+                                return false;
+                            }
+                        }
+                        if reaches_append {
+                            let outcome =
+                                buckets.allow(limits::BucketKind::FeedEntries, now);
+                            if !observe_limit_outcome(
+                                home,
+                                peer_gateway_id,
+                                limits::BucketKind::FeedEntries,
+                                outcome,
+                                peer_supports_deferred,
+                                &mut buckets,
+                                &mut deferred_ack,
+                            ) {
+                                frame_deferred = true;
+                                return false;
+                            }
+                        }
+                        true
+                    },
+                )?;
+                if report.feed_entry_refunds > 0 {
+                    buckets.refund(
+                        limits::BucketKind::FeedEntries,
+                        report.feed_entry_refunds,
+                    );
+                }
+                deferred = frame_deferred || report.deferred;
+                cursors.persist_merged(home, std::slice::from_ref(&origin))?;
             }
         }
         Frame::Note { note } => {
-            let trace_id = note.note_id.clone().unwrap_or_default();
-            let envelope = notes_wire::SpooledNote {
-                schema_version: 1,
-                trace_id: trace_id.clone(),
-                from_gateway: peer_gateway_id.to_string(),
-                to_gateway: local_gateway_id.to_string(),
-                to_peer: note.to.clone(),
-                attempts: 0,
-                next_attempt_after: None,
-                note,
+            let kind = if note.kind == crate::mesh::work_store::WORK_OFFER_KIND {
+                limits::BucketKind::WorkOffers
+            } else {
+                limits::BucketKind::Notes
             };
-            let ack = notes_wire::receive_note(home, cfg, &envelope).unwrap_or(
-                notes_wire::NoteAck::Rejected {
-                    code: "ingress_refused".to_string(),
-                },
-            );
-            let outcome = match ack {
-                notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => {
-                    "delivered".to_string()
-                }
-                notes_wire::NoteAck::Rejected { code } => code,
-            };
-            let _ = out_tx
-                .send(Frame::Ack {
+            let outcome = buckets.allow(kind, now);
+            if observe_limit_outcome(
+                home,
+                peer_gateway_id,
+                kind,
+                outcome,
+                peer_supports_deferred,
+                &mut buckets,
+                &mut deferred_ack,
+            ) {
+                let trace_id = note.note_id.clone().unwrap_or_default();
+                let envelope = notes_wire::SpooledNote {
+                    schema_version: 1,
+                    trace_id: trace_id.clone(),
+                    from_gateway: peer_gateway_id.to_string(),
+                    to_gateway: local_gateway_id.to_string(),
+                    to_peer: note.to.clone(),
+                    attempts: 0,
+                    next_attempt_after: None,
+                    note,
+                };
+                let ack = notes_wire::receive_note(home, cfg, &envelope).unwrap_or(
+                    notes_wire::NoteAck::Rejected {
+                        code: "ingress_refused".to_string(),
+                    },
+                );
+                let outcome = match ack {
+                    notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => {
+                        "delivered".to_string()
+                    }
+                    notes_wire::NoteAck::Rejected { code } => code,
+                };
+                outbound.push(Frame::Ack {
                     ref_id: trace_id,
                     outcome,
-                })
-                .await;
+                });
+            } else {
+                deferred = true;
+            }
         }
         Frame::Ack { ref_id, outcome } => {
             let _ = notes_wire::handle_ack(home, peer_gateway_id, &ref_id, &outcome)?;
@@ -887,7 +1265,64 @@ async fn handle_inbound_frame(
         }
         Frame::Err { .. } | Frame::Challenge { .. } | Frame::Hello { .. } => {}
     }
+    drop(buckets);
+    drop(cursors);
+    if deferred {
+        if let Some(frame) = deferred_ack {
+            let _ = out_tx.try_send(frame);
+        }
+        return Ok(());
+    }
+    for frame in outbound {
+        let _ = out_tx.send(frame).await;
+    }
     Ok(())
+}
+
+fn observe_limit_outcome(
+    home: &A2aHome,
+    peer_gateway_id: &str,
+    kind: limits::BucketKind,
+    outcome: limits::LimitOutcome,
+    peer_supports_deferred: bool,
+    buckets: &mut limits::PeerBuckets,
+    deferred_ack: &mut Option<Frame>,
+) -> bool {
+    let limits::LimitOutcome::Deferred {
+        transitioned,
+        retry_after_secs,
+    } = outcome
+    else {
+        return true;
+    };
+    if transitioned {
+        limits::log_bucket_transition(home, peer_gateway_id, kind, "over");
+    }
+    if peer_supports_deferred {
+        if deferred_ack.is_none() {
+            *deferred_ack = Some(limits::deferred_frame(
+                "RATE_LIMITED",
+                Some(retry_after_secs),
+            ));
+        }
+    } else {
+        buckets.record_drop(kind);
+    }
+    false
+}
+
+fn is_known_origin(
+    home: &A2aHome,
+    local_gateway_id: &str,
+    peer_gateway_id: &str,
+    origin: &str,
+) -> bool {
+    origin == local_gateway_id
+        || origin == peer_gateway_id
+        || presence_wire::cached_gateway(home, origin)
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 pub async fn push_watcher_deltas(
@@ -900,8 +1335,8 @@ pub async fn push_watcher_deltas(
     let mut sent = 0usize;
     for peer in peers {
         let (tx, cursors) = {
-            let links = state.inner.links.lock().await;
-            let Some(link) = links.get(&peer) else {
+            let peers = state.inner.peers.lock().await;
+            let Some(link) = peers.get(&peer).and_then(PeerLinkState::selected) else {
                 continue;
             };
             (link.tx.clone(), link.sent_cursors.clone())
@@ -924,8 +1359,8 @@ pub async fn push_watcher_deltas(
                 )
             })?;
             sent += batch.len();
-            let mut links = state.inner.links.lock().await;
-            if let Some(link) = links.get_mut(&peer) {
+            let mut peers = state.inner.peers.lock().await;
+            if let Some(link) = peers.get_mut(&peer).and_then(PeerLinkState::selected_mut) {
                 let max_seq = batch
                     .iter()
                     .filter_map(|entry| entry.origin_seq)

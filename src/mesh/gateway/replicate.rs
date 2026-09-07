@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Mutex as StdMutex;
 
 const CURSORS_FILE: &str = "cursors.json";
+static CURSOR_PERSIST_LOCK: StdMutex<()> = StdMutex::new(());
 pub const DEFAULT_WANT_ENTRY_CAP: usize = 128;
 pub const DEFAULT_REORDER_BUFFER_CAP: usize = 1024;
 
@@ -98,6 +100,13 @@ pub struct FeedReceiveReport {
     pub rejected: usize,
     pub buffered: usize,
     pub evictions: Vec<ReorderEviction>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeteredFeedReceiveReport {
+    pub receive: FeedReceiveReport,
+    pub deferred: bool,
+    pub feed_entry_refunds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -218,6 +227,57 @@ impl CursorStore {
     }
 
     pub fn persist(&self, home: &A2aHome) -> Result<(), AppError> {
+        let _guard = CURSOR_PERSIST_LOCK.lock().map_err(|_| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                "gateway cursor persistence lock is poisoned",
+            )
+        })?;
+        self.persist_unlocked(home)
+    }
+
+    pub fn persist_merged(
+        &self,
+        home: &A2aHome,
+        owned_origins: &[String],
+    ) -> Result<(), AppError> {
+        let _guard = CURSOR_PERSIST_LOCK.lock().map_err(|_| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                "gateway cursor persistence lock is poisoned",
+            )
+        })?;
+        let mut merged = match std::fs::read(cursor_path(home)) {
+            Ok(bytes) => {
+                let file: CursorFile = serde_json::from_slice(&bytes).map_err(data_err)?;
+                CursorStore {
+                    origins: file.origins,
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CursorStore::default(),
+            Err(e) => return Err(io_err("reading cursors.json", e)),
+        };
+        for origin in owned_origins {
+            let Some(incoming) = self.origins.get(origin) else {
+                continue;
+            };
+            let stored = merged.origins.entry(origin.clone()).or_default();
+            stored.last_seq = stored.last_seq.max(incoming.last_seq);
+            stored.compacted_before_seq = stored
+                .compacted_before_seq
+                .max(incoming.compacted_before_seq);
+        }
+        merged.persist_unlocked(home)
+    }
+
+    pub(crate) fn retain_origins(&mut self, owned_origins: &[String]) {
+        self.origins
+            .retain(|origin, _| owned_origins.iter().any(|owned| owned == origin));
+    }
+
+    fn persist_unlocked(&self, home: &A2aHome) -> Result<(), AppError> {
         let path = cursor_path(home);
         if let Some(parent) = path.parent() {
             create_dir_0700(parent).map_err(|e| io_err("creating gateway cursor dir", e))?;
@@ -526,6 +586,73 @@ pub fn receive_feed_entries(
     Ok(report)
 }
 
+pub fn receive_feed_entries_metered<F>(
+    home: &A2aHome,
+    cfg: &Config,
+    cursors: &mut CursorStore,
+    reorder: &mut FeedReorderBuffers,
+    frame_origin: &str,
+    entries: Vec<FeedEntry>,
+    mut admit: F,
+) -> Result<MeteredFeedReceiveReport, AppError>
+where
+    F: FnMut(&FeedEntry, bool) -> bool,
+{
+    let mut metered = MeteredFeedReceiveReport::default();
+    for entry in entries {
+        let origin_seq = entry.origin_seq.unwrap_or(entry.seq);
+        if origin_seq == 0 {
+            metered.receive.rejected += 1;
+            continue;
+        }
+        let expected = cursors.last_seq(frame_origin).saturating_add(1);
+        if origin_seq > expected {
+            let (inserted, eviction) = reorder.insert(frame_origin, origin_seq, entry);
+            if inserted {
+                metered.receive.buffered += 1;
+            }
+            if let Some(eviction) = eviction {
+                metered.receive.evictions.push(eviction);
+            }
+            continue;
+        }
+        if !apply_entry_for_metered_report(
+            home,
+            cfg,
+            cursors,
+            frame_origin,
+            entry,
+            &mut metered,
+            &mut admit,
+        )? {
+            metered.deferred = true;
+            break;
+        }
+        loop {
+            let expected = cursors.last_seq(frame_origin).saturating_add(1);
+            let Some(entry) = reorder.take(frame_origin, expected) else {
+                break;
+            };
+            if !apply_entry_for_metered_report(
+                home,
+                cfg,
+                cursors,
+                frame_origin,
+                entry,
+                &mut metered,
+                &mut admit,
+            )? {
+                metered.deferred = true;
+                break;
+            }
+        }
+        if metered.deferred {
+            break;
+        }
+    }
+    Ok(metered)
+}
+
 pub fn entries_for_want(
     home: &A2aHome,
     origin: &str,
@@ -805,7 +932,8 @@ pub fn compact_feed(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_err("removing compacted feed generation", e)),
         }
-        cursors.persist(home)?;
+        let owned_origins = compacted_before.keys().cloned().collect::<Vec<_>>();
+        cursors.persist_merged(home, &owned_origins)?;
     }
     Ok(FeedCompaction {
         removed,
@@ -828,6 +956,53 @@ fn apply_entry_for_report(
         IngestDecision::Rejected { .. } => report.rejected += 1,
     }
     Ok(())
+}
+
+fn apply_entry_for_metered_report<F>(
+    home: &A2aHome,
+    cfg: &Config,
+    cursors: &mut CursorStore,
+    frame_origin: &str,
+    entry: FeedEntry,
+    metered: &mut MeteredFeedReceiveReport,
+    admit: &mut F,
+) -> Result<bool, AppError>
+where
+    F: FnMut(&FeedEntry, bool) -> bool,
+{
+    let reaches_append = entry_reaches_append(home, cursors, frame_origin, &entry)?;
+    if !admit(&entry, reaches_append) {
+        return Ok(false);
+    }
+    let decision = append_remote_entry(home, cfg, cursors, frame_origin, entry)?;
+    if reaches_append && !matches!(decision, IngestDecision::Accepted { .. }) {
+        metered.feed_entry_refunds = metered.feed_entry_refunds.saturating_add(1);
+    }
+    match decision {
+        IngestDecision::Accepted { .. } => metered.receive.accepted += 1,
+        IngestDecision::Duplicate => metered.receive.duplicates += 1,
+        IngestDecision::Compacted { .. } => metered.receive.compacted += 1,
+        IngestDecision::Rejected { .. } => metered.receive.rejected += 1,
+    }
+    Ok(true)
+}
+
+fn entry_reaches_append(
+    home: &A2aHome,
+    cursors: &CursorStore,
+    frame_origin: &str,
+    entry: &FeedEntry,
+) -> Result<bool, AppError> {
+    let origin_seq = entry.origin_seq.unwrap_or(entry.seq);
+    if origin_seq == 0 || feed::validate_post_text(&entry.text).is_err() {
+        return Ok(false);
+    }
+    if origin_seq < cursors.compacted_before_seq(frame_origin) {
+        return Ok(false);
+    }
+    Ok(!scan_origin_sequences(home)?
+        .get(frame_origin)
+        .is_some_and(|present| present.contains(&origin_seq)))
 }
 
 fn drain_contiguous_buffer(

@@ -110,6 +110,26 @@ a2a mesh feed           # the other machine's feed entries appear within seconds
 a2a mesh gateway status # loops all "running", endpoint_url populated
 ```
 
+## Ingest limits
+
+The connection/session bounds ship enabled at permissive defaults. The six
+metered traffic buckets ship at `0`, which means OFF rather than deny; enable
+them only after every member reports a version that understands deferred
+frames. The calibrated deployment values are filled during the fleet rollout.
+
+| `[mesh.limits]` key | Shipped default | Calibrated value |
+|---|---:|---:|
+| `notes_per_min` | 0 (off) | pending calibration |
+| `feed_entries_per_min` | 0 (off) | pending calibration |
+| `feed_bytes_per_min` | 0 (off) | pending calibration |
+| `work_offers_per_hour` | 0 (off) | pending calibration |
+| `wants_per_min` | 0 (off) | pending calibration |
+| `digests_per_min` | 0 (off) | pending calibration |
+| `max_unauthenticated_sessions` | 32 | pending calibration |
+| `handshake_deadline_secs` | 10 | pending calibration |
+| `connects_per_min_per_source` | 60 | pending calibration |
+| `handshakes_per_min_per_peer` | 12 | pending calibration |
+
 ## Housekeeping
 
 - **Revoke a machine** (owner): `a2a mesh fleet revoke <gateway-id>` — peers drop it
@@ -125,6 +145,9 @@ a2a mesh gateway status # loops all "running", endpoint_url populated
 
 | Code | Meaning | Remedy |
 |---|---|---|
+| `SESSION_LIMIT` | A linked peer opened a surplus directional session or exceeded its authenticated handshake rate. | Keep the incumbent link and retry after the one-minute handshake window. |
+| `PREAUTH_LIMIT` | The source exceeded a pre-auth bound or missed the handshake deadline. | Verify TLS/authentication reachability and retry after the source window clears. |
+| `WORK_POOL_FULL` | This gateway already holds 512 pool offers. | Approve, decline, or expire an offer before accepting another. |
 | `ROOTS_UNREADABLE` | This reader could not load its local `mesh/fleet/root.pub` or `root.pub.next`. | Repair the local root files and permissions before judging any peer row. |
 | `ENROLLMENT_REBIND_REQUIRED` | The requested gateway id is already bound to a different key in the owner ledger or live row. | Verify both printed fingerprints out of band, then rerun `fleet enroll` with `--rebind`. |
 | `REVOCATION_INVALID` | A revocation record or local cached tombstone is malformed or does not verify under a fleet root. | Preserve the suspect row for evidence, then mint a fresh revocation on the fleet root machine. |

@@ -11,3 +11,4 @@ test(mesh): align work-loop clean completion fixture with outgoing note scanning
 T1: add staged fleet root rotation, signed distribution, enrollment issuer ledgering, and gated promotion/retirement
 >>>>>>> l4/rotation
 L1: add deferred acknowledgements and durable outbound spool backoff
+L2: add metered mesh buckets, bounded handshakes, and per-peer link state

@@ -5,7 +5,7 @@ use a2a::mesh::keys::{
     enroll_gateway_token, fleet_init, gateway_identity, gateway_public_key_b64,
     install_gateway_token, SystemClock,
 };
-use a2a::mesh::gateway::link::{self, LinkStateHandle};
+use a2a::mesh::gateway::link::{self, LinkDirection, LinkStateHandle};
 use a2a::mesh::gateway::{limits, presence_wire};
 use a2a::mesh::gateway::notes_wire::{
     self, deliver_spooled_once, receive_note, NoteAck, NoteDeliveryTarget,
@@ -598,7 +598,10 @@ async fn push_spooled_notes_marks_backoff_before_sending_and_skips_until_due() {
     let cfg = cfg_for(&sender);
     let state = LinkStateHandle::new(&sender, Duration::from_secs(60)).unwrap();
     let (tx, mut rx) = mpsc::channel(16);
-    state.register("gw-b".into(), tx).await;
+    state
+        .register("gw-b".into(), LinkDirection::Outbound, tx)
+        .await
+        .unwrap();
     let path = notes_wire::spool_note(
         &sender,
         &cfg,
@@ -659,7 +662,10 @@ async fn a_deferred_frame_defers_the_whole_peer_spool_and_archives_nothing() {
     let cfg = cfg_for(&sender);
     let state = LinkStateHandle::new(&sender, Duration::from_secs(60)).unwrap();
     let (tx, _rx) = mpsc::channel(16);
-    state.register("gw-b".into(), tx).await;
+    state
+        .register("gw-b".into(), LinkDirection::Outbound, tx)
+        .await
+        .unwrap();
     for (text, note_id) in [
         ("first deferred note", "01K3KV00000000000000000008"),
         ("second deferred note", "01K3KV00000000000000000009"),

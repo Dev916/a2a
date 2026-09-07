@@ -668,13 +668,31 @@ pub enum MeshWorkCmd {
         /// Print unmasked worker output (never pipe this into agent context)
         #[arg(long)]
         raw: bool,
+        /// Emit structured review data and never mint a confirmation token
+        #[arg(long)]
+        json: bool,
     },
     /// Force one result branch push attempt for a completed local work item
     RetryPush { work_id: String },
     /// Push and report a locally held completed work item
-    Release { work_id: String },
+    Release {
+        work_id: String,
+        /// Permit a reviewed secret-bearing result with out-of-band confirmation
+        #[arg(long)]
+        allow_secrets: bool,
+        /// One-time digest-bound token printed by an interactive work diff
+        #[arg(long, value_name = "TOKEN", requires = "allow_secrets")]
+        confirm_token: Option<String>,
+    },
     /// Reject a locally held completed work item without publishing its result
-    Reject { work_id: String },
+    Reject {
+        work_id: String,
+        #[arg(long)]
+        reason: String,
+        /// Send the reason to the sender; do not describe what you found
+        #[arg(long)]
+        notify_sender: bool,
+    },
     /// Restore a locally held item swept by the release-stall horizon
     Reopen { work_id: String },
 }

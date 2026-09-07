@@ -402,7 +402,16 @@ impl WorkSpawner for RealSpawner {
             danger_full_access: false,
             reason: None,
         };
-        crate::commands::spawn::run(home, &args, true, true)?
+        crate::commands::spawn::run_with_overrides(
+            home,
+            &args,
+            None,
+            crate::commands::spawn::SpawnOverrides {
+                network: Some(false),
+            },
+            true,
+            true,
+        )?
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -441,7 +450,15 @@ where
     G: GitAdapter + ?Sized,
     S: WorkSpawner + ?Sized,
 {
-    let require_signed_rows = crate::config::load(home)?.0.mesh.gateway.require_signed_rows;
+    let cfg = crate::config::load(home)?.0;
+    let require_signed_rows = cfg.mesh.gateway.require_signed_rows;
+    let lane = cfg
+        .lanes
+        .get(&Lane::Impl)
+        .expect("config::load seeds the impl lane");
+    let overrides = crate::commands::spawn::SpawnOverrides {
+        network: Some(false),
+    };
     let preflight = preflight(home, git, spawner, work_id, require_signed_rows).await?;
     Ok(json!({
         "work_id": work_id,
@@ -453,6 +470,8 @@ where
         "title": preflight.verified.envelope.title,
         "acceptance": preflight.verified.envelope.acceptance,
         "brief_text": preflight.verified.envelope.brief_text,
+        "sandbox": lane.sandbox.as_str(),
+        "network": crate::commands::spawn::effective_network(lane.network, &overrides),
         "preflight": {
             "repo_reachable": true,
             "checkout_root_admitted": true,
@@ -660,6 +679,7 @@ pub enum CompletionStopAfter {
 #[derive(Clone, Debug)]
 pub struct WorkLoopOptions {
     pub force_push: bool,
+    pub allow_secrets: bool,
     pub stop_after: Option<CompletionStopAfter>,
     pub retry_cap: Duration,
     pub claim_stall: Duration,
@@ -670,6 +690,7 @@ impl WorkLoopOptions {
     pub fn for_config(cfg: &Config) -> Self {
         Self {
             force_push: false,
+            allow_secrets: false,
             stop_after: None,
             retry_cap: Duration::from_secs(cfg.mesh.gateway.outbound_retry_max_secs.max(1)),
             claim_stall: Duration::from_secs(cfg.mesh.work.claim_stall_secs.max(1)),
@@ -847,8 +868,8 @@ where
                     missing_work_state_field(&state.work_id, "held result range")
                 })?;
                 state.result_status = Some(WorkStatus::Done);
-                state.result_summary = Some(redact::redact_egress(&summary));
-                state.evidence_excerpt = Some(redact::redact_egress(&evidence_excerpt));
+                state.result_summary = Some(summary);
+                state.evidence_excerpt = Some(evidence_excerpt);
                 state.held_commit_sha = Some(held.head_sha.clone());
                 state.closure_digest = Some(held.closure_digest.clone());
                 if cfg.mesh.work.auto_push {
@@ -860,6 +881,7 @@ where
                         cfg,
                         &state.checkout,
                         held,
+                        &state,
                     )
                     .await;
                     if let Some(err) = scan_error {
@@ -880,8 +902,8 @@ where
                     missing_work_state_field(&state.work_id, "held result range")
                 })?;
                 state.result_status = Some(WorkStatus::Failed);
-                state.result_summary = Some(redact::redact_egress(&summary));
-                state.evidence_excerpt = Some(redact::redact_egress(&evidence_excerpt));
+                state.result_summary = Some(summary);
+                state.evidence_excerpt = Some(evidence_excerpt);
                 state.held_commit_sha = Some(held.head_sha.clone());
                 state.closure_digest = Some(held.closure_digest.clone());
                 if cfg.mesh.work.auto_push {
@@ -893,6 +915,7 @@ where
                         cfg,
                         &state.checkout,
                         held,
+                        &state,
                     )
                     .await;
                     if let Some(err) = scan_error {
@@ -932,17 +955,22 @@ where
                 .remedy("approve records remote_url; this item predates the pinned push gate")
         })?;
         let held = held_range_from_state(&state)?;
-        if let Err(err) = work_gate::gate_push(home, cfg, &state.checkout, &held).await {
-            state.result_summary = Some(redact::redact_egress(&format!(
-                "{}: {}",
-                err.code, err.message
-            )));
-            let (report, _) = scan_result_for_hold(home, cfg, &state.checkout, &held).await;
-            enter_hold(home, cfg, registry, &mut state, &report).await?;
-            if options.force_push {
-                return Err(err);
+        if !options.allow_secrets {
+            if let Err(err) =
+                work_gate::gate_push(home, cfg, &state.checkout, &held, &state).await
+            {
+                state.result_summary = Some(redact::redact_egress(&format!(
+                    "{}: {}",
+                    err.code, err.message
+                )));
+                let (report, _) =
+                    scan_result_for_hold(home, cfg, &state.checkout, &held, &state).await;
+                enter_hold(home, cfg, registry, &mut state, &report).await?;
+                if options.force_push {
+                    return Err(err);
+                }
+                return Ok(state);
             }
-            return Ok(state);
         }
         let io_for_block = io.clone();
         let pushed = tokio::task::spawn_blocking(move || {
@@ -1124,13 +1152,15 @@ async fn scan_result_for_hold(
     cfg: &Config,
     checkout: &Path,
     range: &work_gate::ResultRange,
+    state: &WorkState,
 ) -> (work_gate::ScanReport, Option<AppError>) {
     let home = home.clone();
     let cfg = cfg.clone();
     let checkout = checkout.to_path_buf();
     let range = range.clone();
+    let state = state.clone();
     match tokio::task::spawn_blocking(move || {
-        work_gate::scan_added_blobs(&home, &cfg, &checkout, &range)
+        work_gate::scan_review_unit(&home, &cfg, &checkout, &range, &state)
     })
     .await
     {
@@ -1189,10 +1219,7 @@ fn spool_hold_note_once(
         to: "user:mesh-work".to_string(),
         ts: held_since,
         kind: work_store::WORK_HELD_KIND.to_string(),
-        text: format!(
-            "work held: {}; review with `a2a mesh work diff {}` then `release` or `reject`",
-            state.work_id, state.work_id
-        ),
+        text: format!("work held: {}", state.work_id),
         refs,
         extra: serde_json::Map::new(),
     };
@@ -1361,24 +1388,9 @@ where
         .result_ref
         .clone()
         .unwrap_or_else(|| format!("a2a/work/{}", state.work_id));
-    let summary = capped_result_text(
-        state.result_summary.as_deref().unwrap_or(status_text),
-        cfg.mesh.work.result_note_max_bytes,
-    );
-    let evidence_excerpt = capped_result_text(
-        state.evidence_excerpt.as_deref().unwrap_or_default(),
-        cfg.mesh.work.result_note_max_bytes,
-    );
     let title = title_for(home, &state.work_id)?;
-    let refs = json!({
-        "result": {
-            "work_id": state.work_id,
-            "status": status_text,
-            "result_ref": result_ref,
-            "summary": summary,
-            "evidence_excerpt": evidence_excerpt,
-        }
-    });
+    let (result_payload, _) = work_gate::render_note_payload(state, cfg)?;
+    let refs = json!({ "result": result_payload });
     feed::validate_refs_size(&refs, cfg.mesh.work.result_note_max_bytes)?;
     let note = Note {
         note_id: Some(state.result_note_id.clone()),
@@ -1478,7 +1490,7 @@ fn title_for(home: &A2aHome, work_id: &str) -> Result<String, AppError> {
         .unwrap_or_else(|| work_id.to_string()))
 }
 
-fn capped_result_text(text: &str, cap: u64) -> String {
+pub(crate) fn capped_result_text(text: &str, cap: u64) -> String {
     let redacted = redact::redact_egress(text);
     if cap == 0 || redacted.len() <= cap as usize {
         return redacted;
@@ -1861,7 +1873,7 @@ fn lost_outcome(row: WorkRow) -> ApproveOutcome {
     }
 }
 
-fn status_name(status: WorkStatus) -> &'static str {
+pub(crate) fn status_name(status: WorkStatus) -> &'static str {
     match status {
         WorkStatus::Offered => "offered",
         WorkStatus::Approved => "approved",

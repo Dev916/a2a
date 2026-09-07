@@ -104,7 +104,7 @@ Senders monitor and finish work with:
 a2a mesh work status <work_id>
 a2a mesh work diff <work_id>
 a2a mesh work release <work_id>
-a2a mesh work reject <work_id>
+a2a mesh work reject <work_id> --reason "local review reason"
 a2a mesh work ack <work_id>
 ```
 
@@ -113,13 +113,17 @@ terminal worker and stops at `awaiting_release` without pushing. It emits one
 machine-generated `work_held` note. Review the frozen result with `diff`, then
 use `release` to push the recorded SHA, mark the row `done` or `failed`, send the
 `work_result` note, and post the milestone. Use `reject` to leave the row
-`rejected` with no result ref. `retry-push` is only for a transient push failure
+`rejected` with no result ref. The rejection reason stays local by default;
+`--notify-sender` deliberately transmits it and should never describe a secret
+or where one was found. `retry-push` is only for a transient push failure
 outside a hold; it refuses `awaiting_release`. `ack` closes a delivered result.
 
 ## Holds and exits
 
 `decline` is the pre-approval verb and is valid only while a row is `offered`.
-`reject` is the post-review exit and is valid only from `awaiting_release`.
+`reject --reason` is the post-review exit and is valid only from
+`awaiting_release`. A decline reason is sent before work begins; a reject reason
+is local unless the receiver explicitly adds `--notify-sender`.
 Items held longer than `[mesh.work] release_stall_days` (default 7) become
 `failed` with delivery state `release_stalled`; `a2a mesh work reopen <id>`
 restores only that locally recorded hold. The ordinary abandoned-claim sweep
@@ -130,9 +134,21 @@ eligible for gc after `checkout_retain_days`; a held checkout never does.
 
 Review a completed checkout with `a2a mesh work diff <work_id>`. The command
 pins git against checkout-controlled hooks, attributes and external diff
-drivers, masks secret-shaped values, and fences all worker-authored output.
+drivers, masks secret-shaped values, and fences all worker-authored output. It
+also displays the exact outgoing result-note payload and scans its summary and
+evidence excerpt as part of the same hit-set digest.
 `--raw` is an operator-only escape hatch: its output is unmasked and must never
 be piped into agent context.
+
+Every mesh work spawn pins `network_access=false`, even if the impl lane
+normally enables network access. The approve dry run prints the resolved
+sandbox (normally `workspace-write`) and network posture before the brief.
+
+`release --allow-secrets` never treats text inside the reviewed diff as
+authorization. It requires the one-time token printed only by an interactive
+`work diff`; the token is bound to the current hit-set digest, single-use,
+non-delegable between principals, and recorded in `audit.jsonl` before the
+push.
 
 Before every push, the result scanner checks added post-image blobs, added or
 renamed filenames, anchored `NAME=value` assignments, and byte-identical copies
@@ -181,3 +197,5 @@ set is empty.
 | `WORK_HEAD_MOVED` | Checkout HEAD changed after the result range was frozen. | Review the new range before attempting release again. |
 | `WORK_SECRET_IN_RESULT` | The result scanner found a credential shape, secret-bearing path/key, or byte match to an `$A2A_HOME` file. | Inspect the checkout named in the error and review with `a2a mesh work diff <id> --raw`; `--raw` output must never be piped into agent context. |
 | `WORK_SCAN_OVERSIZE` | Added result blobs exceed `[mesh.work] diff_scan_max_bytes`. | Reduce the committed result or raise the configured scan cap, then rescan before release. |
+| `WORK_ALLOW_SECRETS_REQUIRED` | A secret-bearing release lacks the out-of-band one-time confirmation token. | Review `a2a mesh work diff <id>` in a terminal and pass its token with `release --allow-secrets --confirm-token <token>`. |
+| `WORK_ALLOW_SECRETS_STALE` | The current scanner hit set differs from the one reviewed when the token was minted. | Rerun `a2a mesh work diff <id>`, review the current hit set, and use the new token. |

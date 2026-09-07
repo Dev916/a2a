@@ -1,5 +1,6 @@
 mod common;
 
+use a2a::commands::owner;
 use a2a::home::A2aHome;
 use a2a::mesh::gateway::notes_wire::{
     self, deliver_spooled_once, NoteDeliveryTarget, SpooledNote,
@@ -13,6 +14,7 @@ use a2a::mesh::registry::{
     WorkStatus, REGISTRY_SCHEMA_VERSION,
 };
 use a2a::mesh::work_exec::{self, WorkPhase};
+use a2a::mesh::work_gate;
 use a2a::mesh::work_store;
 use a2a::mesh::work::{
     sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkRepo,
@@ -20,11 +22,15 @@ use a2a::mesh::work::{
 use a2a::mesh::Note;
 use assert_cmd::Command;
 use chrono::{SecondsFormat, TimeZone, Utc};
+use nix::fcntl::{Flock, FlockArg};
 use predicates::prelude::*;
 use rand::{rngs::StdRng, SeedableRng};
 use serde_json::{json, Value};
-use std::fs;
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 fn cmd(home: &Path, work: &Path) -> Command {
     common::a2a(home, work)
@@ -158,8 +164,10 @@ fn work_rows_path(fixture: &MeshFixture) -> PathBuf {
 
 fn spooled_notes(home: &A2aHome, gateway: &str) -> Vec<SpooledNote> {
     let dir = home.root().join("mesh").join("outbound").join(gateway);
-    let mut out = fs::read_dir(dir)
-        .unwrap()
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = entries
         .flatten()
         .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
         .map(|entry| notes_wire::read_spooled(&entry.path()).unwrap())
@@ -256,6 +264,74 @@ fn held_item(fixture: &MeshFixture, title: &str) -> String {
     state.hold_hit_count = Some(0);
     work_exec::save_state(&fixture.receiver, &state).unwrap();
     work_id
+}
+
+fn held_git_item(fixture: &MeshFixture, title: &str, result: &str) -> (String, PathBuf) {
+    let work_id = held_item(fixture, title);
+    let state = work_exec::load_state(&fixture.receiver, &work_id)
+        .unwrap()
+        .unwrap();
+    let repo = state.checkout.clone();
+    fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "test@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Test User"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("README.md"), "base\n").unwrap();
+    run_git(&repo, &["add", "--", "README.md"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+    let base_sha = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("result.txt"), result).unwrap();
+    run_git(&repo, &["add", "--", "result.txt"]);
+    run_git(&repo, &["commit", "-m", "worker result"]);
+    let range = work_gate::freeze_range(&repo, &base_sha).unwrap();
+
+    let bare = fixture
+        ._tmp
+        .path()
+        .join(format!("{work_id}-remote.git"));
+    run_git(
+        fixture._tmp.path(),
+        &["init", "--bare", bare.to_str().unwrap()],
+    );
+    let mut state = state;
+    state.base_sha = Some(base_sha);
+    state.held_commit_sha = Some(range.head_sha);
+    state.closure_digest = Some(range.closure_digest);
+    state.base_ref = Some("main".to_string());
+    state.remote_url = Some(bare.to_string_lossy().into_owned());
+    state.result_summary = Some("completed".to_string());
+    state.evidence_excerpt = Some("focused verification passed".to_string());
+    work_exec::save_state(&fixture.receiver, &state).unwrap();
+    (work_id, bare)
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = ProcessCommand::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = ProcessCommand::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -682,11 +758,20 @@ fn decline_cancel_ack_status_and_show_route_notes_and_sanitize_display_strings()
 }
 
 #[test]
-fn reject_moves_a_held_item_to_rejected_with_no_result_ref() {
+fn reject_reason_stays_local_unless_notify_sender_is_passed() {
     let fixture = mesh_fixture("0.3.0");
     let work_id = held_item(&fixture, "Reject Me");
+    let reason = "found creds in build.rs";
     let rejected = cmd(fixture.receiver.root(), &fixture.work)
-        .args(["--json", "mesh", "work", "reject", &work_id])
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "reject",
+            &work_id,
+            "--reason",
+            reason,
+        ])
         .assert()
         .success();
     let out = json_out(&rejected);
@@ -705,13 +790,326 @@ fn reject_moves_a_held_item_to_rejected_with_no_result_ref() {
         .unwrap();
     assert_eq!(state.phase, WorkPhase::Rejected);
     let notes = spooled_notes(&fixture.receiver, &fixture.sender_gw);
+    assert!(
+        notes.iter().all(|note| !serde_json::to_string(note).unwrap().contains("build.rs")),
+        "plain reject must not spool its reason: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .all(|note| note.note.kind != work_store::WORK_RESULT_KIND),
+        "plain reject must not spool a result note: {notes:?}"
+    );
+
+    let notified = cmd(fixture.receiver.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "reject",
+            &work_id,
+            "--reason",
+            reason,
+            "--notify-sender",
+        ])
+        .assert()
+        .success();
+    assert_eq!(json_out(&notified)["data"]["summary"], "rejected by the receiver");
+    let notes = spooled_notes(&fixture.receiver, &fixture.sender_gw);
     let result = notes
         .iter()
         .find(|note| note.note.kind == work_store::WORK_RESULT_KIND)
         .unwrap();
     assert_eq!(result.note.refs["result"]["status"], "rejected");
     assert_eq!(result.note.refs["result"]["result_ref"], Value::Null);
+    assert_eq!(result.note.refs["result"]["summary"], reason);
     assert!(!result.note.text.contains("a2a/work/"));
+
+    cmd(fixture.receiver.root(), &fixture.work)
+        .args(["mesh", "work", "reject", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Send the reason to the sender; do not describe what you found",
+        ));
+}
+
+#[test]
+fn allow_secrets_is_refused_without_confirmation() {
+    let fixture = mesh_fixture("0.3.0");
+    let work_id = held_item(&fixture, "Needs Secret Confirmation");
+    let refused = cmd(fixture.receiver.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "release",
+            &work_id,
+            "--allow-secrets",
+        ])
+        .assert()
+        .failure();
+    let out = json_out(&refused);
+    assert_eq!(out["error"]["code"], "WORK_ALLOW_SECRETS_REQUIRED", "{out}");
+}
+
+#[test]
+fn approve_dry_run_prints_the_resolved_sandbox_posture() {
+    let fixture = mesh_fixture("0.3.0");
+    let origin = fixture._tmp.path().join("approve-origin");
+    fs::create_dir_all(&origin).unwrap();
+    run_git(&origin, &["init", "-b", "main"]);
+    run_git(&origin, &["config", "user.email", "test@example.invalid"]);
+    run_git(&origin, &["config", "user.name", "Test User"]);
+    fs::write(origin.join("README.md"), "base\n").unwrap();
+    run_git(&origin, &["add", "--", "README.md"]);
+    run_git(&origin, &["commit", "-m", "base"]);
+    let bare = fixture._tmp.path().join("approve-origin.git");
+    run_git(
+        fixture._tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            origin.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+
+    let brief = write_valid_brief(&fixture.work, "mesh_work_cli");
+    let sent = cmd(fixture.sender.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "send",
+            "--to",
+            &fixture.receiver_gw,
+            "--repo",
+            &format!("file://{}", bare.display()),
+            "--base-ref",
+            "main",
+            "--title",
+            "Dry-run posture",
+            "--brief",
+            brief.to_str().unwrap(),
+            "--acceptance",
+            "focused test passes",
+        ])
+        .assert()
+        .success();
+    let work_id = json_out(&sent)["data"]["work_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    deliver_to_receiver(&fixture);
+    a2a::mesh::gateway::presence_wire::refresh_registry_cache(
+        &fixture.receiver,
+        &[(
+            gateway_row(
+                &fixture.sender,
+                &fleet_id(&fixture.receiver).unwrap(),
+                "0.3.0",
+            ),
+            a2a::mesh::row_sig::RowVerdict::Unsigned { stripped: false },
+        )],
+        Utc::now(),
+    )
+    .unwrap();
+
+    let lock_path = fixture
+        .receiver
+        .root()
+        .join("mesh")
+        .join(a2a::mesh::gateway::GATEWAY_LOCK);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    let _gateway_lock = Flock::lock(lock_file, FlockArg::LockExclusive).unwrap();
+
+    let json = cmd(fixture.receiver.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "approve",
+            &work_id,
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+    let json = json_out(&json);
+    assert_eq!(json["data"]["sandbox"], "workspace-write", "{json}");
+    assert_eq!(json["data"]["network"], false, "{json}");
+
+    let human = cmd(fixture.receiver.root(), &fixture.work)
+        .args(["mesh", "work", "approve", &work_id, "--dry-run"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(human.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.starts_with("sandbox: workspace-write, network: false\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("# Do the task"), "{stdout}");
+}
+
+#[test]
+fn allow_secrets_token_is_single_use_and_digest_bound() {
+    let fixture = mesh_fixture("0.3.0");
+    let (work_id, bare) = held_git_item(
+        &fixture,
+        "Release Secret Result",
+        "postgresql://a2a:hunter2@h/db\n",
+    );
+    let cfg = a2a::config::load(&fixture.receiver).unwrap().0;
+    let state = work_exec::load_state(&fixture.receiver, &work_id)
+        .unwrap()
+        .unwrap();
+    let range = work_gate::freeze_range(
+        &state.checkout,
+        state.base_sha.as_deref().unwrap(),
+    )
+    .unwrap();
+    let report = work_gate::scan_review_unit(
+        &fixture.receiver,
+        &cfg,
+        &state.checkout,
+        &range,
+        &state,
+    )
+    .unwrap();
+    assert!(!report.hits.is_empty());
+    let token = work_gate::AllowSecretsToken::mint(&state, &report.digest());
+    assert_eq!(token.len(), 32);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let token_path = fixture
+        .receiver
+        .work_dir()
+        .join(&work_id)
+        .join("allow-secrets.json");
+    assert_eq!(
+        fs::metadata(&token_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let principal = owner::caller();
+    let mut release = cmd(fixture.receiver.root(), &fixture.work);
+    let released = release
+        .env("A2A_OWNER", &principal)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "release",
+            &work_id,
+            "--allow-secrets",
+            "--confirm-token",
+            &token,
+        ])
+        .assert()
+        .success();
+    let released = json_out(&released);
+    assert_eq!(released["data"]["phase"], "reported", "{released}");
+    assert!(!token_path.exists(), "a successful token is consumed");
+    let pushed = ProcessCommand::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            &format!("refs/heads/a2a/work/{work_id}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(pushed.status.success(), "secret-bearing result was not pushed");
+
+    let mut replay = cmd(fixture.receiver.root(), &fixture.work);
+    let replayed = replay
+        .env("A2A_OWNER", &principal)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "release",
+            &work_id,
+            "--allow-secrets",
+            "--confirm-token",
+            &token,
+        ])
+        .assert()
+        .failure();
+    let replayed = json_out(&replayed);
+    assert_eq!(
+        replayed["error"]["code"],
+        "WORK_ALLOW_SECRETS_REQUIRED",
+        "{replayed}"
+    );
+
+    let (stale_id, _) = held_git_item(
+        &fixture,
+        "Stale Secret Result",
+        "postgresql://a2a:first@h/db\n",
+    );
+    let stale_state = work_exec::load_state(&fixture.receiver, &stale_id)
+        .unwrap()
+        .unwrap();
+    let stale_range = work_gate::freeze_range(
+        &stale_state.checkout,
+        stale_state.base_sha.as_deref().unwrap(),
+    )
+    .unwrap();
+    let stale_report = work_gate::scan_review_unit(
+        &fixture.receiver,
+        &cfg,
+        &stale_state.checkout,
+        &stale_range,
+        &stale_state,
+    )
+    .unwrap();
+    let stale_token = work_gate::AllowSecretsToken::mint(&stale_state, &stale_report.digest());
+    fs::write(
+        stale_state.checkout.join("new-secret.txt"),
+        "redis://mesh:second@cache/db\n",
+    )
+    .unwrap();
+    run_git(&stale_state.checkout, &["add", "--", "new-secret.txt"]);
+    run_git(
+        &stale_state.checkout,
+        &["commit", "-m", "change the hit set"],
+    );
+    let mut stale_release = cmd(fixture.receiver.root(), &fixture.work);
+    let stale = stale_release
+        .env("A2A_OWNER", &principal)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "release",
+            &stale_id,
+            "--allow-secrets",
+            "--confirm-token",
+            &stale_token,
+        ])
+        .assert()
+        .failure();
+    let stale = json_out(&stale);
+    assert_eq!(stale["error"]["code"], "WORK_ALLOW_SECRETS_STALE", "{stale}");
+
+    let audit = fs::read_to_string(fixture.receiver.root().join("audit.jsonl")).unwrap();
+    let entries = audit.lines().collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1, "{audit}");
+    let entry: Value = serde_json::from_str(entries[0]).unwrap();
+    assert_eq!(
+        entry.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["event", "hit_set_digest", "principal", "work_id"])
+    );
+    assert_eq!(entry["event"], "work_release_allow_secrets");
+    assert_eq!(entry["work_id"], work_id);
+    assert_eq!(entry["hit_set_digest"], report.digest());
+    assert_eq!(entry["principal"], principal);
 }
 
 #[test]

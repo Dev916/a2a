@@ -107,6 +107,7 @@ fn handshake_identity(
         fleet_id: "filled-by-signer".to_string(),
         gateway_id: gateway_id.to_string(),
         pubkey_b64: b64_encode(&key.verifying_key().to_bytes()),
+        key_epoch: 0,
         issued_at: now - 10,
         exp: now + 1_000,
     };

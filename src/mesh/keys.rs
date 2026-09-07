@@ -88,6 +88,8 @@ pub struct TokenClaims {
     pub fleet_id: String,
     pub gateway_id: String,
     pub pubkey_b64: String,
+    #[serde(default)]
+    pub key_epoch: u64,
     pub issued_at: i64,
     pub exp: i64,
 }
@@ -104,6 +106,13 @@ impl RootSet {
             roots.push(read_root_pub(&next)?);
         }
         Ok(Self(roots))
+    }
+
+    pub fn fingerprints(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .filter_map(|root| root_fingerprint(root).ok())
+            .collect()
     }
 }
 
@@ -286,6 +295,17 @@ pub fn gateway_public_key_fingerprint(home: &A2aHome) -> Result<String, AppError
     Ok(hex(&Sha256::digest(pubkey)))
 }
 
+pub fn fpr_of_pubkey_b64(pubkey_b64: &str) -> Result<String, AppError> {
+    let key = verifying_key_from_b64(pubkey_b64).map_err(|_| {
+        AppError::new(
+            "INVALID_PUBKEY",
+            ExitCode::Precondition,
+            "gateway public key must be a base64-encoded ed25519 verifying key",
+        )
+    })?;
+    Ok(hex(&Sha256::digest(key.to_bytes())))
+}
+
 pub fn gateway_signing_key(home: &A2aHome) -> Result<SigningKey, AppError> {
     let gateway = read_gateway_key(&gateway_dir(home)?.join(GW_KEY))?;
     signing_key_from_b64(&gateway.secret_b64).map_err(|_| {
@@ -329,7 +349,7 @@ pub fn verify_gateway_token(
         Err(err) if err.code == "TOKEN_EXPIRED" => return Err(gateway_token_expired(err.message)),
         Err(err) => {
             if err.code == "TOKEN_INVALID" {
-                if let Ok(claims) = unverified_token_claims(token.trim()) {
+                if let Ok(claims) = unverified_claims(token.trim()) {
                     if claims.fleet_id != home_fleet_id {
                         return Err(gateway_fleet_mismatch(&claims.fleet_id, &home_fleet_id));
                     }
@@ -379,6 +399,7 @@ pub fn ensure_gateway_token(home: &A2aHome, clock: &dyn Clock) -> Result<bool, A
         fleet_id: String::new(),
         gateway_id: identity.gateway_id,
         pubkey_b64: gateway_public_key_b64(home)?,
+        key_epoch: 0,
         issued_at,
         exp: issued_at + 90 * 24 * 60 * 60,
     };
@@ -413,6 +434,7 @@ pub fn enroll_gateway_token(
         fleet_id: root.fleet_id,
         gateway_id: gateway_id.to_string(),
         pubkey_b64: pubkey_b64.to_string(),
+        key_epoch: 0,
         issued_at,
         exp: issued_at + 90 * 24 * 60 * 60,
     };
@@ -492,6 +514,7 @@ fn resign_gateway_token_with_next(
         fleet_id: root.fleet_id.clone(),
         gateway_id: gateway.gateway_id,
         pubkey_b64: b64_encode(&signing.verifying_key().to_bytes()),
+        key_epoch: 0,
         issued_at,
         exp: issued_at + 90 * 24 * 60 * 60,
     };
@@ -506,6 +529,15 @@ pub fn verify_token(
     roots: &RootSet,
     clock: &dyn Clock,
 ) -> Result<TokenClaims, AppError> {
+    let (claims, _) = verify_token_no_clock(token_b64, roots)?;
+    check_claim_clock(&claims, clock.now().timestamp())?;
+    Ok(claims)
+}
+
+pub fn verify_token_no_clock(
+    token_b64: &str,
+    roots: &RootSet,
+) -> Result<(TokenClaims, String), AppError> {
     let token = b64_decode(token_b64).map_err(|_| token_invalid("token is not base64"))?;
     let envelope: TokenEnvelope =
         serde_json::from_slice(&token).map_err(|_| token_invalid("token envelope is invalid"))?;
@@ -528,26 +560,19 @@ pub fn verify_token(
         return Err(claims_invalid("claims are not canonical"));
     }
 
-    let mut verified = false;
     for root in &roots.0 {
         let key = verifying_key_from_b64(&root.pubkey_b64)
             .map_err(|_| token_invalid("root public key is invalid"))?;
         if key.verify(&claims_bytes, &signature).is_ok() {
-            verified = true;
-            break;
+            return Ok((claims, root_fingerprint(root)?));
         }
     }
-    if !verified {
-        return Err(token_invalid(
-            "signature does not verify against trusted roots",
-        ));
-    }
-
-    check_claim_clock(&claims, clock.now().timestamp())?;
-    Ok(claims)
+    Err(token_invalid(
+        "signature does not verify against trusted roots",
+    ))
 }
 
-fn unverified_token_claims(token_b64: &str) -> Result<TokenClaims, AppError> {
+pub fn unverified_claims(token_b64: &str) -> Result<TokenClaims, AppError> {
     let token = b64_decode(token_b64).map_err(|_| token_invalid("token is not base64"))?;
     let envelope: TokenEnvelope =
         serde_json::from_slice(&token).map_err(|_| token_invalid("token envelope is invalid"))?;
@@ -595,13 +620,16 @@ fn root_fingerprint(root: &RootPubFile) -> Result<String, AppError> {
 }
 
 fn canonical_claims(claims: &TokenClaims) -> Result<Vec<u8>, AppError> {
-    let fields: BTreeMap<&str, Value> = BTreeMap::from([
+    let mut fields: BTreeMap<&str, Value> = BTreeMap::from([
         ("exp", json!(claims.exp)),
         ("fleet_id", json!(claims.fleet_id)),
         ("gateway_id", json!(claims.gateway_id)),
         ("issued_at", json!(claims.issued_at)),
         ("pubkey_b64", json!(claims.pubkey_b64)),
     ]);
+    if claims.key_epoch != 0 {
+        fields.insert("key_epoch", json!(claims.key_epoch));
+    }
     canonical_json_fields(fields)
 }
 

@@ -1,8 +1,10 @@
 use a2a::home::A2aHome;
 use a2a::mesh::keys::{
     enroll_gateway_token, ensure_gateway_token, fleet_init, gateway_identity,
-    gateway_public_key_b64, gateway_public_key_fingerprint, install_gateway_token, mint_ulid,
-    sign_token, verify_token, RootSet, TestClock, TokenClaims, SKEW_TOLERANCE_SECS,
+    fleet_root_fingerprint, fpr_of_pubkey_b64, gateway_public_key_b64,
+    gateway_public_key_fingerprint, install_gateway_token, mint_ulid, sign_token,
+    unverified_claims, verify_token, verify_token_no_clock, Clock, RootSet, TestClock, TokenClaims,
+    SKEW_TOLERANCE_SECS,
 };
 use chrono::{TimeZone, Utc};
 use std::fs;
@@ -22,6 +24,7 @@ fn claims(exp: i64, issued_at: i64) -> TokenClaims {
         fleet_id: "fleet-1234abcd".to_string(),
         gateway_id: "gw-testhost-abcdef".to_string(),
         pubkey_b64: "AQIDBA==".to_string(),
+        key_epoch: 0,
         issued_at,
         exp,
     }
@@ -224,6 +227,7 @@ fn remote_install_rejects_expired_tokens() {
         fleet_id: fleet.fleet_id,
         gateway_id: identity.gateway_id,
         pubkey_b64: gateway_public_key_b64(&join_home).unwrap(),
+        key_epoch: 0,
         issued_at: old_now,
         exp: old_now + 10,
     };
@@ -338,4 +342,58 @@ fn forced_errors_do_not_leak_private_key_material() {
     for entry in corpus {
         assert!(!entry.contains(secret), "{entry}");
     }
+}
+
+#[test]
+fn pre_l4_token_without_key_epoch_verifies_as_epoch_zero_and_stays_canonical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    fleet_init(&home).unwrap();
+    let gateway = gateway_identity(&home, false).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let token = enroll_gateway_token(
+        &home,
+        &gateway.gateway_id,
+        &gateway_public_key_b64(&home).unwrap(),
+        &clock,
+    )
+    .unwrap();
+
+    let claims = verify_token(&token, &RootSet::load(&home).unwrap(), &clock).unwrap();
+    assert_eq!(claims.key_epoch, 0);
+    assert_eq!(unverified_claims(&token).unwrap().key_epoch, 0);
+    assert_eq!(
+        fpr_of_pubkey_b64(&gateway_public_key_b64(&home).unwrap()).unwrap(),
+        gateway_public_key_fingerprint(&home).unwrap()
+    );
+    assert!(verify_token(&token, &RootSet::load(&home).unwrap(), &clock).is_ok());
+}
+
+#[test]
+fn verify_token_no_clock_accepts_an_expired_token_and_names_the_issuing_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    fleet_init(&home).unwrap();
+    let gateway = gateway_identity(&home, false).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let token = enroll_gateway_token(
+        &home,
+        &gateway.gateway_id,
+        &gateway_public_key_b64(&home).unwrap(),
+        &clock,
+    )
+    .unwrap();
+    let roots = RootSet::load(&home).unwrap();
+    let claims = verify_token(&token, &roots, &clock).unwrap();
+    let expected_root_fpr = fleet_root_fingerprint(&home).unwrap();
+    assert_eq!(roots.fingerprints(), vec![expected_root_fpr.clone()]);
+
+    clock.advance(chrono::Duration::seconds(
+        claims.exp - clock.now().timestamp() + SKEW_TOLERANCE_SECS + 1,
+    ));
+    assert_eq!(verify_token(&token, &roots, &clock).unwrap_err().code, "TOKEN_EXPIRED");
+
+    let (without_clock, issuing_root_fpr) = verify_token_no_clock(&token, &roots).unwrap();
+    assert_eq!(without_clock, claims);
+    assert_eq!(issuing_root_fpr, expected_root_fpr);
 }

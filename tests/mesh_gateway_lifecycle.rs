@@ -624,6 +624,7 @@ fn gateway_startup_refuses_token_for_another_gateway_id() {
         fleet_id: String::new(),
         gateway_id: format!("{}-other", local.gateway_id),
         pubkey_b64: keys::gateway_public_key_b64(&resolved).unwrap(),
+        key_epoch: 0,
         issued_at: Utc::now().timestamp(),
         exp: Utc::now().timestamp() + 3600,
     };
@@ -655,6 +656,7 @@ fn gateway_startup_refuses_token_for_another_gateway_pubkey() {
         fleet_id: String::new(),
         gateway_id: local.gateway_id,
         pubkey_b64: keys::gateway_public_key_b64(&other_home).unwrap(),
+        key_epoch: 0,
         issued_at: Utc::now().timestamp(),
         exp: Utc::now().timestamp() + 3600,
     };
@@ -684,6 +686,7 @@ fn gateway_startup_refuses_expired_token() {
         fleet_id: String::new(),
         gateway_id: identity.gateway_id,
         pubkey_b64: keys::gateway_public_key_b64(&resolved).unwrap(),
+        key_epoch: 0,
         issued_at,
         exp: Utc::now().timestamp() - SKEW_TOLERANCE_SECS - 1,
     };

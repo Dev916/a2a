@@ -2,8 +2,9 @@ use super::RegistryErrorChange;
 use crate::config::Config;
 use crate::home::A2aHome;
 use crate::mesh::keys::{self, Clock};
-use crate::mesh::registry::{GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
-use crate::mesh::row_sig::{self, RowMsg, RowSigFault, RowVerdict, ROW_MSG_VER};
+use crate::mesh::registry::{self, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
+use crate::mesh::row_mark::RowMarkStore;
+use crate::mesh::row_sig::{self, RowMsg, RowVerdict, RowVerifyCfg, ROW_MSG_VER};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Timelike, Utc};
 use rand::Rng;
@@ -147,6 +148,7 @@ pub struct RowSigningContext {
     pub registry_heartbeat_secs: u64,
     pub enforce_require_signed_rows: bool,
     pub enforce_auto_push: bool,
+    pub max_accepted_row_resign_secs: u64,
 }
 
 impl std::fmt::Debug for RowSigningContext {
@@ -161,6 +163,10 @@ impl std::fmt::Debug for RowSigningContext {
                 &self.enforce_require_signed_rows,
             )
             .field("enforce_auto_push", &self.enforce_auto_push)
+            .field(
+                "max_accepted_row_resign_secs",
+                &self.max_accepted_row_resign_secs,
+            )
             .finish()
     }
 }
@@ -179,6 +185,10 @@ impl RowSigningContext {
             registry_heartbeat_secs: cfg.mesh.gateway.registry_heartbeat_secs,
             enforce_require_signed_rows: cfg.mesh.gateway.require_signed_rows,
             enforce_auto_push,
+            max_accepted_row_resign_secs: cfg
+                .mesh
+                .gateway
+                .max_accepted_row_resign_secs,
         }
     }
 }
@@ -393,7 +403,25 @@ impl ExposurePublisher {
     {
         // Keep discover -> writer verification -> repair in this one awaited tick. The caller
         // never selects over individual phases, so cancellation cannot skip only the repair.
-        let rows = match registry.discover(&self.row.fleet_id).await {
+        let rows_result = match (
+            registry::reader_roots(&ctx.home),
+            RowMarkStore::open(&ctx.home),
+        ) {
+            (Ok(roots), Ok(marks)) => {
+                let mut verify_cfg = RowVerifyCfg::new(now);
+                verify_cfg.max_accepted_row_resign_secs = ctx.max_accepted_row_resign_secs;
+                registry::discover_verified(
+                    registry,
+                    &self.row.fleet_id,
+                    &roots,
+                    &marks,
+                    &verify_cfg,
+                )
+                .await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        let rows = match rows_result {
             Ok(rows) => rows,
             Err(err) => {
                 let registry_error_change = self.record_registry_error(&err, now);
@@ -415,22 +443,25 @@ impl ExposurePublisher {
         };
         let existing = rows
             .into_iter()
-            .find(|row| row.gateway_id == self.row.gateway_id);
-        if let Some(row) = &existing {
+            .find(|(row, _verdict)| row.gateway_id == self.row.gateway_id);
+        if let Some((row, _verdict)) = &existing {
             self.created_at = Some(row.created_at);
         }
-        let own_pubkey = keys::gateway_public_key_b64(&ctx.home)?;
-        // R4 will replace this writer-only check with the full verifier when it lands.
-        let (self_verdict, existing_msg) = existing
+        let self_verdict = existing.as_ref().map(|(_row, verdict)| *verdict);
+        let existing_msg = existing
             .as_ref()
-            .map(|row| writer_self_check(row, &own_pubkey))
-            .unwrap_or((None, None));
+            .and_then(|(row, _verdict)| row.row_msg.as_deref())
+            .and_then(|text| row_sig::parse_row_msg_strict(text).ok());
         let detected_self_tamper = match self_verdict {
             Some(RowVerdict::ValidSigned) => None,
             Some(verdict) => Some(verdict.label().to_string()),
             None => Some("MISSING".to_string()),
         };
-        let repair = detected_self_tamper.is_some();
+        let revocation_blocks_repair = matches!(
+            self_verdict,
+            Some(RowVerdict::Revoked | RowVerdict::RowRevocationMisplaced)
+        );
+        let repair = detected_self_tamper.is_some() && !revocation_blocks_repair;
         let self_tamper = self.self_tamper_transition(detected_self_tamper);
 
         let (endpoint_url, exposure_error, exposure_error_since, exposure_error_change) =
@@ -497,7 +528,29 @@ impl ExposurePublisher {
                 }
             };
 
-        let candidate = self.signed_row(ctx, endpoint_url.clone(), now)?;
+        let candidate = match self.signed_row(ctx, endpoint_url.clone(), now) {
+            Ok(candidate) => candidate,
+            Err(error) if error.code == "ROOTS_UNREADABLE" => {
+                let _ = registry
+                    .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
+                    .await;
+                let registry_error_change = self.record_registry_error(&error, now);
+                let (registry_error, registry_error_since) = self.registry_error_fields();
+                return Ok(ExposureTick {
+                    endpoint_url,
+                    upserted: false,
+                    resigned: false,
+                    self_tamper,
+                    exposure_error,
+                    exposure_error_since,
+                    exposure_error_change,
+                    registry_error,
+                    registry_error_since,
+                    registry_error_change,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let candidate_msg = signed_message(&candidate)?;
         let endpoint_changed = self
             .last_endpoint_url
@@ -516,10 +569,8 @@ impl ExposurePublisher {
             .unwrap_or(true);
         // row_resign_secs is only the unchanged-row cadence. A failed self-check takes the
         // repair path above on every registry heartbeat, bounding tamper persistence to one tick.
-        let should_resign = repair
-            || endpoint_changed
-            || signed_fields_changed
-            || cadence_elapsed;
+        let should_resign = !revocation_blocks_repair
+            && (repair || endpoint_changed || signed_fields_changed || cadence_elapsed);
         let registry_result = if should_resign {
             registry
                 .upsert_self(candidate.clone())
@@ -555,6 +606,11 @@ impl ExposurePublisher {
                 });
             }
         };
+        let mark_error = if resigned {
+            persist_verified_row_mark(&ctx.home, &candidate, &candidate_msg).err()
+        } else {
+            None
+        };
         if resigned {
             self.last_endpoint_url = Some(endpoint_url.clone());
             self.last_signed_msg = Some(candidate_msg);
@@ -562,7 +618,11 @@ impl ExposurePublisher {
                 self.last_self_tamper = None;
             }
         }
-        let registry_error_change = self.clear_registry_error();
+        let registry_error_change = match mark_error.as_ref() {
+            Some(error) => self.record_registry_error(error, now),
+            None => self.clear_registry_error(),
+        };
+        let (registry_error, registry_error_since) = self.registry_error_fields();
         Ok(ExposureTick {
             endpoint_url,
             upserted: resigned,
@@ -571,8 +631,8 @@ impl ExposurePublisher {
             exposure_error,
             exposure_error_since,
             exposure_error_change,
-            registry_error: None,
-            registry_error_since: None,
+            registry_error,
+            registry_error_since,
             registry_error_change,
         })
     }
@@ -614,7 +674,7 @@ impl ExposurePublisher {
         now: DateTime<Utc>,
     ) -> Result<GatewayRow, AppError> {
         let token = keys::gateway_token(&ctx.home)?;
-        let roots = keys::RootSet::load(&ctx.home)?;
+        let roots = registry::reader_roots(&ctx.home)?;
         let mut root_fingerprints = roots.fingerprints();
         root_fingerprints.sort();
         let roots_held = serde_json::to_string(&root_fingerprints).map_err(|err| {
@@ -735,40 +795,22 @@ impl ExposurePublisher {
     }
 }
 
-fn writer_self_check(row: &GatewayRow, own_pubkey: &str) -> (Option<RowVerdict>, Option<RowMsg>) {
-    let (row_msg, row_token, row_sig, signed_at) =
-        match (&row.row_msg, &row.row_token, &row.row_sig, row.signed_at) {
-            (Some(row_msg), Some(row_token), Some(row_sig), Some(signed_at)) => {
-                (row_msg, row_token, row_sig, signed_at)
-            }
-            (None, None, None, None) => {
-                return (Some(RowVerdict::Unsigned { stripped: false }), None)
-            }
-            _ => return (Some(RowVerdict::RowSigIncomplete), None),
-        };
-    let parsed = match row_sig::verify_row_bytes(row_msg, row_sig, own_pubkey) {
-        Ok(parsed) => parsed,
-        Err(RowSigFault::UnknownVersion(_)) => {
-            return (Some(RowVerdict::RowSigUnknownVersion), None)
-        }
-        Err(_) => return (Some(RowVerdict::BadSig), None),
-    };
-    let projection_matches = parsed.fleet_id == row.fleet_id
-        && parsed.gateway_id == row.gateway_id
-        && parsed.endpoint_url == row.endpoint_url
-        && parsed.pubkey_fpr == row.pubkey_fpr
-        && parsed.cert_fpr == row.cert_fpr
-        && parsed.version == row.version
-        && parsed.owner == row.owner
-        && parsed.created_at == row.created_at
-        && parsed.schema_version == row.schema_version
-        && parsed.signed_at == signed_at
-        && parsed.row_token_sha256 == sha256_hex(row_token.as_bytes());
-    if projection_matches {
-        (Some(RowVerdict::ValidSigned), Some(parsed))
-    } else {
-        (Some(RowVerdict::BadSig), Some(parsed))
-    }
+fn persist_verified_row_mark(
+    home: &A2aHome,
+    row: &GatewayRow,
+    msg: &RowMsg,
+) -> Result<(), AppError> {
+    let token = row.row_token.as_deref().ok_or_else(|| {
+        AppError::new(
+            "INTERNAL",
+            ExitCode::Internal,
+            "locally signed registry row is missing its enrollment token",
+        )
+    })?;
+    let roots = registry::reader_roots(home)?;
+    let claims = keys::verify_token_no_clock(token, &roots)?.0;
+    let mut marks = RowMarkStore::open(home)?;
+    marks.apply_verified(&row.gateway_id, msg, &claims)
 }
 
 fn signed_message(row: &GatewayRow) -> Result<RowMsg, AppError> {

@@ -4,6 +4,7 @@ use a2a::home::A2aHome;
 use a2a::mesh::gateway::presence_wire;
 use a2a::mesh::gateway::replicate::CursorStore;
 use a2a::mesh::registry::{GatewayRow, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::row_sig::RowVerdict;
 use a2a::mesh::{PeerId, Presence};
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::{json, Value};
@@ -272,13 +273,21 @@ fn gc_keeps_remote_homed_peer_until_home_gateway_is_registry_retired_then_archiv
     presence_wire::refresh_registry_cache(
         &a2a_home,
         &[
-            registry_row("gw-b", now - Duration::days(8)),
-            registry_row("gw-c", now),
+            (
+                registry_row("gw-b", now - Duration::days(8)),
+                RowVerdict::ValidSigned,
+            ),
+            (registry_row("gw-c", now), RowVerdict::ValidSigned),
         ],
-        now - Duration::minutes(1),
+        now - Duration::days(8) - Duration::minutes(1),
     )
     .unwrap();
-    presence_wire::refresh_registry_cache(&a2a_home, &[registry_row("gw-c", now)], now).unwrap();
+    presence_wire::refresh_registry_cache(
+        &a2a_home,
+        &[(registry_row("gw-c", now), RowVerdict::ValidSigned)],
+        now - Duration::days(8),
+    )
+    .unwrap();
 
     let mut cursors = CursorStore::load_or_rebuild(&a2a_home).unwrap();
     cursors.apply_advance(a2a::mesh::gateway::replicate::CursorAdvance::new("gw-b", 4));

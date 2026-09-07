@@ -4,6 +4,8 @@ use crate::mesh::{
     feed,
     keys::{self, SystemClock},
     registry::{self, Registry, WorkOwner, WorkPatch},
+    row_mark::RowMarkStore,
+    row_sig::RowVerifyCfg,
     peer_dir, scan_or_refuse,
     work::{verify_envelope, WorkEnvelope},
     work_store::{self, WorkSource, WORK_OFFER_KIND, WORK_RESULT_KIND},
@@ -256,7 +258,12 @@ async fn record_result_delivery_ack_async(
     delivery: String,
 ) -> Result<(), AppError> {
     let registry_url = registry::read_registry_env(&home)?;
-    let registry = registry::open_registry(&registry_url)?;
+    let registry = registry::open_registry(
+        &registry_url,
+        registry::reader_roots(&home)?,
+        keys::fleet_id(&home)?,
+    )?
+    .with_reader_state(RowMarkStore::open(&home)?, RowVerifyCfg::new(Utc::now()));
     let fleet_id = keys::fleet_id(&home)?;
     let Some(row) = registry.work_get(&fleet_id, &work_id).await? else {
         return Ok(());

@@ -3,6 +3,8 @@ use crate::home::A2aHome;
 use crate::mesh::{
     keys::{self, Clock, SystemClock},
     registry::{self, Registry, RegistryHandle},
+    row_mark::RowMarkStore,
+    row_sig::RowVerifyCfg,
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1262,7 +1264,15 @@ fn bootstrap_registry_runtime(
     cfg: &Config,
 ) -> Result<GatewayRegistryRuntime, AppError> {
     let registry_url = read_gateway_registry_env(home)?;
-    let registry = registry::open_registry(&registry_url)?;
+    let registry = registry::open_registry(
+        &registry_url,
+        registry::reader_roots(home)?,
+        keys::fleet_id(home)?,
+    )?
+    .with_reader_state(
+        RowMarkStore::open(home)?,
+        RowVerifyCfg::from_config(Utc::now(), cfg),
+    );
     let exposure = ExposureProvider::from_config(cfg)?;
     Ok(GatewayRegistryRuntime {
         registry,
@@ -1952,7 +1962,7 @@ async fn dialer_loop(
                 }
             }
             _ = poll.tick() => {
-                let rows = match cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await {
+                let rows = match cfg.registry.registry.discover().await {
                     Ok(rows) => {
                         if tx.send(registry_error_recovered(slot)).await.is_err() {
                             token.cancel();
@@ -1968,16 +1978,24 @@ async fn dialer_loop(
                         continue;
                     }
                 };
+                let visible_rows = rows
+                    .iter()
+                    .map(|(row, _verdict)| row.clone())
+                    .collect::<Vec<_>>();
                 for peer in refresh_dial_state_maps(
                     &mut last_seen,
-                    &rows,
+                    &visible_rows,
                     &mut attempts,
                     &mut next_dial_after,
                 ) {
                     cfg.links.reset_peer_damping(&peer).await;
                 }
                 cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
-                for row in link::discover_outbound_peers(&cfg.registry.row.gateway_id, &rows) {
+                for row in link::discover_outbound_peers(
+                    &cfg.registry.row.gateway_id,
+                    &rows,
+                    cfg.config.mesh.gateway.require_signed_rows,
+                ) {
                     if next_dial_after
                         .get(&row.gateway_id)
                         .is_some_and(|next| Instant::now() < *next)
@@ -2127,13 +2145,15 @@ async fn anti_entropy_loop(
             }
             _ = anti_entropy.tick() => {
                 link::push_anti_entropy_digest(&cfg.home, &cfg.links).await?;
-                match cfg.registry.registry.discover(&cfg.registry.row.fleet_id).await {
+                match cfg.registry.registry.discover().await {
                     Ok(rows) => {
                         if tx.send(registry_error_recovered(slot)).await.is_err() {
                             token.cancel();
                             return Ok(());
                         }
-                        cfg.links.refresh_registry_cache(&cfg.home, &rows, Utc::now()).await?;
+                        cfg.links
+                            .refresh_registry_cache(&cfg.home, &rows, Utc::now())
+                            .await?;
                     }
                     Err(err) => {
                         if tx.send(registry_error_down(slot, &err)).await.is_err() {
@@ -2145,7 +2165,11 @@ async fn anti_entropy_loop(
                 presence_wire::retire_stale_origins(
                     &cfg.home,
                     Utc::now(),
-                    cfg.config.mesh.gateway.registry_timeout_secs as i64,
+                    cfg.config
+                        .mesh
+                        .gc_after_days
+                        .saturating_mul(86_400)
+                        .min(i64::MAX as u64) as i64,
                 )?;
                 let mut cursors = replicate::CursorStore::load_or_rebuild(&cfg.home)?;
                 replicate::compact_feed(
@@ -2398,6 +2422,7 @@ mod tests {
                 "shutdown_grace_secs",
                 "require_signed_rows",
                 "row_resign_secs",
+                "max_accepted_row_resign_secs",
             ]
         );
     }

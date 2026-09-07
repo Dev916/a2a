@@ -290,6 +290,50 @@ fn send_preflights_peer_version_validates_brief_inserts_row_spools_note_and_post
 }
 
 #[test]
+fn send_refuses_an_invalid_peer_row_before_the_peer_version_check() {
+    let fixture = mesh_fixture("0.2.9");
+    let mut invalid = gateway_row(
+        &fixture.receiver,
+        &fleet_id(&fixture.receiver).unwrap(),
+        "0.2.9",
+    );
+    invalid.row_token = Some("partial-signature-shape".to_string());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime
+        .block_on(fixture.registry.upsert_self(invalid))
+        .unwrap();
+    let brief = write_valid_brief(&fixture.work, "mesh_work_cli");
+
+    let rejected = cmd(fixture.sender.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "send",
+            "--to",
+            &fixture.receiver_gw,
+            "--repo",
+            "https://github.com/example/project.git",
+            "--base-ref",
+            "main",
+            "--title",
+            "Capture invalid row",
+            "--brief",
+            brief.to_str().unwrap(),
+            "--acceptance",
+            "focused test passes",
+        ])
+        .assert()
+        .failure();
+    let out = json_out(&rejected);
+    assert_eq!(out["error"]["code"], "WORK_PEER_ROW_INVALID", "{out}");
+    let remedy = out["error"]["remedy"].as_str().unwrap();
+    assert!(remedy.contains("capture the row for evidence first"), "{out}");
+    assert!(remedy.contains("do NOT ask the peer to restart or republish"), "{out}");
+    assert_ne!(out["error"]["code"], "WORK_PEER_TOO_OLD", "{out}");
+}
+
+#[test]
 fn offer_uses_pool_feed_cap_and_writes_registry_row() {
     let fixture = mesh_fixture("0.3.0");
     let big_brief = common::write_brief(

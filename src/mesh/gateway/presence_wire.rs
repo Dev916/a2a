@@ -1,6 +1,7 @@
 use crate::home::{create_dir_0700, A2aHome};
 use crate::mesh::gateway::replicate::CursorStore;
 use crate::mesh::registry::GatewayRow;
+use crate::mesh::row_sig::RowVerdict;
 use crate::mesh::wire::Frame;
 use crate::mesh::{mesh_root, presence, PeerId, Presence};
 use crate::output::{AppError, ExitCode};
@@ -32,6 +33,10 @@ struct CachedGateway {
     last_heartbeat: DateTime<Utc>,
     #[serde(default)]
     revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    invalid_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    verdict: Option<String>,
     #[serde(default)]
     missing_since: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -141,23 +146,40 @@ pub fn merge_presence_frame(
 
 pub fn refresh_registry_cache(
     home: &A2aHome,
-    rows: &[GatewayRow],
+    rows: &[(GatewayRow, RowVerdict)],
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let mut cache = load_registry_cache(home)?;
     let mut seen = BTreeSet::new();
-    for row in rows {
+    for (row, verdict) in rows {
         seen.insert(row.gateway_id.clone());
+        let previous = cache.gateways.get(&row.gateway_id);
+        let verdict_label = verdict.label();
+        let invalid_since = if matches!(verdict, RowVerdict::ValidSigned) {
+            None
+        } else {
+            previous
+                .and_then(|cached| cached.invalid_since)
+                .or(Some(now))
+        };
+        if previous.and_then(|cached| cached.verdict.as_deref()) != Some(verdict_label) {
+            log_row_verdict_transition(
+                home,
+                &row.gateway_id,
+                previous.and_then(|cached| cached.verdict.as_deref()),
+                verdict_label,
+                now,
+            );
+        }
         cache.gateways.insert(
             row.gateway_id.clone(),
             CachedGateway {
                 last_heartbeat: row.last_heartbeat,
                 revoked_at: row.revoked_at,
+                invalid_since,
+                verdict: Some(verdict_label.to_string()),
                 missing_since: None,
-                retired_at: cache
-                    .gateways
-                    .get(&row.gateway_id)
-                    .and_then(|cached| cached.retired_at),
+                retired_at: previous.and_then(|cached| cached.retired_at),
             },
         );
     }
@@ -241,12 +263,9 @@ fn presence_tuple(p: &Presence, fallback_gateway: &str) -> (u64, DateTime<Utc>, 
 }
 
 fn registry_retirable(cached: &CachedGateway, now: DateTime<Utc>, gc_after_secs: i64) -> bool {
-    if cached.revoked_at.is_none() && cached.missing_since.is_none() {
-        return false;
-    }
-    now.signed_duration_since(cached.last_heartbeat)
-        .num_seconds()
-        > gc_after_secs
+    cached.missing_since.is_some_and(|missing_since| {
+        now.signed_duration_since(missing_since).num_seconds() > gc_after_secs
+    })
 }
 
 fn peer_ids(home: &A2aHome) -> Result<Vec<PeerId>, AppError> {
@@ -322,6 +341,32 @@ fn log_origin_retired(home: &A2aHome, gateway_id: &str, archived: usize, cursors
             "gateway_id": gateway_id,
             "archived": archived,
             "cursors_dropped": cursors_dropped,
+        });
+        if let Ok(mut bytes) = serde_json::to_vec(&line) {
+            bytes.push(b'\n');
+            let _ = f.write_all(&bytes);
+        }
+    }
+}
+
+fn log_row_verdict_transition(
+    home: &A2aHome,
+    gateway_id: &str,
+    from: Option<&str>,
+    to: &str,
+    now: DateTime<Utc>,
+) {
+    let dir = home.root().join("mesh").join("gateway");
+    if create_dir_0700(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = crate::exec::open_append_0600(&dir.join(super::GATEWAY_JSONL)) {
+        let line = json!({
+            "ts": now,
+            "kind": "row_verdict_transition",
+            "gateway_id": gateway_id,
+            "from": from,
+            "to": to,
         });
         if let Ok(mut bytes) = serde_json::to_vec(&line) {
             bytes.push(b'\n');

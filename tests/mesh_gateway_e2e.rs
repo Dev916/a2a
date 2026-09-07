@@ -182,7 +182,7 @@ async fn fleet_e2e_replicates_feeds_routes_notes_and_merges_presence() {
             .await
             .unwrap();
     }
-    let rows = registry.discover(&fleet.fleet_id).await.unwrap();
+    let rows = registry.discover_unverified(&fleet.fleet_id).await.unwrap();
     assert_eq!(rows.len(), 3, "fleet init plus three enrolled gateway rows");
     assert_eq!(
         rows.iter()

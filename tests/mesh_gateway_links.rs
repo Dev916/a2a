@@ -8,6 +8,7 @@ use a2a::mesh::gateway::link::{
 };
 use a2a::mesh::keys::{fleet_init, sign_token, RootSet, TestClock, TokenClaims};
 use a2a::mesh::registry::{FileRegistry, GatewayRow, Registry, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::row_sig::RowVerdict;
 use a2a::mesh::wire::{
     handshake_acceptor, handshake_dialer, test_link, Frame, HandshakeIdentity, TlsIdentity,
 };
@@ -267,16 +268,21 @@ async fn discovery_orders_deduped_links_and_damped_side_still_accepts_inbound() 
         .await
         .unwrap();
     registry.upsert_self(row("gw-c", None)).await.unwrap();
-    let rows = registry.discover("fleet-a").await.unwrap();
+    let rows = registry.discover_unverified("fleet-a").await.unwrap();
+    let verified_rows = rows
+        .iter()
+        .cloned()
+        .map(|row| (row, RowVerdict::Unsigned { stripped: false }))
+        .collect::<Vec<_>>();
 
     assert_eq!(
-        discover_outbound_peers("gw-a", &rows)
+        discover_outbound_peers("gw-a", &verified_rows, false)
             .into_iter()
             .map(|r| r.gateway_id.clone())
             .collect::<Vec<_>>(),
         vec!["gw-b"]
     );
-    assert!(discover_outbound_peers("gw-b", &rows).is_empty());
+    assert!(discover_outbound_peers("gw-b", &verified_rows, false).is_empty());
 
     let mut damping = PeerDamping::new(Duration::from_secs(300));
     let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -506,12 +512,23 @@ async fn acceptor_and_dialer_connect_over_discovered_injected_io_endpoint() {
         )
         .await
         .unwrap();
-    let mut rows = registry.discover("fleet-a").await.unwrap();
-    rows[0].cert_fpr = Some(tls.spki_fpr().to_string());
+    let mut rows = registry.discover_unverified("fleet-a").await.unwrap();
+    let gw_b = rows
+        .iter()
+        .position(|r| r.gateway_id == "gw-b")
+        .expect("gw-b row present (revoked gw-a is visible-and-flagged post-L4)");
+    rows[gw_b].cert_fpr = Some(tls.spki_fpr().to_string());
+    let verified_rows = rows
+        .into_iter()
+        .map(|row| (row, RowVerdict::ValidSigned))
+        .collect::<Vec<_>>();
 
     let (client, server) = tokio::io::duplex(a2a::mesh::wire::MAX_FRAME_BYTES * 2 + 4096);
     let accept = tokio::spawn(accept_once_io(server, tls));
-    let mut side = dial_gateway_io(client, discover_outbound_peers("gw-a", &rows)[0])
+    let mut side = dial_gateway_io(
+        client,
+        discover_outbound_peers("gw-a", &verified_rows, false)[0],
+    )
         .await
         .unwrap();
 

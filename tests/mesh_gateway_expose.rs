@@ -170,7 +170,7 @@ async fn publisher_tick_writes_a_row_that_verifies_as_valid_signed() {
     assert!(tick.resigned);
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -218,7 +218,7 @@ async fn unchanged_signed_rows_heartbeat_until_the_resign_cadence() {
         .await
         .unwrap();
     assert!(!heartbeat.resigned);
-    let row = fixture.registry.discover(&fixture.fleet_id).await.unwrap().remove(0);
+    let row = fixture.registry.discover_unverified(&fixture.fleet_id).await.unwrap().remove(0);
     assert_eq!(row.signed_at, Some(t0));
     assert_eq!(row.last_heartbeat, t0 + chrono::Duration::seconds(1));
 
@@ -231,7 +231,7 @@ async fn unchanged_signed_rows_heartbeat_until_the_resign_cadence() {
         .await
         .unwrap();
     assert!(cadence.resigned);
-    let row = fixture.registry.discover(&fixture.fleet_id).await.unwrap().remove(0);
+    let row = fixture.registry.discover_unverified(&fixture.fleet_id).await.unwrap().remove(0);
     assert_eq!(row.signed_at, Some(t0 + chrono::Duration::seconds(86_400)));
     assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
 }
@@ -262,7 +262,7 @@ async fn publisher_reloads_the_gateway_token_and_held_roots_each_tick() {
         .await
         .unwrap();
     assert!(tick.resigned);
-    let row = fixture.registry.discover(&fixture.fleet_id).await.unwrap().remove(0);
+    let row = fixture.registry.discover_unverified(&fixture.fleet_id).await.unwrap().remove(0);
     assert_ne!(row.row_token.as_deref(), Some(old_token.as_str()));
     let parsed = writer_verdict(&fixture.home, &row).1.unwrap();
     let held: Vec<String> = serde_json::from_str(&parsed.roots_held).unwrap();
@@ -301,7 +301,7 @@ async fn restarted_publisher_signs_the_registrys_original_created_at() {
     assert!(tick.resigned);
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -342,7 +342,7 @@ async fn tampered_own_row_is_detected_and_repaired_within_one_tick() {
     assert!(tick.resigned);
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -411,7 +411,7 @@ async fn registry_loop_logs_one_self_tamper_transition_and_repairs_the_row() {
     assert_eq!(count_log_lines(&root, "\"verdict\":\"BAD_SIG\""), 1);
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -452,7 +452,7 @@ async fn unexposing_publishes_a_valid_signed_row_with_a_null_endpoint() {
     assert!(tick.resigned);
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -477,7 +477,7 @@ async fn gateway_resign_republishes_a_freshly_signed_row() {
         .unwrap();
     let old_signed_at = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()[0]
         .signed_at
@@ -505,7 +505,7 @@ async fn gateway_resign_republishes_a_freshly_signed_row() {
     );
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -537,7 +537,7 @@ async fn install_token_forces_an_immediate_registry_resign() {
         .unwrap();
     let before = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()[0]
         .signed_at
@@ -564,7 +564,7 @@ async fn install_token_forces_an_immediate_registry_resign() {
     assert!(output["data"]["signed_at"].is_string());
     let row = fixture
         .registry
-        .discover(&fixture.fleet_id)
+        .discover_unverified(&fixture.fleet_id)
         .await
         .unwrap()
         .remove(0);
@@ -643,13 +643,13 @@ async fn changed_exposure_reupserts_file_registry_row_with_cert_fingerprint() {
             .upserted
     );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0]
+        registry.discover_unverified("fleet-a").await.unwrap()[0]
             .endpoint_url
             .as_deref(),
         Some("wss://old.example.test:10000")
     );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0]
+        registry.discover_unverified("fleet-a").await.unwrap()[0]
             .cert_fpr
             .as_deref(),
         Some("cert-a")
@@ -659,7 +659,7 @@ async fn changed_exposure_reupserts_file_registry_row_with_cert_fingerprint() {
     let same = publisher.tick(&registry, &exposure, t1).await.unwrap();
     assert!(!same.upserted);
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0].last_heartbeat,
+        registry.discover_unverified("fleet-a").await.unwrap()[0].last_heartbeat,
         t1
     );
 
@@ -672,7 +672,7 @@ async fn changed_exposure_reupserts_file_registry_row_with_cert_fingerprint() {
             .upserted
     );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0]
+        registry.discover_unverified("fleet-a").await.unwrap()[0]
             .endpoint_url
             .as_deref(),
         Some("wss://new.example.test:10001")
@@ -687,7 +687,7 @@ async fn changed_exposure_reupserts_file_registry_row_with_cert_fingerprint() {
             .upserted
     );
     assert_eq!(
-        registry.discover("fleet-a").await.unwrap()[0].endpoint_url,
+        registry.discover_unverified("fleet-a").await.unwrap()[0].endpoint_url,
         None
     );
 }
@@ -815,7 +815,7 @@ async fn real_registry_slot_with_fake_ngrok_publishes_row_and_health_endpoint() 
         tokio::select! {
             result = &mut run => panic!("registry slot exited before publish: {:?}", result),
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                let rows = registry.discover(&fleet_id).await.unwrap();
+                let rows = registry.discover_unverified(&fleet_id).await.unwrap();
                 let health_endpoint = std::fs::read_to_string(home.root().join("mesh/gateway-health.json"))
                     .ok()
                     .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -836,7 +836,7 @@ async fn real_registry_slot_with_fake_ngrok_publishes_row_and_health_endpoint() 
         published,
         "registry slot did not publish row and health endpoint"
     );
-    let rows = registry.discover(&fleet_id).await.unwrap();
+    let rows = registry.discover_unverified(&fleet_id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].gateway_id, identity.gateway_id);
     assert_eq!(
@@ -1260,9 +1260,18 @@ async fn none_exposure_keeps_null_endpoint_and_outbound_discovery_skips_it() {
         )
         .await
         .unwrap();
-    let rows = registry.discover("fleet-a").await.unwrap();
+    let rows = registry.discover_unverified("fleet-a").await.unwrap();
     assert_eq!(rows[0].endpoint_url, None);
-    assert!(a2a::mesh::gateway::link::discover_outbound_peers("gw-a", &rows).is_empty());
+    let verified_rows = rows
+        .into_iter()
+        .map(|row| (row, RowVerdict::Unsigned { stripped: false }))
+        .collect::<Vec<_>>();
+    assert!(a2a::mesh::gateway::link::discover_outbound_peers(
+        "gw-a",
+        &verified_rows,
+        false,
+    )
+    .is_empty());
 }
 
 struct RotatingExposure {
@@ -1319,7 +1328,7 @@ async fn wait_for_row_in_fleet(
     expected_url: Option<&str>,
 ) {
     for _ in 0..100 {
-        let rows = registry.discover(fleet_id).await.unwrap();
+        let rows = registry.discover_unverified(fleet_id).await.unwrap();
         if rows
             .first()
             .map(|row| row.endpoint_url.as_deref() == expected_url)
@@ -1332,7 +1341,7 @@ async fn wait_for_row_in_fleet(
     panic!(
         "registry did not publish expected url {:?}: {:?}",
         expected_url,
-        registry.discover(fleet_id).await.unwrap()
+        registry.discover_unverified(fleet_id).await.unwrap()
     );
 }
 
@@ -1346,7 +1355,7 @@ where
     F: std::future::Future<Output = Result<(), AppError>>,
 {
     for _ in 0..100 {
-        let rows = registry.discover(fleet_id).await.unwrap();
+        let rows = registry.discover_unverified(fleet_id).await.unwrap();
         if let Some(row) = rows
             .first()
             .filter(|row| row.last_heartbeat > after)
@@ -1362,7 +1371,7 @@ where
     panic!(
         "registry heartbeat did not advance after {:?}: {:?}",
         after,
-        registry.discover(fleet_id).await.unwrap()
+        registry.discover_unverified(fleet_id).await.unwrap()
     );
 }
 
@@ -1375,7 +1384,7 @@ async fn wait_for_row_in_fleet_while_running<F>(
     F: std::future::Future<Output = Result<(), AppError>>,
 {
     for _ in 0..100 {
-        let rows = registry.discover(fleet_id).await.unwrap();
+        let rows = registry.discover_unverified(fleet_id).await.unwrap();
         if rows
             .first()
             .map(|row| row.endpoint_url.as_deref() == expected_url)
@@ -1391,7 +1400,7 @@ async fn wait_for_row_in_fleet_while_running<F>(
     panic!(
         "registry did not publish expected url {:?}: {:?}",
         expected_url,
-        registry.discover(fleet_id).await.unwrap()
+        registry.discover_unverified(fleet_id).await.unwrap()
     );
 }
 
@@ -1603,8 +1612,8 @@ impl Registry for FlippingRegistry {
         self.inner.heartbeat(fleet_id, gateway_id, now).await
     }
 
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
-        self.inner.discover(fleet_id).await
+    async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        self.inner.discover_unverified(fleet_id).await
     }
 
     async fn revoke(

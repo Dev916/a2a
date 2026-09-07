@@ -95,7 +95,7 @@ async fn neon_registry_own_row_lifecycle_and_pooler_statement_cache_probe() {
         .heartbeat(&fleet_id, &gateway_id, now + chrono::Duration::seconds(1))
         .await
         .unwrap();
-    let rows = registry.discover(&fleet_id).await.unwrap();
+    let rows = registry.discover_unverified(&fleet_id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].gateway_id, gateway_id);
     assert_eq!(rows[0].owner, "mesh-l2-live-test");

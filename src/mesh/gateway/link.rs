@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::home::A2aHome;
 use crate::mesh::gateway::{notes_wire, presence_wire, replicate};
 use crate::mesh::registry::GatewayRow;
+use crate::mesh::row_sig::{Disposition, RowVerdict};
 use crate::mesh::wire::{
     accept_pinned, accept_pinned_io, connect_pinned, connect_pinned_io, Frame, Side, TlsIdentity,
 };
@@ -210,9 +211,14 @@ impl PeerDamping {
 
 pub fn discover_outbound_peers<'a>(
     local_gateway_id: &str,
-    rows: &'a [GatewayRow],
+    rows: &'a [(GatewayRow, RowVerdict)],
+    require_signed_rows: bool,
 ) -> Vec<&'a GatewayRow> {
     rows.iter()
+        .filter(|(_row, verdict)| {
+            verdict.disposition(require_signed_rows) != Disposition::Refused
+        })
+        .map(|(row, _verdict)| row)
         .filter(|row| row.gateway_id != local_gateway_id)
         .filter(|row| row.endpoint_url.is_some())
         .filter(|row| local_gateway_id < row.gateway_id.as_str())
@@ -429,7 +435,7 @@ impl LinkStateHandle {
     pub async fn refresh_registry_cache(
         &self,
         home: &A2aHome,
-        rows: &[GatewayRow],
+        rows: &[(GatewayRow, RowVerdict)],
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let _guard = self.inner.registry_cache.lock().await;

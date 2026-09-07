@@ -160,8 +160,8 @@ impl Registry for CountingRegistry {
     async fn heartbeat(&self, fleet_id: &str, gateway_id: &str, now: chrono::DateTime<Utc>) -> Result<(), AppError> {
         self.inner.heartbeat(fleet_id, gateway_id, now).await
     }
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
-        self.inner.discover(fleet_id).await
+    async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        self.inner.discover_unverified(fleet_id).await
     }
     async fn revoke(&self, fleet_id: &str, gateway_id: &str, now: chrono::DateTime<Utc>) -> Result<(), AppError> {
         self.inner.revoke(fleet_id, gateway_id, now).await

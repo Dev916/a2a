@@ -1,4 +1,7 @@
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::mesh::keys::RootSet;
+use crate::mesh::row_mark::RowMarkStore;
+use crate::mesh::row_sig::{verify_row, RowVerdict, RowVerifyCfg, StoredRowColumns};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
 use nix::fcntl::{Flock, FlockArg};
@@ -233,7 +236,9 @@ pub trait Registry {
         gateway_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError>;
+    /// Raw gateway-row read. Public consumers use [`RegistryHandle::discover`], which applies the
+    /// row verifier; verification helpers in this module are the only callers of this method.
+    async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError>;
     async fn revoke(
         &self,
         fleet_id: &str,
@@ -492,11 +497,11 @@ impl Registry for FileRegistry {
         self.write_rows(&rows)
     }
 
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+    async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
         Ok(self
             .read_rows()?
             .into_iter()
-            .filter(|r| r.fleet_id == fleet_id && r.revoked_at.is_none())
+            .filter(|r| r.fleet_id == fleet_id)
             .collect())
     }
 
@@ -721,25 +726,72 @@ pub struct PgRegistry {
     first_acquire: AtomicBool,
 }
 
-pub enum RegistryHandle {
+pub(crate) enum RegistryBackend {
     File(FileRegistry),
     Pg(PgRegistry),
 }
 
+pub struct RegistryHandle {
+    backend: RegistryBackend,
+    roots: RootSet,
+    fleet_id: String,
+    marks: RowMarkStore,
+    verify_cfg: RowVerifyCfg,
+}
+
 impl RegistryHandle {
     pub async fn apply_migration(&self, sql: &str) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.apply_migration(sql),
-            RegistryHandle::Pg(registry) => registry.apply_migration(sql).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.apply_migration(sql),
+            RegistryBackend::Pg(registry) => registry.apply_migration(sql).await,
         }
     }
+
+    pub fn with_reader_state(mut self, marks: RowMarkStore, cfg: RowVerifyCfg) -> Self {
+        self.marks = marks;
+        self.verify_cfg = cfg;
+        self
+    }
+
+    pub async fn discover(&self) -> Result<Vec<(GatewayRow, RowVerdict)>, AppError> {
+        discover_verified(
+            self,
+            &self.fleet_id,
+            &self.roots,
+            &self.marks,
+            &self.verify_cfg,
+        )
+        .await
+    }
+
+    pub fn is_file_backend(&self) -> bool {
+        matches!(self.backend, RegistryBackend::File(_))
+    }
+}
+
+pub(crate) async fn discover_verified<R: Registry + ?Sized>(
+    registry: &R,
+    fleet_id: &str,
+    roots: &RootSet,
+    marks: &RowMarkStore,
+    verify_cfg: &RowVerifyCfg,
+) -> Result<Vec<(GatewayRow, RowVerdict)>, AppError> {
+    let rows = registry.discover_unverified(fleet_id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let stored = StoredRowColumns::from(&row);
+            let verdict = verify_row(&stored, roots, marks.get(&row.gateway_id), verify_cfg);
+            (row, verdict)
+        })
+        .collect())
 }
 
 impl Registry for RegistryHandle {
     async fn upsert_self(&self, row: GatewayRow) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.upsert_self(row).await,
-            RegistryHandle::Pg(registry) => registry.upsert_self(row).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.upsert_self(row).await,
+            RegistryBackend::Pg(registry) => registry.upsert_self(row).await,
         }
     }
 
@@ -749,16 +801,16 @@ impl Registry for RegistryHandle {
         gateway_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
-            RegistryHandle::Pg(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
+            RegistryBackend::Pg(registry) => registry.heartbeat(fleet_id, gateway_id, now).await,
         }
     }
 
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.discover(fleet_id).await,
-            RegistryHandle::Pg(registry) => registry.discover(fleet_id).await,
+    async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.discover_unverified(fleet_id).await,
+            RegistryBackend::Pg(registry) => registry.discover_unverified(fleet_id).await,
         }
     }
 
@@ -768,23 +820,23 @@ impl Registry for RegistryHandle {
         gateway_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.revoke(fleet_id, gateway_id, now).await,
-            RegistryHandle::Pg(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+            RegistryBackend::Pg(registry) => registry.revoke(fleet_id, gateway_id, now).await,
         }
     }
 
     async fn schema_version(&self) -> Result<i32, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.schema_version().await,
-            RegistryHandle::Pg(registry) => registry.schema_version().await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.schema_version().await,
+            RegistryBackend::Pg(registry) => registry.schema_version().await,
         }
     }
 
     async fn work_insert(&self, row: WorkRow) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.work_insert(row).await,
-            RegistryHandle::Pg(registry) => registry.work_insert(row).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.work_insert(row).await,
+            RegistryBackend::Pg(registry) => registry.work_insert(row).await,
         }
     }
 
@@ -794,9 +846,9 @@ impl Registry for RegistryHandle {
         work_id: &str,
         claimer_gw: &str,
     ) -> Result<ClaimOutcome, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.work_claim(fleet_id, work_id, claimer_gw).await,
-            RegistryHandle::Pg(registry) => registry.work_claim(fleet_id, work_id, claimer_gw).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.work_claim(fleet_id, work_id, claimer_gw).await,
+            RegistryBackend::Pg(registry) => registry.work_claim(fleet_id, work_id, claimer_gw).await,
         }
     }
 
@@ -809,13 +861,13 @@ impl Registry for RegistryHandle {
         owner: WorkOwner,
         patch: WorkPatch,
     ) -> Result<TransitionOutcome, AppError> {
-        match self {
-            RegistryHandle::File(registry) => {
+        match &self.backend {
+            RegistryBackend::File(registry) => {
                 registry
                     .work_transition(fleet_id, work_id, from, to, owner, patch)
                     .await
             }
-            RegistryHandle::Pg(registry) => {
+            RegistryBackend::Pg(registry) => {
                 registry
                     .work_transition(fleet_id, work_id, from, to, owner, patch)
                     .await
@@ -824,9 +876,9 @@ impl Registry for RegistryHandle {
     }
 
     async fn work_get(&self, fleet_id: &str, work_id: &str) -> Result<Option<WorkRow>, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.work_get(fleet_id, work_id).await,
-            RegistryHandle::Pg(registry) => registry.work_get(fleet_id, work_id).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.work_get(fleet_id, work_id).await,
+            RegistryBackend::Pg(registry) => registry.work_get(fleet_id, work_id).await,
         }
     }
 
@@ -835,9 +887,9 @@ impl Registry for RegistryHandle {
         fleet_id: &str,
         filter: WorkListFilter,
     ) -> Result<Vec<WorkRow>, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.work_list(fleet_id, filter).await,
-            RegistryHandle::Pg(registry) => registry.work_list(fleet_id, filter).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.work_list(fleet_id, filter).await,
+            RegistryBackend::Pg(registry) => registry.work_list(fleet_id, filter).await,
         }
     }
 
@@ -847,11 +899,11 @@ impl Registry for RegistryHandle {
         work_id: &str,
         claimer: &str,
     ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => {
+        match &self.backend {
+            RegistryBackend::File(registry) => {
                 registry.work_touch_running(fleet_id, work_id, claimer).await
             }
-            RegistryHandle::Pg(registry) => {
+            RegistryBackend::Pg(registry) => {
                 registry.work_touch_running(fleet_id, work_id, claimer).await
             }
         }
@@ -862,9 +914,9 @@ impl Registry for RegistryHandle {
         fleet_id: &str,
         swept_by: &str,
     ) -> Result<Vec<String>, AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.work_sweep_expired(fleet_id, swept_by).await,
-            RegistryHandle::Pg(registry) => registry.work_sweep_expired(fleet_id, swept_by).await,
+        match &self.backend {
+            RegistryBackend::File(registry) => registry.work_sweep_expired(fleet_id, swept_by).await,
+            RegistryBackend::Pg(registry) => registry.work_sweep_expired(fleet_id, swept_by).await,
         }
     }
 
@@ -874,13 +926,13 @@ impl Registry for RegistryHandle {
         claimer_gw: &str,
         stall: Duration,
     ) -> Result<Vec<WorkRow>, AppError> {
-        match self {
-            RegistryHandle::File(registry) => {
+        match &self.backend {
+            RegistryBackend::File(registry) => {
                 registry
                     .work_sweep_abandoned(fleet_id, claimer_gw, stall)
                     .await
             }
-            RegistryHandle::Pg(registry) => {
+            RegistryBackend::Pg(registry) => {
                 registry
                     .work_sweep_abandoned(fleet_id, claimer_gw, stall)
                     .await
@@ -889,14 +941,43 @@ impl Registry for RegistryHandle {
     }
 }
 
-pub fn open_registry(url: &str) -> Result<RegistryHandle, AppError> {
-    if let Some(path) = url.strip_prefix("file://") {
-        return Ok(RegistryHandle::File(FileRegistry::new(Path::new(path))));
-    }
-    if let Some(path) = url.strip_prefix("file:") {
-        return Ok(RegistryHandle::File(FileRegistry::new(Path::new(path))));
-    }
-    PgRegistry::connect_lazy(url, DEFAULT_REGISTRY_TIMEOUT_SECS).map(RegistryHandle::Pg)
+pub fn open_registry(
+    url: &str,
+    roots: RootSet,
+    fleet_id: String,
+) -> Result<RegistryHandle, AppError> {
+    let backend = if let Some(path) = url.strip_prefix("file://") {
+        RegistryBackend::File(FileRegistry::new(Path::new(path)))
+    } else if let Some(path) = url.strip_prefix("file:") {
+        RegistryBackend::File(FileRegistry::new(Path::new(path)))
+    } else {
+        RegistryBackend::Pg(PgRegistry::connect_lazy(url, DEFAULT_REGISTRY_TIMEOUT_SECS)?)
+    };
+    Ok(RegistryHandle {
+        backend,
+        roots,
+        fleet_id,
+        marks: RowMarkStore::empty(),
+        verify_cfg: RowVerifyCfg::new(Utc::now()),
+    })
+}
+
+pub fn reader_roots(home: &A2aHome) -> Result<RootSet, AppError> {
+    RootSet::load(home).map_err(|error| {
+        let fleet_dir = home.root().join("mesh").join("fleet");
+        AppError::new(
+            "ROOTS_UNREADABLE",
+            ExitCode::Precondition,
+            format!(
+                "local root files {}/root.pub and {}/root.pub.next are unreadable: {}: {}",
+                fleet_dir.display(),
+                fleet_dir.display(),
+                error.code,
+                error.message
+            ),
+        )
+        .remedy("repair the LOCAL root.pub/root.pub.next files and permissions, then retry")
+    })
 }
 
 pub fn registry_env_path(home: &A2aHome) -> PathBuf {
@@ -1089,7 +1170,7 @@ impl Registry for PgRegistry {
         .map_err(|_| registry_unreachable_timeout())?
     }
 
-    async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
+    async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
         let mut conn = self.acquire().await?;
         let fleet_id = fleet_id.to_string();
         let timeout = self.timeout;
@@ -1101,7 +1182,7 @@ impl Registry for PgRegistry {
                  version, created_at, last_heartbeat, revoked_at, schema_version, row_msg, \
                  row_token, row_sig, signed_at, revocation \
                  FROM mesh_gateways \
-                 WHERE fleet_id = $1 AND revoked_at IS NULL \
+                 WHERE fleet_id = $1 \
                  ORDER BY gateway_id",
             )
             .bind(fleet_id)

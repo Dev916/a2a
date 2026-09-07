@@ -8,9 +8,12 @@ use crate::mesh::{
     gateway::notes_wire,
     keys,
     registry::{
-        open_registry, read_registry_env, Registry, RegistryHandle, TransitionOutcome,
-        WorkListFilter, WorkOwner, WorkPatch, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
+        open_registry, read_registry_env, reader_roots, Registry, RegistryHandle,
+        TransitionOutcome, WorkListFilter, WorkOwner, WorkPatch, WorkRow, WorkStatus,
+        REGISTRY_SCHEMA_VERSION,
     },
+    row_mark::RowMarkStore,
+    row_sig::{Disposition, RowVerdict, RowVerifyCfg},
     work::{sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo},
     work_exec::{self, RealGit, RealSpawner},
     work_store::{self, StoredWork, WORK_CANCELLED_KIND, WORK_OFFER_KIND, WORK_RESULT_KIND},
@@ -74,10 +77,44 @@ pub fn run(
 }
 
 async fn send(home: &A2aHome, cfg: &Config, args: &MeshWorkSendArgs) -> Result<Value, AppError> {
-    let registry = registry(home)?;
-    let fleet_id = keys::fleet_id(home)?;
-    let addressee = addressee_row(&registry, &fleet_id, &args.to).await?;
-    preflight_peer_version(&args.to, addressee.as_ref().map(|row| row.version.as_str()))?;
+    let registry = registry_with_verify_cfg(home, RowVerifyCfg::from_config(Utc::now(), cfg))?;
+    let addressee = addressee_row(&registry, &args.to).await?;
+    if let Some((row, verdict)) = &addressee {
+        match verdict.disposition(cfg.mesh.gateway.require_signed_rows) {
+            Disposition::Refused => {
+                return Err(AppError::new(
+                    "WORK_PEER_ROW_INVALID",
+                    ExitCode::Precondition,
+                    format!(
+                        "gateway {} has registry verdict {} and cannot receive directed work",
+                        args.to,
+                        verdict.label()
+                    ),
+                )
+                .remedy("capture the row for evidence first (`a2a mesh fleet ls --json`); do NOT ask the peer to restart or republish")
+                .data(json!({
+                    "gateway_id": args.to,
+                    "verdict": verdict.label(),
+                    "version": row.version,
+                })));
+            }
+            Disposition::UsableWarn => {
+                eprintln!(
+                    "a2a: warning: gateway {} registry row is {}: {}",
+                    args.to,
+                    verdict.label(),
+                    verdict.remedy()
+                );
+            }
+            Disposition::Usable => {}
+        }
+    }
+    preflight_peer_version(
+        &args.to,
+        addressee
+            .as_ref()
+            .map(|(row, _verdict)| row.version.as_str()),
+    )?;
     let env = build_envelope(
         home,
         &args.common,
@@ -610,8 +647,16 @@ fn spool_cancelled_note(
 }
 
 fn registry(home: &A2aHome) -> Result<RegistryHandle, AppError> {
+    registry_with_verify_cfg(home, RowVerifyCfg::new(Utc::now()))
+}
+
+fn registry_with_verify_cfg(
+    home: &A2aHome,
+    verify_cfg: RowVerifyCfg,
+) -> Result<RegistryHandle, AppError> {
     let url = read_registry_env(home)?;
-    open_registry(&url)
+    Ok(open_registry(&url, reader_roots(home)?, keys::fleet_id(home)?)?
+        .with_reader_state(RowMarkStore::open(home)?, verify_cfg))
 }
 
 async fn registry_rows(home: &A2aHome, work_id: Option<&str>) -> Result<Vec<WorkRow>, AppError> {
@@ -638,14 +683,13 @@ async fn registry_row_optional(
 
 async fn addressee_row(
     registry: &RegistryHandle,
-    fleet_id: &str,
     gateway_id: &str,
-) -> Result<Option<crate::mesh::registry::GatewayRow>, AppError> {
+) -> Result<Option<(crate::mesh::registry::GatewayRow, RowVerdict)>, AppError> {
     Ok(registry
-        .discover(fleet_id)
+        .discover()
         .await?
         .into_iter()
-        .find(|row| row.gateway_id == gateway_id))
+        .find(|(row, _verdict)| row.gateway_id == gateway_id))
 }
 
 fn preflight_peer_version(gateway_id: &str, version: Option<&str>) -> Result<(), AppError> {
@@ -886,6 +930,8 @@ fn work_not_found(work_id: &str) -> AppError {
     .remedy("check `a2a mesh work list` or ask the sender to re-send the work")
 }
 
+/// Work JSON sanitation preserves line structure and is explicitly not the terminal-safe
+/// `mesh::render::escape_untrusted` contract used for peer-authored fleet display fields.
 fn clean(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))

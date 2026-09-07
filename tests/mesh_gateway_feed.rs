@@ -707,7 +707,7 @@ fn anti_entropy_digest_repairs_mid_log_delete_and_updates_health_shape() {
 }
 
 #[tokio::test]
-async fn revoked_peer_is_closed_within_two_anti_entropy_discovery_cycles() {
+async fn legacy_revoked_at_does_not_make_a_present_peer_look_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = FileRegistry::new(tmp.path());
     registry.init_schema().unwrap();
@@ -724,7 +724,7 @@ async fn revoked_peer_is_closed_within_two_anti_entropy_discovery_cycles() {
         .closed_after_discovery(
             "gw-a",
             ["gw-b"],
-            &registry.discover("fleet-a").await.unwrap()
+            &registry.discover_unverified("fleet-a").await.unwrap()
         )
         .is_empty());
 
@@ -740,17 +740,16 @@ async fn revoked_peer_is_closed_within_two_anti_entropy_discovery_cycles() {
         .closed_after_discovery(
             "gw-a",
             ["gw-b"],
-            &registry.discover("fleet-a").await.unwrap()
+            &registry.discover_unverified("fleet-a").await.unwrap()
         )
         .is_empty());
-    assert_eq!(
-        tracker.closed_after_discovery(
+    assert!(tracker
+        .closed_after_discovery(
             "gw-a",
             ["gw-b"],
-            &registry.discover("fleet-a").await.unwrap()
-        ),
-        vec!["gw-b".to_string()]
-    );
+            &registry.discover_unverified("fleet-a").await.unwrap()
+        )
+        .is_empty());
 }
 
 fn silently_delete_origin_seq(home: &A2aHome, origin: &str, origin_seq: u64) {

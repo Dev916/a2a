@@ -1,7 +1,6 @@
 use a2a::mesh::registry::{
     open_registry, read_registry_env, registry_plan, staleness, write_registry_env, FileRegistry,
-    GatewayRow, Registry, RegistryHandle, RegistryStaleness, REGISTRY_SCHEMA_VERSION,
-    UPSERT_GATEWAY_SQL,
+    GatewayRow, Registry, RegistryStaleness, REGISTRY_SCHEMA_VERSION, UPSERT_GATEWAY_SQL,
 };
 use assert_cmd::Command;
 use chrono::{TimeZone, Utc};
@@ -42,7 +41,7 @@ fn a2a(home: &Path) -> Command {
 }
 
 #[tokio::test]
-async fn file_registry_implements_lifecycle_and_skips_revoked_rows() {
+async fn file_registry_implements_lifecycle_and_keeps_revoked_rows_visible() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = FileRegistry::new(tmp.path());
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -59,14 +58,16 @@ async fn file_registry_implements_lifecycle_and_skips_revoked_rows() {
     registry.heartbeat("fleet-a", "gw-a", t1).await.unwrap();
     registry.revoke("fleet-a", "gw-b", t1).await.unwrap();
 
-    let rows = registry.discover("fleet-a").await.unwrap();
-    assert_eq!(rows.len(), 1);
+    let rows = registry.discover_unverified("fleet-a").await.unwrap();
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].gateway_id, "gw-a");
     assert_eq!(rows[0].last_heartbeat, t1);
     assert_eq!(
         rows[0].endpoint_url.as_deref(),
         Some("wss://gw-a.example.test")
     );
+    assert_eq!(rows[1].gateway_id, "gw-b");
+    assert_eq!(rows[1].revoked_at, Some(t1));
     assert_eq!(
         registry.schema_version().await.unwrap(),
         REGISTRY_SCHEMA_VERSION
@@ -98,7 +99,7 @@ async fn signed_columns_round_trip_through_the_file_registry() {
     };
 
     registry.upsert_self(signed.clone()).await.unwrap();
-    let rows = registry.discover("fleet-a").await.unwrap();
+    let rows = registry.discover_unverified("fleet-a").await.unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].row_msg, signed.row_msg);
@@ -120,7 +121,7 @@ async fn file_upsert_preserves_insert_only_created_at_and_root_revocation() {
     let mut replacement = row("fleet-a", "gw-a", t0.timestamp() + 3_600);
     replacement.owner = "updated-owner".to_string();
     registry.upsert_self(replacement).await.unwrap();
-    let stored = registry.discover("fleet-a").await.unwrap().remove(0);
+    let stored = registry.discover_unverified("fleet-a").await.unwrap().remove(0);
 
     assert_eq!(stored.created_at, t0);
     assert_eq!(stored.owner, "updated-owner");
@@ -178,7 +179,7 @@ async fn legacy_file_registry_rows_without_signed_columns_still_load() {
     )
     .unwrap();
 
-    let rows = registry.discover("fleet-a").await.unwrap();
+    let rows = registry.discover_unverified("fleet-a").await.unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].gateway_id, "gw-legacy");
@@ -239,14 +240,18 @@ fn shared_registry_env_helpers_preserve_cli_file_registry_behavior() {
         0o600
     );
     assert_eq!(read_registry_env(&home).unwrap(), url);
-    assert!(matches!(
-        open_registry(&url).unwrap(),
-        RegistryHandle::File(_)
-    ));
-    assert!(matches!(
-        open_registry(&format!("file:{}", registry_dir.display())).unwrap(),
-        RegistryHandle::File(_)
-    ));
+    let fleet = a2a::mesh::keys::fleet_init(&home).unwrap();
+    let roots = a2a::mesh::keys::RootSet::load(&home).unwrap();
+    assert!(open_registry(&url, roots.clone(), fleet.fleet_id.clone())
+        .unwrap()
+        .is_file_backend());
+    assert!(open_registry(
+        &format!("file:{}", registry_dir.display()),
+        roots,
+        fleet.fleet_id,
+    )
+    .unwrap()
+    .is_file_backend());
 }
 
 #[test]
@@ -256,7 +261,7 @@ fn pg_source_keeps_ddl_out_of_client_and_bounds_gucs_to_local_transactions() {
     assert!(!source.contains("ALTER TABLE"), "{source}");
     assert!(!source.contains("DROP TABLE"), "{source}");
     assert!(!source.contains("\"SET "), "{source}");
-    assert!(source.contains("revoked_at IS NULL"), "{source}");
+    assert!(!source.contains("revoked_at IS NULL"), "{source}");
     assert!(source.contains("SET_LOCAL_STATEMENT_TIMEOUT"), "{source}");
 }
 
@@ -320,6 +325,7 @@ fn fleet_cli_init_ls_and_revoke_are_hermetic_with_file_registry() {
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
-    let rows = rt.block_on(async { reg.discover(fleet_id).await.unwrap() });
-    assert!(rows.is_empty());
+    let rows = rt.block_on(async { reg.discover_unverified(fleet_id).await.unwrap() });
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].revoked_at.is_some());
 }

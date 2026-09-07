@@ -1,4 +1,6 @@
 use crate::mesh::keys;
+use crate::mesh::registry::GatewayRow;
+use crate::mesh::row_mark::RowMark;
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
@@ -107,6 +109,42 @@ impl RowVerdict {
             _ => Disposition::Refused,
         }
     }
+
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            Self::ValidSigned => "no action is required",
+            Self::Unsigned { stripped: false } => {
+                "enable signed rows on the peer, then confirm a valid signature before requiring them"
+            }
+            Self::Unsigned { stripped: true } => {
+                "capture the row for evidence, then restore the peer's signed publisher"
+            }
+            Self::UnsignedStale => {
+                "capture the row for evidence and have the peer publish a freshly signed row"
+            }
+            Self::Unverified => {
+                "install the issuing fleet root only after verifying its fingerprint out of band"
+            }
+            Self::BadSig => {
+                "capture the row for evidence first; only then, if deliberate, run `a2a mesh fleet clear-signature <gw>`"
+            }
+            Self::RowSigIncomplete => {
+                "capture the row for evidence and have the peer republish all signature columns atomically"
+            }
+            Self::RowSigUnknownVersion => "upgrade this reader before trusting or using this row",
+            Self::RowKeySuperseded => {
+                "install the peer's current enrollment token and have it publish with the latest key epoch"
+            }
+            Self::RowReplayed => {
+                "capture the row for evidence first; use `a2a mesh fleet forget-signed <gw>` only for a deliberate replay reset"
+            }
+            Self::RowClockAhead => "check the local and peer clocks before accepting a newer row",
+            Self::Revoked => "keep the row as evidence and re-enroll the peer only through the fleet root",
+            Self::RowRevocationMisplaced => {
+                "capture the carrying row and revocation for evidence; do not move or copy the record"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,14 +176,266 @@ impl RowVerifyCfg {
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
             now,
-            max_accepted_row_resign_secs: 604_800,
+            max_accepted_row_resign_secs:
+                crate::config::DEFAULT_MESH_GATEWAY_MAX_ACCEPTED_ROW_RESIGN_SECS,
             skew_tolerance_secs: keys::SKEW_TOLERANCE_SECS,
+        }
+    }
+
+    pub fn from_config(now: DateTime<Utc>, cfg: &crate::config::Config) -> Self {
+        Self {
+            max_accepted_row_resign_secs: cfg
+                .mesh
+                .gateway
+                .max_accepted_row_resign_secs,
+            ..Self::new(now)
         }
     }
 }
 
-// R4's verify_row decision procedure consumes these parsing, signature, verdict, and config
-// primitives; keeping that policy out of this module lets this layer remain byte-focused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowFlag {
+    StaleRow,
+    FirstTrust,
+}
+
+impl RowFlag {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::StaleRow => "stale-row",
+            Self::FirstTrust => "first-trust",
+        }
+    }
+
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            Self::StaleRow => {
+                "check the peer gateway and run `a2a mesh gateway resign` on that machine"
+            }
+            Self::FirstTrust => {
+                "verify the gateway identity and key fingerprint out of band before relying on this first trust"
+            }
+        }
+    }
+}
+
+impl From<&GatewayRow> for StoredRowColumns {
+    fn from(row: &GatewayRow) -> Self {
+        Self {
+            fleet_id: row.fleet_id.clone(),
+            gateway_id: row.gateway_id.clone(),
+            endpoint_url: row.endpoint_url.clone(),
+            pubkey_fpr: row.pubkey_fpr.clone(),
+            cert_fpr: row.cert_fpr.clone(),
+            version: row.version.clone(),
+            owner: row.owner.clone(),
+            created_at: row.created_at,
+            schema_version: row.schema_version,
+            row_msg: row.row_msg.clone(),
+            row_token: row.row_token.clone(),
+            row_sig: row.row_sig.clone(),
+            signed_at: row.signed_at,
+            revocation: row.revocation.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    AllNull,
+    Partial,
+    Present,
+}
+
+fn shape(stored: &StoredRowColumns) -> Shape {
+    let present = [
+        stored.row_msg.is_some(),
+        stored.row_token.is_some(),
+        stored.row_sig.is_some(),
+        stored.signed_at.is_some(),
+    ]
+    .into_iter()
+    .filter(|value| *value)
+    .count();
+    match present {
+        0 => Shape::AllNull,
+        4 => Shape::Present,
+        _ => Shape::Partial,
+    }
+}
+
+// REVOKED > ROW_REVOCATION_MISPLACED > ROW_SIG_UNKNOWN_VERSION > ROW_SIG_INCOMPLETE
+//   > malformation-BAD_SIG > ROW_KEY_SUPERSEDED > ROW_REPLAYED / ROW_CLOCK_AHEAD
+//   > disagreement (BAD_SIG | UNSIGNED-STALE, by the bit) > UNVERIFIED > UNSIGNED > valid-signed
+pub fn verify_row(
+    stored: &StoredRowColumns,
+    roots: &keys::RootSet,
+    mark: Option<&RowMark>,
+    cfg: &RowVerifyCfg,
+) -> RowVerdict {
+    // R5 replaces this neutral hook with root-signed revocation verification. Keeping the hook at
+    // precedence step zero makes that merge local and prevents legacy revoked_at from becoming a
+    // trust input in the meantime.
+    if let Some(verdict) = revocation_verdict(stored, roots) {
+        return verdict;
+    }
+    if let Some(text) = stored.row_msg.as_deref() {
+        match peek_msg_ver(text) {
+            Err(RowSigFault::UnknownVersion(_)) => return RowVerdict::RowSigUnknownVersion,
+            Err(_) => return RowVerdict::BadSig,
+            Ok(_) => {}
+        }
+    }
+    let bit = mark.is_some_and(|row_mark| row_mark.first_signature);
+    match shape(stored) {
+        Shape::Partial => return RowVerdict::RowSigIncomplete,
+        Shape::AllNull => return RowVerdict::Unsigned { stripped: bit },
+        Shape::Present => {}
+    }
+    let msg = match parse_row_msg_strict(stored.row_msg.as_deref().expect("present shape")) {
+        Ok(msg) => msg,
+        Err(_) => return RowVerdict::BadSig,
+    };
+    let token = stored.row_token.as_deref().expect("present shape");
+    let (claims, token_verified) = match keys::verify_token_no_clock(token, roots) {
+        Ok((claims, _issuer)) => (claims, true),
+        Err(_) => match keys::unverified_claims(token) {
+            Ok(claims) => (claims, false),
+            Err(_) => return RowVerdict::BadSig,
+        },
+    };
+    let public_key_matches = keys::fpr_of_pubkey_b64(&claims.pubkey_b64)
+        .ok()
+        .as_deref()
+        == Some(stored.pubkey_fpr.as_str());
+    if sha256_hex(token.as_bytes()) != msg.row_token_sha256
+        || claims.gateway_id != stored.gateway_id
+        || claims.fleet_id != stored.fleet_id
+        || !public_key_matches
+        || claims.key_epoch != msg.key_epoch
+        || !gateway_id_binds_key(&stored.gateway_id, &claims)
+    {
+        return RowVerdict::BadSig;
+    }
+    if let Some(row_mark) = mark {
+        if claims.key_epoch < row_mark.highest_key_epoch {
+            return RowVerdict::RowKeySuperseded;
+        }
+        if row_mark
+            .pinned_pubkey_b64
+            .as_deref()
+            .is_some_and(|pinned| pinned != claims.pubkey_b64)
+            && claims.key_epoch <= row_mark.highest_key_epoch
+        {
+            return RowVerdict::BadSig;
+        }
+        if let Some(high_water) = row_mark.high_water {
+            if msg.signed_at < high_water {
+                return RowVerdict::RowReplayed;
+            }
+            let stored_digest = sha256_hex(
+                stored
+                    .row_msg
+                    .as_deref()
+                    .expect("present shape")
+                    .as_bytes(),
+            );
+            if msg.signed_at == high_water
+                && row_mark.msg_digest.as_deref() != Some(stored_digest.as_str())
+            {
+                return RowVerdict::RowReplayed;
+            }
+        }
+    }
+    if msg.signed_at > cfg.now + chrono::Duration::seconds(cfg.skew_tolerance_secs) {
+        return RowVerdict::RowClockAhead;
+    }
+    let key = mark
+        .and_then(|row_mark| row_mark.pinned_pubkey_b64.clone())
+        .unwrap_or_else(|| claims.pubkey_b64.clone());
+    let verifies = verify_row_bytes(
+        stored.row_msg.as_deref().expect("present shape"),
+        stored.row_sig.as_deref().expect("present shape"),
+        &key,
+    )
+    .is_ok()
+        && columns_bind(&msg, stored);
+    if !verifies {
+        return if bit {
+            RowVerdict::BadSig
+        } else {
+            RowVerdict::UnsignedStale
+        };
+    }
+    if !token_verified {
+        return RowVerdict::Unverified;
+    }
+    RowVerdict::ValidSigned
+}
+
+pub fn row_flags(
+    stored: &StoredRowColumns,
+    mark: Option<&RowMark>,
+    cfg: &RowVerifyCfg,
+) -> Vec<RowFlag> {
+    let mut flags = Vec::new();
+    if let Some(msg) = stored
+        .row_msg
+        .as_deref()
+        .and_then(|text| parse_row_msg_strict(text).ok())
+    {
+        let declared = msg
+            .row_resign_secs
+            .min(cfg.max_accepted_row_resign_secs);
+        let stale_after = declared.saturating_mul(2).min(i64::MAX as u64) as i64;
+        if cfg.now.signed_duration_since(msg.signed_at)
+            > chrono::Duration::seconds(stale_after)
+        {
+            flags.push(RowFlag::StaleRow);
+        }
+    }
+    if mark.is_none() {
+        flags.push(RowFlag::FirstTrust);
+    }
+    flags
+}
+
+fn columns_bind(msg: &RowMsg, stored: &StoredRowColumns) -> bool {
+    msg.fleet_id == stored.fleet_id
+        && msg.gateway_id == stored.gateway_id
+        && msg.endpoint_url == stored.endpoint_url
+        && msg.pubkey_fpr == stored.pubkey_fpr
+        && msg.cert_fpr == stored.cert_fpr
+        && msg.version == stored.version
+        && msg.owner == stored.owner
+        && trunc_us(msg.created_at) == trunc_us(stored.created_at)
+        && msg.schema_version == stored.schema_version
+        && stored
+            .signed_at
+            .is_some_and(|signed_at| trunc_us(msg.signed_at) == trunc_us(signed_at))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn gateway_id_binds_key(_gateway_id: &str, _claims: &keys::TokenClaims) -> bool {
+    // R5 owns the key-derived id and rebind-ledger rules. Until that merge, the root-signed token
+    // bindings above remain enforced and this hook is deliberately neutral.
+    true
+}
+
+fn revocation_verdict(
+    _stored: &StoredRowColumns,
+    _roots: &keys::RootSet,
+) -> Option<RowVerdict> {
+    // R5 owns the revocation envelope and cache. Legacy revoked_at is intentionally absent from
+    // StoredRowColumns and must never be substituted here.
+    None
+}
 
 pub fn canonical_row_msg(msg: &RowMsg) -> Result<String, AppError> {
     let fields: BTreeMap<&str, Value> = BTreeMap::from([
@@ -236,7 +526,11 @@ impl<'de> Deserialize<'de> for StrictObject {
 
 pub fn peek_msg_ver(text: &str) -> Result<u64, RowSigFault> {
     let fields = strict_fields(text)?;
-    required_u64(&fields, "msg_ver")
+    let msg_ver = required_u64(&fields, "msg_ver")?;
+    if msg_ver != ROW_MSG_VER {
+        return Err(RowSigFault::UnknownVersion(msg_ver));
+    }
+    Ok(msg_ver)
 }
 
 pub fn parse_row_msg_strict(text: &str) -> Result<RowMsg, RowSigFault> {

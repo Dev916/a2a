@@ -31,6 +31,7 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
             "shutdown_grace_secs",
             "require_signed_rows",
             "row_resign_secs",
+            "max_accepted_row_resign_secs",
         ]
     );
     assert_eq!(
@@ -97,6 +98,10 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
     assert_eq!(data["mesh"]["gateway"]["shutdown_grace_secs"], 10);
     assert_eq!(data["mesh"]["gateway"]["require_signed_rows"], true);
     assert_eq!(data["mesh"]["gateway"]["row_resign_secs"], 43_200);
+    assert_eq!(
+        data["mesh"]["gateway"]["max_accepted_row_resign_secs"],
+        604_800
+    );
     assert_eq!(data["mesh"]["work"]["work_poll_secs"], 15);
     assert_eq!(data["mesh"]["work"]["claim_stall_secs"], 900);
     assert_eq!(data["mesh"]["work"]["checkout_retain_days"], 30);
@@ -769,7 +774,7 @@ fn wait_for_registry_rows(
             let resolved = a2a::home::A2aHome::resolve(Some(home)).unwrap();
             let fleet_id = a2a::mesh::keys::fleet_id(&resolved).unwrap();
             let registry = a2a::mesh::registry::FileRegistry::new(registry_dir);
-            registry.discover(&fleet_id).await.unwrap()
+            registry.discover_unverified(&fleet_id).await.unwrap()
         });
         if rows.len() >= min_rows {
             return rows;

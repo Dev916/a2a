@@ -118,3 +118,9 @@ a2a mesh gateway status # loops all "running", endpoint_url populated
   reused, so only `enroll` + `install-token` are needed).
 - **Root rotation** (owner): `a2a mesh fleet rotate-root` stages `root.pub.next`;
   distribute the new `root.pub` to joiners before retiring the old root.
+
+## Reader errors
+
+| Code | Meaning | Remedy |
+|---|---|---|
+| `ROOTS_UNREADABLE` | This reader could not load its local `mesh/fleet/root.pub` or `root.pub.next`. | Repair the local root files and permissions before judging any peer row. |

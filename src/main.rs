@@ -83,6 +83,8 @@ fn command_name(cmd: &Cmd) -> &'static str {
             MeshCmd::Fleet { cmd } => match cmd {
                 MeshFleetCmd::Init { .. } => "mesh fleet init",
                 MeshFleetCmd::Ls { .. } => "mesh fleet ls",
+                MeshFleetCmd::ForgetSigned { .. } => "mesh fleet forget-signed",
+                MeshFleetCmd::ClearSignature { .. } => "mesh fleet clear-signature",
                 MeshFleetCmd::Migrate => "mesh fleet migrate",
                 MeshFleetCmd::Revoke { .. } => "mesh fleet revoke",
                 MeshFleetCmd::Enroll { .. } => "mesh fleet enroll",

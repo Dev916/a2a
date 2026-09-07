@@ -570,6 +570,10 @@ pub enum MeshFleetCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Deliberately clear this reader's replay high-water and row digest; logs the local change
+    ForgetSigned { gateway_id: String },
+    /// Deliberately clear only this reader's first-signature bit; logs the local trust downgrade
+    ClearSignature { gateway_id: String },
     /// Apply all mesh fleet registry migrations; root machine only
     Migrate,
     /// Mark a gateway revoked in the registry

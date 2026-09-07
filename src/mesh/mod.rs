@@ -186,6 +186,7 @@ pub mod notes;
 pub mod presence;
 pub mod registry;
 pub mod render;
+pub mod row_mark;
 pub mod row_sig;
 pub mod routing;
 pub mod wire;

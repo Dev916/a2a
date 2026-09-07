@@ -6,9 +6,12 @@ use crate::mesh::{
     notes::{self, RosterRow},
     presence,
     registry::{
-        open_registry, read_registry_env, staleness, write_registry_env, GatewayRow, Registry,
-        DEFAULT_REGISTRY_HEARTBEAT_SECS,
+        open_registry, read_registry_env, reader_roots, staleness, write_registry_env, GatewayRow,
+        Registry, RegistryHandle, DEFAULT_REGISTRY_HEARTBEAT_SECS,
     },
+    row_mark::RowMarkStore,
+    row_sig::{row_flags, RowVerdict, RowVerifyCfg, StoredRowColumns},
+    render::escape_untrusted,
     scan_or_refuse, FeedEntry, Note, PeerId, Provider, STATUS_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode, Outcome};
@@ -502,7 +505,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 let url = registry_input(registry)?;
                 write_registry_env(home, &url)?;
                 rt.block_on(async {
-                    let registry = open_registry(&url)?;
+                    let registry = open_fleet_registry(home, &url, Utc::now())?;
                     apply_mesh_migrations(&registry).await.map(|_| ())
                 })?;
             }
@@ -513,26 +516,62 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
         }
         MeshFleetCmd::Ls { json } => {
             let url = read_registry_env(home)?;
-            let fleet_id = crate::mesh::keys::fleet_id(home)?;
-            let rows = rt.block_on(async {
-                let registry = open_registry(&url)?;
-                registry.discover(&fleet_id).await
-            })?;
             let now = Utc::now();
-            let data = rows
-                .into_iter()
-                .map(|row| fleet_row_json(row, now))
-                .collect::<Vec<_>>();
+            let marks = RowMarkStore::open(home)?;
+            let (cfg, _origins, _warnings) = crate::config::load(home)?;
+            let verify_cfg = RowVerifyCfg::from_config(now, &cfg);
+            let rows = rt.block_on(async {
+                let registry = open_registry(
+                    &url,
+                    reader_roots(home)?,
+                    crate::mesh::keys::fleet_id(home)?,
+                )?
+                .with_reader_state(marks.clone(), verify_cfg.clone());
+                registry.discover().await
+            })?;
             if json_mode || *json {
+                let data = rows
+                    .iter()
+                    .map(|row| fleet_row_json(row, now, &marks, &verify_cfg))
+                    .collect::<Vec<_>>();
                 return Ok(Outcome::from(json!({ "rows": data })));
             }
-            Ok(Outcome::from(Value::String(human_fleet_rows(&data))))
+            Ok(Outcome::from(Value::String(human_fleet_rows(
+                &rows,
+                now,
+                &marks,
+                &verify_cfg,
+            ))))
+        }
+        MeshFleetCmd::ForgetSigned { gateway_id } => {
+            let mut marks = RowMarkStore::open(home)?;
+            marks.try_forget_signed(gateway_id)?;
+            eprintln!(
+                "a2a: DELIBERATE LOCAL STATE CHANGE: CLEARED replay high-water and row digest for {gateway_id}; KEPT first-signature bit"
+            );
+            Ok(Outcome::from(json!({
+                "gateway_id": gateway_id,
+                "cleared": ["high_water", "msg_digest"],
+                "kept": ["first_signature", "pinned_pubkey_b64", "highest_key_epoch"]
+            })))
+        }
+        MeshFleetCmd::ClearSignature { gateway_id } => {
+            let mut marks = RowMarkStore::open(home)?;
+            marks.try_clear_signature(gateway_id)?;
+            eprintln!(
+                "a2a: DELIBERATE LOCAL TRUST DOWNGRADE: CLEARED first-signature bit for {gateway_id}; KEPT replay high-water, digest, pinned key, and key epoch"
+            );
+            Ok(Outcome::from(json!({
+                "gateway_id": gateway_id,
+                "cleared": ["first_signature"],
+                "kept": ["high_water", "msg_digest", "pinned_pubkey_b64", "highest_key_epoch"]
+            })))
         }
         MeshFleetCmd::Migrate => {
             require_fleet_root_key(home)?;
             let url = read_registry_env(home)?;
             let applied = rt.block_on(async {
-                let registry = open_registry(&url)?;
+                let registry = open_fleet_registry(home, &url, Utc::now())?;
                 apply_mesh_migrations(&registry).await
             })?;
             Ok(Outcome::from(json!({ "applied": applied })))
@@ -541,7 +580,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
             let url = read_registry_env(home)?;
             let fleet_id = crate::mesh::keys::fleet_id(home)?;
             rt.block_on(async {
-                let registry = open_registry(&url)?;
+                let registry = open_fleet_registry(home, &url, Utc::now())?;
                 registry.revoke(&fleet_id, gateway_id, Utc::now()).await
             })?;
             Ok(Outcome::from(Value::Null))
@@ -585,6 +624,18 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
             })))
         }
     }
+}
+
+fn open_fleet_registry(
+    home: &A2aHome,
+    url: &str,
+    now: DateTime<Utc>,
+) -> Result<RegistryHandle, AppError> {
+    let roots = reader_roots(home)?;
+    let fleet_id = crate::mesh::keys::fleet_id(home)?;
+    let marks = RowMarkStore::open(home)?;
+    Ok(open_registry(url, roots, fleet_id)?
+        .with_reader_state(marks, RowVerifyCfg::new(now)))
 }
 
 fn run_gateway(
@@ -687,9 +738,16 @@ fn resign_gateway_row(
         })?;
     runtime.block_on(async {
         let registry_url = read_registry_env(home)?;
-        let registry = open_registry(&registry_url)?;
+        let registry = open_registry(
+            &registry_url,
+            reader_roots(home)?,
+            crate::mesh::keys::fleet_id(home)?,
+        )?
+        .with_reader_state(
+            RowMarkStore::open(home)?,
+            RowVerifyCfg::from_config(Utc::now(), cfg),
+        );
         let row = crate::mesh::gateway::registry_exposure_row(home)?;
-        let fleet_id = row.fleet_id.clone();
         let gateway_id = row.gateway_id.clone();
         let exposure = crate::mesh::gateway::expose::ExposureProvider::from_config(cfg)?;
         let mut publisher = crate::mesh::gateway::expose::ExposurePublisher::new(row)
@@ -707,9 +765,10 @@ fn resign_gateway_row(
             ));
         }
         let stored = registry
-            .discover(&fleet_id)
+            .discover()
             .await?
             .into_iter()
+            .map(|(stored, _verdict)| stored)
             .find(|stored| stored.gateway_id == gateway_id)
             .ok_or_else(|| {
                 AppError::new(
@@ -893,16 +952,63 @@ fn statement_terminators(sql: &str) -> usize {
         .sum()
 }
 
-fn fleet_row_json(row: GatewayRow, now: chrono::DateTime<Utc>) -> Value {
+fn fleet_row_json(
+    row_and_verdict: &(GatewayRow, RowVerdict),
+    now: chrono::DateTime<Utc>,
+    marks: &RowMarkStore,
+    verify_cfg: &RowVerifyCfg,
+) -> Value {
+    let (row, verdict) = row_and_verdict;
     let state = staleness(row.last_heartbeat, now, DEFAULT_REGISTRY_HEARTBEAT_SECS);
+    let mark = marks.get(&row.gateway_id);
+    let stored = StoredRowColumns::from(row);
+    let mut flags = Vec::<String>::new();
+    let mut remedies = Vec::<Value>::new();
+    for flag in row_flags(&stored, mark, verify_cfg) {
+        push_fleet_flag(&mut flags, &mut remedies, flag.label(), flag.remedy());
+    }
+    if mark.is_some_and(|mark| !mark.first_signature) {
+        push_fleet_flag(
+            &mut flags,
+            &mut remedies,
+            "signature-cleared",
+            "verify why this reader's first-signature bit was deliberately cleared before relying on a degraded row",
+        );
+    }
+    if row.revoked_at.is_some() {
+        push_fleet_flag(
+            &mut flags,
+            &mut remedies,
+            "legacy-revoked-at",
+            "treat legacy revoked_at as advisory only; verify the root-signed revocation verdict",
+        );
+    }
+
+    let endpoint_url = row.endpoint_url.as_deref().map(|value| {
+        render_fleet_field(value, 512, "endpoint", &mut flags, &mut remedies)
+    });
+    let owner = render_fleet_field(&row.owner, 256, "owner", &mut flags, &mut remedies);
+    let version = render_fleet_field(&row.version, 128, "version", &mut flags, &mut remedies);
+    let cert_fpr = row.cert_fpr.as_deref().map(|value| {
+        render_fleet_field(value, 256, "cert-fpr", &mut flags, &mut remedies)
+    });
+    let gateway_id = escape_untrusted(&row.gateway_id, 128).text;
+    let pubkey_fpr = escape_untrusted(&row.pubkey_fpr, 256).text;
+    let verdict_remedy = (*verdict != RowVerdict::ValidSigned).then(|| {
+        verdict.remedy().replace("<gw>", &gateway_id)
+    });
     json!({
+        "verdict": verdict.label(),
+        "verdict_remedy": verdict_remedy,
+        "flags": flags,
+        "flag_remedies": remedies,
         "fleet_id": row.fleet_id,
-        "gateway_id": row.gateway_id,
-        "owner": row.owner,
-        "endpoint_url": row.endpoint_url,
-        "pubkey_fpr": row.pubkey_fpr,
-        "cert_fpr": row.cert_fpr,
-        "version": row.version,
+        "gateway_id": gateway_id,
+        "owner": owner,
+        "endpoint_url": endpoint_url,
+        "pubkey_fpr": pubkey_fpr,
+        "cert_fpr": cert_fpr,
+        "version": version,
         "created_at": row.created_at,
         "last_heartbeat": row.last_heartbeat,
         "revoked_at": row.revoked_at,
@@ -911,18 +1017,98 @@ fn fleet_row_json(row: GatewayRow, now: chrono::DateTime<Utc>) -> Value {
     })
 }
 
-fn human_fleet_rows(rows: &[Value]) -> String {
+fn human_fleet_rows(
+    rows: &[(GatewayRow, RowVerdict)],
+    now: chrono::DateTime<Utc>,
+    marks: &RowMarkStore,
+    verify_cfg: &RowVerifyCfg,
+) -> String {
     rows.iter()
         .map(|row| {
-            format!(
-                "{} {} {}",
+            let row = fleet_row_json(row, now, marks, verify_cfg);
+            let flags = row["flags"]
+                .as_array()
+                .map(|flags| {
+                    flags
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let flags = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{flags}]")
+            };
+            let mut lines = vec![format!(
+                "{}{} gateway={} state={} endpoint={} owner={} version={} cert_fpr={}",
+                row["verdict"].as_str().unwrap_or("UNKNOWN"),
+                flags,
                 row["gateway_id"].as_str().unwrap_or(""),
                 row["staleness"].as_str().unwrap_or(""),
-                row["endpoint_url"].as_str().unwrap_or("outbound-only")
-            )
+                row["endpoint_url"].as_str().unwrap_or("outbound-only"),
+                row["owner"].as_str().unwrap_or(""),
+                row["version"].as_str().unwrap_or(""),
+                row["cert_fpr"].as_str().unwrap_or("none"),
+            )];
+            if let Some(remedy) = row["verdict_remedy"].as_str() {
+                lines.push(format!(
+                    "  remedy {}: {}",
+                    row["verdict"].as_str().unwrap_or("verdict"),
+                    remedy
+                ));
+            }
+            if let Some(remedies) = row["flag_remedies"].as_array() {
+                lines.extend(remedies.iter().filter_map(|remedy| {
+                    Some(format!(
+                        "  remedy {}: {}",
+                        remedy.get("flag")?.as_str()?,
+                        remedy.get("remedy")?.as_str()?
+                    ))
+                }));
+            }
+            lines.join("\n")
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_fleet_field(
+    value: &str,
+    max_chars: usize,
+    field: &str,
+    flags: &mut Vec<String>,
+    remedies: &mut Vec<Value>,
+) -> String {
+    let rendered = escape_untrusted(value, max_chars);
+    if rendered.non_ascii {
+        push_fleet_flag(
+            flags,
+            remedies,
+            &format!("{field}-non-ascii"),
+            "inspect the escaped value carefully and verify it through a trusted channel",
+        );
+    }
+    if rendered.clamped {
+        push_fleet_flag(
+            flags,
+            remedies,
+            &format!("{field}-clamped"),
+            "inspect the complete registry value through a bounded evidence capture before acting",
+        );
+    }
+    rendered.text
+}
+
+fn push_fleet_flag(
+    flags: &mut Vec<String>,
+    remedies: &mut Vec<Value>,
+    flag: &str,
+    remedy: &str,
+) {
+    flags.push(flag.to_string());
+    remedies.push(json!({ "flag": flag, "remedy": remedy }));
 }
 
 #[cfg(test)]

@@ -118,7 +118,7 @@ const BLOCKED_UNTIL_MIGRATED: [&str; 3] = ["atlassian", "google-workspace", "tel
 /// The fourteen checks `doctor` publishes, in report order — the same pin
 /// `tests/cmd_doctor.rs` holds, restated here because this file asserts the
 /// list mid-pipeline rather than in isolation.
-const CHECK_IDS: [&str; 15] = [
+const CHECK_IDS: [&str; 16] = [
     "codex_present",
     "codex_version",
     "layout_version",
@@ -130,6 +130,7 @@ const CHECK_IDS: [&str; 15] = [
     "codex_home_match",
     "broker_status",
     "gateway_enrollment",
+    "mesh_hardening",
     "auth_mode",
     "context_canon",
     "codex_config_secrets",

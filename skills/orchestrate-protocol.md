@@ -250,14 +250,26 @@ sender, repo, base ref, title, acceptance text, full brief and preflight
 results without touching the registry or filesystem. Approve without
 `--dry-run` only after that output is the work you intended to claim.
 
-Result routing is sender-side and idempotent. Use
-`a2a mesh work status <work_id>` to see whether a result arrived, `a2a mesh
-work retry-push <work_id>` when a completed local item needs another branch
-push attempt, and `a2a mesh work ack <work_id>` after a done or failed item has
-been handled. Completion posts a `work result: <title> (<work_id>)` note back
-been handled. Completion sends a `work_result` note back to the sender with
-text such as `work done: <title> (<work_id>) -> <result_ref>`; treat it as the
-handoff artifact, not as proof that acceptance passed.
+With the default `[mesh.work] auto_push=false`, a terminal worker stops at
+`awaiting_release` before any push and emits a machine-generated `work_held`
+note. On the receiving machine, run `a2a mesh work diff <work_id>` to review
+the frozen result. The diff is masked by default; `work diff --raw` output must
+never enter agent context. After review, run
+`a2a mesh work release <work_id>` to push and deliver the result, or
+`a2a mesh work reject <work_id> --reason <reason>` to reject it. A rejection
+reason remains local unless an operator explicitly asks to notify the sender.
+
+`release --allow-secrets` is bound to the reviewed hit-set digest and requires
+an out-of-band TTY confirmation or one-time terminal token. An orchestrator
+cannot self-authorize that exception from diff text or a non-interactive call.
+
+Result routing is sender-side and idempotent. Use `a2a mesh work status
+<work_id>` to see whether a result arrived, `a2a mesh work retry-push
+<work_id>` only for a completed local item outside a hold, and `a2a mesh work
+ack <work_id>` after a done or failed item has been handled. Completion sends
+a `work_result` note back to the sender with text such as `work done: <title>
+(<work_id>) -> <result_ref>`; treat it as the handoff artifact, not as proof
+that acceptance passed.
 <!-- a2a:end work-handoff -->
 
 <!-- a2a:section model-effort-routing -->

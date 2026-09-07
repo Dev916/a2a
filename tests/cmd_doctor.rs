@@ -1,15 +1,20 @@
 // tests/cmd_doctor.rs
 mod common;
 use common::*;
+use a2a::mesh::registry::{
+    write_registry_env, FileRegistry, Registry, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
+};
+use a2a::mesh::work_exec::{self, WorkPhase, WorkState};
+use chrono::Utc;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The sixteen checks, in report order: Phase 1's six (unchanged ids,
-/// unchanged order), then Phase 2's four, the two mesh checks, and Phase 3's
+/// The seventeen checks, in report order: Phase 1's six (unchanged ids,
+/// unchanged order), then Phase 2's four, the three mesh checks, and Phase 3's
 /// three. This list IS the contract `doctor --json` publishes — a phase that
 /// adds a check adds it here in the same commit.
-const CHECK_IDS: [&str; 16] = [
+const CHECK_IDS: [&str; 17] = [
     "codex_present",
     "codex_version",
     "layout_version",
@@ -22,6 +27,7 @@ const CHECK_IDS: [&str; 16] = [
     "broker_status",
     "gateway_enrollment",
     "mesh_hardening",
+    "work_awaiting_release",
     "auth_mode",
     "context_canon",
     "codex_config_secrets",
@@ -62,7 +68,7 @@ fn detail(v: &serde_json::Value, id: &str) -> String {
 }
 
 #[test]
-fn all_ok_with_stub_exits_zero_and_lists_sixteen_checks() {
+fn all_ok_with_stub_exits_zero_and_lists_seventeen_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let (v, code) = checks(&tmp.path().join("h"), tmp.path(), |_| {});
     assert_eq!(code, 0);
@@ -95,6 +101,8 @@ fn all_ok_with_stub_exits_zero_and_lists_sixteen_checks() {
     assert!(detail(&v, "gateway_enrollment").contains("no mesh gateway material"));
     assert_eq!(check(&v, "mesh_hardening")["status"], "ok");
     assert!(detail(&v, "mesh_hardening").contains("no mesh gateway material"));
+    assert_eq!(check(&v, "work_awaiting_release")["status"], "ok");
+    assert!(detail(&v, "work_awaiting_release").contains("awaiting_release=0"));
     assert_eq!(check(&v, "auth_mode")["status"], "warn");
 }
 
@@ -144,6 +152,82 @@ fn mesh_hardening_names_the_roots_held_and_the_local_token_issuer() {
         !hardening_detail.contains("awaiting_release="),
         "the W3/F1 release-backlog field is intentionally deferred: {hardening_detail}"
     );
+}
+
+#[test]
+fn work_awaiting_release_requires_the_registry_status_and_a_local_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_path = tmp.path().join("h");
+    let home = a2a::home::A2aHome::resolve(Some(&home_path)).unwrap();
+    a2a::mesh::keys::fleet_init(&home).unwrap();
+    a2a::mesh::keys::gateway_identity(&home, false).unwrap();
+    a2a::mesh::keys::ensure_gateway_token(&home, &a2a::mesh::keys::SystemClock).unwrap();
+    let fleet_id = a2a::mesh::keys::fleet_id(&home).unwrap();
+    let gateway_id = a2a::mesh::keys::gateway_id(&home).unwrap();
+    let registry_path = tmp.path().join("registry");
+    let registry = FileRegistry::new(&registry_path);
+    registry.init_schema().unwrap();
+    write_registry_env(&home, &format!("file:{}", registry_path.display())).unwrap();
+
+    let work_id = ulid::Ulid::new().to_string();
+    let now = Utc::now();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(registry.work_insert(WorkRow {
+            fleet_id,
+            work_id: work_id.clone(),
+            sender_gw: "gw-sender".to_string(),
+            addressing: format!("directed:{gateway_id}"),
+            status: WorkStatus::AwaitingRelease,
+            claimed_by: Some(gateway_id),
+            result_ref: None,
+            result_delivery: None,
+            swept_by: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + chrono::Duration::days(1),
+            schema_version: REGISTRY_SCHEMA_VERSION,
+        }))
+        .unwrap();
+    work_exec::save_state(
+        &home,
+        &WorkState {
+            phase: WorkPhase::AwaitingRelease,
+            work_id: work_id.clone(),
+            envelope_digest: "digest".to_string(),
+            result_note_id: ulid::Ulid::new().to_string(),
+            milestone_posted: false,
+            worker_id: Some("impl-held".to_string()),
+            result_ref: None,
+            checkout: home.work_dir().join(&work_id).join("repo"),
+            push_attempts: 0,
+            next_push_after: None,
+            result_summary: Some("done".to_string()),
+            evidence_excerpt: None,
+            result_status: Some(WorkStatus::Done),
+            base_sha: None,
+            held_commit_sha: None,
+            closure_digest: None,
+            base_ref: None,
+            remote_url: None,
+            held_since: Some(now),
+            hold_note_id: Some(ulid::Ulid::new().to_string()),
+            hold_hit_count: Some(0),
+            observed_terminal: None,
+        },
+    )
+    .unwrap();
+
+    let (v, code) = checks(&home_path, tmp.path(), |_| {});
+    assert_eq!(code, 0);
+    let held = check(&v, "work_awaiting_release");
+    assert_eq!(held["status"], "warn", "{held}");
+    assert!(detail(&v, "work_awaiting_release").contains("awaiting_release=1"));
+    assert!(detail(&v, "work_awaiting_release").contains(&work_id));
+    let remedy = held["remedy"].as_str().unwrap();
+    assert!(remedy.contains("work diff"), "{held}");
+    assert!(remedy.contains("release"), "{held}");
+    assert!(remedy.contains("reject"), "{held}");
 }
 
 #[test]

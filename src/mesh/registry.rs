@@ -1984,7 +1984,8 @@ fn registry_unreachable(e: sqlx::Error) -> AppError {
     .remedy("check the registry URL, network path, and database availability")
 }
 
-pub(crate) fn map_gateway_sqlstate(code: Option<&str>) -> Option<AppError> {
+#[doc(hidden)]
+pub fn map_gateway_sqlstate(code: Option<&str>) -> Option<AppError> {
     (code == Some("42703")).then(|| {
         AppError::new(
             "REGISTRY_SCHEMA_STALE",

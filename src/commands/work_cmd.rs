@@ -31,7 +31,8 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MIN_WORK_PEER_VERSION: &str = crate::broker::wire::BINARY_VERSION;
+// Spec §7 step 2: this compatibility floor must not track the sender build.
+const MIN_WORK_PEER_VERSION: &str = "0.3.0";
 const RESULT_NOTE_ID_PREFIX: &str = "work-result-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1573,5 +1574,19 @@ fn safe_peer_component(s: &str) -> String {
         "mesh-work-cli".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_work_peer_version_is_the_literal_floor_not_this_build() {
+        assert_eq!(MIN_WORK_PEER_VERSION, "0.3.0");
+        assert!(version_at_least(
+            crate::broker::wire::BINARY_VERSION,
+            MIN_WORK_PEER_VERSION
+        ));
     }
 }

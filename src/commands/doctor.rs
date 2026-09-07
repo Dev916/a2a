@@ -9,9 +9,9 @@
 //! `fn(&Ctx) -> Check`; the runner maps over it and knows nothing about any
 //! individual check. Phase 2's four (app-server handshake, codex-home
 //! agreement, broker status, auth mode) were appended to that slice and the
-//! runner was not touched. The mesh enrollment and hardening checks and Phase 3's three
+//! runner was not touched. The mesh enrollment, hardening, and held-work checks and Phase 3's three
 //! (context canon, the allowed-roots check, tracked-secret check, sync state)
-//! were appended the same way. Phase 1's six, Phase 2's four, both mesh checks,
+//! were appended the same way. Phase 1's six, Phase 2's four, the three mesh checks,
 //! Phase 3's three — and it is pinned by a test.
 //!
 //! **Only `fail` is fatal.** `fail` means "a worker spawned right now would
@@ -47,7 +47,13 @@ use crate::brokerclient::{self, Handshake};
 use crate::config::{self, Config};
 use crate::exec::{self, Liveness};
 use crate::home::{self, A2aHome, LAYOUT_VERSION};
-use crate::mesh::keys;
+use crate::mesh::{
+    keys,
+    registry::{
+        self, open_registry, Registry, WorkListFilter, WorkStatus,
+    },
+    work_exec::{self, WorkPhase},
+};
 use crate::output::{AppError, ExitCode, Outcome};
 use crate::reconcile::reconcile;
 use crate::rpc::RpcError;
@@ -149,7 +155,7 @@ pub struct Ctx {
 }
 
 /// The check list, in report order. Append-only across phases: Phase 1's six,
-/// the allowed-roots first-run check, Phase 2's four, both mesh checks, then
+/// the allowed-roots first-run check, Phase 2's four, the three mesh checks, then
 /// Phase 3's three.
 const CHECKS: &[fn(&Ctx) -> Check] = &[
     codex_present,
@@ -164,6 +170,7 @@ const CHECKS: &[fn(&Ctx) -> Check] = &[
     broker_status,
     gateway_enrollment,
     mesh_hardening,
+    work_awaiting_release,
     auth_mode,
     context_canon,
     codex_config_secrets,
@@ -910,6 +917,134 @@ fn root_role_name(role: keys::RootRole) -> &'static str {
     }
 }
 
+fn work_awaiting_release(ctx: &Ctx) -> Check {
+    const ID: &str = "work_awaiting_release";
+    let local_ids = match work_exec::load_states(&ctx.home) {
+        Ok(states) => states
+            .into_iter()
+            .filter(|state| {
+                state.phase == WorkPhase::AwaitingRelease && state.held_since.is_some()
+            })
+            .map(|state| state.work_id)
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            return Check::warn(
+                ID,
+                format!(
+                    "awaiting_release=unknown; local held state is unreadable: {}: {}",
+                    err.code, err.message
+                ),
+            )
+            .remedy("repair the local work state files, then rerun doctor");
+        }
+    };
+
+    let Some(registry_ids) = registry_awaiting_release_ids(ctx, ID, &local_ids) else {
+        return if local_ids.is_empty() {
+            Check::ok(ID, "awaiting_release=0; no local held items")
+        } else {
+            Check::warn(
+                ID,
+                format!(
+                    "awaiting_release=unknown; local_held=[{}]; registry status is unavailable",
+                    local_ids.join(",")
+                ),
+            )
+            .remedy("restore registry access, then review each local hold with `a2a mesh work diff <id>`")
+        };
+    };
+
+    let confirmed = registry_ids
+        .iter()
+        .filter(|work_id| local_ids.contains(work_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let registry_only = registry_ids
+        .iter()
+        .filter(|work_id| !local_ids.contains(work_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let local_only = local_ids
+        .iter()
+        .filter(|work_id| !registry_ids.contains(work_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if confirmed.is_empty() && registry_only.is_empty() && local_only.is_empty() {
+        return Check::ok(
+            ID,
+            "awaiting_release=0; registry status and local held state agree",
+        );
+    }
+
+    Check::warn(
+        ID,
+        format!(
+            "awaiting_release={}; confirmed=[{}]; registry_only=[{}]; local_only=[{}]",
+            confirmed.len(),
+            confirmed.join(","),
+            registry_only.join(","),
+            local_only.join(","),
+        ),
+    )
+    .remedy(
+        "review confirmed items with `a2a mesh work diff <id>`, then `release` or `reject`; repair any registry/local mismatch before release",
+    )
+}
+
+fn registry_awaiting_release_ids(
+    ctx: &Ctx,
+    check_id: &'static str,
+    local_ids: &[String],
+) -> Option<Vec<String>> {
+    if !registry::registry_env_path(&ctx.home).exists() {
+        return None;
+    }
+    let query = || -> Result<Vec<String>, AppError> {
+        let url = registry::read_registry_env(&ctx.home)?;
+        let roots = keys::RootSet::load(&ctx.home)?;
+        let fleet_id = keys::fleet_id(&ctx.home)?;
+        let gateway_id = keys::gateway_id(&ctx.home)?;
+        let registry = open_registry(&url, roots, fleet_id.clone())?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| {
+                AppError::new(
+                    "RUNTIME",
+                    ExitCode::Internal,
+                    format!("starting registry check runtime: {err}"),
+                )
+            })?;
+        let mut ids = runtime
+            .block_on(registry.work_list(
+                &fleet_id,
+                WorkListFilter {
+                    status: Some(WorkStatus::AwaitingRelease),
+                    claimed_by: Some(gateway_id),
+                },
+            ))?
+            .into_iter()
+            .map(|row| row.work_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    };
+    match query() {
+        Ok(ids) => Some(ids),
+        Err(err) => {
+            eprintln!(
+                "a2a: warning: {check_id}: registry awaiting-release query failed: {}: {}; local_held=[{}]",
+                err.code,
+                err.message,
+                local_ids.join(","),
+            );
+            None
+        }
+    }
+}
+
 /// Which plan the fleet bills to, from the two facts that decide it — and only
 /// from facts this process can read without touching the network.
 ///
@@ -1340,14 +1475,14 @@ mod tests {
     use crate::sync::manifest::DriftSummary;
 
     #[test]
-    fn the_check_list_is_exactly_sixteen_named_checks() {
+    fn the_check_list_is_exactly_seventeen_named_checks() {
         // The list is the contract `doctor --json` publishes; a phase that adds
         // a check adds it here and to the acceptance test in the same commit.
         // Six in Phase 1, the allowed-roots check, four in Phase 2, the mesh
-        // enrollment + hardening checks, and three in Phase 3 — the ids and their order are
+        // enrollment, hardening, and held-work checks, and three in Phase 3 — the ids and their order are
         // pinned end-to-end by
         // `tests/cmd_doctor.rs`.
-        assert_eq!(CHECKS.len(), 16);
+        assert_eq!(CHECKS.len(), 17);
     }
 
     #[test]

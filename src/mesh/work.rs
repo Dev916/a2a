@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::process::Command;
 
 const WORK_ENVELOPE_VERSION: u8 = 1;
 const WORK_ENVELOPE_DOMAIN: &[u8] = b"a2a/work-envelope/v1\0";
@@ -77,6 +78,7 @@ pub fn sign_envelope(
     clock: &dyn Clock,
 ) -> Result<WorkEnvelope, AppError> {
     validate_repo_url(&unsigned.repo.remote_url)?;
+    validate_base_ref(&unsigned.repo.base_ref)?;
     validate_remote_text("title", &unsigned.title, TextShape::OneLine)?;
     validate_remote_text("brief_text", &unsigned.brief_text, TextShape::MultiLine)?;
     validate_remote_text("acceptance", &unsigned.acceptance, TextShape::MultiLine)?;
@@ -190,6 +192,7 @@ pub fn verify_envelope(
 
 pub fn validate_envelope_hygiene(env: &WorkEnvelope, max_bytes: usize) -> Result<(), AppError> {
     validate_repo_url(&env.repo.remote_url)?;
+    validate_base_ref(&env.repo.base_ref)?;
     validate_remote_text("title", &env.title, TextShape::OneLine)?;
     validate_remote_text("brief_text", &env.brief_text, TextShape::MultiLine)?;
     validate_remote_text("acceptance", &env.acceptance, TextShape::MultiLine)?;
@@ -329,6 +332,34 @@ fn validate_repo_url(url: &str) -> Result<(), AppError> {
             "work envelope repo remote_url must be ssh://, https://, file://, or git@host:path and must not begin with '-'",
         )
         .remedy("use a canonical git remote URL; git invocation paths pass it after `--`"))
+    }
+}
+
+fn validate_base_ref(base_ref: &str) -> Result<(), AppError> {
+    let basic_shape = !base_ref.is_empty()
+        && base_ref.len() <= 255
+        && !base_ref.starts_with('-')
+        && !base_ref.contains("@{")
+        && !base_ref
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace());
+    let checked = basic_shape
+        && Command::new("git")
+            .args(["check-ref-format", "--branch"])
+            .arg(base_ref)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .is_ok_and(|output| output.status.success());
+    if checked {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "WORK_BAD_BASE_REF",
+            ExitCode::Precondition,
+            "work envelope repo base_ref is not a safe git branch/ref shape",
+        )
+        .remedy("use a branch name such as `main` or `release/1.2` without whitespace or option prefixes"))
     }
 }
 

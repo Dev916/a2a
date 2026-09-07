@@ -109,6 +109,26 @@ sender with text such as `work done: <title> (<work_id>) -> <result_ref>`.
 `retry-push` is safe to re-run after a transient git failure. `ack` closes a
 result after the sender has handled it.
 
+## Security
+
+Review a completed checkout with `a2a mesh work diff <work_id>`. The command
+pins git against checkout-controlled hooks, attributes and external diff
+drivers, masks secret-shaped values, and fences all worker-authored output.
+`--raw` is an operator-only escape hatch: its output is unmasked and must never
+be piped into agent context.
+
+Before every push, the result scanner checks added post-image blobs, added or
+renamed filenames, anchored `NAME=value` assignments, and byte-identical copies
+of regular files under `$A2A_HOME`. The scan stops with `WORK_SCAN_OVERSIZE`
+after `[mesh.work] diff_scan_max_bytes` bytes (default 5,242,880); an oversize
+scan is a hold, never a clean result.
+
+The scanner is an accidental-disclosure backstop, not a proof that a result is
+secret-free. It deliberately does not claim coverage for encoded credentials,
+values split so no individual line matches a rule, or entropy-only values with
+no secret-bearing key name. Review the complete fenced diff even when the hit
+set is empty.
+
 ## Errors
 
 | Code | Meaning | Remedy |
@@ -129,7 +149,14 @@ result after the sender has handled it.
 | `WORK_TOKEN_MISMATCH` | The sender token and gateway identity do not match. | Re-enroll the gateway and retry with a fresh envelope. |
 | `WORK_WRONG_FLEET` | The envelope is for a different fleet. | Only ingest work from the local fleet. |
 | `WORK_BAD_REPO_URL` | The repo URL failed hygiene checks. | Use a canonical git remote URL. |
+| `WORK_BAD_BASE_REF` | The base ref failed option, control-character, length, or git ref-shape hygiene. | Use a branch name such as `main` or `release/1.2`. |
 | `WORK_CONTROL_CHARS` | Work text contained terminal control characters. | Remove the control characters before sending. |
 | `WORK_BRIEF_INVALID` | Brief front matter is missing or malformed. | Fix the brief YAML before sending work. |
 | `WORK_STATE_CONFLICT` | The local work state does not allow the requested transition. | Re-check `a2a mesh work status <id>` and use the next valid command. |
 | `WORK_NOT_FOUND` | The work id is not present locally or in the registry. | Check `a2a mesh work list` or ask the sender to re-send. |
+| `WORK_RESULT_NOT_LINEAR` | The reviewed commit range contains a merge, an unrelated base, or commits outside the HEAD chain. | Rebase the result into one linear chain rooted at the approved base. |
+| `WORK_BINARY_IN_RESULT` | An added or modified result blob/path is not reviewable UTF-8. | Replace binary output with reviewable UTF-8 text and rerun the worker. |
+| `WORK_ATTRS_IN_RESULT` | An added or modified `.gitattributes` names diff or textconv behavior. | Remove the diff/textconv attribute change and resubmit the result. |
+| `WORK_HEAD_MOVED` | Checkout HEAD changed after the result range was frozen. | Review the new range before attempting release again. |
+| `WORK_SECRET_IN_RESULT` | The result scanner found a credential shape, secret-bearing path/key, or byte match to an `$A2A_HOME` file. | Inspect the checkout named in the error and review with `a2a mesh work diff <id> --raw`; `--raw` output must never be piped into agent context. |
+| `WORK_SCAN_OVERSIZE` | Added result blobs exceed `[mesh.work] diff_scan_max_bytes`. | Reduce the committed result or raise the configured scan cap, then rescan before release. |

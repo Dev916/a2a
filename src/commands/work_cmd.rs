@@ -16,7 +16,9 @@ use crate::mesh::{
     row_sig::{endpoint_conflicts, Disposition, RowVerdict, RowVerifyCfg},
     render::escape_untrusted,
     work::{sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo},
+    render,
     work_exec::{self, RealGit, RealSpawner},
+    work_gate::{self, ResultRange},
     work_store::{self, StoredWork, WORK_CANCELLED_KIND, WORK_OFFER_KIND, WORK_RESULT_KIND},
     Note, PeerId,
 };
@@ -71,6 +73,7 @@ pub fn run(
             MeshWorkCmd::Cancel { work_id } => cancel(home, cfg, work_id).await?,
             MeshWorkCmd::Status { work_id } => status(home, work_id.as_deref()).await?,
             MeshWorkCmd::Ack { work_id } => ack(home, work_id).await?,
+            MeshWorkCmd::Diff { work_id, raw } => diff(home, cfg, work_id, *raw)?,
             MeshWorkCmd::RetryPush { work_id } => retry_push(home, cfg, work_id).await?,
         };
         Ok(Outcome::from(sanitize_value(out)))
@@ -398,6 +401,52 @@ async fn ack(home: &A2aHome, work_id: &str) -> Result<Value, AppError> {
     }
     write_ack_marker(home, work_id)?;
     Ok(json!({ "work_id": work_id, "status": "acked" }))
+}
+
+fn diff(home: &A2aHome, cfg: &Config, work_id: &str, raw: bool) -> Result<Value, AppError> {
+    let state = work_exec::load_state(home, work_id)?.ok_or_else(|| work_not_found(work_id))?;
+    let base_sha = state.base_sha.clone().ok_or_else(|| {
+        AppError::new(
+            "WORK_STATE_INVALID",
+            ExitCode::Precondition,
+            format!("work item {work_id} has no recorded base_sha"),
+        )
+        .remedy("approve records base_sha; this item predates the gate")
+    })?;
+    let range = if let Some(head_sha) = state.held_commit_sha.clone() {
+        let closure_digest = state.closure_digest.clone().ok_or_else(|| {
+            AppError::new(
+                "WORK_STATE_INVALID",
+                ExitCode::Precondition,
+                format!("work item {work_id} has a held commit without a closure digest"),
+            )
+            .remedy("reconcile the completed work item to freeze a complete review range")
+        })?;
+        ResultRange {
+            base_sha,
+            head_sha,
+            closure_digest,
+        }
+    } else {
+        work_gate::freeze_range(&state.checkout, &base_sha)?
+    };
+    let report = work_gate::scan_added_blobs(home, cfg, &state.checkout, &range)?;
+    let mut output = work_gate::render_diff(&state.checkout, &range, raw)?;
+    output.push('\n');
+    for hit in &report.hits {
+        let path = render::escape_untrusted(&hit.path, 4_096);
+        output.push_str(&format!(
+            "hit: {}:{} ({})\n",
+            path.text, hit.line, hit.rule
+        ));
+    }
+    output.push_str(&format!("hit_set_digest: {}", report.digest()));
+    if raw {
+        eprintln!(
+            "a2a: warning: --raw prints unmasked worker output; never pipe it into agent context"
+        );
+    }
+    Ok(Value::String(output))
 }
 
 async fn retry_push(home: &A2aHome, cfg: &Config, work_id: &str) -> Result<Value, AppError> {

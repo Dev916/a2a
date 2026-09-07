@@ -44,6 +44,7 @@ pub struct IngressHit {
 /// (`context/.env`) cannot slip past a bare-name check.
 const FILENAME_RULES: &[(&str, FileMatch)] = &[
     (".env*", FileMatch::DotEnv),
+    ("*.env", FileMatch::Suffix(".env")),
     ("*.pem", FileMatch::Suffix(".pem")),
     ("*.key", FileMatch::Suffix(".key")),
     ("*.pfx", FileMatch::Suffix(".pfx")),
@@ -82,6 +83,10 @@ static VALUE_RULES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
         ("aws_access_key_id", r"AKIA[0-9A-Z]{16}"),
         ("bearer_token", r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
         ("private_key_block", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        ("dsn_credentials", r"(postgres|postgresql|mysql|mongodb(\+srv)?|redis|amqp)://[^:@/\s]+:[^@/\s]+@"),
+        ("json_secret_key", r#""(secret_b64|private_key)"\s*:"#),
+        ("aws_session_key_id", r"ASIA[0-9A-Z]{16}"),
+        ("gw_token_envelope", r#""claims_b64"\s*:\s*"[A-Za-z0-9+/=_-]{8,}""#),
     ]
     .into_iter()
     .map(|(name, pat)| {
@@ -213,6 +218,7 @@ mod tests {
             (".env", ".env*"),
             (".env.local", ".env*"),
             ("context/.env.production", ".env*"),
+            ("deploy/prod.env", "*.env"),
             ("server.pem", "*.pem"),
             ("tls.key", "*.key"),
             ("cert.pfx", "*.pfx"),
@@ -240,12 +246,129 @@ mod tests {
             "AKIAABCDEFGHIJKLMNOP",
             "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y",
             "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "postgresql://a2a:hunter2@ep-x.neon.tech/mesh?sslmode=require",
+            r#"{"gateway_id":"gw-a","secret_b64":"MC4CAQAwBQYDK2VwBCIEIA"}"#,
+            "ASIA0123456789ABCDEF",
+            r#"{"v":1,"claims_b64":"eyJ4IjoxfQ","sig_b64":"AAAA"}"#,
         ];
         for text in planted {
             assert!(!scan_text(text).is_empty(), "ingress missed: {text}");
             assert!(
                 redact_egress(text).contains("[REDACTED:"),
                 "egress missed: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_credential_shapes_are_true_positives() {
+        for (text, expected_rule) in [
+            (
+                "postgresql://a2a:hunter2@ep-x.neon.tech/mesh?sslmode=require",
+                "dsn_credentials",
+            ),
+            ("redis://u:p@h:6379/0", "dsn_credentials"),
+            (
+                "mongodb+srv://u:p@c.example.net/db",
+                "dsn_credentials",
+            ),
+            ("amqp://u:p@h/vh", "dsn_credentials"),
+            (
+                r#"{"gateway_id":"gw-a","secret_b64":"MC4CAQAwBQYDK2VwBCIEIA"}"#,
+                "json_secret_key",
+            ),
+            (r#"{"private_key":"…"}"#, "json_secret_key"),
+            ("ASIA0123456789ABCDEF", "aws_session_key_id"),
+            (
+                r#"{"v":1,"claims_b64":"eyJ4IjoxfQ","sig_b64":"AAAA"}"#,
+                "gw_token_envelope",
+            ),
+        ] {
+            let hits = scan_text(text);
+            assert!(
+                hits.iter().any(|hit| hit.rule == expected_rule),
+                "{expected_rule} missed {text}: {hits:?}"
+            );
+        }
+
+        let long_first_fragment = ["xoxb-", "1234567890-", "\n", "abcdef"].concat();
+        assert!(
+            scan_text(&long_first_fragment)
+                .iter()
+                .any(|hit| hit.rule == "slack_token"),
+            "the long first line is already strong enough to detect"
+        );
+    }
+
+    #[test]
+    fn documented_misses_are_asserted_as_misses() {
+        let encoded_dsn = "cG9zdGdyZXNxbDovL2EyYTpvcGFxdWVAZXhhbXBsZS5uZXQvZGI=";
+        let short_split = ["xoxb-1234", "\n", "567890-abcdef"].concat();
+        let entropy_only =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        for documented_miss in [encoded_dsn, short_split.as_str(), entropy_only] {
+            assert!(
+                scan_text(documented_miss).is_empty(),
+                "documented miss unexpectedly claimed as covered: {documented_miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_sources_are_clean() {
+        for (name, text) in [
+            (
+                "benign_main.rs",
+                include_str!("../tests/fixtures/scanner/benign_main.rs"),
+            ),
+            (
+                "benign_readme.md",
+                include_str!("../tests/fixtures/scanner/benign_readme.md"),
+            ),
+        ] {
+            assert!(scan_text(text).is_empty(), "false positive in {name}");
+        }
+    }
+
+    #[test]
+    fn scanner_corpus_classifies_every_fixture() {
+        for (name, text, expected_hits) in [
+            (
+                "fleet_credentials.txt",
+                include_str!("../tests/fixtures/scanner/fleet_credentials.txt"),
+                1,
+            ),
+            (
+                "gw_token.json",
+                include_str!("../tests/fixtures/scanner/gw_token.json"),
+                1,
+            ),
+            (
+                "root_key.json",
+                include_str!("../tests/fixtures/scanner/root_key.json"),
+                1,
+            ),
+            (
+                "benign_main.rs",
+                include_str!("../tests/fixtures/scanner/benign_main.rs"),
+                0,
+            ),
+            (
+                "benign_readme.md",
+                include_str!("../tests/fixtures/scanner/benign_readme.md"),
+                0,
+            ),
+            (
+                "documented_misses.txt",
+                include_str!("../tests/fixtures/scanner/documented_misses.txt"),
+                0,
+            ),
+        ] {
+            assert_eq!(
+                scan_text(text).len(),
+                expected_hits,
+                "wrong corpus classification for {name}"
             );
         }
     }

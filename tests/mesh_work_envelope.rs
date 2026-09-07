@@ -197,6 +197,39 @@ fn envelope_hygiene_is_rejected_at_construction() {
     );
 }
 
+#[test]
+fn base_ref_hygiene_refuses_control_chars_leading_dash_and_bad_ref_shape() {
+    let (_tmp, _root, sender, clock) = fixture();
+    let bad_refs = [
+        "-x".to_string(),
+        "a\nb".to_string(),
+        "refs//x".to_string(),
+        "x..y".to_string(),
+        "x".repeat(300),
+    ];
+    for bad_ref in &bad_refs {
+        let mut value = unsigned();
+        value.repo.base_ref = bad_ref.clone();
+        assert_code(sign_envelope(&sender, value, &clock), "WORK_BAD_BASE_REF");
+    }
+
+    for valid_ref in ["main", "release/1.2"] {
+        let mut value = unsigned();
+        value.repo.base_ref = valid_ref.to_string();
+        let envelope = sign_envelope(&sender, value, &clock).unwrap();
+        validate_envelope_hygiene(&envelope, MAX_DIRECTED_BYTES).unwrap();
+
+        for bad_ref in &bad_refs {
+            let mut received = envelope.clone();
+            received.repo.base_ref = bad_ref.clone();
+            assert_code(
+                validate_envelope_hygiene(&received, MAX_DIRECTED_BYTES),
+                "WORK_BAD_BASE_REF",
+            );
+        }
+    }
+}
+
 fn b64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

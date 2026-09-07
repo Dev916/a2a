@@ -191,9 +191,15 @@ impl WorkCompletionIo for TerminalGitIo {
         })
     }
 
-    fn push_result_branch(&self, checkout: &Path, work_id: &str) -> Result<(), AppError> {
-        let refspec = format!("HEAD:refs/heads/a2a/work/{work_id}");
-        common::run_git(checkout, &["push", "--", "origin", &refspec]);
+    fn push_result_branch(
+        &self,
+        checkout: &Path,
+        work_id: &str,
+        remote_url: &str,
+        held: &a2a::mesh::work_gate::ResultRange,
+    ) -> Result<(), AppError> {
+        let refspec = format!("{}:refs/heads/a2a/work/{work_id}", held.head_sha);
+        common::run_git(checkout, &["push", "--", remote_url, &refspec]);
         Ok(())
     }
 }

@@ -23,6 +23,7 @@ use a2a::output::{AppError, ExitCode};
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -128,6 +129,16 @@ fn fixture(work_id: &str) -> Fixture {
     block_on(inner.work_insert(row)).unwrap();
     let registry = CountingRegistry::new(inner);
 
+    let checkout = receiver.work_dir().join(work_id).join("repo");
+    run_git(&checkout, &["init", "-b", "main"]);
+    run_git(&checkout, &["config", "user.email", "test@example.invalid"]);
+    run_git(&checkout, &["config", "user.name", "Test User"]);
+    run_git(&checkout, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(checkout.join("README.md"), "reviewed base\n").unwrap();
+    run_git(&checkout, &["add", "README.md"]);
+    run_git(&checkout, &["commit", "-m", "reviewed base"]);
+    let base_sha = git_stdout(&checkout, &["rev-parse", "HEAD"]);
+
     let mut state = WorkState {
         phase: WorkPhase::Running,
         work_id: work_id.to_string(),
@@ -136,12 +147,17 @@ fn fixture(work_id: &str) -> Fixture {
         milestone_posted: false,
         worker_id: Some("impl-terminal".to_string()),
         result_ref: None,
-        checkout: receiver.work_dir().join(work_id).join("repo"),
+        checkout,
         push_attempts: 0,
         next_push_after: None,
         result_summary: None,
         evidence_excerpt: None,
         result_status: None,
+        base_sha: Some(base_sha),
+        held_commit_sha: None,
+        closure_digest: None,
+        base_ref: Some("main".to_string()),
+        remote_url: Some("file:///tmp/a2a-work-loop.git".to_string()),
     };
     work_exec::save_state(&receiver, &state).unwrap();
     state.checkout = work_exec::load_state(&receiver, work_id).unwrap().unwrap().checkout;
@@ -293,7 +309,13 @@ impl WorkCompletionIo for FakeIo {
         Ok(self.completion.clone())
     }
 
-    fn push_result_branch(&self, _checkout: &Path, work_id: &str) -> Result<(), AppError> {
+    fn push_result_branch(
+        &self,
+        _checkout: &Path,
+        work_id: &str,
+        _remote_url: &str,
+        _held: &a2a::mesh::work_gate::ResultRange,
+    ) -> Result<(), AppError> {
         if !*self.fail_push.lock().unwrap() {
             let inserted = self.pushed_refs.lock().unwrap().insert(work_id.to_string());
             if inserted {
@@ -344,6 +366,8 @@ async fn completion_tick_is_idempotent_across_every_phase_boundary() {
         let expected_ref = format!("a2a/work/{}", f.work_id);
         assert_eq!(state.result_ref.as_deref(), Some(expected_ref.as_str()));
         assert!(state.milestone_posted);
+        assert!(state.held_commit_sha.is_some());
+        assert_eq!(state.closure_digest.as_deref().map(str::len), Some(64));
         let row = f.registry.row(&fleet_id(&f.receiver).unwrap(), &f.work_id).await;
         assert_eq!(row.status, WorkStatus::Done);
         assert_eq!(row.result_ref.as_deref(), Some(expected_ref.as_str()));
@@ -539,25 +563,37 @@ async fn rejected_result_ack_records_result_delivery_on_registry_row() {
 }
 
 #[test]
-fn real_file_url_git_push_and_retry_push_cli_succeed() {
+fn push_uses_recorded_sha_and_remote_url_and_ignores_hooks_and_pushurl() {
     let f = fixture("work-loop-real-git");
     let cfg = cfg_for(&f.receiver);
     let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
     let bare = f._tmp.path().join("remote.git");
     run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
-    run_git(&checkout, &["init", "-b", "main"]);
-    run_git(&checkout, &["config", "user.email", "test@example.invalid"]);
-    run_git(&checkout, &["config", "user.name", "Test User"]);
-    std::fs::write(checkout.join("README.md"), "result\n").unwrap();
-    run_git(&checkout, &["add", "README.md"]);
+    std::fs::write(checkout.join("result.txt"), "result\n").unwrap();
+    run_git(&checkout, &["add", "result.txt"]);
     run_git(&checkout, &["commit", "-m", "result"]);
     run_git(&checkout, &["remote", "add", "origin", &format!("file://{}", bare.display())]);
+    run_git(&checkout, &["config", "remote.origin.pushurl", "file:///dev/null"]);
+    run_git(&checkout, &["config", "diff.external", "/bin/false"]);
+    let hook = checkout.join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\ntouch \"$PWD/HOOK_RAN\"\n").unwrap();
+    let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).unwrap();
 
     let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
     state.phase = WorkPhase::Pushing;
     state.result_status = Some(WorkStatus::Done);
     state.result_summary = Some("done".to_string());
     state.evidence_excerpt = Some("clean".to_string());
+    let held = a2a::mesh::work_gate::freeze_range(
+        &checkout,
+        state.base_sha.as_deref().unwrap(),
+    )
+    .unwrap();
+    state.held_commit_sha = Some(held.head_sha.clone());
+    state.closure_digest = Some(held.closure_digest.clone());
+    state.remote_url = Some(format!("file://{}", bare.display()));
     work_exec::save_state(&f.receiver, &state).unwrap();
 
     block_on(work_exec::work_loop_tick(
@@ -572,6 +608,13 @@ fn real_file_url_git_push_and_retry_push_cli_succeed() {
         .output()
         .unwrap();
     assert!(heads.status.success(), "{}", String::from_utf8_lossy(&heads.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&heads.stdout)
+            .split_whitespace()
+            .next(),
+        Some(held.head_sha.as_str())
+    );
+    assert!(!checkout.join("HOOK_RAN").exists());
 
     let retry = common::a2a(f.receiver.root(), f._tmp.path())
         .args(["--json", "mesh", "work", "retry-push", &f.work_id])
@@ -579,6 +622,115 @@ fn real_file_url_git_push_and_retry_push_cli_succeed() {
         .success();
     let out: Value = serde_json::from_slice(&retry.get_output().stdout).unwrap();
     assert_eq!(out["data"]["forced"], true, "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_is_refused_when_the_result_carries_a_credential() {
+    let f = fixture("work-loop-secret-gate");
+    let cfg = cfg_for(&f.receiver);
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    let bare = f._tmp.path().join("secret-gate-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    std::fs::write(
+        checkout.join("credentials.txt"),
+        "postgresql://a2a:push-only-secret@db.example.invalid/mesh\n",
+    )
+    .unwrap();
+    run_git(&checkout, &["add", "--", "credentials.txt"]);
+    run_git(&checkout, &["commit", "-m", "credential-bearing result"]);
+
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.phase = WorkPhase::Pushing;
+    state.result_status = Some(WorkStatus::Done);
+    state.result_summary = Some("done".to_string());
+    state.evidence_excerpt = Some("clean".to_string());
+    let held = a2a::mesh::work_gate::freeze_range(
+        &checkout,
+        state.base_sha.as_deref().unwrap(),
+    )
+    .unwrap();
+    state.held_commit_sha = Some(held.head_sha);
+    state.closure_digest = Some(held.closure_digest);
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let report = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &RealWorkCompletionIo,
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(report.item_errors, 1, "{report:?}");
+
+    let pushed = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            &format!("refs/heads/a2a/work/{}", f.work_id),
+        ])
+        .output()
+        .unwrap();
+    assert!(!pushed.status.success(), "result branch must not land");
+    let saved = work_exec::load_state(&f.receiver, &f.work_id)
+        .unwrap()
+        .unwrap();
+    let summary = saved.result_summary.as_deref().unwrap_or_default();
+    assert!(summary.contains("WORK_SECRET_IN_RESULT"), "{saved:?}");
+    assert!(!summary.contains("push-only-secret"), "{saved:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_refuses_after_head_moves_past_the_recorded_sha() {
+    let f = fixture("work-loop-head-moved");
+    let cfg = cfg_for(&f.receiver);
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    let bare = f._tmp.path().join("head-moved-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    std::fs::write(checkout.join("result.txt"), "held result\n").unwrap();
+    run_git(&checkout, &["add", "result.txt"]);
+    run_git(&checkout, &["commit", "-m", "held result"]);
+
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.phase = WorkPhase::Pushing;
+    state.result_status = Some(WorkStatus::Done);
+    let held = a2a::mesh::work_gate::freeze_range(
+        &checkout,
+        state.base_sha.as_deref().unwrap(),
+    )
+    .unwrap();
+    state.held_commit_sha = Some(held.head_sha);
+    state.closure_digest = Some(held.closure_digest);
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    std::fs::write(checkout.join("after-review.txt"), "moved\n").unwrap();
+    run_git(&checkout, &["add", "after-review.txt"]);
+    run_git(&checkout, &["commit", "-m", "move after review"]);
+
+    let err = advance_completion_until(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &RealWorkCompletionIo,
+        state,
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "WORK_HEAD_MOVED", "{err:?}");
+    let pushed = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            &format!("refs/heads/a2a/work/{}", f.work_id),
+        ])
+        .output()
+        .unwrap();
+    assert!(!pushed.status.success());
 }
 
 fn spooled_result_notes(home: &A2aHome, to_gateway: &str) -> Vec<Value> {
@@ -610,6 +762,16 @@ fn run_git(cwd: &Path, args: &[&str]) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 struct AlwaysErrRegistry;

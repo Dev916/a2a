@@ -266,6 +266,15 @@ impl GitAdapter for FakeGit {
     async fn clone_checkout(&self, _remote_url: &str, _base_ref: &str, checkout: &Path) -> Result<(), AppError> {
         self.counts.lock().unwrap().clones += 1;
         std::fs::create_dir_all(checkout).unwrap();
+        if !checkout.join(".git").exists() {
+            common::run_git(checkout, &["init", "-b", "main"]);
+            common::run_git(checkout, &["config", "user.email", "test@example.invalid"]);
+            common::run_git(checkout, &["config", "user.name", "Test User"]);
+            common::run_git(checkout, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(checkout.join("README.md"), "reviewed base\n").unwrap();
+            common::run_git(checkout, &["add", "README.md"]);
+            common::run_git(checkout, &["commit", "-m", "reviewed base"]);
+        }
         Ok(())
     }
 }

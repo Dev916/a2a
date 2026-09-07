@@ -60,6 +60,7 @@ pub const DEFAULT_MESH_WORK_TTL_DAYS: u64 = 7;
 pub const DEFAULT_MESH_WORK_MAX_DIRECTED_BYTES: u64 = 262_144;
 pub const DEFAULT_MESH_WORK_MAX_POOL_BYTES: u64 = 32_768;
 pub const DEFAULT_MESH_WORK_RESULT_NOTE_MAX_BYTES: u64 = 65_536;
+pub const DEFAULT_MESH_WORK_DIFF_SCAN_MAX_BYTES: u64 = 5_242_880;
 pub const DEFAULT_MESH_WORK_WORK_POLL_SECS: u64 = 15;
 pub const DEFAULT_MESH_WORK_CLAIM_STALL_SECS: u64 = 900;
 pub const DEFAULT_MESH_WORK_CHECKOUT_RETAIN_DAYS: u64 = 30;
@@ -187,7 +188,7 @@ pub const UPDATE_FIELDS: [&str; 1] = ["repo_url"];
 pub const MESH_FIELDS: [&str; 3] = ["feed_max_bytes", "stale_after_secs", "gc_after_days"];
 
 /// Every `[mesh.work]` key, in the order `config show --origin` reports them.
-pub const MESH_WORK_FIELDS: [&str; 7] = [
+pub const MESH_WORK_FIELDS: [&str; 8] = [
     "ttl_days",
     "max_directed_bytes",
     "max_pool_bytes",
@@ -195,6 +196,7 @@ pub const MESH_WORK_FIELDS: [&str; 7] = [
     "work_poll_secs",
     "claim_stall_secs",
     "checkout_retain_days",
+    "diff_scan_max_bytes",
 ];
 
 /// Every `[mesh.gateway]` key, in the order `config show --origin` reports them.
@@ -552,6 +554,7 @@ pub struct MeshWorkConfig {
     pub max_directed_bytes: u64,
     pub max_pool_bytes: u64,
     pub result_note_max_bytes: u64,
+    pub diff_scan_max_bytes: u64,
     pub work_poll_secs: u64,
     pub claim_stall_secs: u64,
     pub checkout_retain_days: u64,
@@ -564,6 +567,7 @@ impl Default for MeshWorkConfig {
             max_directed_bytes: DEFAULT_MESH_WORK_MAX_DIRECTED_BYTES,
             max_pool_bytes: DEFAULT_MESH_WORK_MAX_POOL_BYTES,
             result_note_max_bytes: DEFAULT_MESH_WORK_RESULT_NOTE_MAX_BYTES,
+            diff_scan_max_bytes: DEFAULT_MESH_WORK_DIFF_SCAN_MAX_BYTES,
             work_poll_secs: DEFAULT_MESH_WORK_WORK_POLL_SECS,
             claim_stall_secs: DEFAULT_MESH_WORK_CLAIM_STALL_SECS,
             checkout_retain_days: DEFAULT_MESH_WORK_CHECKOUT_RETAIN_DAYS,
@@ -1337,6 +1341,7 @@ fn apply_mesh_work_toml(
         "max_directed_bytes" => work.max_directed_bytes = want_u64(dotted, v)?,
         "max_pool_bytes" => work.max_pool_bytes = want_u64(dotted, v)?,
         "result_note_max_bytes" => work.result_note_max_bytes = want_u64(dotted, v)?,
+        "diff_scan_max_bytes" => work.diff_scan_max_bytes = want_u64(dotted, v)?,
         "work_poll_secs" => work.work_poll_secs = want_u64(dotted, v)?,
         "claim_stall_secs" => work.claim_stall_secs = want_u64(dotted, v)?,
         "checkout_retain_days" => work.checkout_retain_days = want_u64(dotted, v)?,
@@ -1693,6 +1698,7 @@ fn apply_mesh_work_str(
         "max_directed_bytes" => work.max_directed_bytes = parse_u64_str(key, s)?,
         "max_pool_bytes" => work.max_pool_bytes = parse_u64_str(key, s)?,
         "result_note_max_bytes" => work.result_note_max_bytes = parse_u64_str(key, s)?,
+        "diff_scan_max_bytes" => work.diff_scan_max_bytes = parse_u64_str(key, s)?,
         "work_poll_secs" => work.work_poll_secs = parse_u64_str(key, s)?,
         "claim_stall_secs" => work.claim_stall_secs = parse_u64_str(key, s)?,
         "checkout_retain_days" => work.checkout_retain_days = parse_u64_str(key, s)?,
@@ -2322,6 +2328,7 @@ mod tests {
         assert_eq!(mesh.work.max_directed_bytes, 262_144);
         assert_eq!(mesh.work.max_pool_bytes, 32_768);
         assert_eq!(mesh.work.result_note_max_bytes, 65_536);
+        assert_eq!(mesh.work.diff_scan_max_bytes, 5_242_880);
         assert_eq!(mesh.work.work_poll_secs, 15);
         assert_eq!(mesh.work.claim_stall_secs, 900);
         assert_eq!(mesh.work.checkout_retain_days, 30);
@@ -2329,6 +2336,7 @@ mod tests {
         assert_eq!(DEFAULT_STALE_AFTER_SECS, 900);
         assert_eq!(DEFAULT_GC_AFTER_DAYS, 7);
         assert_eq!(DEFAULT_MESH_WORK_TTL_DAYS, 7);
+        assert_eq!(DEFAULT_MESH_WORK_DIFF_SCAN_MAX_BYTES, 5_242_880);
         assert_eq!(
             MESH_FIELDS,
             ["feed_max_bytes", "stale_after_secs", "gc_after_days"]
@@ -2343,6 +2351,7 @@ mod tests {
                 "work_poll_secs",
                 "claim_stall_secs",
                 "checkout_retain_days",
+                "diff_scan_max_bytes",
             ]
         );
         assert_eq!(mesh_env_key("feed_max_bytes"), "A2A_MESH_FEED_MAX_BYTES");
@@ -2356,7 +2365,7 @@ mod tests {
         );
         assert_eq!(mesh_env_key("gc_after_days"), "A2A_MESH_GC_AFTER_DAYS");
 
-        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n[mesh.work]\nttl_days = 6\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\nresult_note_max_bytes = 2048\nwork_poll_secs = 2\nclaim_stall_secs = 3\ncheckout_retain_days = 4\n"
+        let table: toml::Table = "[mesh]\nfeed_max_bytes = 4096\nstale_after_secs = 60\ngc_after_days = 3\nbogus = 1\n[mesh.work]\nttl_days = 6\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\nresult_note_max_bytes = 2048\ndiff_scan_max_bytes = 1024\nwork_poll_secs = 2\nclaim_stall_secs = 3\ncheckout_retain_days = 4\n"
             .parse()
             .unwrap();
         let mut cfg = Config {
@@ -2381,6 +2390,7 @@ mod tests {
         assert_eq!(cfg.mesh.work.max_directed_bytes, 8192);
         assert_eq!(cfg.mesh.work.max_pool_bytes, 4096);
         assert_eq!(cfg.mesh.work.result_note_max_bytes, 2048);
+        assert_eq!(cfg.mesh.work.diff_scan_max_bytes, 1024);
         assert_eq!(cfg.mesh.work.work_poll_secs, 2);
         assert_eq!(cfg.mesh.work.claim_stall_secs, 3);
         assert_eq!(cfg.mesh.work.checkout_retain_days, 4);

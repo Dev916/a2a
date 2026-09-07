@@ -192,6 +192,7 @@ pub mod routing;
 pub mod wire;
 pub mod work;
 pub mod work_exec;
+pub mod work_gate;
 pub mod work_store;
 pub mod enroll_ledger;
 

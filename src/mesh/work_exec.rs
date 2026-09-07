@@ -12,7 +12,7 @@ use crate::mesh::work::{canonical_envelope_without_sig, verify_envelope, Verifie
 use crate::mesh::{
     feed,
     gateway::{notes_wire, presence_wire},
-    Note, PeerId, Provider,
+    work_gate, Note, PeerId, Provider,
 };
 use crate::mesh::work_store;
 use crate::output::{AppError, ExitCode};
@@ -70,6 +70,16 @@ pub struct WorkState {
     pub evidence_excerpt: Option<String>,
     #[serde(default)]
     pub result_status: Option<WorkStatus>,
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    #[serde(default)]
+    pub held_commit_sha: Option<String>,
+    #[serde(default)]
+    pub closure_digest: Option<String>,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub remote_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,10 +333,9 @@ impl GitAdapter for RealGit {
                 format!("git clone exited with {status}"),
             ));
         }
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(checkout)
-            .args(["checkout", base_ref])
+        let status = work_gate::git_pinned(checkout)
+            .args(["checkout", "--end-of-options"])
+            .arg(base_ref)
             .status()
             .map_err(|e| io_err("running git checkout", e))?;
         if !status.success() {
@@ -520,6 +529,10 @@ where
         )
         .await
         .map_err(|err| mark_failed(home, state.clone(), err))?;
+        let head = work_gate::rev_parse_head(&state.checkout)?;
+        state.base_sha = Some(head);
+        state.remote_url = Some(stored.envelope.repo.remote_url.clone());
+        state.base_ref = Some(stored.envelope.repo.base_ref.clone());
         if stop_after == Some(ApproveStopAfter::Cloned) {
             state.phase = WorkPhase::Spawning;
             save_state_unlocked(home, &state)?;
@@ -653,7 +666,13 @@ pub trait WorkCompletionIo: Clone + Send + Sync + 'static {
         cfg: &Config,
         worker_id: &str,
     ) -> Result<WorkCompletion, AppError>;
-    fn push_result_branch(&self, checkout: &Path, work_id: &str) -> Result<(), AppError>;
+    fn push_result_branch(
+        &self,
+        checkout: &Path,
+        work_id: &str,
+        remote_url: &str,
+        held: &work_gate::ResultRange,
+    ) -> Result<(), AppError>;
 }
 
 #[derive(Clone, Copy)]
@@ -681,12 +700,19 @@ impl WorkCompletionIo for RealWorkCompletionIo {
         }
     }
 
-    fn push_result_branch(&self, checkout: &Path, work_id: &str) -> Result<(), AppError> {
-        let refspec = format!("HEAD:refs/heads/a2a/work/{work_id}");
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(checkout)
-            .args(["push", "--", "origin", &refspec])
+    fn push_result_branch(
+        &self,
+        checkout: &Path,
+        work_id: &str,
+        remote_url: &str,
+        held: &work_gate::ResultRange,
+    ) -> Result<(), AppError> {
+        work_gate::assert_head_unmoved(checkout, held)?;
+        let refspec = format!("{}:refs/heads/a2a/work/{work_id}", held.head_sha);
+        let output = work_gate::git_push_pinned(checkout)
+            .args(["push", "--no-verify", "--atomic", "--"])
+            .arg(remote_url)
+            .arg(&refspec)
             .output()
             .map_err(|e| work_push_failed(format!("running git push: {e}")))?;
         if output.status.success() {
@@ -747,8 +773,27 @@ where
         let home_for_block = home.clone();
         let cfg_for_block = cfg.clone();
         let io_for_block = io.clone();
-        let completion = tokio::task::spawn_blocking(move || {
-            io_for_block.reconcile_worker(&home_for_block, &cfg_for_block, &worker_id)
+        let checkout_for_block = state.checkout.clone();
+        let base_sha_for_block = state.base_sha.clone();
+        let work_id_for_block = state.work_id.clone();
+        let (completion, frozen) = tokio::task::spawn_blocking(move || {
+            let completion =
+                io_for_block.reconcile_worker(&home_for_block, &cfg_for_block, &worker_id)?;
+            // Range freezing invokes git, so it stays in the existing blocking region with
+            // reconciliation instead of becoming an uncancellable subprocess on the async path.
+            let frozen = if matches!(
+                &completion,
+                WorkCompletion::Done { .. } | WorkCompletion::Failed { .. }
+            ) {
+                let base_sha = base_sha_for_block.as_deref().ok_or_else(|| {
+                    missing_work_state_field(&work_id_for_block, "base_sha")
+                        .remedy("approve records base_sha; this item predates the gate")
+                })?;
+                Some(work_gate::freeze_range(&checkout_for_block, base_sha)?)
+            } else {
+                None
+            };
+            Ok::<_, AppError>((completion, frozen))
         })
         .await
         .map_err(|e| {
@@ -764,9 +809,14 @@ where
                 summary,
                 evidence_excerpt,
             } => {
+                let held = frozen.as_ref().ok_or_else(|| {
+                    missing_work_state_field(&state.work_id, "held result range")
+                })?;
                 state.result_status = Some(WorkStatus::Done);
                 state.result_summary = Some(redact::redact_egress(&summary));
                 state.evidence_excerpt = Some(redact::redact_egress(&evidence_excerpt));
+                state.held_commit_sha = Some(held.head_sha.clone());
+                state.closure_digest = Some(held.closure_digest.clone());
                 state.phase = WorkPhase::Pushing;
                 save_state_unlocked(home, &state)?;
             }
@@ -774,9 +824,14 @@ where
                 summary,
                 evidence_excerpt,
             } => {
+                let held = frozen.as_ref().ok_or_else(|| {
+                    missing_work_state_field(&state.work_id, "held result range")
+                })?;
                 state.result_status = Some(WorkStatus::Failed);
                 state.result_summary = Some(redact::redact_egress(&summary));
                 state.evidence_excerpt = Some(redact::redact_egress(&evidence_excerpt));
+                state.held_commit_sha = Some(held.head_sha.clone());
+                state.closure_digest = Some(held.closure_digest.clone());
                 state.phase = WorkPhase::Pushing;
                 save_state_unlocked(home, &state)?;
             }
@@ -793,9 +848,22 @@ where
         }
         let checkout = state.checkout.clone();
         let work_id = state.work_id.clone();
+        let remote_url = state.remote_url.clone().ok_or_else(|| {
+            missing_work_state_field(&state.work_id, "remote_url")
+                .remedy("approve records remote_url; this item predates the pinned push gate")
+        })?;
+        let held = held_range_from_state(&state)?;
+        if let Err(err) = work_gate::gate_push(home, cfg, &state.checkout, &held).await {
+            state.result_summary = Some(redact::redact_egress(&format!(
+                "{}: {}",
+                err.code, err.message
+            )));
+            save_state_unlocked(home, &state)?;
+            return Err(err);
+        }
         let io_for_block = io.clone();
         let pushed = tokio::task::spawn_blocking(move || {
-            io_for_block.push_result_branch(&checkout, &work_id)
+            io_for_block.push_result_branch(&checkout, &work_id, &remote_url, &held)
         })
         .await
         .map_err(|e| AppError::new("WORK_PUSH_FAILED", ExitCode::Internal, e.to_string()))?;
@@ -1154,6 +1222,32 @@ fn work_push_failed(detail: impl Into<String>) -> AppError {
     .remedy("fix git credentials or the remote, then run `a2a mesh work retry-push <id>`")
 }
 
+fn held_range_from_state(state: &WorkState) -> Result<work_gate::ResultRange, AppError> {
+    Ok(work_gate::ResultRange {
+        base_sha: state
+            .base_sha
+            .clone()
+            .ok_or_else(|| missing_work_state_field(&state.work_id, "base_sha"))?,
+        head_sha: state
+            .held_commit_sha
+            .clone()
+            .ok_or_else(|| missing_work_state_field(&state.work_id, "held_commit_sha"))?,
+        closure_digest: state
+            .closure_digest
+            .clone()
+            .ok_or_else(|| missing_work_state_field(&state.work_id, "closure_digest"))?,
+    })
+}
+
+fn missing_work_state_field(work_id: &str, field: &str) -> AppError {
+    AppError::new(
+        "WORK_STATE_INVALID",
+        ExitCode::Precondition,
+        format!("work item {work_id} has no recorded {field}"),
+    )
+    .remedy("re-approve a fresh work item so the reviewed result gate can record every field")
+}
+
 fn worker_result_excerpt(home: &A2aHome, worker_id: &str) -> Option<String> {
     let dir = home.worker_dir(worker_id);
     for name in [
@@ -1193,6 +1287,11 @@ fn initial_claiming_state_from_verified(
         result_summary: None,
         evidence_excerpt: None,
         result_status: None,
+        base_sha: None,
+        held_commit_sha: None,
+        closure_digest: None,
+        base_ref: None,
+        remote_url: None,
     })
 }
 

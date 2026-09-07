@@ -662,6 +662,13 @@ pub enum MeshWorkCmd {
     Status { work_id: Option<String> },
     /// Acknowledge a done or failed item you sent
     Ack { work_id: String },
+    /// Render the frozen worker result for review
+    Diff {
+        work_id: String,
+        /// Print unmasked worker output (never pipe this into agent context)
+        #[arg(long)]
+        raw: bool,
+    },
     /// Force one result branch push attempt for a completed local work item
     RetryPush { work_id: String },
 }

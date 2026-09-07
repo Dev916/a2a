@@ -1152,37 +1152,26 @@ async fn handle_inbound_frame(
                     reorder,
                     &origin,
                     entries,
-                    |entry, reaches_append| {
-                        if entry.refs.get("work").is_some() {
-                            let outcome = buckets.allow(limits::BucketKind::WorkOffers, now);
-                            if !observe_limit_outcome(
-                                home,
-                                peer_gateway_id,
-                                limits::BucketKind::WorkOffers,
-                                outcome,
-                                peer_supports_deferred,
-                                &mut buckets,
-                                &mut deferred_ack,
-                            ) {
-                                frame_deferred = true;
-                                return false;
-                            }
-                        }
-                        if reaches_append {
-                            let outcome =
-                                buckets.allow(limits::BucketKind::FeedEntries, now);
-                            if !observe_limit_outcome(
-                                home,
-                                peer_gateway_id,
-                                limits::BucketKind::FeedEntries,
-                                outcome,
-                                peer_supports_deferred,
-                                &mut buckets,
-                                &mut deferred_ack,
-                            ) {
-                                frame_deferred = true;
-                                return false;
-                            }
+                    |entry, charge_feed_entry| {
+                        let kind = if charge_feed_entry {
+                            limits::BucketKind::FeedEntries
+                        } else if entry.refs.get("work").is_some() {
+                            limits::BucketKind::WorkOffers
+                        } else {
+                            return true;
+                        };
+                        let outcome = buckets.allow(kind, now);
+                        if !observe_limit_outcome(
+                            home,
+                            peer_gateway_id,
+                            kind,
+                            outcome,
+                            peer_supports_deferred,
+                            &mut buckets,
+                            &mut deferred_ack,
+                        ) {
+                            frame_deferred = true;
+                            return false;
                         }
                         true
                     },

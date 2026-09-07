@@ -71,13 +71,7 @@ pub fn store_offer(
     source: WorkSource,
 ) -> Result<PathBuf, AppError> {
     let _pool_guard = if source == WorkSource::Pool {
-        Some(POOL_STORE_LOCK.lock().map_err(|_| {
-            AppError::new(
-                "INTERNAL",
-                ExitCode::Internal,
-                "pool work-store lock is poisoned",
-            )
-        })?)
+        Some(pool_store_guard()?)
     } else {
         None
     };
@@ -85,32 +79,8 @@ pub fn store_offer(
     let path = path_for(home, source, &work_id);
     if let Some(parent) = path.parent() {
         create_dir_0700(parent).map_err(|e| io_err("creating work store", e))?;
-        if source == WorkSource::Pool && !path.exists() {
-            let mut count = 0usize;
-            for entry in
-                fs::read_dir(parent).map_err(|e| io_err("reading pool work store", e))?
-            {
-                let entry = entry.map_err(|e| io_err("reading pool work store", e))?;
-                if entry
-                    .file_type()
-                    .map_err(|e| io_err("reading pool work store", e))?
-                    .is_file()
-                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
-                {
-                    count = count.saturating_add(1);
-                    if count == MAX_POOL_OFFERS {
-                        break;
-                    }
-                }
-            }
-            if count >= MAX_POOL_OFFERS {
-                return Err(AppError::new(
-                    "WORK_POOL_FULL",
-                    ExitCode::Precondition,
-                    format!("pool work store already contains {MAX_POOL_OFFERS} offers"),
-                )
-                .remedy("approve, decline, or expire a pool offer before accepting another"));
-            }
+        if source == WorkSource::Pool {
+            ensure_pool_offer_capacity_unlocked(parent, &path)?;
         }
     }
     let stored = StoredWorkFile {
@@ -128,6 +98,65 @@ pub fn store_offer(
         .map_err(|e| io_err("writing work", e))?;
     file.sync_all().map_err(|e| io_err("syncing work", e))?;
     Ok(path)
+}
+
+pub(crate) fn ensure_pool_offer_capacity(
+    home: &A2aHome,
+    work_id: &str,
+) -> Result<(), AppError> {
+    let _pool_guard = pool_store_guard()?;
+    let path = path_for(home, WorkSource::Pool, work_id);
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if !parent.exists() {
+        return Ok(());
+    }
+    ensure_pool_offer_capacity_unlocked(parent, &path)
+}
+
+fn pool_store_guard() -> Result<std::sync::MutexGuard<'static, ()>, AppError> {
+    POOL_STORE_LOCK.lock().map_err(|_| {
+        AppError::new(
+            "INTERNAL",
+            ExitCode::Internal,
+            "pool work-store lock is poisoned",
+        )
+    })
+}
+
+fn ensure_pool_offer_capacity_unlocked(parent: &Path, path: &Path) -> Result<(), AppError> {
+    if path.exists() {
+        return Err(AppError::new(
+            "IO",
+            ExitCode::Internal,
+            format!("writing work: {} already exists", path.display()),
+        ));
+    }
+    let mut count = 0usize;
+    for entry in fs::read_dir(parent).map_err(|e| io_err("reading pool work store", e))? {
+        let entry = entry.map_err(|e| io_err("reading pool work store", e))?;
+        if entry
+            .file_type()
+            .map_err(|e| io_err("reading pool work store", e))?
+            .is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            count = count.saturating_add(1);
+            if count == MAX_POOL_OFFERS {
+                break;
+            }
+        }
+    }
+    if count >= MAX_POOL_OFFERS {
+        return Err(AppError::new(
+            "WORK_POOL_FULL",
+            ExitCode::Precondition,
+            format!("pool work store already contains {MAX_POOL_OFFERS} offers"),
+        )
+        .remedy("approve, decline, or expire a pool offer before accepting another"));
+    }
+    Ok(())
 }
 
 pub fn list(home: &A2aHome) -> Result<Vec<StoredWork>, AppError> {

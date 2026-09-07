@@ -489,6 +489,142 @@ async fn only_appended_entries_burn_the_feed_bucket() {
 }
 
 #[tokio::test]
+async fn rejected_entries_are_exempt_even_when_the_feed_bucket_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let receiver = home_at(&tmp.path().join("receiver"));
+    write_gateway_key(sender.root(), "gw-a");
+    write_gateway_key(receiver.root(), "gw-b");
+    let cfg_a = cfg_for(&sender);
+    let mut cfg_b = cfg_for(&receiver);
+    cfg_b.mesh.limits.feed_entries_per_min = 1;
+    let link = common::start_mesh_link(
+        sender,
+        cfg_a,
+        "gw-a",
+        receiver.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+
+    let mut accepted = local_feed_entry("the one accepted entry");
+    accepted.seq = 1;
+    accepted.origin = Some("gw-a".to_string());
+    accepted.origin_seq = Some(1);
+    assert!(link
+        .a_state
+        .send(
+            "gw-b",
+            Frame::Feed {
+                origin: "gw-a".to_string(),
+                entries: vec![accepted],
+            },
+        )
+        .await);
+    common::wait_until(|| a2a::mesh::feed::read(&receiver, 0).unwrap().len() == 1).await;
+
+    let mut rejected = local_feed_entry("invalid work is rejected without a feed token");
+    rejected.seq = 2;
+    rejected.origin = Some("gw-a".to_string());
+    rejected.origin_seq = Some(2);
+    rejected.refs = json!({"work": {"invalid": true}});
+    assert!(link
+        .a_state
+        .send(
+            "gw-b",
+            Frame::Feed {
+                origin: "gw-a".to_string(),
+                entries: vec![rejected],
+            },
+        )
+        .await);
+    let cursors = link.b_state.peer_cursors("gw-a").await;
+    common::wait_until(|| {
+        cursors
+            .try_lock()
+            .is_ok_and(|cursor| cursor.last_seq("gw-a") == 2)
+    })
+    .await;
+
+    assert_eq!(a2a::mesh::feed::read(&receiver, 0).unwrap().len(), 1);
+    let health = link.b_state.limits_health().await;
+    assert_eq!(health["gw-a"].defers.get("feed_entries"), None);
+    link.stop().await;
+}
+
+#[tokio::test]
+async fn full_pool_rejections_are_exempt_when_the_feed_bucket_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("link-sender"));
+    let (receiver, verified) = verified_pool_offer(tmp.path());
+    write_gateway_key(sender.root(), "gw-a");
+    write_gateway_key(receiver.root(), "gw-b");
+    let pool = receiver.root().join("work/pool");
+    fs::create_dir_all(&pool).unwrap();
+    for index in 0..MAX_POOL_OFFERS {
+        fs::write(pool.join(format!("occupied-{index}.json")), b"{}").unwrap();
+    }
+    let cfg_a = cfg_for(&sender);
+    let mut cfg_b = cfg_for(&receiver);
+    cfg_b.mesh.limits.feed_entries_per_min = 1;
+    let link = common::start_mesh_link(
+        sender,
+        cfg_a,
+        "gw-a",
+        receiver.clone(),
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+
+    let mut accepted = local_feed_entry("the one accepted entry");
+    accepted.seq = 1;
+    accepted.origin = Some("gw-a".to_string());
+    accepted.origin_seq = Some(1);
+    assert!(link
+        .a_state
+        .send(
+            "gw-b",
+            Frame::Feed {
+                origin: "gw-a".to_string(),
+                entries: vec![accepted],
+            },
+        )
+        .await);
+    common::wait_until(|| a2a::mesh::feed::read(&receiver, 0).unwrap().len() == 1).await;
+
+    let mut rejected = local_feed_entry("a full pool rejects without a feed token");
+    rejected.seq = 2;
+    rejected.origin = Some("gw-a".to_string());
+    rejected.origin_seq = Some(2);
+    rejected.refs = json!({"work": verified.envelope});
+    assert!(link
+        .a_state
+        .send(
+            "gw-b",
+            Frame::Feed {
+                origin: "gw-a".to_string(),
+                entries: vec![rejected],
+            },
+        )
+        .await);
+    let cursors = link.b_state.peer_cursors("gw-a").await;
+    common::wait_until(|| {
+        cursors
+            .try_lock()
+            .is_ok_and(|cursor| cursor.last_seq("gw-a") == 2)
+    })
+    .await;
+
+    let health = link.b_state.limits_health().await;
+    assert_eq!(health["gw-a"].defers.get("feed_entries"), None);
+    let log = fs::read_to_string(receiver.root().join("mesh/gateway/gateway.jsonl")).unwrap();
+    assert!(log.contains("WORK_POOL_FULL"), "{log}");
+    link.stop().await;
+}
+
+#[tokio::test]
 async fn pool_offers_are_charged_before_verify_and_the_pool_store_is_capped() {
     let tmp = tempfile::tempdir().unwrap();
     let sender = home_at(&tmp.path().join("sender"));

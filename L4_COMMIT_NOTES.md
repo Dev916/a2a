@@ -12,3 +12,4 @@ T1: add staged fleet root rotation, signed distribution, enrollment issuer ledge
 >>>>>>> l4/rotation
 L1: add deferred acknowledgements and durable outbound spool backoff
 L2: add metered mesh buckets, bounded handshakes, and per-peer link state
+L2-continue: exempt rejected feed entries from metering without bypassing work-offer admission or the pool cap

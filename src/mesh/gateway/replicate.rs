@@ -495,7 +495,18 @@ pub fn append_remote_entry(
     cfg: &Config,
     cursors: &mut CursorStore,
     frame_origin: &str,
+    entry: FeedEntry,
+) -> Result<IngestDecision, AppError> {
+    append_remote_entry_with_prepared_work(home, cfg, cursors, frame_origin, entry, None)
+}
+
+fn append_remote_entry_with_prepared_work(
+    home: &A2aHome,
+    cfg: &Config,
+    cursors: &mut CursorStore,
+    frame_origin: &str,
     mut entry: FeedEntry,
+    prepared_work: Option<Result<Option<crate::mesh::work::VerifiedEnvelope>, AppError>>,
 ) -> Result<IngestDecision, AppError> {
     if frame_origin.is_empty() {
         return Err(AppError::new(
@@ -532,12 +543,24 @@ pub fn append_remote_entry(
     }
 
     let previous = cursors.last_seq(frame_origin);
-    if let Err(err) = validate_work_refs(home, cfg, &entry) {
-        cursors.apply_advance(CursorAdvance::new(frame_origin, origin_seq));
-        log_feed_ingest_refused(home, frame_origin, origin_seq, err.code);
-        return Ok(IngestDecision::Rejected {
-            reason: err.code.to_string(),
-        });
+    let verified_work = match prepared_work.unwrap_or_else(|| prepare_work_refs(home, cfg, &entry)) {
+        Ok(verified) => verified,
+        Err(err) => {
+            cursors.apply_advance(CursorAdvance::new(frame_origin, origin_seq));
+            log_feed_ingest_refused(home, frame_origin, origin_seq, err.code);
+            return Ok(IngestDecision::Rejected {
+                reason: err.code.to_string(),
+            });
+        }
+    };
+    if let Some(verified) = verified_work {
+        if let Err(err) = work_store::store_offer(home, verified, WorkSource::Pool) {
+            cursors.apply_advance(CursorAdvance::new(frame_origin, origin_seq));
+            log_feed_ingest_refused(home, frame_origin, origin_seq, err.code);
+            return Ok(IngestDecision::Rejected {
+                reason: err.code.to_string(),
+            });
+        }
     }
 
     entry.seq = 0;
@@ -971,11 +994,26 @@ where
     F: FnMut(&FeedEntry, bool) -> bool,
 {
     let reaches_append = entry_reaches_append(home, cursors, frame_origin, &entry)?;
-    if !admit(&entry, reaches_append) {
+    if !admit(&entry, false) {
         return Ok(false);
     }
-    let decision = append_remote_entry(home, cfg, cursors, frame_origin, entry)?;
-    if reaches_append && !matches!(decision, IngestDecision::Accepted { .. }) {
+    let prepared_work = reaches_append.then(|| prepare_metered_work_refs(home, cfg, &entry));
+    let will_append = reaches_append
+        && prepared_work
+            .as_ref()
+            .is_some_and(|prepared| prepared.is_ok());
+    if will_append && !admit(&entry, true) {
+        return Ok(false);
+    }
+    let decision = append_remote_entry_with_prepared_work(
+        home,
+        cfg,
+        cursors,
+        frame_origin,
+        entry,
+        prepared_work,
+    )?;
+    if will_append && !matches!(decision, IngestDecision::Accepted { .. }) {
         metered.feed_entry_refunds = metered.feed_entry_refunds.saturating_add(1);
     }
     match decision {
@@ -1022,10 +1060,14 @@ fn drain_contiguous_buffer(
     }
 }
 
-fn validate_work_refs(home: &A2aHome, cfg: &Config, entry: &FeedEntry) -> Result<(), AppError> {
+fn prepare_work_refs(
+    home: &A2aHome,
+    cfg: &Config,
+    entry: &FeedEntry,
+) -> Result<Option<crate::mesh::work::VerifiedEnvelope>, AppError> {
     feed::validate_refs_size(&entry.refs, cfg.mesh.work.max_pool_bytes)?;
     let Some(work) = entry.refs.get("work") else {
-        return Ok(());
+        return Ok(None);
     };
     let envelope: WorkEnvelope = serde_json::from_value(work.clone()).map_err(|e| {
         AppError::new(
@@ -1043,8 +1085,19 @@ fn validate_work_refs(home: &A2aHome, cfg: &Config, entry: &FeedEntry) -> Result
             "feed refs.work must carry a pool-addressed work envelope",
         ));
     }
-    work_store::store_offer(home, verified, WorkSource::Pool)?;
-    Ok(())
+    Ok(Some(verified))
+}
+
+fn prepare_metered_work_refs(
+    home: &A2aHome,
+    cfg: &Config,
+    entry: &FeedEntry,
+) -> Result<Option<crate::mesh::work::VerifiedEnvelope>, AppError> {
+    let verified = prepare_work_refs(home, cfg, entry)?;
+    if let Some(verified) = &verified {
+        work_store::ensure_pool_offer_capacity(home, &verified.envelope.work_id)?;
+    }
+    Ok(verified)
 }
 
 fn log_feed_ingest_refused(

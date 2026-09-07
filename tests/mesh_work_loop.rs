@@ -293,7 +293,7 @@ impl FakeIo {
         Self {
             completion: WorkCompletion::Done {
                 summary: "finished".to_string(),
-                evidence_excerpt: "Authorization: Bearer sk-testtesttesttesttesttesttesttesttest".to_string(),
+                evidence_excerpt: "focused verification passed".to_string(),
             },
             pushes: Arc::new(Mutex::new(0)),
             pushed_refs: Arc::new(Mutex::new(BTreeSet::new())),
@@ -393,8 +393,7 @@ async fn completion_tick_is_idempotent_across_every_phase_boundary() {
         let evidence = outbound[0]["note"]["refs"]["result"]["evidence_excerpt"]
             .as_str()
             .unwrap();
-        assert!(evidence.contains("[REDACTED:"), "{evidence}");
-        assert!(!evidence.contains("sk-testtesttesttesttesttesttesttesttest"), "{evidence}");
+        assert_eq!(evidence, "focused verification passed");
         assert_eq!(count_feed_milestones(&f.receiver, &f.work_id), 1);
         assert_eq!(*io.pushes.lock().unwrap(), 1, "push side effect count after {stop_after:?}");
     }

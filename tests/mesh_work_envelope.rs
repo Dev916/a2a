@@ -123,6 +123,9 @@ fn signed_envelope_round_trips_and_rejects_verification_matrix() {
         verify_envelope(&receiver, &foreign_env, &clock),
         "ROOT_NEXT_FLEET_MISMATCH",
     );
+    // A foreign next root poisons the whole RootSet (by design) — remove it
+    // so the remaining matrix legs verify under a clean set again.
+    fs::remove_file(receiver.root().join("mesh/fleet/root.pub.next")).unwrap();
 
     let mut binding_mismatch = env.clone();
     binding_mismatch.sender.gateway_id.push_str("-renamed");

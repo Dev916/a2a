@@ -274,7 +274,7 @@ impl WorkSpawner for FakeSpawner {
 
 #[tokio::test]
 async fn a_refused_sender_row_warns_at_ingest_and_refuses_at_approve() {
-    let fixture = Fixture::new("work-refused-row");
+    let fixture = Fixture::new("01BX5ZZKBKACTAV9WEVGEMMVBN");
     fixture.cache(fixture.signed_sender_row(), RowVerdict::BadSig);
     let cfg = fixture.cfg(true);
 
@@ -313,7 +313,7 @@ async fn a_refused_sender_row_warns_at_ingest_and_refuses_at_approve() {
 
 #[tokio::test]
 async fn a_revoked_sender_is_refused_at_both_ingest_and_approve() {
-    let fixture = Fixture::new("work-revoked-sender");
+    let fixture = Fixture::new("01BX5ZZKBKACTAV9WEVGEMMVDQ");
     fixture.cache(fixture.signed_sender_row(), RowVerdict::ValidSigned);
     let record = keys::mint_revocation(
         &fixture.root,
@@ -364,7 +364,7 @@ async fn a_revoked_sender_is_refused_at_both_ingest_and_approve() {
 #[tokio::test]
 async fn a_valid_signed_sender_row_whose_row_msg_pubkey_fpr_differs_from_the_envelope_key_is_refused_at_approve(
 ) {
-    let fixture = Fixture::new("work-row-key-mismatch");
+    let fixture = Fixture::new("01BX5ZZKBKACTAV9WEVGEMMVER");
     let row = fixture.valid_rekeyed_sender_row();
     assert_ne!(
         row.pubkey_fpr,
@@ -389,7 +389,7 @@ async fn a_valid_signed_sender_row_whose_row_msg_pubkey_fpr_differs_from_the_env
 #[tokio::test]
 async fn a_usable_unsigned_sender_row_under_flag_false_proceeds_with_the_fpr_check_skipped_and_warned(
 ) {
-    let fixture = Fixture::new("work-unsigned-compatible");
+    let fixture = Fixture::new("01BX5ZZKBKACTAV9WEVGEMMVFS");
     let mut row = fixture.signed_sender_row();
     row.pubkey_fpr = "bare-column-must-not-be-trusted".to_string();
     row.row_msg = None;
@@ -422,7 +422,7 @@ async fn a_usable_unsigned_sender_row_under_flag_false_proceeds_with_the_fpr_che
 
 #[tokio::test]
 async fn an_absent_sender_row_follows_the_same_degrade_split() {
-    let fixture = Fixture::new("work-absent-sender-row");
+    let fixture = Fixture::new("01BX5ZZKBKACTAV9WEVGEMMVAM");
     let mut other = fixture.signed_sender_row();
     other.gateway_id = "other-cached-gateway".to_string();
     fixture.cache(other, RowVerdict::BadSig);
@@ -451,7 +451,7 @@ async fn an_absent_sender_row_follows_the_same_degrade_split() {
 
 #[test]
 fn a_registry_unreachable_at_ingest_warns_and_proceeds() {
-    let fixture = Fixture::new("work-registry-unreachable");
+    let fixture = Fixture::new("01BX5ZZKBKACTAV9WEVGEMMVCP");
     let cfg = fixture.cfg(true);
     assert!(!fixture.receiver.root().join("mesh/gateway/registry-cache.json").exists());
 

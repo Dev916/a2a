@@ -116,8 +116,10 @@ a2a mesh gateway status # loops all "running", endpoint_url populated
   on their next registry refresh.
 - **Token expiry**: tokens live 90 days; re-run steps 1–3 to renew (identity is
   reused, so only `enroll` + `install-token` are needed).
-- **Root rotation** (owner): `a2a mesh fleet rotate-root` stages `root.pub.next`;
-  distribute the new `root.pub` to joiners before retiring the old root.
+- **Root rotation** (owner): `a2a mesh fleet rotate-root --stage --out announcement.txt`
+  emits a current-root-signed announcement. Distribute that announcement out of
+  band; each joiner runs `a2a mesh gateway install-root-next --file announcement.txt`
+  and restarts. Never overwrite `root.pub`, and never install a bare `root.pub.next`.
 
 ## Reader errors
 
@@ -126,3 +128,12 @@ a2a mesh gateway status # loops all "running", endpoint_url populated
 | `ROOTS_UNREADABLE` | This reader could not load its local `mesh/fleet/root.pub` or `root.pub.next`. | Repair the local root files and permissions before judging any peer row. |
 | `ENROLLMENT_REBIND_REQUIRED` | The requested gateway id is already bound to a different key in the owner ledger or live row. | Verify both printed fingerprints out of band, then rerun `fleet enroll` with `--rebind`. |
 | `REVOCATION_INVALID` | A revocation record or local cached tombstone is malformed or does not verify under a fleet root. | Preserve the suspect row for evidence, then mint a fresh revocation on the fleet root machine. |
+| `ROOT_ROTATION_STAGED` | A staged next-root pair already exists. | Inspect the staged fingerprint, then use `rotate-root --abort` or deliberately restage with `--stage --force`. |
+| `ROOT_ROTATION_ABORT_REFUSED` | At least one enrollment was issued under the staged root. | Re-enroll the named gateways under the current root, or use `--abort --force` only after confirming they may be stranded. |
+| `ROOT_NEXT_MISSING` | The requested operation needs a staged next-root pair, but it is absent. | Run `a2a mesh fleet rotate-root --stage` on the root machine. |
+| `ROOT_PREV_MISSING` | Retirement was requested before a previous-root pair existed. | Promote a staged root before retiring the prior root. |
+| `ROOT_NEXT_FLEET_MISMATCH` | A held next or previous root names a different fleet than `root.pub`. | Remove the mismatched file and install only roots from this fleet's signed rotation flow. |
+| `ROOT_ANNOUNCEMENT_INVALID` | The rotation announcement is malformed, non-canonical, or not current-root-signed. | Obtain the signed announcement from the root operator; never substitute a bare `root.pub.next`. |
+| `ROOT_ANNOUNCEMENT_FLEET_MISMATCH` | A validly signed announcement names a different fleet. | Obtain the announcement for the fleet named by this gateway's `root.pub`. |
+| `ROTATION_PHASE_UNMET` | Verified member rows do not yet prove every ledgered gateway is on the target root. | Re-enroll, install, restart, and re-sign the named members before retrying promotion or retirement. |
+| `ROTATION_SOAK_UNMET` | Post-promotion handshakes or the configured soak interval are incomplete. | Wait for the missing gateways and interval; `--retire --force` skips only this soak check. |

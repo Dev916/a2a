@@ -1,9 +1,10 @@
 use a2a::home::A2aHome;
 use a2a::mesh::keys::{
-    enroll_gateway_token, ensure_gateway_token, fleet_init, gateway_identity,
+    enroll_gateway_token, enroll_gateway_token_with, ensure_gateway_token, fleet_init, gateway_identity,
     fleet_root_fingerprint, fpr_of_pubkey_b64, gateway_public_key_b64,
     gateway_public_key_fingerprint, install_gateway_token, mint_ulid, sign_token,
-    unverified_claims, verify_token, verify_token_no_clock, Clock, RootSet, TestClock, TokenClaims,
+    stage_root, unverified_claims, verify_announcement, verify_token, verify_token_no_clock,
+    verify_token_with_issuer, Clock, RootRole, RootSet, RootSigner, TestClock, TokenClaims,
     SKEW_TOLERANCE_SECS,
 };
 use chrono::{TimeZone, Utc};
@@ -68,7 +69,7 @@ fn fleet_and_gateway_material_have_stable_ids_modes_and_fingerprint() {
 }
 
 #[test]
-fn sign_verify_roundtrip_and_root_rotation_accepts_current_or_next() {
+fn sign_verify_roundtrip_accepts_the_current_root() {
     let tmp = tempfile::tempdir().unwrap();
     let home = home_in(&tmp);
     let root = fleet_init(&home).unwrap();
@@ -78,17 +79,77 @@ fn sign_verify_roundtrip_and_root_rotation_accepts_current_or_next() {
     assert_eq!(verified.gateway_id, "gw-testhost-abcdef");
     assert_eq!(verified.fleet_id, root.fleet_id);
 
-    let next_tmp = tempfile::tempdir().unwrap();
-    let next_home = home_in(&next_tmp);
-    fleet_init(&next_home).unwrap();
-    let next_token = sign_token(&claims(1_700_001_000, 1_699_999_000), &next_home).unwrap();
+}
+
+#[test]
+fn an_announcement_verifies_under_the_current_root_and_is_never_a_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    fleet_init(&home).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let staged = stage_root(&home, &clock, false).unwrap();
+    let roots = RootSet::load(&home).unwrap();
+
+    let (announcement, issuer) = verify_announcement(&staged.announcement, &roots).unwrap();
+    assert_eq!(announcement.fleet_id, staged.fleet_id);
+    assert_eq!(announcement.next_fpr, staged.next_fingerprint);
+    assert_eq!(issuer, staged.current_fingerprint);
+    assert_eq!(roots.role_of(&issuer), Some(RootRole::Current));
+
+    let err = verify_token(&staged.announcement, &roots, &clock).unwrap_err();
+    assert_eq!(err.code, "TOKEN_CLAIMS_INVALID");
+
+    let real_token = sign_token(&claims(1_700_001_000, 1_699_999_000), &home).unwrap();
+    let err = verify_announcement(&real_token, &roots).unwrap_err();
+    assert_eq!(err.code, "ROOT_ANNOUNCEMENT_INVALID");
+}
+
+#[test]
+fn root_set_refuses_a_next_root_from_another_fleet() {
+    let first_tmp = tempfile::tempdir().unwrap();
+    let first_home = home_in(&first_tmp);
+    let first = fleet_init(&first_home).unwrap();
+    let second_tmp = tempfile::tempdir().unwrap();
+    let second_home = home_in(&second_tmp);
+    let second = fleet_init(&second_home).unwrap();
     fs::copy(
-        next_tmp.path().join("mesh/fleet/root.pub"),
-        tmp.path().join("mesh/fleet/root.pub.next"),
+        second_tmp.path().join("mesh/fleet/root.pub"),
+        first_tmp.path().join("mesh/fleet/root.pub.next"),
     )
     .unwrap();
-    let verified_next = verify_token(&next_token, &RootSet::load(&home).unwrap(), &clock).unwrap();
-    assert_eq!(verified_next.gateway_id, "gw-testhost-abcdef");
+
+    let err = RootSet::load(&first_home).unwrap_err();
+    assert_eq!(err.code, "ROOT_NEXT_FLEET_MISMATCH");
+    assert!(err.message.contains(&first.fleet_id), "{}", err.message);
+    assert!(err.message.contains(&second.fleet_id), "{}", err.message);
+}
+
+#[test]
+fn verify_token_with_issuer_names_the_root_that_verified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_in(&tmp);
+    fleet_init(&home).unwrap();
+    let identity = gateway_identity(&home, false).unwrap();
+    let pubkey = gateway_public_key_b64(&home).unwrap();
+    let clock = TestClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    stage_root(&home, &clock, false).unwrap();
+    let current_token = enroll_gateway_token(&home, &identity.gateway_id, &pubkey, &clock).unwrap();
+    let (next_token, next_issuer) = enroll_gateway_token_with(
+        &home,
+        &identity.gateway_id,
+        &pubkey,
+        RootSigner::Next,
+        &clock,
+    )
+    .unwrap();
+    let roots = RootSet::load(&home).unwrap();
+    let (_claims, current_issuer) =
+        verify_token_with_issuer(&current_token, &roots, &clock).unwrap();
+    let (_claims, verified_next_issuer) =
+        verify_token_with_issuer(&next_token, &roots, &clock).unwrap();
+    assert_eq!(roots.role_of(&current_issuer), Some(RootRole::Current));
+    assert_eq!(verified_next_issuer, next_issuer);
+    assert_eq!(roots.role_of(&verified_next_issuer), Some(RootRole::Next));
 }
 
 #[test]

@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 54] = [
+pub const KNOWN_CODES: [&str; 63] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -146,6 +146,15 @@ pub const KNOWN_CODES: [&str; 54] = [
     "WORK_SENDER_ROW_INVALID",
     "WORK_SECRET_IN_RESULT",
     "WORK_SCAN_OVERSIZE",
+    "ROOT_ROTATION_STAGED",
+    "ROOT_ROTATION_ABORT_REFUSED",
+    "ROOT_NEXT_MISSING",
+    "ROOT_PREV_MISSING",
+    "ROOT_NEXT_FLEET_MISMATCH",
+    "ROOT_ANNOUNCEMENT_INVALID",
+    "ROOT_ANNOUNCEMENT_FLEET_MISMATCH",
+    "ROTATION_PHASE_UNMET",
+    "ROTATION_SOAK_UNMET",
 ];
 
 /// This process's protocol version.

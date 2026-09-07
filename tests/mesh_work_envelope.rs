@@ -121,7 +121,7 @@ fn signed_envelope_round_trips_and_rejects_verification_matrix() {
     .unwrap();
     assert_code(
         verify_envelope(&receiver, &foreign_env, &clock),
-        "WORK_WRONG_FLEET",
+        "ROOT_NEXT_FLEET_MISMATCH",
     );
 
     let mut binding_mismatch = env.clone();

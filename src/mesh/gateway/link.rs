@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::home::A2aHome;
-use crate::mesh::gateway::{notes_wire, presence_wire, replicate};
+use crate::mesh::gateway::{limits, notes_wire, presence_wire, replicate};
 use crate::mesh::registry::GatewayRow;
 use crate::mesh::row_sig::{endpoint_conflicts, Disposition, RowVerdict};
 use crate::mesh::wire::{
@@ -868,6 +868,20 @@ async fn handle_inbound_frame(
         Frame::Ack { ref_id, outcome } => {
             let _ = notes_wire::handle_ack(home, peer_gateway_id, &ref_id, &outcome)?;
         }
+        Frame::Deferred {
+            code,
+            retry_after_secs,
+        } => {
+            let _ = notes_wire::defer_spool_for_peer(
+                home,
+                cfg,
+                peer_gateway_id,
+                retry_after_secs,
+                Utc::now(),
+                &mut rand::thread_rng(),
+            )?;
+            limits::log_deferral_received(home, peer_gateway_id, &code, retry_after_secs);
+        }
         Frame::Presence { peers } => {
             presence_wire::merge_presence_frame(home, peer_gateway_id, peers)?;
         }
@@ -939,9 +953,12 @@ pub async fn push_presence_gossip(
     Ok(())
 }
 
-pub async fn push_spooled_notes(
+pub async fn push_spooled_notes<R: Rng + Send + ?Sized>(
     home: &A2aHome,
+    cfg: &Config,
     state: &LinkStateHandle,
+    now: DateTime<Utc>,
+    rng: &mut R,
 ) -> Result<usize, AppError> {
     let root = crate::mesh::mesh_root(home).join("outbound");
     let entries = match std::fs::read_dir(&root) {
@@ -1002,10 +1019,23 @@ pub async fn push_spooled_notes(
             if !note.file_name().to_string_lossy().ends_with(".note.json") {
                 continue;
             }
-            let envelope = notes_wire::read_spooled(&note.path())?;
+            let path = note.path();
+            let mut envelope = match notes_wire::read_spooled(&path) {
+                Ok(envelope) => envelope,
+                Err(_) if matches!(path.try_exists(), Ok(false)) => continue,
+                Err(err) => return Err(err),
+            };
+            if envelope
+                .next_attempt_after
+                .map(|due| due > now)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            notes_wire::schedule_retry(cfg, &path, &mut envelope, now, rng)?;
             if tx
                 .send(Frame::Note {
-                    note: envelope.note,
+                    note: envelope.note.clone(),
                 })
                 .await
                 .is_ok()

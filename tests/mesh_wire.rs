@@ -197,6 +197,10 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
             code: "NOPE".to_string(),
             detail: "detail".to_string(),
         },
+        Frame::Deferred {
+            code: "RATE_LIMITED".to_string(),
+            retry_after_secs: Some(30),
+        },
     ];
 
     for frame in frames {
@@ -204,6 +208,25 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
         assert!(line.ends_with('\n'), "{line:?}");
         assert_eq!(Frame::from_ndjson(&line).unwrap(), Some(frame));
     }
+}
+
+#[test]
+fn deferred_frame_is_known_and_older_readers_skip_it() {
+    assert_eq!(
+        Frame::from_ndjson(
+            "{\"kind\":\"deferred\",\"code\":\"RATE_LIMITED\",\"retry_after_secs\":null}\n"
+        )
+        .unwrap(),
+        Some(Frame::Deferred {
+            code: "RATE_LIMITED".to_string(),
+            retry_after_secs: None,
+        })
+    );
+    // The pre-L4 reader's behaviour, reproduced: an unknown kind is skipped, not fatal.
+    assert_eq!(
+        Frame::from_ndjson("{\"kind\":\"deferred_v2\",\"code\":\"X\"}\n").unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

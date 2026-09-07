@@ -227,6 +227,7 @@ pub fn handle_ack(
             );
             Ok(true)
         }
+        "RATE_LIMITED" => Ok(false),
         _ => Ok(false),
     }
 }
@@ -515,22 +516,61 @@ fn work_envelope_from_refs(refs: &serde_json::Value) -> Result<WorkEnvelope, App
     })
 }
 
-fn schedule_retry<R: Rng + ?Sized>(
+pub(crate) fn schedule_retry<R: Rng + ?Sized>(
     cfg: &Config,
     path: &Path,
     envelope: &mut SpooledNote,
     now: DateTime<Utc>,
     rng: &mut R,
 ) -> Result<(), AppError> {
+    schedule_retry_with_hint(cfg, path, envelope, None, now, rng)
+}
+
+fn schedule_retry_with_hint<R: Rng + ?Sized>(
+    cfg: &Config,
+    path: &Path,
+    envelope: &mut SpooledNote,
+    retry_after_secs: Option<u64>,
+    now: DateTime<Utc>,
+    rng: &mut R,
+) -> Result<(), AppError> {
     envelope.attempts = envelope.attempts.saturating_add(1);
-    let delay = jittered_retry_backoff(
-        envelope.attempts,
-        Duration::from_secs(cfg.mesh.gateway.outbound_retry_max_secs),
-        rng,
-    );
+    let cap = Duration::from_secs(cfg.mesh.gateway.outbound_retry_max_secs);
+    let delay = match retry_after_secs {
+        Some(secs) => Duration::from_secs(secs).min(cap),
+        None => jittered_retry_backoff(envelope.attempts, cap, rng),
+    };
     envelope.next_attempt_after =
         Some(now + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX));
     write_envelope_atomic(path, envelope)
+}
+
+pub fn defer_spool_for_peer<R: Rng + ?Sized>(
+    home: &A2aHome,
+    cfg: &Config,
+    to_gateway: &str,
+    retry_after_secs: Option<u64>,
+    now: DateTime<Utc>,
+    rng: &mut R,
+) -> Result<usize, AppError> {
+    let mut deferred = 0usize;
+    for path in note_paths(&outbound_dir(home, to_gateway))? {
+        let mut envelope = match read_spooled(&path) {
+            Ok(envelope) => envelope,
+            Err(_) if matches!(path.try_exists(), Ok(false)) => continue,
+            Err(err) => return Err(err),
+        };
+        schedule_retry_with_hint(
+            cfg,
+            &path,
+            &mut envelope,
+            retry_after_secs,
+            now,
+            rng,
+        )?;
+        deferred += 1;
+    }
+    Ok(deferred)
 }
 
 pub fn jittered_retry_backoff<R: Rng + ?Sized>(

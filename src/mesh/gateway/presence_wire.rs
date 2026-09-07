@@ -40,6 +40,8 @@ pub(crate) struct CachedGateway {
     #[serde(default)]
     pub(crate) pubkey_fpr: Option<String>,
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     missing_since: Option<DateTime<Utc>>,
     #[serde(default)]
     retired_at: Option<DateTime<Utc>>,
@@ -189,6 +191,7 @@ pub fn refresh_registry_cache(
                 invalid_since,
                 verdict: Some(verdict_label.to_string()),
                 pubkey_fpr,
+                version: Some(row.version.clone()),
                 missing_since: None,
                 retired_at: previous.and_then(|cached| cached.retired_at),
             },
@@ -207,6 +210,15 @@ pub(crate) fn cached_gateway(
     gateway_id: &str,
 ) -> Result<Option<CachedGateway>, AppError> {
     Ok(load_registry_cache(home)?.gateways.get(gateway_id).cloned())
+}
+
+pub fn cached_peer_version(home: &A2aHome, gateway_id: &str) -> Option<String> {
+    load_registry_cache(home)
+        .ok()?
+        .gateways
+        .get(gateway_id)?
+        .version
+        .clone()
 }
 
 pub(crate) fn registry_cache_available(home: &A2aHome) -> bool {

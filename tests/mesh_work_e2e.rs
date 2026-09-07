@@ -15,6 +15,7 @@ use a2a::mesh::{work_store, PeerId};
 use a2a::output::AppError;
 use assert_cmd::assert::Assert;
 use chrono::Utc;
+use rand::{rngs::StdRng, SeedableRng};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -223,7 +224,13 @@ async fn directed_work_round_trips_result_and_ack() {
     .await;
 
     let work_id = send_directed(&f, "Directed E2E");
-    assert_eq!(push_spooled_notes(&f.home_a, &link.a_state).await.unwrap(), 1);
+    let mut rng = StdRng::seed_from_u64(29);
+    assert_eq!(
+        push_spooled_notes(&f.home_a, &cfg_a, &link.a_state, Utc::now(), &mut rng)
+            .await
+            .unwrap(),
+        1
+    );
     common::wait_until(|| work_store::load(&f.home_b, &work_id).unwrap().is_some()).await;
 
     let listed = cmd(&f.home_b, &f.work)
@@ -271,7 +278,12 @@ async fn directed_work_round_trips_result_and_ack() {
     assert_eq!(tick.registry_error, None, "{tick:?}");
     assert_bare_has_result_ref(&f.remote_bare, &work_id);
 
-    assert_eq!(push_spooled_notes(&f.home_b, &link.b_state).await.unwrap(), 1);
+    assert_eq!(
+        push_spooled_notes(&f.home_b, &cfg_b, &link.b_state, Utc::now(), &mut rng)
+            .await
+            .unwrap(),
+        1
+    );
     common::wait_until(|| {
         result_notes(&f.home_a).iter().any(|note| {
             note["refs"]["result"]["work_id"] == work_id
@@ -437,7 +449,13 @@ async fn declined_with_reason_round_trips_to_sender() {
     .await;
 
     let work_id = send_directed(&f, "Decline E2E");
-    assert_eq!(push_spooled_notes(&f.home_a, &link.a_state).await.unwrap(), 1);
+    let mut rng = StdRng::seed_from_u64(31);
+    assert_eq!(
+        push_spooled_notes(&f.home_a, &cfg_a, &link.a_state, Utc::now(), &mut rng)
+            .await
+            .unwrap(),
+        1
+    );
     common::wait_until(|| work_store::load(&f.home_b, &work_id).unwrap().is_some()).await;
 
     let declined = cmd(&f.home_b, &f.work)
@@ -456,7 +474,12 @@ async fn declined_with_reason_round_trips_to_sender() {
     assert_eq!(declined["data"]["status"], "declined", "{declined}");
     assert_eq!(registry_row(&f, &work_id).await.status, WorkStatus::Declined);
 
-    assert_eq!(push_spooled_notes(&f.home_b, &link.b_state).await.unwrap(), 1);
+    assert_eq!(
+        push_spooled_notes(&f.home_b, &cfg_b, &link.b_state, Utc::now(), &mut rng)
+            .await
+            .unwrap(),
+        1
+    );
     common::wait_until(|| {
         result_notes(&f.home_a).iter().any(|note| {
             note["refs"]["result"]

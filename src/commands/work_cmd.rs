@@ -1188,7 +1188,7 @@ fn preflight_peer_version(gateway_id: &str, version: Option<&str>) -> Result<(),
     .data(json!({ "gateway_id": gateway_id, "version": recorded, "minimum": MIN_WORK_PEER_VERSION })))
 }
 
-fn version_at_least(actual: &str, minimum: &str) -> bool {
+pub(crate) fn version_at_least(actual: &str, minimum: &str) -> bool {
     let Some(actual) = parse_version(actual) else {
         return false;
     };

@@ -5,9 +5,14 @@ use a2a::mesh::keys::{
     enroll_gateway_token, fleet_init, gateway_identity, gateway_public_key_b64,
     install_gateway_token, SystemClock,
 };
+use a2a::mesh::gateway::link::{self, LinkStateHandle};
+use a2a::mesh::gateway::{limits, presence_wire};
 use a2a::mesh::gateway::notes_wire::{
     self, deliver_spooled_once, receive_note, NoteAck, NoteDeliveryTarget,
 };
+use a2a::mesh::registry::{GatewayRow, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::row_sig::RowVerdict;
+use a2a::mesh::wire::Frame;
 use a2a::mesh::work::{
     sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo,
 };
@@ -19,6 +24,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 fn home_at(path: &Path) -> A2aHome {
     A2aHome::resolve(Some(path)).unwrap()
@@ -147,6 +154,31 @@ fn work_note(to_gateway: &str, env: &WorkEnvelope, note_id: &str) -> Note {
     }
 }
 
+fn row_with_version(gateway_id: &str, version: &str) -> (GatewayRow, RowVerdict) {
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    (
+        GatewayRow {
+            fleet_id: "fleet-a".to_string(),
+            gateway_id: gateway_id.to_string(),
+            owner: gateway_id.to_string(),
+            endpoint_url: None,
+            pubkey_fpr: format!("{gateway_id}-pubkey"),
+            cert_fpr: None,
+            version: version.to_string(),
+            created_at: now,
+            last_heartbeat: now,
+            revoked_at: None,
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            row_msg: None,
+            row_token: None,
+            row_sig: None,
+            signed_at: None,
+            revocation: None,
+        },
+        RowVerdict::Unsigned { stripped: false },
+    )
+}
+
 fn note_files(home: &Path, peer: &str) -> Vec<PathBuf> {
     let id = PeerId::parse(peer).unwrap();
     let inbox = home
@@ -210,16 +242,23 @@ async fn spooled_note_delivers_over_session_acks_and_dedupes_duplicate_note_id()
 
     let link = common::start_mesh_link(
         sender.clone(),
-        cfg_a,
+        cfg_a.clone(),
         "gw-a",
         receiver.clone(),
         cfg_b,
         "gw-b",
     )
     .await;
-    a2a::mesh::gateway::link::push_spooled_notes(&sender, &link.a_state)
-        .await
-        .unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+    a2a::mesh::gateway::link::push_spooled_notes(
+        &sender,
+        &cfg_a,
+        &link.a_state,
+        Utc::now(),
+        &mut rng,
+    )
+    .await
+    .unwrap();
     common::wait_until(|| {
         note_files(receiver.root(), target).len() == 1
             && json_files(
@@ -549,6 +588,265 @@ fn offline_target_holds_and_restart_pass_resumes_with_capped_full_jitter_retry()
         )
         .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn push_spooled_notes_marks_backoff_before_sending_and_skips_until_due() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let cfg = cfg_for(&sender);
+    let state = LinkStateHandle::new(&sender, Duration::from_secs(60)).unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    state.register("gw-b".into(), tx).await;
+    let path = notes_wire::spool_note(
+        &sender,
+        &cfg,
+        "gw-a",
+        "gw-b",
+        note(
+            "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "back off between watcher polls",
+            "01K3KV00000000000000000007",
+        ),
+    )
+    .unwrap();
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let mut rng = StdRng::seed_from_u64(17);
+
+    assert_eq!(
+        link::push_spooled_notes(&sender, &cfg, &state, now, &mut rng)
+            .await
+            .unwrap(),
+        1
+    );
+    let held = notes_wire::read_spooled(&path).unwrap();
+    assert_eq!(held.attempts, 1);
+    let due = held
+        .next_attempt_after
+        .expect("first push schedules the next attempt");
+    assert!(due > now);
+    assert!(due <= now + chrono::Duration::seconds(1_920));
+
+    let before_due = due - chrono::Duration::nanoseconds(1);
+    assert_eq!(
+        link::push_spooled_notes(&sender, &cfg, &state, before_due, &mut rng)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(matches!(rx.try_recv(), Ok(Frame::Note { .. })));
+    assert!(rx.try_recv().is_err(), "only the first poll reached the link");
+
+    assert_eq!(
+        link::push_spooled_notes(&sender, &cfg, &state, due, &mut rng)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(rx.try_recv(), Ok(Frame::Note { .. })));
+    assert!(rx.try_recv().is_err(), "the due poll sent exactly once");
+    let retried = notes_wire::read_spooled(&path).unwrap();
+    assert_eq!(retried.attempts, 2);
+    assert!(retried.next_attempt_after.unwrap() <= due + chrono::Duration::seconds(1_920));
+}
+
+#[tokio::test]
+async fn a_deferred_frame_defers_the_whole_peer_spool_and_archives_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let cfg = cfg_for(&sender);
+    let state = LinkStateHandle::new(&sender, Duration::from_secs(60)).unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+    state.register("gw-b".into(), tx).await;
+    for (text, note_id) in [
+        ("first deferred note", "01K3KV00000000000000000008"),
+        ("second deferred note", "01K3KV00000000000000000009"),
+    ] {
+        notes_wire::spool_note(
+            &sender,
+            &cfg,
+            "gw-a",
+            "gw-b",
+            note(
+                "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                text,
+                note_id,
+            ),
+        )
+        .unwrap();
+    }
+    let outbound_root = sender.root().join("mesh").join("outbound");
+    let outbound_gw_b = outbound_root.join("gw-b");
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let mut rng = StdRng::seed_from_u64(19);
+
+    assert_eq!(
+        link::push_spooled_notes(&sender, &cfg, &state, now, &mut rng)
+            .await
+            .unwrap(),
+        2
+    );
+    let deferred =
+        notes_wire::defer_spool_for_peer(&sender, &cfg, "gw-b", Some(45), now, &mut rng)
+            .unwrap();
+    assert_eq!(deferred, 2);
+    for path in json_files(&outbound_gw_b) {
+        let held = notes_wire::read_spooled(&path).unwrap();
+        let due = held.next_attempt_after.unwrap();
+        assert!(due >= now + chrono::Duration::seconds(45));
+        assert!(due <= now + chrono::Duration::seconds(1_920));
+    }
+    assert!(json_files(&outbound_root.join("sent").join("gw-b")).is_empty());
+    assert!(json_files(&outbound_root.join("rejected").join("gw-b")).is_empty());
+
+    let capped_at = now + chrono::Duration::seconds(1);
+    assert_eq!(
+        notes_wire::defer_spool_for_peer(
+            &sender,
+            &cfg,
+            "gw-b",
+            Some(10_000),
+            capped_at,
+            &mut rng,
+        )
+        .unwrap(),
+        2
+    );
+    for path in json_files(&outbound_gw_b) {
+        let held = notes_wire::read_spooled(&path).unwrap();
+        assert!(
+            held.next_attempt_after.unwrap()
+                <= capped_at + chrono::Duration::seconds(1_920)
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_frame_reschedules_the_peer_spool_without_ending_the_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let receiver = home_at(&tmp.path().join("receiver"));
+    let cfg_a = cfg_for(&sender);
+    let cfg_b = cfg_for(&receiver);
+    let path = notes_wire::spool_note(
+        &sender,
+        &cfg_a,
+        "gw-a",
+        "gw-b",
+        note(
+            "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "defer this peer spool",
+            "01K3KV0000000000000000000C",
+        ),
+    )
+    .unwrap();
+    let link = common::start_mesh_link(
+        sender.clone(),
+        cfg_a,
+        "gw-a",
+        receiver,
+        cfg_b,
+        "gw-b",
+    )
+    .await;
+    let before_send = Utc::now();
+
+    assert!(
+        link.b_state
+            .send(
+                "gw-a",
+                Frame::Deferred {
+                    code: "RATE_LIMITED".to_string(),
+                    retry_after_secs: Some(45),
+                },
+            )
+            .await
+    );
+    common::wait_until(|| {
+        notes_wire::read_spooled(&path)
+            .ok()
+            .is_some_and(|held| held.next_attempt_after.is_some())
+    })
+    .await;
+
+    let held = notes_wire::read_spooled(&path).unwrap();
+    assert_eq!(held.attempts, 1);
+    let due = held.next_attempt_after.unwrap();
+    assert!(due >= before_send + chrono::Duration::seconds(45));
+    assert!(due <= Utc::now() + chrono::Duration::seconds(1_920));
+    assert!(link.a_state.is_live("gw-b").await);
+    let log = fs::read_to_string(
+        sender
+            .root()
+            .join("mesh")
+            .join("gateway")
+            .join("gateway.jsonl"),
+    )
+    .unwrap();
+    assert!(log.contains(r#""action":"deferral_received""#), "{log}");
+    assert!(log.contains(r#""code":"RATE_LIMITED""#), "{log}");
+
+    link.stop().await;
+}
+
+#[test]
+fn handle_ack_on_rate_limited_reschedules_and_never_archives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let cfg = cfg_for(&sender);
+    let trace_id = "01K3KV0000000000000000000B";
+    notes_wire::spool_note(
+        &sender,
+        &cfg,
+        "gw-a",
+        "gw-b",
+        note(
+            "claude:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "codex:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "rate limited",
+            trace_id,
+        ),
+    )
+    .unwrap();
+    let outbound_root = sender.root().join("mesh").join("outbound");
+    let outbound_gw_b = outbound_root.join("gw-b");
+
+    assert!(!notes_wire::handle_ack(&sender, "gw-b", trace_id, "RATE_LIMITED").unwrap());
+    assert_eq!(json_files(&outbound_gw_b).len(), 1);
+    assert!(json_files(&outbound_root.join("rejected").join("gw-b")).is_empty());
+}
+
+#[test]
+fn deferred_is_never_emitted_to_a_peer_that_predates_it() {
+    assert!(!limits::peer_supports_deferred(None));
+    assert!(!limits::peer_supports_deferred(Some("0.3.0")));
+    assert!(limits::peer_supports_deferred(Some("0.4.0")));
+    assert!(limits::peer_supports_deferred(Some("0.4.1-dirty")));
+    assert_eq!(limits::MIN_DEFERRED_PEER_VERSION, "0.4.0");
+    assert_eq!(
+        limits::deferred_frame("RATE_LIMITED", Some(30)),
+        Frame::Deferred {
+            code: "RATE_LIMITED".to_string(),
+            retry_after_secs: Some(30),
+        }
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(tmp.path());
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    presence_wire::refresh_registry_cache(
+        &home,
+        &[row_with_version("gw-b", "0.4.0")],
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        presence_wire::cached_peer_version(&home, "gw-b").as_deref(),
+        Some("0.4.0")
     );
 }
 

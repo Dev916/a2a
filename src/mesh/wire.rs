@@ -73,6 +73,14 @@ pub enum Frame {
         code: String,
         detail: String,
     },
+    /// Over-limit deferral (spec §5). Distinct from `Ack`/`Err` because L3's
+    /// Rejected is terminal: the sender must retry, not archive. Link-level,
+    /// not per-note: it is emitted once per bucket state change, so it carries
+    /// no ref_id and defers the whole outbound spool for that peer.
+    Deferred {
+        code: String,
+        retry_after_secs: Option<u64>,
+    },
 }
 
 impl Frame {
@@ -748,7 +756,16 @@ impl ServerCertVerifier for PinnedSpkiVerifier {
 fn is_known_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "challenge" | "hello" | "feed" | "note" | "presence" | "digest" | "want" | "ack" | "err"
+        "challenge"
+            | "hello"
+            | "feed"
+            | "note"
+            | "presence"
+            | "digest"
+            | "want"
+            | "ack"
+            | "err"
+            | "deferred"
     )
 }
 

@@ -17,7 +17,7 @@ use link::{LinkDirection, LinkSessionParams, LinkStateHandle};
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{kill, SigHandler, Signal};
 use nix::unistd::Pid;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -38,6 +38,7 @@ use tokio_util::task::TaskTracker;
 
 pub mod expose;
 pub mod link;
+pub mod limits;
 pub mod notes_wire;
 pub mod presence_wire;
 pub mod replicate;
@@ -2281,6 +2282,7 @@ async fn watcher_loop(
     let mut poll = tokio::time::interval(Duration::from_secs(
         cfg.config.mesh.gateway.replication_poll_secs.max(1),
     ));
+    let mut outbound_retry_rng = rand::rngs::StdRng::from_entropy();
     let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
     loop {
         tokio::select! {
@@ -2298,7 +2300,13 @@ async fn watcher_loop(
             }
             _ = poll.tick() => {
                 link::push_watcher_deltas(&cfg.home, &cfg.config, &cfg.registry.row.gateway_id, &cfg.links).await?;
-                link::push_spooled_notes(&cfg.home, &cfg.links).await?;
+                link::push_spooled_notes(
+                    &cfg.home,
+                    &cfg.config,
+                    &cfg.links,
+                    Utc::now(),
+                    &mut outbound_retry_rng,
+                ).await?;
                 link::push_presence_gossip(&cfg.home, &cfg.registry.row.gateway_id, &cfg.links).await?;
             }
         }

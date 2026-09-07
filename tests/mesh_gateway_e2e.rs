@@ -63,6 +63,11 @@ fn registry_row(fleet_id: &str, gateway_id: &str, endpoint_url: Option<&str>) ->
         last_heartbeat: now,
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 

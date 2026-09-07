@@ -47,6 +47,11 @@ fn own_row(fleet_id: &str, gateway_id: &str, now: chrono::DateTime<Utc>) -> Gate
         last_heartbeat: now,
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 

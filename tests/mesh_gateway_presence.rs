@@ -71,6 +71,11 @@ fn registry_row(gateway_id: &str, last_heartbeat: chrono::DateTime<Utc>) -> Gate
         last_heartbeat,
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 

@@ -42,6 +42,11 @@ fn row(gateway_id: &str, endpoint: Option<&str>) -> GatewayRow {
         last_heartbeat: now,
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 

@@ -115,6 +115,7 @@ result after the sender has handled it.
 |---|---|---|
 | `WORK_PEER_TOO_OLD` | Target gateway has no version or records a version below 0.3.0. | Ask the operator to upgrade and restart the gateway; the registry version refreshes on restart. |
 | `WORK_SCHEMA_MISSING` | The registry has not been migrated for work rows. | Run `a2a mesh fleet migrate` on the fleet root machine. |
+| `REGISTRY_SCHEMA_STALE` | The gateway registry is missing columns required by this build. | Run `a2a mesh fleet migrate` on the fleet root machine. |
 | `WORK_ALREADY_CLAIMED` | Another gateway won the pool claim. | Use the named claimer, or send a directed item if one machine must run it. |
 | `WORK_REPO_UNREACHABLE` | The receiver could not fetch the requested repository or base ref. | Fix repo URL, credentials or base ref, then send fresh work. |
 | `WORK_DAEMON_DOWN` | Approval needs the gateway daemon for completion routing. | Run `a2a mesh gateway run --daemon` or install the service. |

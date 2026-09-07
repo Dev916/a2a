@@ -14,6 +14,7 @@ use a2a::mesh::wire::TlsIdentity;
 use a2a::output::{AppError, ExitCode};
 use chrono::{DateTime, TimeZone, Utc};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -146,6 +147,40 @@ async fn changed_exposure_reupserts_file_registry_row_with_cert_fingerprint() {
         registry.discover("fleet-a").await.unwrap()[0].endpoint_url,
         None
     );
+}
+
+#[tokio::test]
+async fn upsert_failure_still_heartbeats_and_records_the_registry_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = FlippingRegistry::with_failure(tmp.path(), 1, registry_schema_stale_failure);
+    registry.inner.init_schema().unwrap();
+    let exposure = ManualExposure::new(Some("wss://changed.example.test:7787".to_string()));
+    let row = ExposureRow {
+        fleet_id: "fleet-a".to_string(),
+        gateway_id: "gw-a".to_string(),
+        owner: "owner-a".to_string(),
+        pubkey_fpr: "pub-a".to_string(),
+        cert_fpr: "cert-a".to_string(),
+        version: "test".to_string(),
+    };
+    let mut publisher = ExposurePublisher::new(row);
+
+    let tick = publisher
+        .tick(
+            &registry,
+            &exposure,
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(!tick.upserted);
+    assert!(
+        tick.registry_error
+            .expect("upsert failure is recorded")
+            .starts_with("REGISTRY_SCHEMA_STALE")
+    );
+    assert_eq!(registry.heartbeat_calls(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -306,6 +341,11 @@ async fn registry_slot_keeps_heartbeating_when_ngrok_resolution_fails() {
             last_heartbeat: t0,
             revoked_at: None,
             schema_version: REGISTRY_SCHEMA_VERSION,
+            row_msg: None,
+            row_token: None,
+            row_sig: None,
+            signed_at: None,
+            revocation: None,
         })
         .await
         .unwrap();
@@ -404,6 +444,11 @@ async fn registry_slot_clears_exposure_error_after_ngrok_recovers() {
             last_heartbeat: t0,
             revoked_at: None,
             schema_version: REGISTRY_SCHEMA_VERSION,
+            row_msg: None,
+            row_token: None,
+            row_sig: None,
+            signed_at: None,
+            revocation: None,
         })
         .await
         .unwrap();
@@ -637,6 +682,11 @@ async fn dialer_uses_discovered_cert_fingerprint_and_rejects_wrong_pin() {
         last_heartbeat: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         revoked_at: None,
         schema_version: a2a::mesh::registry::REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     };
 
     let err = dial_gateway_io(client, &row).await.unwrap_err();
@@ -956,13 +1006,25 @@ impl NgrokApi for FakeNgrok {
 struct FlippingRegistry {
     inner: FileRegistry,
     failures_remaining: Mutex<usize>,
+    failure: fn() -> AppError,
+    heartbeat_calls: AtomicUsize,
 }
 
 impl FlippingRegistry {
     fn new(root: impl AsRef<std::path::Path>, failures: usize) -> Self {
+        Self::with_failure(root, failures, registry_test_failure)
+    }
+
+    fn with_failure(
+        root: impl AsRef<std::path::Path>,
+        failures: usize,
+        failure: fn() -> AppError,
+    ) -> Self {
         Self {
             inner: FileRegistry::new(root),
             failures_remaining: Mutex::new(failures),
+            failure,
+            heartbeat_calls: AtomicUsize::new(0),
         }
     }
 
@@ -970,10 +1032,14 @@ impl FlippingRegistry {
         let mut remaining = self.failures_remaining.lock().unwrap();
         if *remaining > 0 {
             *remaining -= 1;
-            Err(registry_test_failure())
+            Err((self.failure)())
         } else {
             Ok(())
         }
+    }
+
+    fn heartbeat_calls(&self) -> usize {
+        self.heartbeat_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -989,6 +1055,7 @@ impl Registry for FlippingRegistry {
         gateway_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
+        self.heartbeat_calls.fetch_add(1, Ordering::SeqCst);
         self.maybe_fail()?;
         self.inner.heartbeat(fleet_id, gateway_id, now).await
     }
@@ -1091,4 +1158,13 @@ fn registry_test_failure() -> AppError {
         ExitCode::BrokerUnavailable,
         "registry test failure",
     )
+}
+
+fn registry_schema_stale_failure() -> AppError {
+    AppError::new(
+        "REGISTRY_SCHEMA_STALE",
+        ExitCode::Precondition,
+        "mesh gateway registry schema is stale",
+    )
+    .remedy("the fleet root machine must run `a2a mesh fleet migrate`")
 }

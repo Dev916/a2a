@@ -24,6 +24,11 @@ fn row(fleet: &str, gateway: &str, last_heartbeat: i64) -> GatewayRow {
         last_heartbeat: now,
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 
@@ -63,6 +68,76 @@ async fn file_registry_implements_lifecycle_and_skips_revoked_rows() {
         registry.schema_version().await.unwrap(),
         REGISTRY_SCHEMA_VERSION
     );
+}
+
+#[tokio::test]
+async fn signed_columns_round_trip_through_the_file_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = FileRegistry::new(tmp.path());
+    let t0 = Utc.timestamp_opt(1_700_000_000, 123_456_000).unwrap();
+    let signed = GatewayRow {
+        fleet_id: "fleet-a".to_string(),
+        gateway_id: "gw-a".to_string(),
+        owner: "owner".to_string(),
+        endpoint_url: Some("wss://gw-a.example.test".to_string()),
+        pubkey_fpr: "gw-a-pub".to_string(),
+        cert_fpr: Some("gw-a-cert".to_string()),
+        version: "test-version".to_string(),
+        created_at: t0,
+        last_heartbeat: t0,
+        revoked_at: None,
+        schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: Some("{}".into()),
+        row_token: Some("tok".into()),
+        row_sig: Some("sig".into()),
+        signed_at: Some(t0),
+        revocation: None,
+    };
+
+    registry.upsert_self(signed.clone()).await.unwrap();
+    let rows = registry.discover("fleet-a").await.unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row_msg, signed.row_msg);
+    assert_eq!(rows[0].row_token, signed.row_token);
+    assert_eq!(rows[0].row_sig, signed.row_sig);
+    assert_eq!(rows[0].signed_at, signed.signed_at);
+    assert_eq!(rows[0].revocation, signed.revocation);
+}
+
+#[tokio::test]
+async fn legacy_file_registry_rows_without_signed_columns_still_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = FileRegistry::new(tmp.path());
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let legacy = serde_json::json!([{
+        "fleet_id": "fleet-a",
+        "gateway_id": "gw-legacy",
+        "owner": "owner",
+        "endpoint_url": "wss://gw-legacy.example.test",
+        "pubkey_fpr": "gw-legacy-pub",
+        "cert_fpr": "gw-legacy-cert",
+        "version": "pre-l4",
+        "created_at": t0,
+        "last_heartbeat": t0,
+        "revoked_at": null,
+        "schema_version": REGISTRY_SCHEMA_VERSION
+    }]);
+    fs::write(
+        tmp.path().join("mesh_gateways.json"),
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let rows = registry.discover("fleet-a").await.unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].gateway_id, "gw-legacy");
+    assert_eq!(rows[0].row_msg, None);
+    assert_eq!(rows[0].row_token, None);
+    assert_eq!(rows[0].row_sig, None);
+    assert_eq!(rows[0].signed_at, None);
+    assert_eq!(rows[0].revocation, None);
 }
 
 #[test]

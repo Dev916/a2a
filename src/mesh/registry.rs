@@ -77,6 +77,16 @@ pub struct GatewayRow {
     pub last_heartbeat: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub schema_version: i32,
+    #[serde(default)]
+    pub row_msg: Option<String>,
+    #[serde(default)]
+    pub row_token: Option<String>,
+    #[serde(default)]
+    pub row_sig: Option<String>,
+    #[serde(default)]
+    pub signed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub revocation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1036,13 +1046,16 @@ impl Registry for PgRegistry {
             sqlx::query(
                 "INSERT INTO mesh_gateways \
                  (fleet_id, gateway_id, owner, endpoint_url, pubkey_fpr, cert_fpr, version, \
-                  created_at, last_heartbeat, revoked_at, schema_version) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                  created_at, last_heartbeat, revoked_at, schema_version, row_msg, row_token, \
+                  row_sig, signed_at, revocation) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
                  ON CONFLICT (fleet_id, gateway_id) DO UPDATE SET \
                  owner = EXCLUDED.owner, endpoint_url = EXCLUDED.endpoint_url, \
                  pubkey_fpr = EXCLUDED.pubkey_fpr, cert_fpr = EXCLUDED.cert_fpr, \
                  version = EXCLUDED.version, last_heartbeat = EXCLUDED.last_heartbeat, \
-                 revoked_at = EXCLUDED.revoked_at, schema_version = EXCLUDED.schema_version",
+                 schema_version = EXCLUDED.schema_version, row_msg = EXCLUDED.row_msg, \
+                 row_token = EXCLUDED.row_token, row_sig = EXCLUDED.row_sig, \
+                 signed_at = EXCLUDED.signed_at",
             )
             .bind(row.fleet_id)
             .bind(row.gateway_id)
@@ -1055,9 +1068,14 @@ impl Registry for PgRegistry {
             .bind(row.last_heartbeat)
             .bind(row.revoked_at)
             .bind(row.schema_version)
+            .bind(row.row_msg)
+            .bind(row.row_token)
+            .bind(row.row_sig)
+            .bind(row.signed_at)
+            .bind(row.revocation)
             .execute(&mut *tx)
             .await
-            .map_err(registry_unreachable)?;
+            .map_err(registry_gateway_error)?;
             tx.commit().await.map_err(registry_unreachable)
         })
         .await
@@ -1086,7 +1104,7 @@ impl Registry for PgRegistry {
             .bind(now)
             .execute(&mut *tx)
             .await
-            .map_err(registry_unreachable)?;
+            .map_err(registry_gateway_error)?;
             tx.commit().await.map_err(registry_unreachable)
         })
         .await
@@ -1102,7 +1120,8 @@ impl Registry for PgRegistry {
             set_local_statement_timeout(&mut tx, timeout).await?;
             let rows = sqlx::query(
                 "SELECT fleet_id, gateway_id, owner, endpoint_url, pubkey_fpr, cert_fpr, \
-                 version, created_at, last_heartbeat, revoked_at, schema_version \
+                 version, created_at, last_heartbeat, revoked_at, schema_version, row_msg, \
+                 row_token, row_sig, signed_at, revocation \
                  FROM mesh_gateways \
                  WHERE fleet_id = $1 AND revoked_at IS NULL \
                  ORDER BY gateway_id",
@@ -1110,7 +1129,7 @@ impl Registry for PgRegistry {
             .bind(fleet_id)
             .fetch_all(&mut *tx)
             .await
-            .map_err(registry_unreachable)?
+            .map_err(registry_gateway_error)?
             .into_iter()
             .map(pg_row)
             .collect::<Result<Vec<_>, _>>()?;
@@ -1143,7 +1162,7 @@ impl Registry for PgRegistry {
             .bind(now)
             .execute(&mut *tx)
             .await
-            .map_err(registry_unreachable)?;
+            .map_err(registry_gateway_error)?;
             tx.commit().await.map_err(registry_unreachable)
         })
         .await
@@ -1172,7 +1191,7 @@ impl Registry for PgRegistry {
             .bind(now)
             .execute(&mut *tx)
             .await
-            .map_err(registry_unreachable)?;
+            .map_err(registry_gateway_error)?;
             tx.commit().await.map_err(registry_unreachable)
         })
         .await
@@ -1190,10 +1209,10 @@ impl Registry for PgRegistry {
             )
             .fetch_one(&mut *tx)
             .await
-            .map_err(registry_unreachable)?;
+            .map_err(registry_gateway_error)?;
             let version = row
                 .try_get("schema_version")
-                .map_err(registry_unreachable)?;
+                .map_err(registry_gateway_error)?;
             tx.commit().await.map_err(registry_unreachable)?;
             Ok(version)
         })
@@ -1536,21 +1555,44 @@ async fn set_local_statement_timeout<'c>(
 
 fn pg_row(row: sqlx::postgres::PgRow) -> Result<GatewayRow, AppError> {
     Ok(GatewayRow {
-        fleet_id: row.try_get("fleet_id").map_err(registry_unreachable)?,
-        gateway_id: row.try_get("gateway_id").map_err(registry_unreachable)?,
-        owner: row.try_get("owner").map_err(registry_unreachable)?,
-        endpoint_url: row.try_get("endpoint_url").map_err(registry_unreachable)?,
-        pubkey_fpr: row.try_get("pubkey_fpr").map_err(registry_unreachable)?,
-        cert_fpr: row.try_get("cert_fpr").map_err(registry_unreachable)?,
-        version: row.try_get("version").map_err(registry_unreachable)?,
-        created_at: row.try_get("created_at").map_err(registry_unreachable)?,
+        fleet_id: row.try_get("fleet_id").map_err(registry_gateway_error)?,
+        gateway_id: row
+            .try_get("gateway_id")
+            .map_err(registry_gateway_error)?,
+        owner: row.try_get("owner").map_err(registry_gateway_error)?,
+        endpoint_url: row
+            .try_get("endpoint_url")
+            .map_err(registry_gateway_error)?,
+        pubkey_fpr: row
+            .try_get("pubkey_fpr")
+            .map_err(registry_gateway_error)?,
+        cert_fpr: row
+            .try_get("cert_fpr")
+            .map_err(registry_gateway_error)?,
+        version: row.try_get("version").map_err(registry_gateway_error)?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(registry_gateway_error)?,
         last_heartbeat: row
             .try_get("last_heartbeat")
-            .map_err(registry_unreachable)?,
-        revoked_at: row.try_get("revoked_at").map_err(registry_unreachable)?,
+            .map_err(registry_gateway_error)?,
+        revoked_at: row
+            .try_get("revoked_at")
+            .map_err(registry_gateway_error)?,
         schema_version: row
             .try_get("schema_version")
-            .map_err(registry_unreachable)?,
+            .map_err(registry_gateway_error)?,
+        row_msg: row.try_get("row_msg").map_err(registry_gateway_error)?,
+        row_token: row
+            .try_get("row_token")
+            .map_err(registry_gateway_error)?,
+        row_sig: row.try_get("row_sig").map_err(registry_gateway_error)?,
+        signed_at: row
+            .try_get("signed_at")
+            .map_err(registry_gateway_error)?,
+        revocation: row
+            .try_get("revocation")
+            .map_err(registry_gateway_error)?,
     })
 }
 
@@ -1636,6 +1678,26 @@ fn registry_unreachable(e: sqlx::Error) -> AppError {
     .remedy("check the registry URL, network path, and database availability")
 }
 
+pub(crate) fn map_gateway_sqlstate(code: Option<&str>) -> Option<AppError> {
+    (code == Some("42703")).then(|| {
+        AppError::new(
+            "REGISTRY_SCHEMA_STALE",
+            ExitCode::Precondition,
+            "mesh gateway registry schema is stale",
+        )
+        .remedy("the fleet root machine must run `a2a mesh fleet migrate`")
+    })
+}
+
+fn registry_gateway_error(e: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db) = &e {
+        if let Some(err) = map_gateway_sqlstate(db.code().as_deref()) {
+            return err;
+        }
+    }
+    registry_unreachable(e)
+}
+
 fn registry_work_error(e: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(db) = &e {
         if db.code().as_deref() == Some("42P01") {
@@ -1657,4 +1719,23 @@ fn registry_unreachable_timeout() -> AppError {
         "registry operation timed out",
     )
     .remedy("check the registry URL, network path, and database availability")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlstate_42703_on_mesh_gateways_maps_to_registry_schema_stale() {
+        let err = map_gateway_sqlstate(Some("42703")).expect("42703 is mapped");
+        assert_eq!(err.code, "REGISTRY_SCHEMA_STALE");
+        assert_eq!(err.exit, ExitCode::Precondition);
+        assert!(
+            err.remedy
+                .expect("schema-stale errors carry a remedy")
+                .contains("a2a mesh fleet migrate")
+        );
+        assert!(map_gateway_sqlstate(Some("42P01")).is_none());
+        assert!(map_gateway_sqlstate(None).is_none());
+    }
 }

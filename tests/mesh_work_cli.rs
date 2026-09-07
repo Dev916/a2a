@@ -64,6 +64,11 @@ fn gateway_row(home: &A2aHome, fleet: &str, version: &str) -> GatewayRow {
         last_heartbeat: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         revoked_at: None,
         schema_version: REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 

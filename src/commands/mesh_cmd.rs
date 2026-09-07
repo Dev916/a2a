@@ -14,7 +14,7 @@ use crate::mesh::{
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -754,59 +754,36 @@ fn require_fleet_root_key(home: &A2aHome) -> Result<(), AppError> {
 async fn apply_mesh_migrations(
     registry: &crate::mesh::registry::RegistryHandle,
 ) -> Result<Vec<String>, AppError> {
-    let migrations = mesh_migration_files()?;
+    let migrations = mesh_migration_files();
     let mut applied = Vec::with_capacity(migrations.len());
     for (name, sql) in migrations {
-        registry.apply_migration(&sql).await?;
-        applied.push(name);
+        eprintln!("a2a: applying {name}:\n{sql}");
+        registry.apply_migration(sql).await?;
+        applied.push(name.to_string());
     }
     Ok(applied)
 }
 
-fn mesh_migration_files() -> Result<Vec<(String, String)>, AppError> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let mut files = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| {
-        AppError::new(
-            "INTERNAL",
-            ExitCode::Internal,
-            format!("reading migrations directory {}: {e}", dir.display()),
-        )
-    })? {
-        let entry = entry.map_err(|e| {
-            AppError::new(
-                "INTERNAL",
-                ExitCode::Internal,
-                format!("reading migrations directory {}: {e}", dir.display()),
-            )
-        })?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("mesh_l") || !name.ends_with(".sql") {
-            continue;
-        }
-        let sql = fs::read_to_string(&path).map_err(|e| {
-            AppError::new(
-                "INTERNAL",
-                ExitCode::Internal,
-                format!("reading migration {}: {e}", path.display()),
-            )
-        })?;
-        if statement_terminators(&sql) != 1 || !sql.trim_end().ends_with(';') {
-            return Err(AppError::new(
-                "INTERNAL",
-                ExitCode::Internal,
-                format!("migration {name} must contain exactly one SQL statement"),
-            ));
-        }
-        files.push((name.to_string(), sql));
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
+pub const MESH_MIGRATIONS: [(&str, &str); 3] = [
+    (
+        "mesh_l2_0001.sql",
+        include_str!("../../migrations/mesh_l2_0001.sql"),
+    ),
+    (
+        "mesh_l3_0001.sql",
+        include_str!("../../migrations/mesh_l3_0001.sql"),
+    ),
+    (
+        "mesh_l4_0001.sql",
+        include_str!("../../migrations/mesh_l4_0001.sql"),
+    ),
+];
+
+fn mesh_migration_files() -> [(&'static str, &'static str); 3] {
+    MESH_MIGRATIONS
 }
 
+#[cfg(test)]
 fn statement_terminators(sql: &str) -> usize {
     sql.lines()
         .map(|line| line.split_once("--").map(|(sql, _)| sql).unwrap_or(line))
@@ -844,4 +821,29 @@ fn human_fleet_rows(rows: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{statement_terminators, MESH_MIGRATIONS};
+
+    #[test]
+    fn mesh_migrations_are_sorted_by_name() {
+        assert_eq!(
+            MESH_MIGRATIONS.map(|(name, _)| name),
+            [
+                "mesh_l2_0001.sql",
+                "mesh_l3_0001.sql",
+                "mesh_l4_0001.sql"
+            ]
+        );
+    }
+
+    #[test]
+    fn mesh_migrations_each_contain_one_statement() {
+        for (name, sql) in MESH_MIGRATIONS {
+            assert_eq!(statement_terminators(sql), 1, "{name}");
+            assert!(sql.trim_end().ends_with(';'), "{name}");
+        }
+    }
 }

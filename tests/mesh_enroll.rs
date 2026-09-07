@@ -188,7 +188,14 @@ fn fleet_migrate_is_root_only_and_idempotent() {
         let out = json_out(&migrate);
         assert_eq!(out["ok"], true, "{out}");
         assert_eq!(out["command"], "mesh fleet migrate");
-        assert_eq!(out["data"]["applied"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            out["data"]["applied"],
+            serde_json::json!([
+                "mesh_l2_0001.sql",
+                "mesh_l3_0001.sql",
+                "mesh_l4_0001.sql"
+            ])
+        );
     }
     assert!(registry_dir.join("mesh_gateways.json").exists());
     assert!(registry_dir.join("mesh_work_items.json").exists());
@@ -202,4 +209,67 @@ fn fleet_migrate_is_root_only_and_idempotent() {
     let out = json_out(&migrate);
     assert_eq!(out["error"]["code"], "FLEET_ALREADY_JOINED", "{out}");
     assert!(!join_tmp.path().join("mesh/fleet/root.key").exists());
+}
+
+#[test]
+fn fleet_migrate_prints_each_migrations_sql_before_applying_it() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let registry_dir = root_tmp.path().join("file-registry");
+    let registry_url = format!("file:{}", registry_dir.display());
+
+    cmd(root_tmp.path())
+        .args(["--json", "mesh", "fleet", "init"])
+        .assert()
+        .success();
+    fs::write(
+        root_tmp.path().join("mesh/fleet/registry.env"),
+        format!("{registry_url}\n"),
+    )
+    .unwrap();
+
+    let migrate = cmd(root_tmp.path())
+        .args(["--json", "mesh", "fleet", "migrate"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&migrate.get_output().stderr);
+    assert!(stderr.contains("mesh_l4_0001.sql"), "{stderr}");
+    assert!(
+        stderr.contains("ADD COLUMN IF NOT EXISTS row_msg"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn fleet_migrate_uses_embedded_sql_not_the_source_tree() {
+    let root_tmp = tempfile::tempdir().unwrap();
+    let run_tmp = tempfile::tempdir().unwrap();
+    let registry_dir = root_tmp.path().join("file-registry");
+    let registry_url = format!("file:{}", registry_dir.display());
+
+    cmd(root_tmp.path())
+        .args(["--json", "mesh", "fleet", "init"])
+        .assert()
+        .success();
+    fs::write(
+        root_tmp.path().join("mesh/fleet/registry.env"),
+        format!("{registry_url}\n"),
+    )
+    .unwrap();
+
+    let migrate = cmd(root_tmp.path())
+        .current_dir(run_tmp.path())
+        .env_remove("CARGO_MANIFEST_DIR")
+        .args(["--json", "mesh", "fleet", "migrate"])
+        .assert()
+        .success();
+    let out = json_out(&migrate);
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(
+        out["data"]["applied"],
+        serde_json::json!([
+            "mesh_l2_0001.sql",
+            "mesh_l3_0001.sql",
+            "mesh_l4_0001.sql"
+        ])
+    );
 }

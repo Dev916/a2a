@@ -263,6 +263,11 @@ impl ExposurePublisher {
                 upserted
             }
             Err(err) => {
+                if changed {
+                    let _ = registry
+                        .heartbeat(&self.row.fleet_id, &self.row.gateway_id, now)
+                        .await;
+                }
                 let registry_error_change = self.record_registry_error(&err, now);
                 let (registry_error, registry_error_since) = self.registry_error_fields();
                 return Ok(ExposureTick {
@@ -346,6 +351,11 @@ impl ExposurePublisher {
             last_heartbeat: now,
             revoked_at: None,
             schema_version: REGISTRY_SCHEMA_VERSION,
+            row_msg: None,
+            row_token: None,
+            row_sig: None,
+            signed_at: None,
+            revocation: None,
         }
     }
 }

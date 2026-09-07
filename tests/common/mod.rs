@@ -360,6 +360,11 @@ fn mesh_gateway_row(
         last_heartbeat: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         revoked_at: None,
         schema_version: a2a::mesh::registry::REGISTRY_SCHEMA_VERSION,
+        row_msg: None,
+        row_token: None,
+        row_sig: None,
+        signed_at: None,
+        revocation: None,
     }
 }
 

@@ -1620,9 +1620,12 @@ impl Registry for FlippingRegistry {
         &self,
         fleet_id: &str,
         gateway_id: &str,
+        revocation: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        self.inner.revoke(fleet_id, gateway_id, now).await
+        self.inner
+            .revoke(fleet_id, gateway_id, revocation, now)
+            .await
     }
 
     async fn schema_version(&self) -> Result<i32, AppError> {

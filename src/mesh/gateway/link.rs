@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::home::A2aHome;
 use crate::mesh::gateway::{notes_wire, presence_wire, replicate};
 use crate::mesh::registry::GatewayRow;
-use crate::mesh::row_sig::{Disposition, RowVerdict};
+use crate::mesh::row_sig::{endpoint_conflicts, Disposition, RowVerdict};
 use crate::mesh::wire::{
     accept_pinned, accept_pinned_io, connect_pinned, connect_pinned_io, Frame, Side, TlsIdentity,
 };
@@ -214,11 +214,13 @@ pub fn discover_outbound_peers<'a>(
     rows: &'a [(GatewayRow, RowVerdict)],
     require_signed_rows: bool,
 ) -> Vec<&'a GatewayRow> {
+    let conflicts = endpoint_conflicts(rows);
     rows.iter()
         .filter(|(_row, verdict)| {
             verdict.disposition(require_signed_rows) != Disposition::Refused
         })
         .map(|(row, _verdict)| row)
+        .filter(|row| !conflicts.contains_key(&row.gateway_id))
         .filter(|row| row.gateway_id != local_gateway_id)
         .filter(|row| row.endpoint_url.is_some())
         .filter(|row| local_gateway_id < row.gateway_id.as_str())

@@ -2,15 +2,19 @@ use crate::cli::{MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshPeerArgs};
 use crate::config::Config;
 use crate::home::A2aHome;
 use crate::mesh::{
+    enroll_ledger::{enroll_conflict, enrollment_epoch, EnrollLedger, LedgerEntry},
     feed,
     notes::{self, RosterRow},
     presence,
     registry::{
-        open_registry, read_registry_env, reader_roots, staleness, write_registry_env, GatewayRow,
-        Registry, RegistryHandle, DEFAULT_REGISTRY_HEARTBEAT_SECS,
+        open_registry, read_registry_env, reader_roots, registry_env_path, staleness,
+        write_registry_env, GatewayRow, Registry, RegistryHandle,
+        DEFAULT_REGISTRY_HEARTBEAT_SECS,
     },
     row_mark::RowMarkStore,
-    row_sig::{row_flags, RowVerdict, RowVerifyCfg, StoredRowColumns},
+    row_sig::{
+        endpoint_conflicts, row_flags, RowFlag, RowVerdict, RowVerifyCfg, StoredRowColumns,
+    },
     render::escape_untrusted,
     scan_or_refuse, FeedEntry, Note, PeerId, Provider, STATUS_MAX_BYTES,
 };
@@ -18,6 +22,7 @@ use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -529,10 +534,11 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 .with_reader_state(marks.clone(), verify_cfg.clone());
                 registry.discover().await
             })?;
+            let conflicts = endpoint_conflicts(&rows);
             if json_mode || *json {
                 let data = rows
                     .iter()
-                    .map(|row| fleet_row_json(row, now, &marks, &verify_cfg))
+                    .map(|row| fleet_row_json(row, now, &marks, &verify_cfg, &conflicts))
                     .collect::<Vec<_>>();
                 return Ok(Outcome::from(json!({ "rows": data })));
             }
@@ -541,6 +547,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 now,
                 &marks,
                 &verify_cfg,
+                &conflicts,
             ))))
         }
         MeshFleetCmd::ForgetSigned { gateway_id } => {
@@ -577,24 +584,105 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
             Ok(Outcome::from(json!({ "applied": applied })))
         }
         MeshFleetCmd::Revoke { gateway_id } => {
+            require_fleet_root_key(home)?;
             let url = read_registry_env(home)?;
             let fleet_id = crate::mesh::keys::fleet_id(home)?;
-            rt.block_on(async {
+            let roots = reader_roots(home)?;
+            let ledger = EnrollLedger::load(home)?;
+            let (registry, live_row) = rt.block_on(async {
                 let registry = open_fleet_registry(home, &url, Utc::now())?;
-                registry.revoke(&fleet_id, gateway_id, Utc::now()).await
+                let live_row = registry
+                    .discover()
+                    .await?
+                    .into_iter()
+                    .find(|(row, _verdict)| row.gateway_id == *gateway_id)
+                    .map(|(row, _verdict)| row);
+                Ok::<_, AppError>((registry, live_row))
             })?;
-            Ok(Outcome::from(Value::Null))
+            let key_epoch = enrollment_epoch(
+                gateway_id,
+                false,
+                &ledger,
+                live_row.as_ref(),
+                &roots,
+            )?;
+            let record = crate::mesh::keys::mint_revocation(
+                home,
+                gateway_id,
+                key_epoch,
+                &crate::mesh::keys::SystemClock,
+            )?;
+            let claims = crate::mesh::keys::verify_revocation(&record, &roots)?;
+            let revoked_at = DateTime::from_timestamp(claims.revoked_at, 0).ok_or_else(|| {
+                AppError::new(
+                    "REVOCATION_INVALID",
+                    ExitCode::Internal,
+                    "minted revocation timestamp is out of range",
+                )
+            })?;
+            rt.block_on(registry.revoke(&fleet_id, gateway_id, &record, revoked_at))?;
+            Ok(Outcome::from(json!({
+                "fleet_id": fleet_id,
+                "gateway_id": gateway_id,
+                "key_epoch": key_epoch,
+                "revoked_at": revoked_at,
+                "revocation": record,
+            })))
         }
         MeshFleetCmd::Enroll {
             gateway_id,
             pubkey,
             out,
+            rebind,
         } => {
-            let token = crate::mesh::keys::enroll_gateway_token(
-                home,
+            require_fleet_root_key(home)?;
+            let roots = reader_roots(home)?;
+            let mut ledger = EnrollLedger::load(home)?;
+            let (registry, live_row) = if registry_env_path(home).exists() {
+                let url = read_registry_env(home)?;
+                let (registry, live_row) = rt.block_on(async {
+                    let registry = open_fleet_registry(home, &url, Utc::now())?;
+                    let live_row = registry
+                        .discover()
+                        .await?
+                        .into_iter()
+                        .find(|(row, _verdict)| row.gateway_id == *gateway_id)
+                        .map(|(row, _verdict)| row);
+                    Ok::<_, AppError>((registry, live_row))
+                })?;
+                (Some(registry), live_row)
+            } else {
+                (None, None)
+            };
+            if !rebind {
+                enroll_conflict(gateway_id, pubkey, &ledger, live_row.as_ref())?;
+            }
+            let key_epoch = enrollment_epoch(
                 gateway_id,
-                pubkey,
-                &crate::mesh::keys::SystemClock,
+                *rebind,
+                &ledger,
+                live_row.as_ref(),
+                &roots,
+            )?;
+            let (token, claims, issuing_root_fpr) =
+                crate::mesh::keys::enroll_gateway_token_at_epoch(
+                    home,
+                    gateway_id,
+                    pubkey,
+                    key_epoch,
+                    &crate::mesh::keys::SystemClock,
+                )?;
+            if *rebind {
+                if let Some(registry) = &registry {
+                    rt.block_on(registry.clear_legacy_revoked_at(
+                        &claims.fleet_id,
+                        gateway_id,
+                    ))?;
+                }
+            }
+            ledger.record(
+                home,
+                LedgerEntry::from_claims(&claims, issuing_root_fpr.clone()),
             )?;
             let reminder =
                 "joining machine needs: token + mesh/fleet/root.pub + mesh/fleet/registry.env";
@@ -602,6 +690,8 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 if json_mode {
                     return Ok(Outcome::from(json!({
                         "token": token,
+                        "key_epoch": key_epoch,
+                        "issuing_root_fpr": issuing_root_fpr,
                         "reminder": reminder
                     })));
                 }
@@ -611,6 +701,8 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
             write_file_0600(Path::new(out), &(token.clone() + "\n"))?;
             Ok(Outcome::from(json!({
                 "token_path": out,
+                "key_epoch": key_epoch,
+                "issuing_root_fpr": issuing_root_fpr,
                 "reminder": reminder
             })))
         }
@@ -907,7 +999,7 @@ fn require_fleet_root_key(home: &A2aHome) -> Result<(), AppError> {
     Err(AppError::new(
         "FLEET_ROOT_KEY_MISSING",
         ExitCode::Precondition,
-        "fleet migration must run on the root machine that holds mesh/fleet/root.key",
+        "this fleet-root operation must run on the machine that holds mesh/fleet/root.key",
     )
     .remedy("run `a2a mesh fleet init` on the fleet root machine, or copy registry.env there and retry"))
 }
@@ -957,15 +1049,28 @@ fn fleet_row_json(
     now: chrono::DateTime<Utc>,
     marks: &RowMarkStore,
     verify_cfg: &RowVerifyCfg,
+    conflicts: &BTreeMap<String, String>,
 ) -> Value {
     let (row, verdict) = row_and_verdict;
     let state = staleness(row.last_heartbeat, now, DEFAULT_REGISTRY_HEARTBEAT_SECS);
     let mark = marks.get(&row.gateway_id);
     let stored = StoredRowColumns::from(row);
+    let gateway_id = escape_untrusted(&row.gateway_id, 128).text;
     let mut flags = Vec::<String>::new();
     let mut remedies = Vec::<Value>::new();
     for flag in row_flags(&stored, mark, verify_cfg) {
         push_fleet_flag(&mut flags, &mut remedies, flag.label(), flag.remedy());
+    }
+    if let Some(incumbent) = conflicts.get(&row.gateway_id) {
+        let incumbent = escape_untrusted(incumbent, 128).text;
+        push_fleet_flag(
+            &mut flags,
+            &mut remedies,
+            RowFlag::EndpointConflict.label(),
+            &format!(
+                "gateway {gateway_id} conflicts with incumbent {incumbent}; keep the incumbent endpoint and investigate this later row"
+            ),
+        );
     }
     if mark.is_some_and(|mark| !mark.first_signature) {
         push_fleet_flag(
@@ -992,11 +1097,27 @@ fn fleet_row_json(
     let cert_fpr = row.cert_fpr.as_deref().map(|value| {
         render_fleet_field(value, 256, "cert-fpr", &mut flags, &mut remedies)
     });
-    let gateway_id = escape_untrusted(&row.gateway_id, 128).text;
     let pubkey_fpr = escape_untrusted(&row.pubkey_fpr, 256).text;
     let verdict_remedy = (*verdict != RowVerdict::ValidSigned).then(|| {
         verdict.remedy().replace("<gw>", &gateway_id)
     });
+    let token_claims = row
+        .row_token
+        .as_deref()
+        .and_then(|token| crate::mesh::keys::unverified_claims(token).ok());
+    let token_expires_at = token_claims
+        .as_ref()
+        .and_then(|claims| DateTime::from_timestamp(claims.exp, 0));
+    let days_remaining = token_expires_at.map(|expires_at| token_days_remaining(expires_at, now));
+    let token_expiry_warning = days_remaining.and_then(token_expiry_warning);
+    if let Some(warning) = token_expiry_warning {
+        push_fleet_flag(
+            &mut flags,
+            &mut remedies,
+            warning,
+            "renew the gateway enrollment token before this warning window closes",
+        );
+    }
     json!({
         "verdict": verdict.label(),
         "verdict_remedy": verdict_remedy,
@@ -1012,6 +1133,9 @@ fn fleet_row_json(
         "created_at": row.created_at,
         "last_heartbeat": row.last_heartbeat,
         "revoked_at": row.revoked_at,
+        "token_expires_at": token_expires_at,
+        "days_remaining": days_remaining,
+        "token_expiry_warning": token_expiry_warning,
         "schema_version": row.schema_version,
         "staleness": state,
     })
@@ -1022,10 +1146,11 @@ fn human_fleet_rows(
     now: chrono::DateTime<Utc>,
     marks: &RowMarkStore,
     verify_cfg: &RowVerifyCfg,
+    conflicts: &BTreeMap<String, String>,
 ) -> String {
     rows.iter()
         .map(|row| {
-            let row = fleet_row_json(row, now, marks, verify_cfg);
+            let row = fleet_row_json(row, now, marks, verify_cfg, conflicts);
             let flags = row["flags"]
                 .as_array()
                 .map(|flags| {
@@ -1042,7 +1167,7 @@ fn human_fleet_rows(
                 format!(" [{flags}]")
             };
             let mut lines = vec![format!(
-                "{}{} gateway={} state={} endpoint={} owner={} version={} cert_fpr={}",
+                "{}{} gateway={} state={} endpoint={} owner={} version={} cert_fpr={} token_expires_at={} days_remaining={}",
                 row["verdict"].as_str().unwrap_or("UNKNOWN"),
                 flags,
                 row["gateway_id"].as_str().unwrap_or(""),
@@ -1051,6 +1176,12 @@ fn human_fleet_rows(
                 row["owner"].as_str().unwrap_or(""),
                 row["version"].as_str().unwrap_or(""),
                 row["cert_fpr"].as_str().unwrap_or("none"),
+                row["token_expires_at"].as_str().unwrap_or("unknown"),
+                row["days_remaining"]
+                    .as_i64()
+                    .map(|days| days.to_string())
+                    .as_deref()
+                    .unwrap_or("unknown"),
             )];
             if let Some(remedy) = row["verdict_remedy"].as_str() {
                 lines.push(format!(
@@ -1107,8 +1238,30 @@ fn push_fleet_flag(
     flag: &str,
     remedy: &str,
 ) {
+    if flags.iter().any(|existing| existing == flag) {
+        return;
+    }
     flags.push(flag.to_string());
     remedies.push(json!({ "flag": flag, "remedy": remedy }));
+}
+
+fn token_days_remaining(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    let seconds = expires_at.timestamp().saturating_sub(now.timestamp());
+    if seconds >= 0 {
+        seconds.saturating_add(86_399) / 86_400
+    } else {
+        seconds.div_euclid(86_400)
+    }
+}
+
+fn token_expiry_warning(days_remaining: i64) -> Option<&'static str> {
+    match days_remaining {
+        i64::MIN..=-1 => Some("TOKEN_EXPIRED"),
+        0..=7 => Some("T-7"),
+        8..=14 => Some("T-14"),
+        15..=30 => Some("T-30"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

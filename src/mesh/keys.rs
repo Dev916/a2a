@@ -94,6 +94,15 @@ pub struct TokenClaims {
     pub exp: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationClaims {
+    pub fleet_id: String,
+    pub gateway_id: String,
+    pub key_epoch: u64,
+    pub revoked_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct RootSet(Vec<RootPubFile>);
 
@@ -240,7 +249,7 @@ pub fn gateway_identity(home: &A2aHome, fresh: bool) -> Result<GatewayIdentity, 
         read_gateway_key(&key_path)?
     } else {
         let signing = new_signing_key();
-        let suffix = &hex(&Sha256::digest(signing.verifying_key().to_bytes()))[..6];
+        let suffix = &hex(&Sha256::digest(signing.verifying_key().to_bytes()))[..16];
         let gateway_id = format!("gw-{}-{suffix}", hostname_slug());
         let gateway = GatewayKeyFile {
             gateway_id,
@@ -414,6 +423,17 @@ pub fn enroll_gateway_token(
     pubkey_b64: &str,
     clock: &dyn Clock,
 ) -> Result<String, AppError> {
+    enroll_gateway_token_at_epoch(home, gateway_id, pubkey_b64, 0, clock)
+        .map(|(token, _claims, _issuer)| token)
+}
+
+pub fn enroll_gateway_token_at_epoch(
+    home: &A2aHome,
+    gateway_id: &str,
+    pubkey_b64: &str,
+    key_epoch: u64,
+    clock: &dyn Clock,
+) -> Result<(String, TokenClaims, String), AppError> {
     validate_gateway_pubkey_b64(pubkey_b64)?;
     let root_key_path = fleet_dir(home)?.join(ROOT_KEY);
     if !root_key_path.exists() {
@@ -434,12 +454,14 @@ pub fn enroll_gateway_token(
         fleet_id: root.fleet_id,
         gateway_id: gateway_id.to_string(),
         pubkey_b64: pubkey_b64.to_string(),
-        key_epoch: 0,
+        key_epoch,
         issued_at,
         exp: issued_at + 90 * 24 * 60 * 60,
     };
     let claims_bytes = canonical_claims(&claims)?;
-    sign_claim_bytes_with_key(&claims_bytes, &root_key_path)
+    let token = sign_claim_bytes_with_key(&claims_bytes, &root_key_path)?;
+    let issuer = root_fingerprint(&read_root_pub(&root_pub_path)?)?;
+    Ok((token, claims, issuer))
 }
 
 pub fn install_gateway_token(
@@ -572,6 +594,62 @@ pub fn verify_token_no_clock(
     ))
 }
 
+pub fn mint_revocation(
+    home: &A2aHome,
+    gateway_id: &str,
+    key_epoch: u64,
+    clock: &dyn Clock,
+) -> Result<String, AppError> {
+    let key_path = fleet_dir(home)?.join(ROOT_KEY);
+    let root = read_root_key(&key_path)?;
+    let claims = RevocationClaims {
+        fleet_id: root.fleet_id,
+        gateway_id: gateway_id.to_string(),
+        key_epoch,
+        revoked_at: clock.now().timestamp(),
+    };
+    let claims_bytes = canonical_revocation_claims(&claims)?;
+    sign_claim_bytes_with_key(&claims_bytes, &key_path)
+}
+
+pub fn verify_revocation(
+    record_b64: &str,
+    roots: &RootSet,
+) -> Result<RevocationClaims, AppError> {
+    let record = b64_decode(record_b64)
+        .map_err(|_| revocation_invalid("revocation record is not base64"))?;
+    let envelope: TokenEnvelope = serde_json::from_slice(&record)
+        .map_err(|_| revocation_invalid("revocation envelope is invalid"))?;
+    if envelope.v != TOKEN_VERSION {
+        return Err(revocation_invalid("revocation version is unsupported"));
+    }
+    let claims_bytes = b64_decode(&envelope.claims_b64)
+        .map_err(|_| revocation_invalid("revocation claims are not base64"))?;
+    let sig_bytes = b64_decode(&envelope.sig_b64)
+        .map_err(|_| revocation_invalid("revocation signature is not base64"))?;
+    let sig: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| revocation_invalid("revocation signature has invalid length"))?;
+    let signature = Signature::from_bytes(&sig);
+    let claims: RevocationClaims = serde_json::from_slice(&claims_bytes).map_err(|_| {
+        revocation_invalid("revocation claims are invalid or contain unknown fields")
+    })?;
+    let canonical = canonical_revocation_claims(&claims)?;
+    if canonical != claims_bytes {
+        return Err(revocation_invalid("revocation claims are not canonical"));
+    }
+    for root in &roots.0 {
+        let key = verifying_key_from_b64(&root.pubkey_b64)
+            .map_err(|_| revocation_invalid("root public key is invalid"))?;
+        if key.verify(&claims_bytes, &signature).is_ok() {
+            return Ok(claims);
+        }
+    }
+    Err(revocation_invalid(
+        "revocation signature does not verify against trusted roots",
+    ))
+}
+
 pub fn unverified_claims(token_b64: &str) -> Result<TokenClaims, AppError> {
     let token = b64_decode(token_b64).map_err(|_| token_invalid("token is not base64"))?;
     let envelope: TokenEnvelope =
@@ -631,6 +709,15 @@ fn canonical_claims(claims: &TokenClaims) -> Result<Vec<u8>, AppError> {
         fields.insert("key_epoch", json!(claims.key_epoch));
     }
     canonical_json_fields(fields)
+}
+
+fn canonical_revocation_claims(claims: &RevocationClaims) -> Result<Vec<u8>, AppError> {
+    canonical_json_fields(BTreeMap::from([
+        ("fleet_id", json!(claims.fleet_id)),
+        ("gateway_id", json!(claims.gateway_id)),
+        ("key_epoch", json!(claims.key_epoch)),
+        ("revoked_at", json!(claims.revoked_at)),
+    ]))
 }
 
 pub(crate) fn canonical_json_fields(fields: BTreeMap<&str, Value>) -> Result<Vec<u8>, AppError> {
@@ -875,6 +962,11 @@ fn token_invalid(message: &'static str) -> AppError {
 
 fn claims_invalid(message: &'static str) -> AppError {
     AppError::new("TOKEN_CLAIMS_INVALID", ExitCode::Precondition, message)
+}
+
+fn revocation_invalid(message: &'static str) -> AppError {
+    AppError::new("REVOCATION_INVALID", ExitCode::Precondition, message)
+        .remedy("discard the record and mint a fresh revocation on the fleet root machine")
 }
 
 fn root_key_invalid() -> AppError {

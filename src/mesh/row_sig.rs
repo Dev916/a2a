@@ -197,6 +197,10 @@ impl RowVerifyCfg {
 pub enum RowFlag {
     StaleRow,
     FirstTrust,
+    KeyRebound,
+    TokenExpired,
+    TokenNotYetValid,
+    EndpointConflict,
 }
 
 impl RowFlag {
@@ -204,6 +208,10 @@ impl RowFlag {
         match self {
             Self::StaleRow => "stale-row",
             Self::FirstTrust => "first-trust",
+            Self::KeyRebound => "row_key_rebound",
+            Self::TokenExpired => "TOKEN_EXPIRED",
+            Self::TokenNotYetValid => "TOKEN_NOT_YET_VALID",
+            Self::EndpointConflict => "ROW_ENDPOINT_CONFLICT",
         }
     }
 
@@ -215,8 +223,32 @@ impl RowFlag {
             Self::FirstTrust => {
                 "verify the gateway identity and key fingerprint out of band before relying on this first trust"
             }
+            Self::KeyRebound => {
+                "confirm the higher key epoch matches an intentional owner-approved gateway rebind"
+            }
+            Self::TokenExpired => {
+                "renew the enrollment token on the fleet root and install it on the gateway"
+            }
+            Self::TokenNotYetValid => {
+                "check local and fleet-root clocks before installing or renewing this token"
+            }
+            Self::EndpointConflict => {
+                "keep the incumbent endpoint and investigate the later gateway row before dialing it"
+            }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevocationState {
+    Absent,
+    Invalid,
+    Misplaced(keys::RevocationClaims),
+    Revoked(keys::RevocationClaims),
+    Superseded {
+        record: keys::RevocationClaims,
+        token_epoch: u64,
+    },
 }
 
 impl From<&GatewayRow> for StoredRowColumns {
@@ -273,9 +305,6 @@ pub fn verify_row(
     mark: Option<&RowMark>,
     cfg: &RowVerifyCfg,
 ) -> RowVerdict {
-    // R5 replaces this neutral hook with root-signed revocation verification. Keeping the hook at
-    // precedence step zero makes that merge local and prevents legacy revoked_at from becoming a
-    // trust input in the meantime.
     if let Some(verdict) = revocation_verdict(stored, roots) {
         return verdict;
     }
@@ -351,6 +380,7 @@ pub fn verify_row(
         return RowVerdict::RowClockAhead;
     }
     let key = mark
+        .filter(|row_mark| claims.key_epoch <= row_mark.highest_key_epoch)
         .and_then(|row_mark| row_mark.pinned_pubkey_b64.clone())
         .unwrap_or_else(|| claims.pubkey_b64.clone());
     let verifies = verify_row_bytes(
@@ -394,10 +424,58 @@ pub fn row_flags(
             flags.push(RowFlag::StaleRow);
         }
     }
+    if let Some(claims) = stored
+        .row_token
+        .as_deref()
+        .and_then(|token| keys::unverified_claims(token).ok())
+    {
+        if claims.key_epoch > 0 {
+            flags.push(RowFlag::KeyRebound);
+        }
+        if cfg.now.timestamp() > claims.exp {
+            flags.push(RowFlag::TokenExpired);
+        }
+        if cfg.now.timestamp() < claims.issued_at {
+            flags.push(RowFlag::TokenNotYetValid);
+        }
+    }
     if mark.is_none() {
         flags.push(RowFlag::FirstTrust);
     }
     flags
+}
+
+pub fn endpoint_conflicts(rows: &[(GatewayRow, RowVerdict)]) -> BTreeMap<String, String> {
+    let mut groups = BTreeMap::<(String, String), Vec<&GatewayRow>>::new();
+    for (row, verdict) in rows {
+        if *verdict != RowVerdict::ValidSigned {
+            continue;
+        }
+        let (Some(endpoint), Some(cert_fpr)) = (&row.endpoint_url, &row.cert_fpr) else {
+            continue;
+        };
+        groups
+            .entry((endpoint.clone(), cert_fpr.clone()))
+            .or_default()
+            .push(row);
+    }
+    let mut conflicts = BTreeMap::new();
+    for group in groups.values_mut() {
+        group.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.gateway_id.cmp(&right.gateway_id))
+        });
+        let Some(incumbent) = group.first() else {
+            continue;
+        };
+        for later in group.iter().skip(1) {
+            if later.gateway_id != incumbent.gateway_id {
+                conflicts.insert(later.gateway_id.clone(), incumbent.gateway_id.clone());
+            }
+        }
+    }
+    conflicts
 }
 
 fn columns_bind(msg: &RowMsg, stored: &StoredRowColumns) -> bool {
@@ -422,19 +500,67 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn gateway_id_binds_key(_gateway_id: &str, _claims: &keys::TokenClaims) -> bool {
-    // R5 owns the key-derived id and rebind-ledger rules. Until that merge, the root-signed token
-    // bindings above remain enforced and this hook is deliberately neutral.
-    true
+pub fn gateway_id_binds_key(gateway_id: &str, claims: &keys::TokenClaims) -> bool {
+    if claims.key_epoch > 0 {
+        return true;
+    }
+    let Some((_prefix, suffix)) = gateway_id.rsplit_once('-') else {
+        return false;
+    };
+    if suffix.len() < 6
+        || suffix.len() > 64
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+    keys::fpr_of_pubkey_b64(&claims.pubkey_b64)
+        .is_ok_and(|fingerprint| fingerprint.starts_with(suffix))
 }
 
 fn revocation_verdict(
-    _stored: &StoredRowColumns,
-    _roots: &keys::RootSet,
+    stored: &StoredRowColumns,
+    roots: &keys::RootSet,
 ) -> Option<RowVerdict> {
-    // R5 owns the revocation envelope and cache. Legacy revoked_at is intentionally absent from
-    // StoredRowColumns and must never be substituted here.
-    None
+    match revocation_state(stored, roots) {
+        RevocationState::Absent | RevocationState::Superseded { .. } => None,
+        RevocationState::Invalid => Some(RowVerdict::BadSig),
+        RevocationState::Misplaced(_) => Some(RowVerdict::RowRevocationMisplaced),
+        RevocationState::Revoked(_) => Some(RowVerdict::Revoked),
+    }
+}
+
+pub fn revocation_state(
+    stored: &StoredRowColumns,
+    roots: &keys::RootSet,
+) -> RevocationState {
+    let Some(text) = stored.revocation.as_deref() else {
+        return RevocationState::Absent;
+    };
+    let record = match keys::verify_revocation(text, roots) {
+        Ok(record) => record,
+        Err(_) => return RevocationState::Invalid,
+    };
+    if record.fleet_id != stored.fleet_id || record.gateway_id != stored.gateway_id {
+        return RevocationState::Misplaced(record);
+    }
+    let token_epoch = stored
+        .row_token
+        .as_deref()
+        .and_then(|token| keys::verify_token_no_clock(token, roots).ok())
+        .map(|(claims, _issuer)| claims)
+        .filter(|claims| {
+            claims.fleet_id == stored.fleet_id && claims.gateway_id == stored.gateway_id
+        })
+        .map(|claims| claims.key_epoch);
+    if let Some(token_epoch) = token_epoch.filter(|epoch| *epoch > record.key_epoch) {
+        return RevocationState::Superseded {
+            record,
+            token_epoch,
+        };
+    }
+    RevocationState::Revoked(record)
 }
 
 pub fn canonical_row_msg(msg: &RowMsg) -> Result<String, AppError> {

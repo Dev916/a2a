@@ -124,3 +124,5 @@ a2a mesh gateway status # loops all "running", endpoint_url populated
 | Code | Meaning | Remedy |
 |---|---|---|
 | `ROOTS_UNREADABLE` | This reader could not load its local `mesh/fleet/root.pub` or `root.pub.next`. | Repair the local root files and permissions before judging any peer row. |
+| `ENROLLMENT_REBIND_REQUIRED` | The requested gateway id is already bound to a different key in the owner ledger or live row. | Verify both printed fingerprints out of band, then rerun `fleet enroll` with `--rebind`. |
+| `REVOCATION_INVALID` | A revocation record or local cached tombstone is malformed or does not verify under a fleet root. | Preserve the suspect row for evidence, then mint a fresh revocation on the fleet root machine. |

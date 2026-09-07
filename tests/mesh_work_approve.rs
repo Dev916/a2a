@@ -163,8 +163,8 @@ impl Registry for CountingRegistry {
     async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
         self.inner.discover_unverified(fleet_id).await
     }
-    async fn revoke(&self, fleet_id: &str, gateway_id: &str, now: chrono::DateTime<Utc>) -> Result<(), AppError> {
-        self.inner.revoke(fleet_id, gateway_id, now).await
+    async fn revoke(&self, fleet_id: &str, gateway_id: &str, revocation: &str, now: chrono::DateTime<Utc>) -> Result<(), AppError> {
+        self.inner.revoke(fleet_id, gateway_id, revocation, now).await
     }
     async fn schema_version(&self) -> Result<i32, AppError> {
         self.inner.schema_version().await

@@ -732,6 +732,7 @@ async fn legacy_revoked_at_does_not_make_a_present_peer_look_missing() {
         .revoke(
             "fleet-a",
             "gw-b",
+            "test-revocation",
             Utc.timestamp_opt(1_700_000_020, 0).unwrap(),
         )
         .await

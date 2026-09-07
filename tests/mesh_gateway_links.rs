@@ -508,6 +508,7 @@ async fn acceptor_and_dialer_connect_over_discovered_injected_io_endpoint() {
         .revoke(
             "fleet-a",
             "gw-a",
+            "test-revocation",
             Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
         )
         .await

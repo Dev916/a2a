@@ -6,12 +6,13 @@ use a2a::mesh::keys::{
     install_gateway_token, RootSet, SystemClock, TokenClaims,
 };
 use a2a::mesh::registry::{open_registry, reader_roots, GatewayRow};
-use a2a::mesh::row_mark::{RowMark, RowMarkStore};
+use a2a::mesh::row_mark::{RevocationCache, RowMark, RowMarkStore};
 use a2a::mesh::row_sig::{
-    row_flags, sign_row, verify_row, Disposition, RowFlag, RowMsg, RowVerdict, RowVerifyCfg,
-    StoredRowColumns, ROW_MSG_VER,
+    endpoint_conflicts, row_flags, sign_row, verify_row, Disposition, RowFlag, RowMsg,
+    RowVerdict, RowVerifyCfg, StoredRowColumns, ROW_MSG_VER,
 };
 use chrono::{Duration, TimeZone, Utc};
+use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -235,6 +236,209 @@ fn a_gateway_id_that_is_not_a_safe_file_part_is_never_written_to_disk() {
         .is_err());
     assert!(!fixture.home.root().join("mesh/evil.json").exists());
     assert!(!fixture.home.root().join("evil.json").exists());
+}
+
+#[test]
+fn a_correctly_bound_revocation_makes_the_row_revoked_under_both_flags() {
+    let fixture = SignedFixture::new();
+    let root = A2aHome::resolve(Some(&fixture._tmp.path().join("root"))).unwrap();
+    let mut stored = fixture.stored.clone();
+    stored.revocation = Some(
+        keys::mint_revocation(
+            &root,
+            &fixture.claims.gateway_id,
+            fixture.claims.key_epoch,
+            &SystemClock,
+        )
+        .unwrap(),
+    );
+
+    let verdict = verify_row(
+        &stored,
+        &fixture.roots,
+        Some(&fixture.mark()),
+        &fixture.verify_cfg(),
+    );
+    assert_eq!(verdict, RowVerdict::Revoked);
+    assert_eq!(verdict.disposition(false), Disposition::Refused);
+    assert_eq!(verdict.disposition(true), Disposition::Refused);
+}
+
+#[test]
+fn a_valid_revocation_from_another_gateway_is_row_revocation_misplaced_and_revokes_nobody() {
+    let fixture = SignedFixture::new();
+    let root = A2aHome::resolve(Some(&fixture._tmp.path().join("root"))).unwrap();
+    let record = keys::mint_revocation(
+        &root,
+        &fixture.claims.gateway_id,
+        fixture.claims.key_epoch,
+        &SystemClock,
+    )
+    .unwrap();
+    let mut carrier = fixture.stored.clone();
+    carrier.gateway_id = "gw-b-0123456789abcdef".to_string();
+    carrier.revocation = Some(record);
+
+    assert_eq!(
+        verify_row(&carrier, &fixture.roots, None, &fixture.verify_cfg()),
+        RowVerdict::RowRevocationMisplaced
+    );
+    assert_eq!(
+        verify_row(
+            &fixture.stored,
+            &fixture.roots,
+            Some(&fixture.mark()),
+            &fixture.verify_cfg(),
+        ),
+        RowVerdict::ValidSigned
+    );
+    let cache = RevocationCache::open(&fixture.home).unwrap();
+    assert!(!cache.is_revoked("gw-b-0123456789abcdef", 0));
+    assert!(!cache.is_revoked(&fixture.claims.gateway_id, 0));
+}
+
+#[test]
+fn a_higher_epoch_token_supersedes_the_revocation_record() {
+    let fixture = SignedFixture::new();
+    let root = A2aHome::resolve(Some(&fixture._tmp.path().join("root"))).unwrap();
+    let rebound_key = SigningKey::from_bytes(&[91_u8; 32]);
+    let mut claims = fixture.claims.clone();
+    claims.key_epoch += 1;
+    claims.pubkey_b64 = b64(&rebound_key.verifying_key().to_bytes());
+    let token = keys::sign_token(&claims, &root).unwrap();
+    let mut msg = fixture.msg.clone();
+    msg.key_epoch = claims.key_epoch;
+    msg.pubkey_fpr = keys::fpr_of_pubkey_b64(&claims.pubkey_b64).unwrap();
+    msg.row_token_sha256 = sha256_hex(token.as_bytes());
+    let (row_msg, row_sig) = sign_row(&msg, &rebound_key).unwrap();
+    let mut stored = fixture.stored.clone();
+    stored.pubkey_fpr = msg.pubkey_fpr.clone();
+    stored.row_msg = Some(row_msg);
+    stored.row_token = Some(token);
+    stored.row_sig = Some(row_sig);
+    stored.revocation = Some(
+        keys::mint_revocation(
+            &root,
+            &claims.gateway_id,
+            fixture.claims.key_epoch,
+            &SystemClock,
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(
+        verify_row(
+            &stored,
+            &fixture.roots,
+            Some(&fixture.mark()),
+            &fixture.verify_cfg(),
+        ),
+        RowVerdict::ValidSigned
+    );
+    assert!(row_flags(&stored, Some(&fixture.mark()), &fixture.verify_cfg())
+        .contains(&RowFlag::KeyRebound));
+}
+
+#[test]
+fn revocation_is_honoured_from_the_cache_when_the_registry_is_unreachable() {
+    let fixture = SignedFixture::new();
+    let root = A2aHome::resolve(Some(&fixture._tmp.path().join("root"))).unwrap();
+    let record = keys::mint_revocation(
+        &root,
+        &fixture.claims.gateway_id,
+        fixture.claims.key_epoch,
+        &SystemClock,
+    )
+    .unwrap();
+    let claims = keys::verify_revocation(&record, &fixture.roots).unwrap();
+    let mut cache = RevocationCache::open(&fixture.home).unwrap();
+    cache.observe(&claims.gateway_id, &claims).unwrap();
+
+    let reopened = RevocationCache::open(&fixture.home).unwrap();
+    assert!(reopened.is_revoked(&claims.gateway_id, claims.key_epoch));
+    assert!(!reopened.is_revoked(&claims.gateway_id, claims.key_epoch + 1));
+}
+
+#[test]
+fn an_expired_token_attaches_a_warn_label_and_the_row_stays_usable() {
+    let fixture = SignedFixture::new();
+    let root = A2aHome::resolve(Some(&fixture._tmp.path().join("root"))).unwrap();
+    let cfg = fixture.verify_cfg();
+    let mut claims = fixture.claims.clone();
+    claims.exp = cfg.now.timestamp() - 1;
+    let token = keys::sign_token(&claims, &root).unwrap();
+    let mut msg = fixture.msg.clone();
+    msg.row_token_sha256 = sha256_hex(token.as_bytes());
+    let (row_msg, row_sig) =
+        sign_row(&msg, &keys::gateway_signing_key(&fixture.home).unwrap()).unwrap();
+    let mut stored = fixture.stored.clone();
+    stored.row_msg = Some(row_msg);
+    stored.row_token = Some(token);
+    stored.row_sig = Some(row_sig);
+
+    let verdict = verify_row(&stored, &fixture.roots, Some(&fixture.mark()), &cfg);
+    assert_eq!(verdict, RowVerdict::ValidSigned);
+    assert_eq!(verdict.disposition(true), Disposition::Usable);
+    assert!(row_flags(&stored, Some(&fixture.mark()), &cfg).contains(&RowFlag::TokenExpired));
+}
+
+#[test]
+fn a_not_yet_valid_token_attaches_a_warn_label_and_the_row_stays_usable() {
+    let fixture = SignedFixture::new();
+    let root = A2aHome::resolve(Some(&fixture._tmp.path().join("root"))).unwrap();
+    let cfg = fixture.verify_cfg();
+    let mut claims = fixture.claims.clone();
+    claims.issued_at = cfg.now.timestamp() + 1;
+    claims.exp = claims.issued_at + 90 * 24 * 60 * 60;
+    let token = keys::sign_token(&claims, &root).unwrap();
+    let mut msg = fixture.msg.clone();
+    msg.row_token_sha256 = sha256_hex(token.as_bytes());
+    let (row_msg, row_sig) =
+        sign_row(&msg, &keys::gateway_signing_key(&fixture.home).unwrap()).unwrap();
+    let mut stored = fixture.stored.clone();
+    stored.row_msg = Some(row_msg);
+    stored.row_token = Some(token);
+    stored.row_sig = Some(row_sig);
+
+    let verdict = verify_row(&stored, &fixture.roots, Some(&fixture.mark()), &cfg);
+    assert_eq!(verdict, RowVerdict::ValidSigned);
+    assert_eq!(verdict.disposition(true), Disposition::Usable);
+    assert!(
+        row_flags(&stored, Some(&fixture.mark()), &cfg).contains(&RowFlag::TokenNotYetValid)
+    );
+}
+
+#[test]
+fn two_null_endpoint_rows_are_not_in_conflict() {
+    let fixture = SignedFixture::new();
+    let mut first = gateway_row_from_stored(&fixture.stored);
+    first.endpoint_url = None;
+    let mut second = first.clone();
+    second.gateway_id = "gw-b-0123456789abcdef".to_string();
+    let rows = vec![
+        (first, RowVerdict::ValidSigned),
+        (second, RowVerdict::ValidSigned),
+    ];
+    assert!(endpoint_conflicts(&rows).is_empty());
+}
+
+#[test]
+fn a_backdated_squatting_row_loses_to_the_incumbents_created_at() {
+    let fixture = SignedFixture::new();
+    let incumbent = gateway_row_from_stored(&fixture.stored);
+    let mut squatter = incumbent.clone();
+    squatter.gateway_id = "gw-z-0123456789abcdef".to_string();
+    squatter.created_at = incumbent.created_at + Duration::days(1);
+    squatter.signed_at = incumbent.signed_at.map(|at| at - Duration::days(365));
+    let rows = vec![
+        (squatter.clone(), RowVerdict::ValidSigned),
+        (incumbent.clone(), RowVerdict::ValidSigned),
+    ];
+
+    assert_eq!(
+        endpoint_conflicts(&rows).get(&squatter.gateway_id),
+        Some(&incumbent.gateway_id)
+    );
 }
 
 #[test]
@@ -603,4 +807,27 @@ fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }

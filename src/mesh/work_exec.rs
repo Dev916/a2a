@@ -6,6 +6,7 @@ use crate::mesh::keys::{self, SystemClock};
 use crate::mesh::registry::{
     ClaimOutcome, Registry, TransitionOutcome, WorkOwner, WorkPatch, WorkRow, WorkStatus,
 };
+use crate::mesh::row_mark::RevocationCache;
 use crate::mesh::work::{canonical_envelope_without_sig, verify_envelope, VerifiedEnvelope};
 use crate::mesh::{feed, gateway::notes_wire, Note, PeerId, Provider};
 use crate::mesh::work_store;
@@ -294,6 +295,7 @@ where
     G: GitAdapter + ?Sized,
     S: WorkSpawner + ?Sized,
 {
+    ensure_sender_not_revoked(home, &verified_for(home, work_id)?)?;
     let _lock = lock_state(home, work_id)?;
     let loaded = load_state_unlocked(home, work_id)?;
     let preflight = if loaded.is_none() {
@@ -1092,6 +1094,7 @@ where
     S: WorkSpawner + ?Sized,
 {
     let verified = verified_for(home, work_id)?;
+    ensure_sender_not_revoked(home, &verified)?;
     let checkout = item_dir(home, work_id).join("repo");
     git.ls_remote(&verified.envelope.repo.remote_url, &verified.envelope.repo.base_ref)
         .await
@@ -1110,6 +1113,22 @@ where
 
 struct Preflight {
     verified: VerifiedEnvelope,
+}
+
+fn ensure_sender_not_revoked(home: &A2aHome, verified: &VerifiedEnvelope) -> Result<(), AppError> {
+    let claims = &verified.sender_claims;
+    if !RevocationCache::open(home)?.is_revoked(&claims.gateway_id, claims.key_epoch) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "WORK_SENDER_UNKNOWN",
+        ExitCode::Precondition,
+        format!(
+            "work sender {} key epoch {} is revoked by the local root-verified cache",
+            claims.gateway_id, claims.key_epoch
+        ),
+    )
+    .remedy("refuse approval until the fleet root issues the sender a strictly higher key epoch"))
 }
 
 fn verified_for(home: &A2aHome, work_id: &str) -> Result<VerifiedEnvelope, AppError> {

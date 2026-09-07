@@ -1,7 +1,9 @@
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::keys::RootSet;
-use crate::mesh::row_mark::RowMarkStore;
-use crate::mesh::row_sig::{verify_row, RowVerdict, RowVerifyCfg, StoredRowColumns};
+use crate::mesh::row_mark::{RevocationCache, RowMarkStore};
+use crate::mesh::row_sig::{
+    revocation_state, verify_row, RevocationState, RowVerdict, RowVerifyCfg, StoredRowColumns,
+};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
 use nix::fcntl::{Flock, FlockArg};
@@ -15,6 +17,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const REGISTRY_SCHEMA_VERSION: i32 = 1;
@@ -243,8 +246,21 @@ pub trait Registry {
         &self,
         fleet_id: &str,
         gateway_id: &str,
+        revocation: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
+    async fn clear_legacy_revoked_at(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+    ) -> Result<(), AppError> {
+        let _ = (fleet_id, gateway_id);
+        Err(AppError::new(
+            "INTERNAL",
+            ExitCode::Internal,
+            "this registry adapter cannot clear the legacy revocation mirror",
+        ))
+    }
     async fn schema_version(&self) -> Result<i32, AppError>;
     async fn work_insert(&self, row: WorkRow) -> Result<(), AppError>;
     async fn work_claim(
@@ -509,6 +525,7 @@ impl Registry for FileRegistry {
         &self,
         fleet_id: &str,
         gateway_id: &str,
+        revocation: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let mut rows = self.read_rows()?;
@@ -516,7 +533,23 @@ impl Registry for FileRegistry {
             .iter_mut()
             .find(|r| r.fleet_id == fleet_id && r.gateway_id == gateway_id)
         {
+            row.revocation = Some(revocation.to_string());
             row.revoked_at = Some(now);
+        }
+        self.write_rows(&rows)
+    }
+
+    async fn clear_legacy_revoked_at(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+    ) -> Result<(), AppError> {
+        let mut rows = self.read_rows()?;
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|r| r.fleet_id == fleet_id && r.gateway_id == gateway_id)
+        {
+            row.revoked_at = None;
         }
         self.write_rows(&rows)
     }
@@ -737,6 +770,7 @@ pub struct RegistryHandle {
     fleet_id: String,
     marks: RowMarkStore,
     verify_cfg: RowVerifyCfg,
+    revocations: Option<Mutex<RevocationCache>>,
 }
 
 impl RegistryHandle {
@@ -753,15 +787,34 @@ impl RegistryHandle {
         self
     }
 
+    pub fn with_revocation_cache(mut self, cache: RevocationCache) -> Self {
+        self.revocations = Some(Mutex::new(cache));
+        self
+    }
+
     pub async fn discover(&self) -> Result<Vec<(GatewayRow, RowVerdict)>, AppError> {
-        discover_verified(
+        let rows = discover_verified(
             self,
             &self.fleet_id,
             &self.roots,
             &self.marks,
             &self.verify_cfg,
         )
-        .await
+        .await?;
+        if let Some(cache) = &self.revocations {
+            let mut cache = cache.lock().map_err(|_| {
+                AppError::new(
+                    "REVOCATION_INVALID",
+                    ExitCode::Internal,
+                    "revocation cache lock is poisoned",
+                )
+                .remedy("restart the gateway and inspect the local mesh/revocations cache")
+            })?;
+            for (row, _verdict) in &rows {
+                observe_row_revocation(&mut cache, row, &self.roots)?;
+            }
+        }
+        Ok(rows)
     }
 
     pub fn is_file_backend(&self) -> bool {
@@ -818,11 +871,39 @@ impl Registry for RegistryHandle {
         &self,
         fleet_id: &str,
         gateway_id: &str,
+        revocation: &str,
         now: DateTime<Utc>,
     ) -> Result<(), AppError> {
         match &self.backend {
-            RegistryBackend::File(registry) => registry.revoke(fleet_id, gateway_id, now).await,
-            RegistryBackend::Pg(registry) => registry.revoke(fleet_id, gateway_id, now).await,
+            RegistryBackend::File(registry) => {
+                registry
+                    .revoke(fleet_id, gateway_id, revocation, now)
+                    .await
+            }
+            RegistryBackend::Pg(registry) => {
+                registry
+                    .revoke(fleet_id, gateway_id, revocation, now)
+                    .await
+            }
+        }
+    }
+
+    async fn clear_legacy_revoked_at(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
+    ) -> Result<(), AppError> {
+        match &self.backend {
+            RegistryBackend::File(registry) => {
+                registry
+                    .clear_legacy_revoked_at(fleet_id, gateway_id)
+                    .await
+            }
+            RegistryBackend::Pg(registry) => {
+                registry
+                    .clear_legacy_revoked_at(fleet_id, gateway_id)
+                    .await
+            }
         }
     }
 
@@ -959,7 +1040,36 @@ pub fn open_registry(
         fleet_id,
         marks: RowMarkStore::empty(),
         verify_cfg: RowVerifyCfg::new(Utc::now()),
+        revocations: None,
     })
+}
+
+fn observe_row_revocation(
+    cache: &mut RevocationCache,
+    row: &GatewayRow,
+    roots: &RootSet,
+) -> Result<(), AppError> {
+    let stored = StoredRowColumns::from(row);
+    match revocation_state(&stored, roots) {
+        RevocationState::Revoked(record) => cache.observe(&row.gateway_id, &record),
+        RevocationState::Superseded { token_epoch, .. } => {
+            cache.supersede(&row.gateway_id, token_epoch).map(|_| ())
+        }
+        RevocationState::Absent => {
+            if let Some(token_epoch) = verified_row_token_epoch(&stored, roots) {
+                cache.supersede(&row.gateway_id, token_epoch)?;
+            }
+            Ok(())
+        }
+        RevocationState::Invalid | RevocationState::Misplaced(_) => Ok(()),
+    }
+}
+
+fn verified_row_token_epoch(stored: &StoredRowColumns, roots: &RootSet) -> Option<u64> {
+    let (claims, _issuer) =
+        crate::mesh::keys::verify_token_no_clock(stored.row_token.as_deref()?, roots).ok()?;
+    (claims.fleet_id == stored.fleet_id && claims.gateway_id == stored.gateway_id)
+        .then_some(claims.key_epoch)
 }
 
 pub fn reader_roots(home: &A2aHome) -> Result<RootSet, AppError> {
@@ -1203,7 +1313,38 @@ impl Registry for PgRegistry {
         &self,
         fleet_id: &str,
         gateway_id: &str,
+        revocation: &str,
         now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let gateway_id = gateway_id.to_string();
+        let revocation = revocation.to_string();
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            sqlx::query(
+                "UPDATE mesh_gateways SET revocation = $3, revoked_at = $4 \
+                 WHERE fleet_id = $1 AND gateway_id = $2",
+            )
+            .bind(fleet_id)
+            .bind(gateway_id)
+            .bind(revocation)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(registry_gateway_error)?;
+            tx.commit().await.map_err(registry_unreachable)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn clear_legacy_revoked_at(
+        &self,
+        fleet_id: &str,
+        gateway_id: &str,
     ) -> Result<(), AppError> {
         let mut conn = self.acquire().await?;
         let fleet_id = fleet_id.to_string();
@@ -1213,12 +1354,11 @@ impl Registry for PgRegistry {
             let mut tx = conn.begin().await.map_err(registry_unreachable)?;
             set_local_statement_timeout(&mut tx, timeout).await?;
             sqlx::query(
-                "UPDATE mesh_gateways SET revoked_at = $3 \
+                "UPDATE mesh_gateways SET revoked_at = NULL \
                  WHERE fleet_id = $1 AND gateway_id = $2",
             )
             .bind(fleet_id)
             .bind(gateway_id)
-            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(registry_gateway_error)?;

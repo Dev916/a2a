@@ -586,6 +586,9 @@ pub enum MeshFleetCmd {
         pubkey: String,
         #[arg(long, default_value = "-")]
         out: String,
+        /// Authorize a new public key for this stable gateway id and advance its key epoch
+        #[arg(long)]
+        rebind: bool,
     },
     /// Mint root.pub.next and re-sign this machine's gateway token
     #[command(

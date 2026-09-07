@@ -199,11 +199,19 @@ fn fleet_ls_marks_a_cold_reader_as_first_trust() {
 #[test]
 fn fleet_ls_shows_a_revoked_row_flagged_instead_of_hiding_it() {
     let fixture = FleetFixture::new();
+    let revocation = keys::mint_revocation(
+        &fixture.reader,
+        &fixture.msg.gateway_id,
+        fixture.claims.key_epoch,
+        &SystemClock,
+    )
+    .unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime
         .block_on(fixture.registry.revoke(
             &fixture.msg.fleet_id,
             &fixture.msg.gateway_id,
+            &revocation,
             Utc::now(),
         ))
         .unwrap();
@@ -217,6 +225,7 @@ fn fleet_ls_shows_a_revoked_row_flagged_instead_of_hiding_it() {
         .stdout
         .clone();
     let output = String::from_utf8(output).unwrap();
+    assert!(output.starts_with("REVOKED"), "{output}");
     assert!(output.contains(&fixture.msg.gateway_id), "{output}");
     assert!(output.contains("legacy-revoked-at"), "{output}");
 }

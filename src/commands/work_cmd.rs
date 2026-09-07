@@ -13,7 +13,8 @@ use crate::mesh::{
         REGISTRY_SCHEMA_VERSION,
     },
     row_mark::RowMarkStore,
-    row_sig::{Disposition, RowVerdict, RowVerifyCfg},
+    row_sig::{endpoint_conflicts, Disposition, RowVerdict, RowVerifyCfg},
+    render::escape_untrusted,
     work::{sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkEnvelope, WorkRepo},
     work_exec::{self, RealGit, RealSpawner},
     work_store::{self, StoredWork, WORK_CANCELLED_KIND, WORK_OFFER_KIND, WORK_RESULT_KIND},
@@ -685,9 +686,25 @@ async fn addressee_row(
     registry: &RegistryHandle,
     gateway_id: &str,
 ) -> Result<Option<(crate::mesh::registry::GatewayRow, RowVerdict)>, AppError> {
-    Ok(registry
-        .discover()
-        .await?
+    let rows = registry.discover().await?;
+    if let Some(incumbent) = endpoint_conflicts(&rows).get(gateway_id) {
+        let rendered_gateway = escape_untrusted(gateway_id, 128).text;
+        let rendered_incumbent = escape_untrusted(incumbent, 128).text;
+        return Err(AppError::new(
+            "WORK_PEER_ROW_INVALID",
+            ExitCode::Precondition,
+            format!(
+                "gateway {rendered_gateway} has ROW_ENDPOINT_CONFLICT with incumbent {rendered_incumbent} and cannot receive directed work"
+            ),
+        )
+        .remedy("capture both rows for evidence first; keep the incumbent endpoint and investigate the later row")
+        .data(json!({
+            "gateway_id": rendered_gateway,
+            "flag": "ROW_ENDPOINT_CONFLICT",
+            "incumbent_gateway_id": rendered_incumbent,
+        })));
+    }
+    Ok(rows
         .into_iter()
         .find(|(row, _verdict)| row.gateway_id == gateway_id))
 }

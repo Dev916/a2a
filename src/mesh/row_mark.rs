@@ -1,5 +1,5 @@
 use crate::home::{create_dir_0700, A2aHome};
-use crate::mesh::keys::TokenClaims;
+use crate::mesh::keys::{RevocationClaims, TokenClaims};
 use crate::mesh::row_sig::{canonical_row_msg, RowMsg};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
@@ -230,6 +230,169 @@ impl RowMarkStore {
     }
 }
 
+/// Reader-local cache of root-verified revocation tombstones.
+///
+/// `open` is read-only until `observe` is called. Gateway daemon registry reads call `observe`;
+/// CLI and approval paths only consult `is_revoked` so a cold read never creates cache state.
+#[derive(Clone, Debug)]
+pub struct RevocationCache {
+    root: Option<PathBuf>,
+    records: BTreeMap<String, RevocationClaims>,
+}
+
+impl Default for RevocationCache {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl RevocationCache {
+    pub fn open(home: &A2aHome) -> Result<Self, AppError> {
+        let root = home.root().join("mesh").join("revocations");
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    root: Some(root),
+                    records: BTreeMap::new(),
+                });
+            }
+            Err(error) => return Err(io_error("reading revocation cache", &root, error)),
+        };
+        let mut records = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error("reading revocation cache", &root, error))?;
+            if !entry
+                .file_type()
+                .map_err(|error| {
+                    io_error("reading revocation cache metadata", &entry.path(), error)
+                })?
+                .is_file()
+                || entry.path().extension().and_then(|part| part.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let gateway_id = entry
+                .path()
+                .file_stem()
+                .and_then(|part| part.to_str())
+                .ok_or_else(|| invalid_revocation("revocation filename is not valid UTF-8"))?
+                .to_string();
+            validate_gateway_id(&gateway_id)?;
+            let bytes = fs::read(entry.path())
+                .map_err(|error| io_error("reading revocation cache", &entry.path(), error))?;
+            let claims: RevocationClaims = serde_json::from_slice(&bytes).map_err(|error| {
+                invalid_revocation(format!(
+                    "revocation cache for {gateway_id} is not valid JSON: {error}"
+                ))
+            })?;
+            if claims.gateway_id != gateway_id {
+                return Err(invalid_revocation(format!(
+                    "revocation cache filename {gateway_id} does not match record {}",
+                    claims.gateway_id
+                )));
+            }
+            records.insert(gateway_id, claims);
+        }
+        Ok(Self {
+            root: Some(root),
+            records,
+        })
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            root: None,
+            records: BTreeMap::new(),
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        gateway_id: &str,
+        claims: &RevocationClaims,
+    ) -> Result<(), AppError> {
+        validate_gateway_id(gateway_id)?;
+        if claims.gateway_id != gateway_id {
+            return Err(invalid_revocation(format!(
+                "refusing to cache revocation for {} under {gateway_id}",
+                claims.gateway_id
+            )));
+        }
+        let previous = self.records.get(gateway_id).cloned();
+        if previous
+            .as_ref()
+            .is_some_and(|record| record.key_epoch > claims.key_epoch)
+        {
+            return Ok(());
+        }
+        self.records
+            .insert(gateway_id.to_string(), claims.clone());
+        if let Err(error) = self.persist_gateway(gateway_id) {
+            match previous {
+                Some(record) => {
+                    self.records.insert(gateway_id.to_string(), record);
+                }
+                None => {
+                    self.records.remove(gateway_id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn is_revoked(&self, gateway_id: &str, token_epoch: u64) -> bool {
+        self.records
+            .get(gateway_id)
+            .is_some_and(|record| token_epoch <= record.key_epoch)
+    }
+
+    pub(crate) fn supersede(
+        &mut self,
+        gateway_id: &str,
+        token_epoch: u64,
+    ) -> Result<bool, AppError> {
+        validate_gateway_id(gateway_id)?;
+        let Some(record) = self.records.get(gateway_id) else {
+            return Ok(false);
+        };
+        if token_epoch <= record.key_epoch {
+            return Ok(false);
+        }
+        let previous = record.clone();
+        self.records.remove(gateway_id);
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let path = root.join(format!("{gateway_id}.json"));
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                self.records.insert(gateway_id.to_string(), previous);
+                return Err(io_error("clearing superseded revocation", &path, error));
+            }
+        }
+        Ok(true)
+    }
+
+    fn persist_gateway(&self, gateway_id: &str) -> Result<(), AppError> {
+        validate_gateway_id(gateway_id)?;
+        let root = self.root.as_deref().ok_or_else(|| {
+            invalid_revocation("this revocation cache is read-only and has no on-disk home")
+        })?;
+        create_dir_0700(root)
+            .map_err(|error| io_error("creating revocation cache directory", root, error))?;
+        let record = self.records.get(gateway_id).ok_or_else(|| {
+            invalid_revocation("revocation disappeared before it could be written")
+        })?;
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|error| invalid_revocation(format!("serializing revocation: {error}")))?;
+        let path = root.join(format!("{gateway_id}.json"));
+        crate::store::write_atomic(&path, &bytes)
+            .map_err(|error| io_error("writing revocation cache", &path, error))
+    }
+}
+
 fn validate_gateway_id(gateway_id: &str) -> Result<(), AppError> {
     let valid = !gateway_id.is_empty()
         && gateway_id.len() <= 64
@@ -254,6 +417,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn invalid_mark(message: impl Into<String>) -> AppError {
     AppError::new("DATA", ExitCode::Precondition, message)
+}
+
+fn invalid_revocation(message: impl Into<String>) -> AppError {
+    AppError::new("REVOCATION_INVALID", ExitCode::Precondition, message)
+        .remedy("discard the local cache entry and refresh it from a root-verified registry row")
 }
 
 fn io_error(context: &str, path: &Path, error: std::io::Error) -> AppError {

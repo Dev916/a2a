@@ -200,8 +200,8 @@ impl Registry for CountingRegistry {
     async fn discover_unverified(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
         self.inner.discover_unverified(fleet_id).await
     }
-    async fn revoke(&self, fleet_id: &str, gateway_id: &str, now: chrono::DateTime<Utc>) -> Result<(), AppError> {
-        self.inner.revoke(fleet_id, gateway_id, now).await
+    async fn revoke(&self, fleet_id: &str, gateway_id: &str, revocation: &str, now: chrono::DateTime<Utc>) -> Result<(), AppError> {
+        self.inner.revoke(fleet_id, gateway_id, revocation, now).await
     }
     async fn schema_version(&self) -> Result<i32, AppError> {
         self.inner.schema_version().await
@@ -619,7 +619,7 @@ impl Registry for AlwaysErrRegistry {
     async fn upsert_self(&self, _row: GatewayRow) -> Result<(), AppError> { unreachable!() }
     async fn heartbeat(&self, _fleet_id: &str, _gateway_id: &str, _now: chrono::DateTime<Utc>) -> Result<(), AppError> { unreachable!() }
     async fn discover_unverified(&self, _fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> { Err(always_err()) }
-    async fn revoke(&self, _fleet_id: &str, _gateway_id: &str, _now: chrono::DateTime<Utc>) -> Result<(), AppError> { unreachable!() }
+    async fn revoke(&self, _fleet_id: &str, _gateway_id: &str, _revocation: &str, _now: chrono::DateTime<Utc>) -> Result<(), AppError> { unreachable!() }
     async fn schema_version(&self) -> Result<i32, AppError> { Err(always_err()) }
     async fn work_insert(&self, _row: WorkRow) -> Result<(), AppError> { Err(always_err()) }
     async fn work_claim(&self, _fleet_id: &str, _work_id: &str, _claimer_gw: &str) -> Result<ClaimOutcome, AppError> { Err(always_err()) }

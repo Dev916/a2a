@@ -193,6 +193,7 @@ pub mod wire;
 pub mod work;
 pub mod work_exec;
 pub mod work_store;
+pub mod enroll_ledger;
 
 fn default_note_kind() -> String {
     "note".to_string()

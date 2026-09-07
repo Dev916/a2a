@@ -56,7 +56,10 @@ async fn file_registry_implements_lifecycle_and_keeps_revoked_rows_visible() {
         .await
         .unwrap();
     registry.heartbeat("fleet-a", "gw-a", t1).await.unwrap();
-    registry.revoke("fleet-a", "gw-b", t1).await.unwrap();
+    registry
+        .revoke("fleet-a", "gw-b", "test-revocation", t1)
+        .await
+        .unwrap();
 
     let rows = registry.discover_unverified("fleet-a").await.unwrap();
     assert_eq!(rows.len(), 2);
@@ -68,6 +71,7 @@ async fn file_registry_implements_lifecycle_and_keeps_revoked_rows_visible() {
     );
     assert_eq!(rows[1].gateway_id, "gw-b");
     assert_eq!(rows[1].revoked_at, Some(t1));
+    assert_eq!(rows[1].revocation.as_deref(), Some("test-revocation"));
     assert_eq!(
         registry.schema_version().await.unwrap(),
         REGISTRY_SCHEMA_VERSION
@@ -149,10 +153,10 @@ fn upsert_sql_sets_the_signature_columns_and_never_created_at_or_revocation() {
 }
 
 #[test]
-fn only_two_raw_updates_target_mesh_gateways() {
+fn only_three_root_or_heartbeat_updates_target_mesh_gateways() {
     let source = include_str!("../src/mesh/registry.rs");
-    // Spec §2.1's write invariant permits only heartbeat and fleet revoke's legacy mirror.
-    assert_eq!(source.matches("UPDATE mesh_gateways").count(), 2);
+    // Spec §2.1 permits heartbeat, signed revoke + mirror, and rebind's mirror clear.
+    assert_eq!(source.matches("UPDATE mesh_gateways").count(), 3);
 }
 
 #[tokio::test]
@@ -324,7 +328,10 @@ fn fleet_cli_init_ls_and_revoke_are_hermetic_with_file_registry() {
         .args(["mesh", "fleet", "revoke", "gw-a"])
         .assert()
         .success()
-        .stdout(predicate::str::is_empty());
+        .stdout(
+            predicate::str::contains("\"gateway_id\": \"gw-a\"")
+                .and(predicate::str::contains("\"revocation\"")),
+        );
     let rows = rt.block_on(async { reg.discover_unverified(fleet_id).await.unwrap() });
     assert_eq!(rows.len(), 1);
     assert!(rows[0].revoked_at.is_some());

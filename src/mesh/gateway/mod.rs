@@ -3,7 +3,7 @@ use crate::home::A2aHome;
 use crate::mesh::{
     keys::{self, Clock, SystemClock},
     registry::{self, Registry, RegistryHandle},
-    row_mark::RowMarkStore,
+    row_mark::{RevocationCache, RowMarkStore},
     row_sig::RowVerifyCfg,
 };
 use crate::output::{AppError, ExitCode, Outcome};
@@ -210,6 +210,12 @@ pub struct GatewayHealth {
     pub registry_error: Option<String>,
     #[serde(default)]
     pub registry_error_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub token_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub days_remaining: Option<i64>,
+    #[serde(default)]
+    pub token_expiry_warning: Option<String>,
     pub loops: BTreeMap<LoopSlot, LoopHealth>,
     pub replication: replicate::ReplicationHealth,
     #[serde(default)]
@@ -233,6 +239,9 @@ impl GatewayHealth {
             exposure_error_since: None,
             registry_error: None,
             registry_error_since: None,
+            token_expires_at: None,
+            days_remaining: None,
+            token_expiry_warning: None,
             loops: LoopSlot::ALL
                 .into_iter()
                 .map(|slot| (slot, LoopHealth::new(slot)))
@@ -247,6 +256,26 @@ impl GatewayHealth {
     pub fn read(home: &A2aHome) -> Option<Self> {
         let text = std::fs::read_to_string(gateway_root(home).join(GATEWAY_HEALTH)).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    fn load_token_lifecycle(&mut self, home: &A2aHome, now: DateTime<Utc>) {
+        let claims = keys::gateway_token(home)
+            .ok()
+            .and_then(|token| keys::RootSet::load(home).ok().map(|roots| (token, roots)))
+            .and_then(|(token, roots)| keys::verify_token_no_clock(&token, &roots).ok())
+            .map(|(claims, _issuer)| claims);
+        self.token_expires_at = claims.and_then(|claims| DateTime::from_timestamp(claims.exp, 0));
+        self.refresh_token_lifecycle(now);
+    }
+
+    fn refresh_token_lifecycle(&mut self, now: DateTime<Utc>) {
+        self.days_remaining = self
+            .token_expires_at
+            .map(|expires_at| token_days_remaining(expires_at, now));
+        self.token_expiry_warning = self
+            .days_remaining
+            .and_then(token_expiry_warning)
+            .map(str::to_string);
     }
 }
 
@@ -926,24 +955,38 @@ pub fn status(home: &A2aHome, json_mode: bool) -> Result<Outcome, AppError> {
         )
         .remedy("run `a2a mesh gateway run`"));
     }
-    let health = GatewayHealth::read(home).ok_or_else(|| {
+    let mut health = GatewayHealth::read(home).ok_or_else(|| {
         AppError::new(
             "GATEWAY_HEALTH_MISSING",
             ExitCode::BrokerUnavailable,
             "mesh gateway is running but has not written health yet",
         )
     })?;
+    health.load_token_lifecycle(home, Utc::now());
     if json_mode {
         return Ok(Outcome::from(json!({"running": true, "health": health})));
     }
     Ok(Outcome::from(Value::String(format!(
-        "mesh gateway up (pid {}, state {}, health_seq {}, listen_port {}, expose {}, links {})",
+        "mesh gateway up (pid {}, state {}, health_seq {}, listen_port {}, expose {}, links {}, token_expires_at {}, days_remaining {}{})",
         health.pid,
         health.state,
         health.health_seq,
         health.listen_port,
         health.expose,
-        health.links.len()
+        health.links.len(),
+        health
+            .token_expires_at
+            .map(|expires_at| expires_at.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "unknown".to_string()),
+        health
+            .days_remaining
+            .map(|days| days.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        health
+            .token_expiry_warning
+            .as_deref()
+            .map(|warning| format!(", warning {warning}"))
+            .unwrap_or_default(),
     ))))
 }
 
@@ -1069,6 +1112,7 @@ async fn supervise(
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut health = GatewayHealth::initial(&cfg);
+    health.load_token_lifecycle(home, Utc::now());
     health.state = "running".to_string();
     write_health(&root, &mut health).await?;
     log.line(json!({"ts": Utc::now(), "kind": "started", "pid": health.pid}))
@@ -1272,7 +1316,8 @@ fn bootstrap_registry_runtime(
     .with_reader_state(
         RowMarkStore::open(home)?,
         RowVerifyCfg::from_config(Utc::now(), cfg),
-    );
+    )
+    .with_revocation_cache(crate::mesh::row_mark::RevocationCache::open(home)?);
     let exposure = ExposureProvider::from_config(cfg)?;
     Ok(GatewayRegistryRuntime {
         registry,
@@ -1869,6 +1914,7 @@ async fn server_loop(
                         &SystemClock,
                     )
                     .await?;
+                    ensure_peer_not_revoked(&params_home, &peer)?;
                     let params = LinkSessionParams::new(
                         params_home,
                         params_cfg,
@@ -2064,6 +2110,23 @@ async fn dial_and_spawn(
     let roots = keys::RootSet::load(&cfg.home)?;
     let peer =
         crate::mesh::wire::handshake_dialer(&mut side, &identity, &roots, &SystemClock).await?;
+    if peer.gateway_id != row.gateway_id {
+        let error = AppError::new(
+            "TOKEN_MISMATCH",
+            ExitCode::Precondition,
+            format!(
+                "dialed registry row {} but the authenticated gateway identified as {}",
+                row.gateway_id, peer.gateway_id
+            ),
+        )
+        .remedy("capture both identities for evidence and refuse the endpoint until the registry row is repaired");
+        let _ = side.close().await;
+        return Err(error);
+    }
+    if let Err(error) = ensure_peer_not_revoked(&cfg.home, &peer) {
+        let _ = side.close().await;
+        return Err(error);
+    }
     let params = LinkSessionParams::new(
         cfg.home.clone(),
         cfg.config.clone(),
@@ -2076,6 +2139,22 @@ async fn dial_and_spawn(
     .with_observer(cfg.link_observer.clone());
     sessions.spawn(link::run_link_session(side, params));
     Ok(())
+}
+
+fn ensure_peer_not_revoked(home: &A2aHome, peer: &keys::TokenClaims) -> Result<(), AppError> {
+    let cache = RevocationCache::open(home)?;
+    if !cache.is_revoked(&peer.gateway_id, peer.key_epoch) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "GATEWAY_TOKEN_INVALID",
+        ExitCode::Precondition,
+        format!(
+            "gateway {} key epoch {} is revoked by the local root-verified cache",
+            peer.gateway_id, peer.key_epoch
+        ),
+    )
+    .remedy("keep the peer disconnected until the fleet root issues a strictly higher key epoch"))
 }
 
 async fn watcher_loop(
@@ -2284,6 +2363,7 @@ fn loop_exit(exited: Result<(LoopSlot, Result<(), String>), JoinError>) -> (Loop
 async fn write_health(root: &Path, health: &mut GatewayHealth) -> Result<(), AppError> {
     health.health_seq = health.health_seq.saturating_add(1);
     health.written_at = Utc::now();
+    health.refresh_token_lifecycle(health.written_at);
     let bytes = serde_json::to_vec_pretty(health).map_err(|e| {
         AppError::new(
             "GATEWAY_HEALTH",
@@ -2296,6 +2376,25 @@ async fn write_health(root: &Path, health: &mut GatewayHealth) -> Result<(), App
         .await
         .map_err(|e| AppError::new("GATEWAY_HEALTH", ExitCode::Internal, e.to_string()))?
         .map_err(|e| AppError::new("GATEWAY_HEALTH", ExitCode::Internal, e.to_string()))
+}
+
+fn token_days_remaining(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    let seconds = expires_at.timestamp().saturating_sub(now.timestamp());
+    if seconds >= 0 {
+        seconds.saturating_add(86_399) / 86_400
+    } else {
+        seconds.div_euclid(86_400)
+    }
+}
+
+fn token_expiry_warning(days_remaining: i64) -> Option<&'static str> {
+    match days_remaining {
+        i64::MIN..=-1 => Some("TOKEN_EXPIRED"),
+        0..=7 => Some("T-7"),
+        8..=14 => Some("T-14"),
+        15..=30 => Some("T-30"),
+        _ => None,
+    }
 }
 
 fn write_jsonl(root: &Path, value: Value) {

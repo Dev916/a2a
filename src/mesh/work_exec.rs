@@ -679,6 +679,14 @@ where
                 .remedy("approve records remote_url; this item predates the pinned push gate")
         })?;
         let held = held_range_from_state(&state)?;
+        if let Err(err) = work_gate::gate_push(home, cfg, &state.checkout, &held).await {
+            state.result_summary = Some(redact::redact_egress(&format!(
+                "{}: {}",
+                err.code, err.message
+            )));
+            save_state_unlocked(home, &state)?;
+            return Err(err);
+        }
         let io_for_block = io.clone();
         let pushed = tokio::task::spawn_blocking(move || {
             io_for_block.push_result_branch(&checkout, &work_id, &remote_url, &held)

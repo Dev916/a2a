@@ -1,12 +1,17 @@
 use crate::config::Config;
 use crate::home::A2aHome;
+use crate::mesh::registry;
 use crate::mesh::render;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output};
+
+const HOME_DIGEST_MAX_FILE_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResultRange {
@@ -26,6 +31,69 @@ pub struct GateHit {
 pub struct ScanReport {
     pub hits: Vec<GateHit>,
     pub scanned_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HomeDigests {
+    sha256_hex: HashSet<String>,
+}
+
+impl HomeDigests {
+    pub fn load(home: &A2aHome) -> Result<HomeDigests, AppError> {
+        let mut digests = HomeDigests::default();
+        let registry_env = registry::registry_env_path(home);
+        digests.add_regular_file(&registry_env)?;
+
+        let excluded = [home.work_dir(), home.workers_dir(), home.worktrees_dir()];
+        let mut pending = vec![home.root().to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let entries = fs::read_dir(&dir)
+                .map_err(|err| home_digest_io("reading a directory", err))?;
+            for entry in entries {
+                let entry = entry.map_err(|err| home_digest_io("reading a directory entry", err))?;
+                let path = entry.path();
+                if excluded.contains(&path) {
+                    continue;
+                }
+                let file_type = entry
+                    .file_type()
+                    .map_err(|err| home_digest_io("reading an entry type", err))?;
+                if file_type.is_dir() {
+                    pending.push(path);
+                } else if file_type.is_file() {
+                    digests.add_regular_file(&path)?;
+                }
+            }
+        }
+        Ok(digests)
+    }
+
+    pub fn contains(&self, blob_sha256_hex: &str) -> bool {
+        self.sha256_hex.contains(blob_sha256_hex)
+    }
+
+    fn add_regular_file(&mut self, path: &Path) -> Result<(), AppError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(home_digest_io("reading file metadata", err)),
+        };
+        if !metadata.file_type().is_file() || metadata.len() > HOME_DIGEST_MAX_FILE_BYTES {
+            return Ok(());
+        }
+
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        File::open(path)
+            .map_err(|err| home_digest_io("opening a file", err))?
+            .take(HOME_DIGEST_MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| home_digest_io("reading a file", err))?;
+        if bytes.len() as u64 <= HOME_DIGEST_MAX_FILE_BYTES {
+            self.sha256_hex
+                .insert(hex_lower(&Sha256::digest(&bytes)));
+        }
+        Ok(())
+    }
 }
 
 impl ScanReport {
@@ -220,11 +288,12 @@ pub fn assert_head_unmoved(checkout: &Path, held: &ResultRange) -> Result<(), Ap
 
 /// Scan the committed post-image blobs, never a rendered patch, for structural and secret holds.
 pub fn scan_added_blobs(
-    _home: &A2aHome,
-    _cfg: &Config,
+    home: &A2aHome,
+    cfg: &Config,
     checkout: &Path,
     range: &ResultRange,
 ) -> Result<ScanReport, AppError> {
+    let home_digests = HomeDigests::load(home)?;
     let revision_range = format!("{}..{}", range.base_sha, range.head_sha);
     let names = git_pinned(checkout)
         .args([
@@ -282,6 +351,27 @@ pub fn scan_added_blobs(
             ));
         }
         scanned_bytes = scanned_bytes.saturating_add(blob.stdout.len() as u64);
+        if scanned_bytes > cfg.mesh.work.diff_scan_max_bytes {
+            return Err(AppError::new(
+                "WORK_SCAN_OVERSIZE",
+                ExitCode::Precondition,
+                format!(
+                    "result scan exceeded mesh.work.diff_scan_max_bytes={} after reading {path}",
+                    cfg.mesh.work.diff_scan_max_bytes
+                ),
+            )
+            .remedy(
+                "reduce the committed result or raise [mesh.work] diff_scan_max_bytes and rescan",
+            ));
+        }
+        let blob_sha256_hex = hex_lower(&Sha256::digest(&blob.stdout));
+        if home_digests.contains(&blob_sha256_hex) {
+            hits.push(GateHit {
+                path: path.clone(),
+                line: 0,
+                rule: "a2a_home_file",
+            });
+        }
         let body = String::from_utf8(blob.stdout).map_err(|_| {
             AppError::new(
                 "WORK_BINARY_IN_RESULT",
@@ -315,12 +405,88 @@ pub fn scan_added_blobs(
             line: hit.line,
             rule: hit.rule,
         }));
+        for (line_index, line) in body.lines().enumerate() {
+            let Some(name) = env_assignment_name(line) else {
+                continue;
+            };
+            if redact::is_secret_key(name) {
+                hits.push(GateHit {
+                    path: path.clone(),
+                    line: line_index + 1,
+                    rule: "secret_key_name",
+                });
+            }
+        }
     }
 
     Ok(ScanReport {
         hits,
         scanned_bytes,
     })
+}
+
+/// Scan the frozen result in one blocking task and refuse any credential-bearing push.
+pub async fn gate_push(
+    home: &A2aHome,
+    cfg: &Config,
+    checkout: &Path,
+    range: &ResultRange,
+) -> Result<ScanReport, AppError> {
+    let home = home.clone();
+    let cfg = cfg.clone();
+    let checkout = checkout.to_path_buf();
+    let range = range.clone();
+    tokio::task::spawn_blocking(move || {
+        let report = scan_added_blobs(&home, &cfg, &checkout, &range)?;
+        if report.hits.is_empty() {
+            return Ok(report);
+        }
+        Err(AppError::new(
+            "WORK_SECRET_IN_RESULT",
+            ExitCode::Precondition,
+            format!(
+                "result scan found {} credential hit(s) in {}",
+                report.hits.len(),
+                checkout.display()
+            ),
+        )
+        .remedy(format!(
+            "inspect the checkout at {} and review with 'a2a mesh work diff <id> --raw'; --raw output must never be piped into agent context",
+            checkout.display()
+        )))
+    })
+    .await
+    .map_err(|err| {
+        AppError::new(
+            "INTERNAL",
+            ExitCode::Internal,
+            format!("work result scan task failed: {err}"),
+        )
+        .remedy("retry the gateway work loop; inspect the checkout if the scan task fails again")
+    })?
+}
+
+fn env_assignment_name(line: &str) -> Option<&str> {
+    let (name, value) = line.split_once('=')?;
+    if value.is_empty() {
+        return None;
+    }
+    let mut bytes = name.bytes();
+    if !matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_')) {
+        return None;
+    }
+    bytes
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .then_some(name)
+}
+
+fn home_digest_io(operation: &str, err: std::io::Error) -> AppError {
+    AppError::new(
+        "IO",
+        ExitCode::Internal,
+        format!("{operation} while scanning $A2A_HOME for result byte matches: {err}"),
+    )
+    .remedy("repair unreadable files under $A2A_HOME and retry the result scan")
 }
 
 /// Render the frozen review surface with pinned git, masking secrets unless raw was requested.

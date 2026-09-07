@@ -398,7 +398,7 @@ fn diff(home: &A2aHome, cfg: &Config, work_id: &str, raw: bool) -> Result<Value,
     for hit in &report.hits {
         let path = render::escape_untrusted(&hit.path, 4_096);
         output.push_str(&format!(
-            "gate_hit: path={} line={} rule={}\n",
+            "hit: {}:{} ({})\n",
             path.text, hit.line, hit.rule
         ));
     }

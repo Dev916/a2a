@@ -628,6 +628,64 @@ fn push_uses_recorded_sha_and_remote_url_and_ignores_hooks_and_pushurl() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn push_is_refused_when_the_result_carries_a_credential() {
+    let f = fixture("work-loop-secret-gate");
+    let cfg = cfg_for(&f.receiver);
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    let bare = f._tmp.path().join("secret-gate-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    std::fs::write(
+        checkout.join("credentials.txt"),
+        "postgresql://a2a:push-only-secret@db.example.invalid/mesh\n",
+    )
+    .unwrap();
+    run_git(&checkout, &["add", "--", "credentials.txt"]);
+    run_git(&checkout, &["commit", "-m", "credential-bearing result"]);
+
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.phase = WorkPhase::Pushing;
+    state.result_status = Some(WorkStatus::Done);
+    state.result_summary = Some("done".to_string());
+    state.evidence_excerpt = Some("clean".to_string());
+    let held = a2a::mesh::work_gate::freeze_range(
+        &checkout,
+        state.base_sha.as_deref().unwrap(),
+    )
+    .unwrap();
+    state.held_commit_sha = Some(held.head_sha);
+    state.closure_digest = Some(held.closure_digest);
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let report = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &RealWorkCompletionIo,
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(report.item_errors, 1, "{report:?}");
+
+    let pushed = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            &format!("refs/heads/a2a/work/{}", f.work_id),
+        ])
+        .output()
+        .unwrap();
+    assert!(!pushed.status.success(), "result branch must not land");
+    let saved = work_exec::load_state(&f.receiver, &f.work_id)
+        .unwrap()
+        .unwrap();
+    let summary = saved.result_summary.as_deref().unwrap_or_default();
+    assert!(summary.contains("WORK_SECRET_IN_RESULT"), "{saved:?}");
+    assert!(!summary.contains("push-only-secret"), "{saved:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn push_refuses_after_head_moves_past_the_recorded_sha() {
     let f = fixture("work-loop-head-moved");
     let cfg = cfg_for(&f.receiver);

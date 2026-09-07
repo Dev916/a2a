@@ -6,7 +6,7 @@ use a2a::mesh::keys::{
     install_gateway_token, SystemClock,
 };
 use a2a::mesh::registry::{
-    FileRegistry, Registry, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
+    registry_env_path, FileRegistry, Registry, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
 };
 use a2a::mesh::work::{
     sign_envelope, verify_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkRepo,
@@ -253,6 +253,111 @@ fn non_utf8_blob_and_diff_touching_gitattributes_are_holds() {
 }
 
 #[test]
+fn added_paths_and_env_assignment_lines_are_hits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let repo = tmp.path().join("path-and-env");
+    init_repo(&repo);
+    commit_text(&repo, "README.md", "base\n", "base");
+    let base_sha = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+    std::fs::create_dir_all(repo.join("deploy")).unwrap();
+    std::fs::write(repo.join("deploy/prod.env"), "ordinary_setting=true\n").unwrap();
+    std::fs::write(
+        repo.join("database.txt"),
+        "DATABASE_PASSWORD=opaque-192-char-value\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("source.rs"), "let API_KEY = foo;\n").unwrap();
+    run_git(
+        &repo,
+        &["add", "--", "deploy/prod.env", "database.txt", "source.rs"],
+    );
+    run_git(&repo, &["commit", "-m", "add deployment settings"]);
+
+    let range = work_gate::freeze_range(&repo, &base_sha).unwrap();
+    let report = work_gate::scan_added_blobs(&home, &cfg, &repo, &range).unwrap();
+    assert!(report.hits.iter().any(|hit| {
+        hit.path == "deploy/prod.env" && hit.line == 0 && hit.rule == "*.env"
+    }), "{report:?}");
+    assert!(report.hits.iter().any(|hit| {
+        hit.path == "database.txt" && hit.line == 1 && hit.rule == "secret_key_name"
+    }), "{report:?}");
+    assert!(
+        !report
+            .hits
+            .iter()
+            .any(|hit| hit.path == "source.rs" && hit.rule == "secret_key_name"),
+        "source assignments outside the NAME=value anchor must stay clean: {report:?}"
+    );
+}
+
+#[test]
+fn a_blob_byte_identical_to_a_home_file_is_refused_without_any_value_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    let registry_env = registry_env_path(&home);
+    std::fs::create_dir_all(registry_env.parent().unwrap()).unwrap();
+    let home_bytes = b"opaque-not-a-secret-shape\n";
+    std::fs::write(&registry_env, home_bytes).unwrap();
+    let cfg = a2a::config::load(&home).unwrap().0;
+
+    let repo = tmp.path().join("home-copy");
+    init_repo(&repo);
+    commit_text(&repo, "README.md", "base\n", "base");
+    let original_base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("copy.txt"), home_bytes).unwrap();
+    run_git(&repo, &["add", "--", "copy.txt"]);
+    run_git(&repo, &["commit", "-m", "copy home bytes"]);
+
+    let identical_range = work_gate::freeze_range(&repo, &original_base).unwrap();
+    let identical =
+        work_gate::scan_added_blobs(&home, &cfg, &repo, &identical_range).unwrap();
+    assert_eq!(
+        identical.hits,
+        [work_gate::GateHit {
+            path: "copy.txt".to_string(),
+            line: 0,
+            rule: "a2a_home_file",
+        }],
+        "{identical:?}"
+    );
+
+    let identical_head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    commit_text(
+        &repo,
+        "copy.txt",
+        "opaque-not-a-secret-shape!\n",
+        "change one byte",
+    );
+    let differing_range = work_gate::freeze_range(&repo, &identical_head).unwrap();
+    let differing = work_gate::scan_added_blobs(&home, &cfg, &repo, &differing_range).unwrap();
+    assert!(differing.hits.is_empty(), "{differing:?}");
+}
+
+#[test]
+fn scan_over_diff_scan_max_bytes_holds_and_never_reports_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    std::fs::write(
+        home.root().join("config.toml"),
+        "[mesh.work]\ndiff_scan_max_bytes = 64\n",
+    )
+    .unwrap();
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let repo = tmp.path().join("oversize");
+    init_repo(&repo);
+    commit_text(&repo, "README.md", "base\n", "base");
+    let base_sha = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    commit_text(&repo, "large.txt", &"x".repeat(4_096), "large clean result");
+    let range = work_gate::freeze_range(&repo, &base_sha).unwrap();
+
+    let err = work_gate::scan_added_blobs(&home, &cfg, &repo, &range).unwrap_err();
+    assert_eq!(err.code, "WORK_SCAN_OVERSIZE", "{err:?}");
+}
+
+#[test]
 fn diff_body_is_fenced_escaped_and_masked_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("render");
@@ -305,7 +410,24 @@ fn work_diff_cli_prints_summary_patch_and_hit_set_digest() {
     init_repo(&repo);
     commit_text(&repo, "README.md", "base\n", "base");
     let base_sha = git_stdout(&repo, &["rev-parse", "HEAD"]);
-    commit_text(&repo, "result.txt", "reviewed result\n", "reviewed result");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/main.rs"),
+        include_str!("fixtures/scanner/benign_main.rs"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("README.md"),
+        include_str!("fixtures/scanner/benign_readme.md"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("Cargo.lock"),
+        "# This file is automatically generated.\nversion = 3\n\n[[package]]\nname = \"benign\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    run_git(&repo, &["add", "--", "src/main.rs", "README.md", "Cargo.lock"]);
+    run_git(&repo, &["commit", "-m", "benign result"]);
     let state = work_exec::WorkState {
         phase: WorkPhase::Running,
         work_id: work_id.to_string(),
@@ -333,12 +455,18 @@ fn work_diff_cli_prints_summary_patch_and_hit_set_digest() {
         .assert()
         .success()
         .stdout(predicate::str::contains("BEGIN UNTRUSTED"))
-        .stdout(predicate::str::contains("1\\u00090\\u0009result.txt"))
+        .stdout(predicate::str::contains("Cargo.lock"))
         .stdout(predicate::str::contains("hit_set_digest: "));
     let masked_stdout = String::from_utf8(masked.get_output().stdout.clone()).unwrap();
+    assert!(
+        !masked_stdout.lines().any(|line| line.starts_with("hit: ")),
+        "benign result must report zero hits: {masked_stdout}"
+    );
     let masked_digest = hit_set_digest(&masked_stdout);
-    assert_eq!(masked_digest.len(), 64);
-    assert!(masked_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        masked_digest,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
 
     let raw = common::a2a(home.root(), tmp.path())
         .args(["mesh", "work", "diff", work_id, "--raw"])
@@ -349,6 +477,148 @@ fn work_diff_cli_prints_summary_patch_and_hit_set_digest() {
         ));
     let raw_stdout = String::from_utf8(raw.get_output().stdout.clone()).unwrap();
     assert_eq!(hit_set_digest(&raw_stdout), masked_digest);
+}
+
+#[test]
+fn work_diff_cli_names_every_scanner_leg_without_leaking_the_dsn_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    let registry_env = registry_env_path(&home);
+    std::fs::create_dir_all(registry_env.parent().unwrap()).unwrap();
+    let home_bytes = b"opaque-not-a-secret-shape\n";
+    std::fs::write(&registry_env, home_bytes).unwrap();
+
+    let work_id = "work-gate-scanner-cli";
+    let repo = home.work_dir().join(work_id).join("repo");
+    init_repo(&repo);
+    commit_text(&repo, "README.md", "base\n", "base");
+    let base_sha = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("deploy")).unwrap();
+    std::fs::write(
+        repo.join("src/cfg.rs"),
+        "pub fn cfg() {\n    let dsn =\n        \"postgresql://a2a:hunter2@ep-x.neon.tech/mesh?sslmode=require\";\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("gw.token"),
+        r#"{"v":1,"claims_b64":"eyJ4IjoxfQ","sig_b64":"AAAA"}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("root.json"),
+        r#"{"gateway_id":"gw-x","secret_b64":"opaque-root-value"}
+"#,
+    )
+    .unwrap();
+    std::fs::write(repo.join("deploy/prod.env"), "ordinary_setting=true\n").unwrap();
+    std::fs::write(repo.join("aws.txt"), "ASIA0123456789ABCDEF\n").unwrap();
+    std::fs::write(
+        repo.join("database.txt"),
+        "DATABASE_PASSWORD=opaque-database-value\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("registry-copy.txt"), home_bytes).unwrap();
+    run_git(&repo, &["add", "--", "."]);
+    run_git(&repo, &["commit", "-m", "scanner corpus result"]);
+
+    let state = work_exec::WorkState {
+        phase: WorkPhase::Running,
+        work_id: work_id.to_string(),
+        envelope_digest: "digest".to_string(),
+        result_note_id: "result-note".to_string(),
+        milestone_posted: false,
+        worker_id: None,
+        result_ref: None,
+        checkout: repo,
+        push_attempts: 0,
+        next_push_after: None,
+        result_summary: None,
+        evidence_excerpt: None,
+        result_status: None,
+        base_sha: Some(base_sha),
+        held_commit_sha: None,
+        closure_digest: None,
+        base_ref: Some("main".to_string()),
+        remote_url: Some("file:///verified-origin.git".to_string()),
+    };
+    work_exec::save_state(&home, &state).unwrap();
+
+    let assert = common::a2a(home.root(), tmp.path())
+        .args(["mesh", "work", "diff", work_id])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    for expected in [
+        "hit: src/cfg.rs:3 (dsn_credentials)",
+        "hit: gw.token:1 (gw_token_envelope)",
+        "hit: root.json:1 (json_secret_key)",
+        "hit: deploy/prod.env:0 (*.env)",
+        "hit: aws.txt:1 (aws_session_key_id)",
+        "hit: database.txt:1 (secret_key_name)",
+        "hit: registry-copy.txt:0 (a2a_home_file)",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}: {stdout}");
+    }
+    assert_eq!(
+        stdout.lines().filter(|line| line.starts_with("hit: ")).count(),
+        7,
+        "only the seven planted scanner legs should fire: {stdout}"
+    );
+    assert!(stdout.contains("hit_set_digest: "), "{stdout}");
+    assert!(!stdout.contains("hunter2"), "password leaked to stdout: {stdout}");
+    assert!(!stderr.contains("hunter2"), "password leaked to stderr: {stderr}");
+}
+
+#[test]
+fn work_diff_cli_oversize_is_nonzero_and_never_reports_a_clean_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home_at(&tmp.path().join("home"));
+    std::fs::write(
+        home.root().join("config.toml"),
+        "[mesh.work]\ndiff_scan_max_bytes = 64\n",
+    )
+    .unwrap();
+    let work_id = "work-gate-oversize-cli";
+    let repo = home.work_dir().join(work_id).join("repo");
+    init_repo(&repo);
+    commit_text(&repo, "README.md", "base\n", "base");
+    let base_sha = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    commit_text(&repo, "large.txt", &"x".repeat(4_096), "large clean result");
+    let state = work_exec::WorkState {
+        phase: WorkPhase::Running,
+        work_id: work_id.to_string(),
+        envelope_digest: "digest".to_string(),
+        result_note_id: "result-note".to_string(),
+        milestone_posted: false,
+        worker_id: None,
+        result_ref: None,
+        checkout: repo,
+        push_attempts: 0,
+        next_push_after: None,
+        result_summary: None,
+        evidence_excerpt: None,
+        result_status: None,
+        base_sha: Some(base_sha),
+        held_commit_sha: None,
+        closure_digest: None,
+        base_ref: Some("main".to_string()),
+        remote_url: Some("file:///verified-origin.git".to_string()),
+    };
+    work_exec::save_state(&home, &state).unwrap();
+
+    let assert = common::a2a(home.root(), tmp.path())
+        .args(["mesh", "work", "diff", work_id])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("WORK_SCAN_OVERSIZE"), "{stderr}");
+    assert!(!stdout.contains("hit_set_digest:"), "{stdout}");
+    assert!(!stderr.contains("hit_set_digest:"), "{stderr}");
 }
 
 struct MaterializingGit;

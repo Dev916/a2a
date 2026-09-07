@@ -117,6 +117,18 @@ drivers, masks secret-shaped values, and fences all worker-authored output.
 `--raw` is an operator-only escape hatch: its output is unmasked and must never
 be piped into agent context.
 
+Before every push, the result scanner checks added post-image blobs, added or
+renamed filenames, anchored `NAME=value` assignments, and byte-identical copies
+of regular files under `$A2A_HOME`. The scan stops with `WORK_SCAN_OVERSIZE`
+after `[mesh.work] diff_scan_max_bytes` bytes (default 5,242,880); an oversize
+scan is a hold, never a clean result.
+
+The scanner is an accidental-disclosure backstop, not a proof that a result is
+secret-free. It deliberately does not claim coverage for encoded credentials,
+values split so no individual line matches a rule, or entropy-only values with
+no secret-bearing key name. Review the complete fenced diff even when the hit
+set is empty.
+
 ## Errors
 
 | Code | Meaning | Remedy |
@@ -143,3 +155,5 @@ be piped into agent context.
 | `WORK_BINARY_IN_RESULT` | An added or modified result blob/path is not reviewable UTF-8. | Replace binary output with reviewable UTF-8 text and rerun the worker. |
 | `WORK_ATTRS_IN_RESULT` | An added or modified `.gitattributes` names diff or textconv behavior. | Remove the diff/textconv attribute change and resubmit the result. |
 | `WORK_HEAD_MOVED` | Checkout HEAD changed after the result range was frozen. | Review the new range before attempting release again. |
+| `WORK_SECRET_IN_RESULT` | The result scanner found a credential shape, secret-bearing path/key, or byte match to an `$A2A_HOME` file. | Inspect the checkout named in the error and review with `a2a mesh work diff <id> --raw`; `--raw` output must never be piped into agent context. |
+| `WORK_SCAN_OVERSIZE` | Added result blobs exceed `[mesh.work] diff_scan_max_bytes`. | Reduce the committed result or raise the configured scan cap, then rescan before release. |

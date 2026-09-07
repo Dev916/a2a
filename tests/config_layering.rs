@@ -489,15 +489,20 @@ fn mesh_work_defaults_layer_and_name_bad_values() {
         v["data"]["mesh"]["work"]["result_note_max_bytes"],
         65_536
     );
+    assert_eq!(v["data"]["mesh"]["work"]["diff_scan_max_bytes"], 5_242_880);
     assert_eq!(v["data"]["mesh"]["work"]["work_poll_secs"], 15);
     assert_eq!(v["data"]["mesh"]["work"]["claim_stall_secs"], 900);
     assert_eq!(v["data"]["mesh"]["work"]["checkout_retain_days"], 30);
     assert_eq!(v["data"]["origins"]["mesh.work.ttl_days"], "default");
+    assert_eq!(
+        v["data"]["origins"]["mesh.work.diff_scan_max_bytes"],
+        "default"
+    );
 
     std::fs::write(
         tmp.path().join("config.toml"),
         "[mesh.work]\nttl_days = 3\nmax_directed_bytes = 8192\nmax_pool_bytes = 4096\n\
-         result_note_max_bytes = 2048\nwork_poll_secs = 2\nclaim_stall_secs = 4\n\
+         result_note_max_bytes = 2048\ndiff_scan_max_bytes = 1024\nwork_poll_secs = 2\nclaim_stall_secs = 4\n\
          checkout_retain_days = 5\nsurprise = 1\n",
     )
     .unwrap();
@@ -510,7 +515,12 @@ fn mesh_work_defaults_layer_and_name_bad_values() {
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["data"]["mesh"]["work"]["ttl_days"], 3);
     assert_eq!(v["data"]["mesh"]["work"]["max_directed_bytes"], 8192);
+    assert_eq!(v["data"]["mesh"]["work"]["diff_scan_max_bytes"], 1024);
     assert_eq!(v["data"]["origins"]["mesh.work.ttl_days"], "file");
+    assert_eq!(
+        v["data"]["origins"]["mesh.work.diff_scan_max_bytes"],
+        "file"
+    );
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(stderr.contains("mesh.work.surprise"), "{stderr}");
 
@@ -519,12 +529,18 @@ fn mesh_work_defaults_layer_and_name_bad_values() {
         &[
             ("A2A_MESH_WORK_TTL_DAYS", "9"),
             ("A2A_MESH_WORK_MAX_DIRECTED_BYTES", "16384"),
+            ("A2A_MESH_WORK_DIFF_SCAN_MAX_BYTES", "1024"),
         ],
         true,
     );
     assert_eq!(v["data"]["mesh"]["work"]["ttl_days"], 9);
     assert_eq!(v["data"]["mesh"]["work"]["max_directed_bytes"], 16_384);
+    assert_eq!(v["data"]["mesh"]["work"]["diff_scan_max_bytes"], 1024);
     assert_eq!(v["data"]["origins"]["mesh.work.ttl_days"], "env");
+    assert_eq!(
+        v["data"]["origins"]["mesh.work.diff_scan_max_bytes"],
+        "env"
+    );
 
     let out = Command::cargo_bin("a2a")
         .unwrap()

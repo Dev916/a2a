@@ -1,0 +1,9 @@
+# Encoded connection string (base64)
+cG9zdGdyZXNxbDovL2EyYTpvcGFxdWVAZXhhbXBsZS5uZXQvZGI=
+
+# Token split so neither individual line reaches the detector threshold
+xoxb-1234
+567890-abcdef
+
+# Entropy-only hex with no secret-bearing key name
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

@@ -114,6 +114,7 @@ result after the sender has handled it.
 | Code | Meaning | Remedy |
 |---|---|---|
 | `WORK_PEER_ROW_INVALID` | The target gateway row's flag-resolved disposition refuses directed work. | Capture the row for evidence first with `a2a mesh fleet ls --json`; do not ask the peer to restart or republish. |
+| `WORK_SENDER_ROW_INVALID` | The sender's cached row is absent, refused, revoked, or its verified key binding differs from the work envelope. | Capture the sender row with `a2a mesh fleet ls --json`; approve only after its disposition and verified key binding are usable. |
 | `WORK_PEER_TOO_OLD` | Target gateway has no version or records a version below 0.3.0. | Ask the operator to upgrade and restart the gateway; the registry version refreshes on restart. |
 | `WORK_SCHEMA_MISSING` | The registry has not been migrated for work rows. | Run `a2a mesh fleet migrate` on the fleet root machine. |
 | `REGISTRY_SCHEMA_STALE` | The gateway registry is missing columns required by this build. | Run `a2a mesh fleet migrate` on the fleet root machine. |

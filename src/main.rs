@@ -89,6 +89,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshFleetCmd::Revoke { .. } => "mesh fleet revoke",
                 MeshFleetCmd::Enroll { .. } => "mesh fleet enroll",
                 MeshFleetCmd::RotateRoot => "mesh fleet rotate-root",
+                MeshFleetCmd::HardeningStatus { .. } => "mesh fleet hardening-status",
             },
             MeshCmd::Gateway { cmd } => match cmd {
                 MeshGatewayCmd::Run { .. } => "mesh gateway run",
@@ -361,7 +362,12 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 return a2a::commands::mesh_cmd::run_hooks(*print);
             }
             let home = A2aHome::resolve(cli.global.home.as_deref())?;
-            let (cfg, _, _) = a2a::config::load(&home)?;
+            let (cfg, _, warnings) = a2a::config::load(&home)?;
+            if !cli.global.quiet {
+                for warning in warnings {
+                    eprintln!("a2a: warning: {warning}");
+                }
+            }
             a2a::commands::mesh_cmd::run(
                 &home,
                 &cfg,

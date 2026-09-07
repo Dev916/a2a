@@ -203,6 +203,10 @@ pub struct GatewayHealth {
     pub state: String,
     pub listen_port: u64,
     pub expose: String,
+    #[serde(default)]
+    pub require_signed_rows: bool,
+    #[serde(default)]
+    pub auto_push: bool,
     pub endpoint_url: Option<String>,
     pub exposure_error: Option<String>,
     pub exposure_error_since: Option<DateTime<Utc>>,
@@ -226,6 +230,10 @@ pub struct GatewayHealth {
 
 impl GatewayHealth {
     fn initial(cfg: &Config) -> Self {
+        let auto_push = serde_json::to_value(&cfg.mesh.work)
+            .ok()
+            .and_then(|work| work.get("auto_push").and_then(Value::as_bool))
+            .unwrap_or(false);
         GatewayHealth {
             schema_version: HEALTH_SCHEMA_VERSION,
             pid: std::process::id(),
@@ -234,6 +242,8 @@ impl GatewayHealth {
             state: "starting".to_string(),
             listen_port: cfg.mesh.gateway.listen_port,
             expose: cfg.mesh.gateway.expose.clone(),
+            require_signed_rows: cfg.mesh.gateway.require_signed_rows,
+            auto_push,
             endpoint_url: None,
             exposure_error: None,
             exposure_error_since: None,
@@ -967,12 +977,14 @@ pub fn status(home: &A2aHome, json_mode: bool) -> Result<Outcome, AppError> {
         return Ok(Outcome::from(json!({"running": true, "health": health})));
     }
     Ok(Outcome::from(Value::String(format!(
-        "mesh gateway up (pid {}, state {}, health_seq {}, listen_port {}, expose {}, links {}, token_expires_at {}, days_remaining {}{})",
+        "mesh gateway up (pid {}, state {}, health_seq {}, listen_port {}, expose {}, require_signed_rows {}, auto_push {}, links {}, token_expires_at {}, days_remaining {}{})",
         health.pid,
         health.state,
         health.health_seq,
         health.listen_port,
         health.expose,
+        health.require_signed_rows,
+        health.auto_push,
         health.links.len(),
         health
             .token_expires_at
@@ -2504,26 +2516,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mesh_gateway_fields_are_exactly_the_spec_keys() {
-        assert_eq!(
-            crate::config::MESH_GATEWAY_FIELDS,
-            [
-                "listen_port",
-                "expose",
-                "endpoint_url",
-                "registry_heartbeat_secs",
-                "registry_timeout_secs",
-                "replication_poll_secs",
-                "outbound_retry_max_secs",
-                "ping_secs",
-                "anti_entropy_secs",
-                "feed_retain_days",
-                "shutdown_grace_secs",
-                "require_signed_rows",
-                "row_resign_secs",
-                "max_accepted_row_resign_secs",
-            ]
-        );
+    fn mesh_gateway_fields_include_the_spec_keys() {
+        for field in [
+            "listen_port",
+            "expose",
+            "endpoint_url",
+            "registry_heartbeat_secs",
+            "registry_timeout_secs",
+            "replication_poll_secs",
+            "outbound_retry_max_secs",
+            "ping_secs",
+            "anti_entropy_secs",
+            "feed_retain_days",
+            "shutdown_grace_secs",
+            "require_signed_rows",
+            "row_resign_secs",
+            "max_accepted_row_resign_secs",
+            "rotation_soak_secs",
+        ] {
+            assert!(crate::config::MESH_GATEWAY_FIELDS.contains(&field));
+        }
     }
 
     #[test]

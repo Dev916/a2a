@@ -7,8 +7,13 @@ use crate::mesh::registry::{
     ClaimOutcome, Registry, TransitionOutcome, WorkOwner, WorkPatch, WorkRow, WorkStatus,
 };
 use crate::mesh::row_mark::RevocationCache;
+use crate::mesh::row_sig::{Disposition, RowVerdict};
 use crate::mesh::work::{canonical_envelope_without_sig, verify_envelope, VerifiedEnvelope};
-use crate::mesh::{feed, gateway::notes_wire, Note, PeerId, Provider};
+use crate::mesh::{
+    feed,
+    gateway::{notes_wire, presence_wire},
+    Note, PeerId, Provider,
+};
 use crate::mesh::work_store;
 use crate::output::{AppError, ExitCode};
 use crate::redact;
@@ -100,6 +105,166 @@ pub enum ApproveStopAfter {
     Claimed,
     Cloned,
     Spawned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorroborationStage {
+    Ingest,
+    Approve,
+}
+
+pub fn corroborate_sender(
+    home: &A2aHome,
+    verified: &VerifiedEnvelope,
+    stage: CorroborationStage,
+    require_signed_rows: bool,
+) -> Result<Option<String>, AppError> {
+    let claims = &verified.sender_claims;
+    if RevocationCache::open(home)?.is_revoked(&claims.gateway_id, claims.key_epoch) {
+        return Err(sender_row_invalid(
+            claims.gateway_id.clone(),
+            "REVOKED",
+            format!(
+                "work sender {} key epoch {} is revoked by the local root-verified cache",
+                claims.gateway_id, claims.key_epoch
+            ),
+        ));
+    }
+
+    let cache_available = presence_wire::registry_cache_available(home);
+    let cached = match presence_wire::cached_gateway(home, &claims.gateway_id) {
+        Ok(cached) => cached,
+        Err(error) => {
+            let detail = format!(
+                "sender {} registry cache is unavailable: {}: {}",
+                claims.gateway_id, error.code, error.message
+            );
+            return degrade_at_ingest_or_refuse(
+                stage,
+                claims.gateway_id.clone(),
+                "CACHE_UNAVAILABLE",
+                detail,
+            );
+        }
+    };
+    let Some(cached) = cached else {
+        let detail = if cache_available {
+            format!(
+                "sender {} row is absent from the registry cache",
+                claims.gateway_id
+            )
+        } else {
+            format!(
+                "sender {} registry cache is unavailable; its row cannot be corroborated",
+                claims.gateway_id
+            )
+        };
+        return degrade_at_ingest_or_refuse(
+            stage,
+            claims.gateway_id.clone(),
+            if cache_available {
+                "ROW_ABSENT"
+            } else {
+                "CACHE_UNAVAILABLE"
+            },
+            detail,
+        );
+    };
+    let verdict_label = cached.verdict.as_deref().unwrap_or("UNKNOWN");
+    let Some(verdict) = row_verdict_from_label(verdict_label) else {
+        return degrade_at_ingest_or_refuse(
+            stage,
+            claims.gateway_id.clone(),
+            verdict_label,
+            format!(
+                "sender {} registry row has unknown cached verdict {verdict_label}",
+                claims.gateway_id
+            ),
+        );
+    };
+
+    match verdict.disposition(require_signed_rows) {
+        Disposition::Refused => degrade_at_ingest_or_refuse(
+            stage,
+            claims.gateway_id.clone(),
+            verdict_label,
+            format!(
+                "sender {} registry row verdict {verdict_label} is refused under require_signed_rows={require_signed_rows}",
+                claims.gateway_id
+            ),
+        ),
+        Disposition::UsableWarn => Ok(Some(format!(
+            "sender {} registry row is {verdict_label} and only usable with a warning; verified row_msg.pubkey_fpr check was skipped",
+            claims.gateway_id
+        ))),
+        Disposition::Usable => {
+            let envelope_fpr = keys::fpr_of_pubkey_b64(&verified.envelope.sender.pubkey_b64)
+                .map_err(|error| {
+                    sender_row_invalid(
+                        claims.gateway_id.clone(),
+                        verdict_label,
+                        format!(
+                            "sender {} envelope public key fingerprint cannot be computed: {}",
+                            claims.gateway_id, error.message
+                        ),
+                    )
+                })?;
+            if cached.pubkey_fpr.as_deref() != Some(envelope_fpr.as_str()) {
+                return Err(sender_row_invalid(
+                    claims.gateway_id.clone(),
+                    verdict_label,
+                    format!(
+                        "sender {} verified row_msg.pubkey_fpr {:?} does not match envelope key {envelope_fpr}",
+                        claims.gateway_id, cached.pubkey_fpr
+                    ),
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn degrade_at_ingest_or_refuse(
+    stage: CorroborationStage,
+    gateway_id: String,
+    verdict: &str,
+    detail: String,
+) -> Result<Option<String>, AppError> {
+    match stage {
+        CorroborationStage::Ingest => Ok(Some(format!("{detail}; proceeding at ingest"))),
+        CorroborationStage::Approve => Err(sender_row_invalid(gateway_id, verdict, detail)),
+    }
+}
+
+fn sender_row_invalid(gateway_id: String, verdict: &str, detail: String) -> AppError {
+    AppError::new(
+        "WORK_SENDER_ROW_INVALID",
+        ExitCode::Precondition,
+        detail,
+    )
+    .remedy(
+        "capture the sender row with `a2a mesh fleet ls --json`; approve only after its flag-resolved disposition and verified key binding are usable",
+    )
+    .data(json!({"gateway_id": gateway_id, "verdict": verdict}))
+}
+
+fn row_verdict_from_label(label: &str) -> Option<RowVerdict> {
+    match label {
+        "valid-signed" => Some(RowVerdict::ValidSigned),
+        "UNSIGNED" => Some(RowVerdict::Unsigned { stripped: false }),
+        "UNSIGNED (stripped)" => Some(RowVerdict::Unsigned { stripped: true }),
+        "UNSIGNED-STALE" => Some(RowVerdict::UnsignedStale),
+        "UNVERIFIED" => Some(RowVerdict::Unverified),
+        "BAD_SIG" => Some(RowVerdict::BadSig),
+        "ROW_SIG_INCOMPLETE" => Some(RowVerdict::RowSigIncomplete),
+        "ROW_SIG_UNKNOWN_VERSION" => Some(RowVerdict::RowSigUnknownVersion),
+        "ROW_KEY_SUPERSEDED" => Some(RowVerdict::RowKeySuperseded),
+        "ROW_REPLAYED" => Some(RowVerdict::RowReplayed),
+        "ROW_CLOCK_AHEAD" => Some(RowVerdict::RowClockAhead),
+        "REVOKED" => Some(RowVerdict::Revoked),
+        "ROW_REVOCATION_MISPLACED" => Some(RowVerdict::RowRevocationMisplaced),
+        _ => None,
+    }
 }
 
 #[allow(async_fn_in_trait)]
@@ -248,7 +413,8 @@ where
     G: GitAdapter + ?Sized,
     S: WorkSpawner + ?Sized,
 {
-    let preflight = preflight(home, git, spawner, work_id).await?;
+    let require_signed_rows = crate::config::load(home)?.0.mesh.gateway.require_signed_rows;
+    let preflight = preflight(home, git, spawner, work_id, require_signed_rows).await?;
     Ok(json!({
         "work_id": work_id,
         "sender_gateway": preflight.verified.envelope.sender.gateway_id,
@@ -295,12 +461,18 @@ where
     G: GitAdapter + ?Sized,
     S: WorkSpawner + ?Sized,
 {
-    ensure_sender_not_revoked(home, &verified_for(home, work_id)?)?;
+    let require_signed_rows = crate::config::load(home)?.0.mesh.gateway.require_signed_rows;
     let _lock = lock_state(home, work_id)?;
     let loaded = load_state_unlocked(home, work_id)?;
     let preflight = if loaded.is_none() {
-        Some(preflight(home, git, spawner, work_id).await?)
+        Some(preflight(home, git, spawner, work_id, require_signed_rows).await?)
     } else {
+        warn_corroboration(corroborate_sender(
+            home,
+            &verified_for(home, work_id)?,
+            CorroborationStage::Approve,
+            require_signed_rows,
+        )?);
         None
     };
     let mut state = match loaded {
@@ -1088,13 +1260,19 @@ async fn preflight<G, S>(
     git: &G,
     spawner: &S,
     work_id: &str,
+    require_signed_rows: bool,
 ) -> Result<Preflight, AppError>
 where
     G: GitAdapter + ?Sized,
     S: WorkSpawner + ?Sized,
 {
     let verified = verified_for(home, work_id)?;
-    ensure_sender_not_revoked(home, &verified)?;
+    warn_corroboration(corroborate_sender(
+        home,
+        &verified,
+        CorroborationStage::Approve,
+        require_signed_rows,
+    )?);
     let checkout = item_dir(home, work_id).join("repo");
     git.ls_remote(&verified.envelope.repo.remote_url, &verified.envelope.repo.base_ref)
         .await
@@ -1115,20 +1293,10 @@ struct Preflight {
     verified: VerifiedEnvelope,
 }
 
-fn ensure_sender_not_revoked(home: &A2aHome, verified: &VerifiedEnvelope) -> Result<(), AppError> {
-    let claims = &verified.sender_claims;
-    if !RevocationCache::open(home)?.is_revoked(&claims.gateway_id, claims.key_epoch) {
-        return Ok(());
+fn warn_corroboration(warning: Option<String>) {
+    if let Some(warning) = warning {
+        eprintln!("a2a: warning: {warning}");
     }
-    Err(AppError::new(
-        "WORK_SENDER_UNKNOWN",
-        ExitCode::Precondition,
-        format!(
-            "work sender {} key epoch {} is revoked by the local root-verified cache",
-            claims.gateway_id, claims.key_epoch
-        ),
-    )
-    .remedy("refuse approval until the fleet root issues the sender a strictly higher key epoch"))
 }
 
 fn verified_for(home: &A2aHome, work_id: &str) -> Result<VerifiedEnvelope, AppError> {

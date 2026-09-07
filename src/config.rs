@@ -69,6 +69,7 @@ pub const DEFAULT_MESH_GATEWAY_REGISTRY_HEARTBEAT_SECS: u64 = 180;
 pub const DEFAULT_MESH_GATEWAY_REQUIRE_SIGNED_ROWS: bool = false;
 pub const DEFAULT_MESH_GATEWAY_ROW_RESIGN_SECS: u64 = 86_400;
 pub const DEFAULT_MESH_GATEWAY_MAX_ACCEPTED_ROW_RESIGN_SECS: u64 = 604_800;
+pub const DEFAULT_MESH_GATEWAY_ROTATION_SOAK_SECS: u64 = 3_600;
 pub const DEFAULT_MESH_GATEWAY_REGISTRY_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_MESH_GATEWAY_REPLICATION_POLL_SECS: u64 = 5;
 pub const DEFAULT_MESH_GATEWAY_OUTBOUND_RETRY_MAX_SECS: u64 = 1920;
@@ -197,7 +198,7 @@ pub const MESH_WORK_FIELDS: [&str; 7] = [
 ];
 
 /// Every `[mesh.gateway]` key, in the order `config show --origin` reports them.
-pub const MESH_GATEWAY_FIELDS: [&str; 14] = [
+pub const MESH_GATEWAY_FIELDS: [&str; 15] = [
     "listen_port",
     "expose",
     "endpoint_url",
@@ -212,6 +213,7 @@ pub const MESH_GATEWAY_FIELDS: [&str; 14] = [
     "require_signed_rows",
     "row_resign_secs",
     "max_accepted_row_resign_secs",
+    "rotation_soak_secs",
 ];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
@@ -518,6 +520,7 @@ pub struct MeshGatewayConfig {
     pub require_signed_rows: bool,
     pub row_resign_secs: u64,
     pub max_accepted_row_resign_secs: u64,
+    pub rotation_soak_secs: u64,
 }
 
 impl Default for MeshGatewayConfig {
@@ -538,6 +541,7 @@ impl Default for MeshGatewayConfig {
             row_resign_secs: DEFAULT_MESH_GATEWAY_ROW_RESIGN_SECS,
             max_accepted_row_resign_secs:
                 DEFAULT_MESH_GATEWAY_MAX_ACCEPTED_ROW_RESIGN_SECS,
+            rotation_soak_secs: DEFAULT_MESH_GATEWAY_ROTATION_SOAK_SECS,
         }
     }
 }
@@ -1364,6 +1368,7 @@ fn apply_mesh_gateway_toml(
         "max_accepted_row_resign_secs" => {
             gw.max_accepted_row_resign_secs = want_u64(dotted, v)?
         }
+        "rotation_soak_secs" => gw.rotation_soak_secs = want_u64(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -1725,6 +1730,7 @@ fn apply_mesh_gateway_str(
         "max_accepted_row_resign_secs" => {
             gw.max_accepted_row_resign_secs = parse_u64_str(key, s)?
         }
+        "rotation_soak_secs" => gw.rotation_soak_secs = parse_u64_str(key, s)?,
         _ => unreachable!("field membership fixed by MESH_GATEWAY_FIELDS"),
     }
     Ok(())

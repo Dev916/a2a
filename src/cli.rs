@@ -595,6 +595,12 @@ pub enum MeshFleetCmd {
         after_help = "After distributing root.pub.next and observing the fleet on the next root, manually remove root.pub.next or promote roots on each machine as appropriate for the rotation."
     )]
     RotateRoot,
+    /// Report fleet-wide enforcement state from verified rows only
+    HardeningStatus {
+        /// Emit the fleet enforcement report as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

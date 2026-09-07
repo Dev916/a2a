@@ -29,14 +29,16 @@ struct RegistryCache {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct CachedGateway {
+pub(crate) struct CachedGateway {
     last_heartbeat: DateTime<Utc>,
     #[serde(default)]
     revoked_at: Option<DateTime<Utc>>,
     #[serde(default)]
     invalid_since: Option<DateTime<Utc>>,
     #[serde(default)]
-    verdict: Option<String>,
+    pub(crate) verdict: Option<String>,
+    #[serde(default)]
+    pub(crate) pubkey_fpr: Option<String>,
     #[serde(default)]
     missing_since: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -155,6 +157,14 @@ pub fn refresh_registry_cache(
         seen.insert(row.gateway_id.clone());
         let previous = cache.gateways.get(&row.gateway_id);
         let verdict_label = verdict.label();
+        let pubkey_fpr = if matches!(verdict, RowVerdict::ValidSigned) {
+            row.row_msg
+                .as_deref()
+                .and_then(|row_msg| crate::mesh::row_sig::parse_row_msg_strict(row_msg).ok())
+                .map(|row_msg| row_msg.pubkey_fpr)
+        } else {
+            None
+        };
         let invalid_since = if matches!(verdict, RowVerdict::ValidSigned) {
             None
         } else {
@@ -178,6 +188,7 @@ pub fn refresh_registry_cache(
                 revoked_at: row.revoked_at,
                 invalid_since,
                 verdict: Some(verdict_label.to_string()),
+                pubkey_fpr,
                 missing_since: None,
                 retired_at: previous.and_then(|cached| cached.retired_at),
             },
@@ -189,6 +200,17 @@ pub fn refresh_registry_cache(
         }
     }
     save_registry_cache(home, &cache)
+}
+
+pub(crate) fn cached_gateway(
+    home: &A2aHome,
+    gateway_id: &str,
+) -> Result<Option<CachedGateway>, AppError> {
+    Ok(load_registry_cache(home)?.gateways.get(gateway_id).cloned())
+}
+
+pub(crate) fn registry_cache_available(home: &A2aHome) -> bool {
+    registry_cache_path(home).is_file()
 }
 
 pub fn home_gateway_registry_retired(

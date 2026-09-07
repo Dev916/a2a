@@ -20,6 +20,7 @@ use crate::mesh::{
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -210,7 +211,7 @@ pub fn run(
         }
         MeshCmd::Hooks { print } => run_hooks(*print),
         MeshCmd::Links => crate::mesh::gateway::links(home, json_mode, quiet),
-        MeshCmd::Fleet { cmd } => run_fleet(home, cmd, json_mode),
+        MeshCmd::Fleet { cmd } => run_fleet(home, cfg, cmd, json_mode),
         MeshCmd::Gateway { cmd } => run_gateway(home, cfg, home_arg, cmd, json_mode, quiet),
         MeshCmd::Work { cmd } => crate::commands::work_cmd::run(home, cfg, cmd, quiet),
     }
@@ -491,7 +492,12 @@ fn short_peer(peer: &str) -> String {
     format!("{}:{}", provider, uuid.chars().take(8).collect::<String>())
 }
 
-fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outcome, AppError> {
+fn run_fleet(
+    home: &A2aHome,
+    cfg: &Config,
+    cmd: &MeshFleetCmd,
+    json_mode: bool,
+) -> Result<Outcome, AppError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -504,7 +510,17 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
         })?;
     match cmd {
         MeshFleetCmd::Init { registry } => {
+            let fleet_dir = home.root().join("mesh").join("fleet");
+            let new_fleet = !fleet_dir.join("root.key").exists()
+                && !fleet_dir.join("root.pub").exists();
             let fleet = crate::mesh::keys::fleet_init(home)?;
+            if new_fleet {
+                crate::commands::config_roots::set_mesh_gateway_bool(
+                    home,
+                    "require_signed_rows",
+                    true,
+                )?;
+            }
             let root_fingerprint = crate::mesh::keys::fleet_root_fingerprint(home)?;
             if let Some(registry) = registry {
                 let url = registry_input(registry)?;
@@ -523,8 +539,7 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
             let url = read_registry_env(home)?;
             let now = Utc::now();
             let marks = RowMarkStore::open(home)?;
-            let (cfg, _origins, _warnings) = crate::config::load(home)?;
-            let verify_cfg = RowVerifyCfg::from_config(now, &cfg);
+            let verify_cfg = RowVerifyCfg::from_config(now, cfg);
             let rows = rt.block_on(async {
                 let registry = open_registry(
                     &url,
@@ -715,6 +730,106 @@ fn run_fleet(home: &A2aHome, cmd: &MeshFleetCmd, json_mode: bool) -> Result<Outc
                 "gateway_token_rotated": rotation.gateway_token_rotated
             })))
         }
+        MeshFleetCmd::HardeningStatus { json } => {
+            let url = read_registry_env(home)?;
+            let now = Utc::now();
+            let rows = rt.block_on(async {
+                open_registry(
+                    &url,
+                    reader_roots(home)?,
+                    crate::mesh::keys::fleet_id(home)?,
+                )?
+                .with_reader_state(
+                    RowMarkStore::open(home)?,
+                    RowVerifyCfg::from_config(now, cfg),
+                )
+                .discover()
+                .await
+            })?;
+            let status = hardening_status(&rows);
+            if json_mode || *json {
+                return Ok(Outcome::from(
+                    serde_json::to_value(status).map_err(|error| {
+                        AppError::new("SERIALIZE", ExitCode::Internal, error.to_string())
+                    })?,
+                ));
+            }
+            Ok(Outcome::from(Value::String(format!(
+                "require_signed_rows enforcing={} not_enforcing={} unknown={}\nauto_push enforcing={} not_enforcing={} unknown={}",
+                status.require_signed_rows.enforcing,
+                status.require_signed_rows.not_enforcing,
+                status.require_signed_rows.unknown,
+                status.auto_push.enforcing,
+                status.auto_push.not_enforcing,
+                status.auto_push.unknown,
+            ))))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct EnforcementCounts {
+    enforcing: usize,
+    not_enforcing: usize,
+    unknown: usize,
+}
+
+impl EnforcementCounts {
+    fn observe(&mut self, value: Option<bool>) {
+        match value {
+            Some(true) => self.enforcing += 1,
+            Some(false) => self.not_enforcing += 1,
+            None => self.unknown += 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HardeningRow {
+    gateway_id: String,
+    verdict: String,
+    enforce_require_signed_rows: Option<bool>,
+    enforce_auto_push: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HardeningStatus {
+    require_signed_rows: EnforcementCounts,
+    auto_push: EnforcementCounts,
+    rows: Vec<HardeningRow>,
+}
+
+fn hardening_status(rows: &[(GatewayRow, RowVerdict)]) -> HardeningStatus {
+    let mut require_signed_rows = EnforcementCounts::default();
+    let mut auto_push = EnforcementCounts::default();
+    let mut status_rows = Vec::with_capacity(rows.len());
+    for (row, verdict) in rows {
+        let verified_msg = if matches!(verdict, RowVerdict::ValidSigned) {
+            row.row_msg
+                .as_deref()
+                .and_then(|row_msg| crate::mesh::row_sig::parse_row_msg_strict(row_msg).ok())
+        } else {
+            None
+        };
+        let enforce_require_signed_rows = verified_msg
+            .as_ref()
+            .map(|row_msg| row_msg.enforce_require_signed_rows);
+        let enforce_auto_push = verified_msg
+            .as_ref()
+            .map(|row_msg| row_msg.enforce_auto_push);
+        require_signed_rows.observe(enforce_require_signed_rows);
+        auto_push.observe(enforce_auto_push);
+        status_rows.push(HardeningRow {
+            gateway_id: row.gateway_id.clone(),
+            verdict: verdict.label().to_string(),
+            enforce_require_signed_rows,
+            enforce_auto_push,
+        });
+    }
+    HardeningStatus {
+        require_signed_rows,
+        auto_push,
+        rows: status_rows,
     }
 }
 

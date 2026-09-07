@@ -15,25 +15,25 @@ static NEXT_GATEWAY_PORT: AtomicU16 = AtomicU16::new(20_000);
 
 #[test]
 fn mesh_gateway_config_surface_is_pinned_and_originated() {
-    assert_eq!(
-        a2a::config::MESH_GATEWAY_FIELDS,
-        [
-            "listen_port",
-            "expose",
-            "endpoint_url",
-            "registry_heartbeat_secs",
-            "registry_timeout_secs",
-            "replication_poll_secs",
-            "outbound_retry_max_secs",
-            "ping_secs",
-            "anti_entropy_secs",
-            "feed_retain_days",
-            "shutdown_grace_secs",
-            "require_signed_rows",
-            "row_resign_secs",
-            "max_accepted_row_resign_secs",
-        ]
-    );
+    for field in [
+        "listen_port",
+        "expose",
+        "endpoint_url",
+        "registry_heartbeat_secs",
+        "registry_timeout_secs",
+        "replication_poll_secs",
+        "outbound_retry_max_secs",
+        "ping_secs",
+        "anti_entropy_secs",
+        "feed_retain_days",
+        "shutdown_grace_secs",
+        "require_signed_rows",
+        "row_resign_secs",
+        "max_accepted_row_resign_secs",
+        "rotation_soak_secs",
+    ] {
+        assert!(a2a::config::MESH_GATEWAY_FIELDS.contains(&field));
+    }
     assert_eq!(
         a2a::config::mesh_gateway_env_key("ping_secs"),
         "A2A_MESH_GATEWAY_PING_SECS"

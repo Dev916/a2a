@@ -4,14 +4,17 @@ use a2a::config::Config;
 use a2a::home::A2aHome;
 use a2a::mesh::feed;
 use a2a::mesh::gateway::link::{push_spooled_notes, push_watcher_deltas};
+use a2a::mesh::gateway::presence_wire;
 use a2a::mesh::keys::fleet_id;
-use a2a::mesh::registry::{Registry, WorkRow, WorkStatus};
+use a2a::mesh::registry::{GatewayRow, Registry, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::row_sig::RowVerdict;
 use a2a::mesh::work_exec::{
     self, ApproveOutcome, RealGit, WorkCompletion, WorkCompletionIo, WorkLoopOptions, WorkSpawner,
 };
 use a2a::mesh::{work_store, PeerId};
 use a2a::output::AppError;
 use assert_cmd::assert::Assert;
+use chrono::Utc;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -130,6 +133,36 @@ fn assert_bare_has_result_ref(remote_bare: &Path, work_id: &str) {
     );
 }
 
+fn cache_usable_sender(home: &A2aHome, gateway_id: &str) {
+    let now = Utc::now();
+    presence_wire::refresh_registry_cache(
+        home,
+        &[(
+            GatewayRow {
+                fleet_id: fleet_id(home).unwrap(),
+                gateway_id: gateway_id.to_string(),
+                owner: "legacy-sender".to_string(),
+                endpoint_url: None,
+                pubkey_fpr: "unverified".to_string(),
+                cert_fpr: None,
+                version: "0.3.0".to_string(),
+                created_at: now,
+                last_heartbeat: now,
+                revoked_at: None,
+                schema_version: REGISTRY_SCHEMA_VERSION,
+                row_msg: None,
+                row_token: None,
+                row_sig: None,
+                signed_at: None,
+                revocation: None,
+            },
+            RowVerdict::Unsigned { stripped: false },
+        )],
+        now,
+    )
+    .unwrap();
+}
+
 struct FakeSpawner;
 
 impl WorkSpawner for FakeSpawner {
@@ -168,6 +201,7 @@ impl WorkCompletionIo for TerminalGitIo {
 #[tokio::test(flavor = "multi_thread")]
 async fn directed_work_round_trips_result_and_ack() {
     let f = common::mesh_work_fixture("directed-work-e2e").await;
+    cache_usable_sender(&f.home_b, &f.gateway_a);
     let cfg_a = cfg_for(&f.home_a);
     let cfg_b = cfg_for(&f.home_b);
     let link = common::start_mesh_link(
@@ -264,6 +298,8 @@ async fn directed_work_round_trips_result_and_ack() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pool_work_claim_race_has_one_winner_and_loser_sees_claimant() {
     let f = common::mesh_work_fixture("pool-work-e2e").await;
+    cache_usable_sender(&f.home_a, &f.gateway_a);
+    cache_usable_sender(&f.home_b, &f.gateway_a);
     let cfg_a = cfg_for(&f.home_a);
     let cfg_b = cfg_for(&f.home_b);
     let link = common::start_mesh_link(

@@ -475,6 +475,139 @@ fn mesh_defaults_layer_and_name_bad_values() {
     );
 }
 
+#[test]
+fn mesh_gateway_hardening_keys_layer_and_warn_on_unknown_siblings() {
+    use a2a::config::MESH_GATEWAY_FIELDS;
+
+    for field in [
+        "require_signed_rows",
+        "row_resign_secs",
+        "max_accepted_row_resign_secs",
+        "rotation_soak_secs",
+    ] {
+        assert!(
+            MESH_GATEWAY_FIELDS.contains(&field),
+            "mesh.gateway.{field} must be reported by config show --origin"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["mesh"]["gateway"]["require_signed_rows"], false);
+    assert_eq!(v["data"]["mesh"]["gateway"]["row_resign_secs"], 86_400);
+    assert_eq!(
+        v["data"]["mesh"]["gateway"]["max_accepted_row_resign_secs"],
+        604_800
+    );
+    assert_eq!(v["data"]["mesh"]["gateway"]["rotation_soak_secs"], 3_600);
+    assert_eq!(
+        v["data"]["origins"]["mesh.gateway.require_signed_rows"],
+        "default"
+    );
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[mesh.gateway]\nrequire_signed_rows = true\nrow_resign_secs = 7200\nmax_accepted_row_resign_secs = 14400\nrotation_soak_secs = 900\nsurprise = 1\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "config", "show", "--origin"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["mesh"]["gateway"]["require_signed_rows"], true);
+    assert_eq!(v["data"]["mesh"]["gateway"]["row_resign_secs"], 7_200);
+    assert_eq!(
+        v["data"]["mesh"]["gateway"]["max_accepted_row_resign_secs"],
+        14_400
+    );
+    assert_eq!(v["data"]["mesh"]["gateway"]["rotation_soak_secs"], 900);
+    for field in [
+        "require_signed_rows",
+        "row_resign_secs",
+        "max_accepted_row_resign_secs",
+        "rotation_soak_secs",
+    ] {
+        assert_eq!(
+            v["data"]["origins"][format!("mesh.gateway.{field}")],
+            "file",
+            "{field}"
+        );
+    }
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("mesh.gateway.surprise"), "{stderr}");
+
+    let v = show(
+        tmp.path(),
+        &[
+            ("A2A_MESH_GATEWAY_REQUIRE_SIGNED_ROWS", "true"),
+            ("A2A_MESH_GATEWAY_ROW_RESIGN_SECS", "1800"),
+            (
+                "A2A_MESH_GATEWAY_MAX_ACCEPTED_ROW_RESIGN_SECS",
+                "3600",
+            ),
+            ("A2A_MESH_GATEWAY_ROTATION_SOAK_SECS", "60"),
+        ],
+        true,
+    );
+    assert_eq!(v["data"]["mesh"]["gateway"]["require_signed_rows"], true);
+    assert_eq!(v["data"]["mesh"]["gateway"]["row_resign_secs"], 1_800);
+    assert_eq!(
+        v["data"]["mesh"]["gateway"]["max_accepted_row_resign_secs"],
+        3_600
+    );
+    assert_eq!(v["data"]["mesh"]["gateway"]["rotation_soak_secs"], 60);
+    for field in [
+        "require_signed_rows",
+        "row_resign_secs",
+        "max_accepted_row_resign_secs",
+        "rotation_soak_secs",
+    ] {
+        assert_eq!(
+            v["data"]["origins"][format!("mesh.gateway.{field}")],
+            "env",
+            "{field}"
+        );
+    }
+
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .env("A2A_MESH_GATEWAY_REQUIRE_SIGNED_ROWS", "sometimes")
+        .args(["--json", "config", "show"])
+        .assert()
+        .failure();
+    let e: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(e["error"]["code"], "CONFIG_INVALID");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("A2A_MESH_GATEWAY_REQUIRE_SIGNED_ROWS"),
+        "{e}"
+    );
+}
+
+#[test]
+fn mesh_commands_surface_config_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[mesh.gateway]\nrequire_signed_rows = false\nsurprise = 1\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("a2a")
+        .unwrap()
+        .env("A2A_HOME", tmp.path())
+        .args(["--json", "mesh", "roster"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("mesh.gateway.surprise"), "{stderr}");
+}
+
 /// The `[mesh.work]` section (work handoff spec §8): every key, including the
 /// envelope TTL, layers through defaults < file < env and reports its origin
 /// under the same dotted path as every other section.

@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use toml_edit::{Array, DocumentMut};
+use toml_edit::{Array, DocumentMut, Item, Table};
 
 pub(crate) struct AddRoot {
     pub added: bool,
@@ -73,6 +73,51 @@ pub(crate) fn add_root(home: &A2aHome, path: &Path) -> Result<AddRoot, AppError>
         path: canon,
         allowed_roots,
     })
+}
+
+pub(crate) fn set_mesh_gateway_bool(
+    home: &A2aHome,
+    field: &str,
+    value: bool,
+) -> Result<(), AppError> {
+    if field != "require_signed_rows" {
+        return Err(AppError::new(
+            "CONFIG_INVALID",
+            ExitCode::Precondition,
+            format!("mesh.gateway.{field} is not a supported boolean config key"),
+        ));
+    }
+    ensure_config_writable(home)?;
+    let path = config_path(home);
+    let mut doc = read_config_doc(&path)?;
+    let mesh = doc
+        .as_table_mut()
+        .entry("mesh")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let mesh = mesh.as_table_mut().ok_or_else(|| {
+        AppError::new(
+            "CONFIG_INVALID",
+            ExitCode::Precondition,
+            "mesh must be a table before mesh.gateway can be set",
+        )
+        .remedy("fix mesh in $A2A_HOME/config.toml")
+    })?;
+    let gateway = mesh
+        .entry("gateway")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let gateway = gateway.as_table_mut().ok_or_else(|| {
+        AppError::new(
+            "CONFIG_INVALID",
+            ExitCode::Precondition,
+            "mesh.gateway must be a table",
+        )
+        .remedy("fix mesh.gateway in $A2A_HOME/config.toml")
+    })?;
+    if gateway.contains_key(field) {
+        return Ok(());
+    }
+    gateway.insert(field, toml_edit::value(value));
+    write_config_doc(&path, &doc)
 }
 
 pub(crate) fn config_path(home: &A2aHome) -> PathBuf {

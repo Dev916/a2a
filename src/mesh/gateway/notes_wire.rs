@@ -8,6 +8,7 @@ use crate::mesh::{
     row_sig::RowVerifyCfg,
     peer_dir, scan_or_refuse,
     work::{verify_envelope, WorkEnvelope},
+    work_exec::{corroborate_sender, CorroborationStage},
     work_store::{self, WorkSource, WORK_OFFER_KIND, WORK_RESULT_KIND},
     Note, PeerId, NOTE_MAX_BYTES,
 };
@@ -360,7 +361,24 @@ fn receive_work_offer(
             )?;
             verify_envelope(home, &work, &SystemClock)
         })
-        .and_then(|verified| work_store::store_offer(home, verified, WorkSource::Directed));
+        .and_then(|verified| {
+            if let Some(warning) = corroborate_sender(
+                home,
+                &verified,
+                CorroborationStage::Ingest,
+                cfg.mesh.gateway.require_signed_rows,
+            )? {
+                log_work_ingest_warning(
+                    home,
+                    &envelope.from_gateway,
+                    &envelope.to_gateway,
+                    &envelope.to_peer,
+                    &envelope.trace_id,
+                    &warning,
+                );
+            }
+            work_store::store_offer(home, verified, WorkSource::Directed)
+        });
     match result {
         Ok(_) => {
             remember_delivered(home, &envelope.from_gateway, note_id)?;
@@ -693,6 +711,36 @@ fn log_work_ingest_refused(
             "to_peer": to_peer,
             "action": "work_ingest_refused",
             "code": code,
+        });
+        if let Ok(mut bytes) = serde_json::to_vec(&line) {
+            bytes.push(b'\n');
+            let _ = f.write_all(&bytes);
+        }
+    }
+}
+
+fn log_work_ingest_warning(
+    home: &A2aHome,
+    from_gateway: &str,
+    to_gateway: &str,
+    to_peer: &str,
+    trace_id: &str,
+    warning: &str,
+) {
+    let dir = home.root().join("mesh").join("gateway");
+    if create_dir_0700(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = crate::exec::open_append_0600(&dir.join(super::GATEWAY_JSONL)) {
+        let line = json!({
+            "ts": Utc::now(),
+            "kind": "note",
+            "trace_id": trace_id,
+            "from_gateway": from_gateway,
+            "to_gateway": to_gateway,
+            "to_peer": to_peer,
+            "action": "work_ingest_warning",
+            "warning": warning,
         });
         if let Ok(mut bytes) = serde_json::to_vec(&line) {
             bytes.push(b'\n');

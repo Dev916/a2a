@@ -1,6 +1,7 @@
 mod common;
 
 use a2a::home::A2aHome;
+use a2a::mesh::gateway::presence_wire;
 use a2a::mesh::keys::{
     enroll_gateway_token, fleet_id, fleet_init, gateway_identity, gateway_public_key_b64,
     install_gateway_token, SystemClock,
@@ -17,6 +18,7 @@ use a2a::mesh::work_exec::{
     ApproveStopAfter, GitAdapter, RealSpawner, WorkPhase, WorkSpawner,
 };
 use a2a::mesh::work_store::{self, WorkSource};
+use a2a::mesh::row_sig::RowVerdict;
 use a2a::output::{AppError, ExitCode};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -96,6 +98,36 @@ fn fixture() -> Fixture {
     .unwrap();
     let verified = verify_envelope(&receiver, &env, &SystemClock).unwrap();
     work_store::store_offer(&receiver, verified, WorkSource::Pool).unwrap();
+    let now = Utc::now();
+    presence_wire::refresh_registry_cache(
+        &receiver,
+        &[(
+            GatewayRow {
+                fleet_id: fleet_id(&receiver).unwrap(),
+                gateway_id: sender_gw.clone(),
+                owner: "legacy-sender".to_string(),
+                endpoint_url: None,
+                pubkey_fpr: a2a::mesh::keys::fpr_of_pubkey_b64(
+                    &env.sender.pubkey_b64,
+                )
+                .unwrap(),
+                cert_fpr: None,
+                version: "0.3.0".to_string(),
+                created_at: now,
+                last_heartbeat: now,
+                revoked_at: None,
+                schema_version: REGISTRY_SCHEMA_VERSION,
+                row_msg: None,
+                row_token: None,
+                row_sig: None,
+                signed_at: None,
+                revocation: None,
+            },
+            RowVerdict::Unsigned { stripped: false },
+        )],
+        now,
+    )
+    .unwrap();
 
     let registry = FileRegistry::new(tmp.path().join("registry"));
     registry.init_schema().unwrap();

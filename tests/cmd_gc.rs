@@ -319,18 +319,33 @@ fn save_work_state(
         result_note_id: format!("fixed-note-{work_id}"),
         milestone_posted: false,
         worker_id: Some(worker_id.to_string()),
-        result_ref: Some(format!("a2a/work/{work_id}")),
+        result_ref: (phase == a2a::mesh::work_exec::WorkPhase::Reported)
+            .then(|| format!("a2a/work/{work_id}")),
         checkout: checkout.clone(),
         push_attempts: 0,
         next_push_after: None,
         result_summary: Some("done".to_string()),
         evidence_excerpt: Some("ok".to_string()),
-        result_status: Some(a2a::mesh::registry::WorkStatus::Done),
+        result_status: Some(match phase {
+            a2a::mesh::work_exec::WorkPhase::Rejected => {
+                a2a::mesh::registry::WorkStatus::Rejected
+            }
+            a2a::mesh::work_exec::WorkPhase::Failed => {
+                a2a::mesh::registry::WorkStatus::Failed
+            }
+            _ => a2a::mesh::registry::WorkStatus::Done,
+        }),
         base_sha: None,
         held_commit_sha: None,
         closure_digest: None,
         base_ref: None,
         remote_url: None,
+        held_since: (phase == a2a::mesh::work_exec::WorkPhase::AwaitingRelease)
+            .then(chrono::Utc::now),
+        hold_note_id: (phase == a2a::mesh::work_exec::WorkPhase::AwaitingRelease)
+            .then(|| ulid::Ulid::new().to_string()),
+        hold_hit_count: (phase == a2a::mesh::work_exec::WorkPhase::AwaitingRelease).then_some(0),
+        observed_terminal: None,
     };
     a2a::mesh::work_exec::save_state(&home, &state).unwrap();
     checkout
@@ -470,6 +485,58 @@ fn a_worker_referenced_by_non_terminal_work_state_is_held_by_worker_gc() {
         .unwrap_or_else(|| panic!("worker hold missing from kept rows: {data}"));
     assert_eq!(held["reason"], "work in progress", "{held}");
     assert_eq!(held["work_id"], work_id, "{held}");
+}
+
+#[test]
+fn gc_reaps_rejected_and_failed_checkouts_but_never_a_held_one() {
+    let (home, tmp, worker_id) = spawn_with(&[]);
+    wait_dead(&home, &worker_id, 10);
+    a2a(&home, tmp.path())
+        .args(["status", &worker_id])
+        .assert()
+        .success();
+    let held_id = "01K42H0LDH0LDH0LDH0LDH0LDH";
+    let rejected_id = "01K42REJECTEDREJECTEDREJECT";
+    let failed_id = "01K42FA1LEDFA1LEDFA1LEDFA1";
+    save_work_state(
+        &home,
+        held_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::AwaitingRelease,
+    );
+    save_work_state(
+        &home,
+        rejected_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::Rejected,
+    );
+    save_work_state(
+        &home,
+        failed_id,
+        &worker_id,
+        a2a::mesh::work_exec::WorkPhase::Failed,
+    );
+    let bin = fake_git_bin(tmp.path());
+
+    let data = fake_git_gc(&home, tmp.path(), &bin, false, false);
+    let removed = data["work"]["removed"].as_array().unwrap();
+    assert!(removed.iter().any(|id| id == rejected_id), "{data}");
+    assert!(removed.iter().any(|id| id == failed_id), "{data}");
+    assert!(!removed.iter().any(|id| id == held_id), "{data}");
+    let held = data["work"]["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["work_id"] == held_id)
+        .unwrap_or_else(|| panic!("held checkout missing from gc report: {data}"));
+    assert_eq!(held["reason"], "work held", "{held}");
+    let remedy = held["remedy"].as_str().unwrap();
+    assert!(remedy.contains("diff"), "{held}");
+    assert!(remedy.contains("release"), "{held}");
+    assert!(remedy.contains("reject"), "{held}");
+    assert!(home.join("work").join(held_id).exists());
+    assert!(!home.join("work").join(rejected_id).exists());
+    assert!(!home.join("work").join(failed_id).exists());
 }
 
 #[test]

@@ -27,6 +27,7 @@ use crate::redact;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -35,17 +36,21 @@ const RESULT_NOTE_ID_PREFIX: &str = "work-result-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkResultStatus {
+    AwaitingRelease,
     Done,
     Failed,
     Declined,
+    Rejected,
 }
 
 impl WorkResultStatus {
     fn as_str(self) -> &'static str {
         match self {
+            WorkResultStatus::AwaitingRelease => "awaiting_release",
             WorkResultStatus::Done => "done",
             WorkResultStatus::Failed => "failed",
             WorkResultStatus::Declined => "declined",
+            WorkResultStatus::Rejected => "rejected",
         }
     }
 }
@@ -56,6 +61,7 @@ pub fn run(
     cmd: &MeshWorkCmd,
     quiet: bool,
 ) -> Result<Outcome, AppError> {
+    validate_command_work_id(cmd)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -75,9 +81,35 @@ pub fn run(
             MeshWorkCmd::Ack { work_id } => ack(home, work_id).await?,
             MeshWorkCmd::Diff { work_id, raw } => diff(home, cfg, work_id, *raw)?,
             MeshWorkCmd::RetryPush { work_id } => retry_push(home, cfg, work_id).await?,
+            MeshWorkCmd::Release { work_id } => release(home, cfg, work_id).await?,
+            MeshWorkCmd::Reject { work_id } => reject(home, cfg, work_id).await?,
+            MeshWorkCmd::Reopen { work_id } => reopen(home, work_id).await?,
         };
         Ok(Outcome::from(sanitize_value(out)))
     })
+}
+
+fn validate_command_work_id(cmd: &MeshWorkCmd) -> Result<(), AppError> {
+    let work_id = match cmd {
+        MeshWorkCmd::Send(args) => args.common.work_id.as_deref(),
+        MeshWorkCmd::Offer(args) => args.common.work_id.as_deref(),
+        MeshWorkCmd::Status { work_id } => work_id.as_deref(),
+        MeshWorkCmd::Show { work_id }
+        | MeshWorkCmd::Approve { work_id, .. }
+        | MeshWorkCmd::Decline { work_id, .. }
+        | MeshWorkCmd::Cancel { work_id }
+        | MeshWorkCmd::Ack { work_id }
+        | MeshWorkCmd::Diff { work_id, .. }
+        | MeshWorkCmd::RetryPush { work_id }
+        | MeshWorkCmd::Release { work_id }
+        | MeshWorkCmd::Reject { work_id }
+        | MeshWorkCmd::Reopen { work_id } => Some(work_id.as_str()),
+        MeshWorkCmd::List => None,
+    };
+    if let Some(work_id) = work_id {
+        work_store::validate_work_id(work_id)?;
+    }
+    Ok(())
 }
 
 async fn send(home: &A2aHome, cfg: &Config, args: &MeshWorkSendArgs) -> Result<Value, AppError> {
@@ -263,7 +295,7 @@ async fn decline(
             work_id,
             "offered",
             status_name(actual.status),
-            "decline only applies to offered work",
+            "decline only applies to offered work; use `a2a mesh work reject <id>` once the item is held",
         ));
     }
     let summary = reason.unwrap_or("declined");
@@ -346,6 +378,7 @@ async fn status(home: &A2aHome, work_id: Option<&str>) -> Result<Value, AppError
     let mut rows = local_views(&work_store::list(home)?);
     let registry_rows = registry_rows(home, work_id).await?;
     overlay_registry_rows(&mut rows, registry_rows, &local_gateway, work_id);
+    overlay_held_statuses(&mut rows, &held_announcements(home)?);
     if let Some(work_id) = work_id {
         if rows.is_empty() {
             return Err(work_not_found(work_id));
@@ -404,6 +437,7 @@ async fn ack(home: &A2aHome, work_id: &str) -> Result<Value, AppError> {
 }
 
 fn diff(home: &A2aHome, cfg: &Config, work_id: &str, raw: bool) -> Result<Value, AppError> {
+    ensure_exact_stored_id(home, work_id)?;
     let state = work_exec::load_state(home, work_id)?.ok_or_else(|| work_not_found(work_id))?;
     let base_sha = state.base_sha.clone().ok_or_else(|| {
         AppError::new(
@@ -452,6 +486,16 @@ fn diff(home: &A2aHome, cfg: &Config, work_id: &str, raw: bool) -> Result<Value,
 async fn retry_push(home: &A2aHome, cfg: &Config, work_id: &str) -> Result<Value, AppError> {
     let state = work_exec::load_state(home, work_id)?
         .ok_or_else(|| work_not_found(work_id))?;
+    if state.phase == work_exec::WorkPhase::AwaitingRelease {
+        return Err(AppError::new(
+            "WORK_HELD",
+            ExitCode::Precondition,
+            format!("work item {work_id} is awaiting release"),
+        )
+        .remedy(
+            "review it with `a2a mesh work diff <id>`, then use `release` or `reject`",
+        ));
+    }
     let registry = registry(home)?;
     let mut options = work_exec::WorkLoopOptions::for_config(cfg);
     options.force_push = true;
@@ -474,6 +518,210 @@ async fn retry_push(home: &A2aHome, cfg: &Config, work_id: &str) -> Result<Value
     }))
 }
 
+async fn release(home: &A2aHome, cfg: &Config, work_id: &str) -> Result<Value, AppError> {
+    ensure_exact_stored_id(home, work_id)?;
+    let mut state = work_exec::load_state(home, work_id)?
+        .ok_or_else(|| work_not_found(work_id))?;
+    if state.phase == work_exec::WorkPhase::Reported && state.held_since.is_some() {
+        return Ok(json!({
+            "work_id": work_id,
+            "status": state.result_status.map(status_name),
+            "phase": "reported",
+            "result_ref": state.result_ref,
+            "idempotent": true,
+        }));
+    }
+    if state.phase != work_exec::WorkPhase::AwaitingRelease || state.held_since.is_none() {
+        return Err(work_not_held(work_id));
+    }
+
+    let registry = registry(home)?;
+    let fleet_id = keys::fleet_id(home)?;
+    let local_gateway = keys::gateway_id(home)?;
+    let row = registry
+        .work_get(&fleet_id, work_id)
+        .await?
+        .ok_or_else(|| work_not_found(work_id))?;
+    if row.status != WorkStatus::AwaitingRelease
+        || row.claimed_by.as_deref() != Some(local_gateway.as_str())
+    {
+        return Err(work_not_held(work_id));
+    }
+    state = work_exec::release_from_hold(home, state)?;
+
+    let mut options = work_exec::WorkLoopOptions::for_config(cfg);
+    options.force_push = true;
+    let next = work_exec::advance_completion_until(
+        home,
+        cfg,
+        &registry,
+        &work_exec::RealWorkCompletionIo,
+        state,
+        options,
+    )
+    .await?;
+    Ok(json!({
+        "work_id": work_id,
+        "status": next.result_status.map(status_name),
+        "phase": format!("{:?}", next.phase).to_lowercase(),
+        "result_ref": next.result_ref,
+        "idempotent": false,
+    }))
+}
+
+async fn reject(home: &A2aHome, cfg: &Config, work_id: &str) -> Result<Value, AppError> {
+    ensure_exact_stored_id(home, work_id)?;
+    let mut state = work_exec::load_state(home, work_id)?
+        .ok_or_else(|| work_not_found(work_id))?;
+    let registry = registry(home)?;
+    let fleet_id = keys::fleet_id(home)?;
+    let local_gateway = keys::gateway_id(home)?;
+    let row = registry
+        .work_get(&fleet_id, work_id)
+        .await?
+        .ok_or_else(|| work_not_found(work_id))?;
+
+    if state.phase == work_exec::WorkPhase::Rejected && row.status == WorkStatus::Rejected {
+        return Ok(json!({
+            "work_id": work_id,
+            "status": "rejected",
+            "result_ref": null,
+            "idempotent": true,
+        }));
+    }
+    if state.phase != work_exec::WorkPhase::AwaitingRelease || state.held_since.is_none() {
+        return Err(work_not_held(work_id));
+    }
+    if row.status != WorkStatus::AwaitingRelease
+        || row.claimed_by.as_deref() != Some(local_gateway.as_str())
+    {
+        return Err(work_not_held(work_id));
+    }
+    let outcome = registry
+        .work_transition(
+            &fleet_id,
+            work_id,
+            WorkStatus::AwaitingRelease,
+            WorkStatus::Rejected,
+            WorkOwner::Claimer(local_gateway),
+            WorkPatch::default(),
+        )
+        .await?;
+    if let TransitionOutcome::Lost(actual) = outcome {
+        if actual.status != WorkStatus::Rejected {
+            return Err(state_conflict(
+                work_id,
+                "awaiting_release",
+                status_name(actual.status),
+                "reject only applies to locally held work",
+            ));
+        }
+    }
+    state.phase = work_exec::WorkPhase::Rejected;
+    state.result_status = Some(WorkStatus::Rejected);
+    state.result_ref = None;
+    work_exec::save_state(home, &state)?;
+
+    let note = send_result_note(
+        home,
+        cfg,
+        &registry,
+        work_id,
+        WorkResultStatus::Rejected,
+        "rejected",
+        &state.result_note_id,
+    )
+    .await?;
+    let feed_seq = if feed::read(home, 0)?.into_iter().any(|entry| {
+        entry.refs["work_id"] == work_id && entry.refs["status"] == "rejected"
+    }) {
+        0
+    } else {
+        feed::post(
+            home,
+            cfg,
+            &local_peer(),
+            &format!("work rejected: {} ({work_id})", title_for(home, work_id)?),
+            json!({ "work_id": work_id, "status": "rejected" }),
+        )?
+    };
+    Ok(json!({
+        "work_id": work_id,
+        "status": "rejected",
+        "result_ref": null,
+        "result_note": note,
+        "feed_seq": feed_seq,
+        "idempotent": false,
+    }))
+}
+
+async fn reopen(home: &A2aHome, work_id: &str) -> Result<Value, AppError> {
+    ensure_exact_stored_id(home, work_id)?;
+    let mut state = work_exec::load_state(home, work_id)?
+        .ok_or_else(|| work_not_found(work_id))?;
+    if state.held_since.is_none() {
+        return Err(work_not_held(work_id));
+    }
+    let registry = registry(home)?;
+    let fleet_id = keys::fleet_id(home)?;
+    let local_gateway = keys::gateway_id(home)?;
+    let row = registry
+        .work_get(&fleet_id, work_id)
+        .await?
+        .ok_or_else(|| work_not_found(work_id))?;
+    if row.status == WorkStatus::AwaitingRelease
+        && row.claimed_by.as_deref() == Some(local_gateway.as_str())
+    {
+        state.phase = work_exec::WorkPhase::AwaitingRelease;
+        work_exec::save_state(home, &state)?;
+        return Ok(json!({
+            "work_id": work_id,
+            "status": "awaiting_release",
+            "idempotent": true,
+        }));
+    }
+    if row.status != WorkStatus::Failed
+        || row.result_delivery.as_deref() != Some("release_stalled")
+        || row.claimed_by.as_deref() != Some(local_gateway.as_str())
+    {
+        return Err(AppError::new(
+            "WORK_NOT_HELD",
+            ExitCode::Precondition,
+            format!("work item {work_id} is not a locally held release-stalled item"),
+        )
+        .remedy("reopen only a held item failed by the release-stall sweep"));
+    }
+    let outcome = registry
+        .work_transition(
+            &fleet_id,
+            work_id,
+            WorkStatus::Failed,
+            WorkStatus::AwaitingRelease,
+            WorkOwner::Claimer(local_gateway),
+            WorkPatch {
+                result_delivery: Some(None),
+                swept_by: Some(None),
+                ..WorkPatch::default()
+            },
+        )
+        .await?;
+    if let TransitionOutcome::Lost(actual) = outcome {
+        return Err(state_conflict(
+            work_id,
+            "failed{release_stalled}",
+            status_name(actual.status),
+            "reopen only a held item failed by the release-stall sweep",
+        ));
+    }
+    state.phase = work_exec::WorkPhase::AwaitingRelease;
+    work_exec::save_state(home, &state)?;
+    Ok(json!({
+        "work_id": work_id,
+        "status": "awaiting_release",
+        "idempotent": false,
+    }))
+}
+
 pub async fn send_result_note<R: Registry + ?Sized>(
     home: &A2aHome,
     cfg: &Config,
@@ -489,14 +737,23 @@ pub async fn send_result_note<R: Registry + ?Sized>(
         .await?
         .ok_or_else(|| work_not_found(work_id))?;
     let local_gateway = keys::gateway_id(home)?;
+    let stored = ensure_exact_stored_id(home, work_id)?;
+    let sender_gateway = stored.verified.envelope.sender.gateway_id;
     let title = title_for(home, work_id)?;
-    let result_ref = row
-        .result_ref
-        .clone()
-        .unwrap_or_else(|| format!("a2a/work/{work_id}"));
+    let result_ref = match status {
+        WorkResultStatus::Done | WorkResultStatus::Failed => Some(
+            row.result_ref
+                .clone()
+                .unwrap_or_else(|| format!("a2a/work/{work_id}")),
+        ),
+        WorkResultStatus::AwaitingRelease
+        | WorkResultStatus::Declined
+        | WorkResultStatus::Rejected => None,
+    };
     let summary = capped_result_text(reason_or_summary, cfg.mesh.work.result_note_max_bytes)?;
     let refs = json!({
         "result": {
+            "work_id": work_id,
             "status": status.as_str(),
             "result_ref": result_ref,
             "summary": summary,
@@ -504,26 +761,30 @@ pub async fn send_result_note<R: Registry + ?Sized>(
         }
     });
     feed::validate_refs_size(&refs, cfg.mesh.work.result_note_max_bytes)?;
-    let note = Note {
-        note_id: Some(note_id.to_string()),
-        from: local_peer().to_string(),
-        to: "user:mesh-work".to_string(),
-        ts: Utc::now(),
-        kind: WORK_RESULT_KIND.to_string(),
-        text: format!(
+    let text = match result_ref.as_deref() {
+        Some(result_ref) => format!(
             "work {}: {} ({}) -> {}",
             status.as_str(),
             clean(&title),
             work_id,
             result_ref
         ),
+        None => format!("work {}: {} ({})", status.as_str(), clean(&title), work_id),
+    };
+    let note = Note {
+        note_id: Some(note_id.to_string()),
+        from: local_peer().to_string(),
+        to: "user:mesh-work".to_string(),
+        ts: Utc::now(),
+        kind: WORK_RESULT_KIND.to_string(),
+        text,
         refs,
         extra: serde_json::Map::new(),
     };
-    let path = notes_wire::spool_note(home, cfg, &local_gateway, &row.sender_gw, note)?;
+    let path = notes_wire::spool_note(home, cfg, &local_gateway, &sender_gateway, note)?;
     Ok(json!({
         "note_id": note_id,
-        "to_gateway": row.sender_gw,
+        "to_gateway": sender_gateway,
         "path": path
     }))
 }
@@ -539,7 +800,11 @@ fn build_envelope(
     validate_work_brief(&brief_text, &args.brief)?;
     scan_work_text("title", &args.title)?;
     scan_work_text("acceptance", &args.acceptance)?;
-    let work_id = ulid::Ulid::new().to_string();
+    let work_id = args
+        .work_id
+        .clone()
+        .unwrap_or_else(|| ulid::Ulid::new().to_string());
+    work_store::validate_work_id(&work_id)?;
     sign_envelope(
         home,
         UnsignedWorkEnvelope {
@@ -865,6 +1130,107 @@ fn overlay_registry_rows(
     }
 }
 
+fn held_announcements(home: &A2aHome) -> Result<BTreeMap<String, String>, AppError> {
+    let peer = PeerId::parse("user:mesh-work")?;
+    let inbox = crate::mesh::peer_dir(home, &peer).join("inbox");
+    let mut newest = BTreeMap::<String, (chrono::DateTime<Utc>, String)>::new();
+    for dir in [inbox.clone(), inbox.join("read")] {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading held work notes: {err}"),
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading held work note entry: {err}"),
+                )
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|err| {
+                    AppError::new(
+                        "IO",
+                        ExitCode::Internal,
+                        format!("reading held work note type: {err}"),
+                    )
+                })?
+                .is_file()
+            {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).map_err(|err| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading held work note: {err}"),
+                )
+            })?;
+            let Ok(note) = serde_json::from_slice::<Note>(&bytes) else {
+                continue;
+            };
+            if note.kind != work_store::WORK_HELD_KIND {
+                continue;
+            }
+            let Some(held) = note.refs.get("held") else {
+                continue;
+            };
+            let Some(work_id) = held.get("work_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(held_since) = held.get("held_since").and_then(Value::as_str) else {
+                continue;
+            };
+            if work_store::validate_work_id(work_id).is_err() {
+                continue;
+            }
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(held_since) else {
+                continue;
+            };
+            let parsed = parsed.with_timezone(&Utc);
+            let replace = newest
+                .get(work_id)
+                .is_none_or(|(existing, _)| parsed > *existing);
+            if replace {
+                newest.insert(work_id.to_string(), (parsed, held_since.to_string()));
+            }
+        }
+    }
+    Ok(newest
+        .into_iter()
+        .map(|(work_id, (_, held_since))| (work_id, held_since))
+        .collect())
+}
+
+fn overlay_held_statuses(
+    rows: &mut BTreeMap<String, Value>,
+    held: &BTreeMap<String, String>,
+) {
+    for (work_id, held_since) in held {
+        let Some(row) = rows.get_mut(work_id) else {
+            continue;
+        };
+        if row["registry"]["status"] != "awaiting_release" {
+            continue;
+        }
+        let Some(gateway) = row["claimed_by"].as_str().map(str::to_string) else {
+            continue;
+        };
+        row["held_since"] = json!(held_since);
+        row["status"] = json!(format!(
+            "running (held on {gateway} since {held_since})"
+        ));
+    }
+}
+
 fn registry_view(row: &WorkRow) -> Value {
     json!({
         "fleet_id": row.fleet_id,
@@ -894,6 +1260,19 @@ fn provenance(stored: &StoredWork) -> Value {
     })
 }
 
+fn ensure_exact_stored_id(home: &A2aHome, work_id: &str) -> Result<StoredWork, AppError> {
+    let stored = work_store::load(home, work_id)?.ok_or_else(|| work_not_found(work_id))?;
+    if stored.verified.envelope.work_id != work_id {
+        return Err(state_conflict(
+            work_id,
+            "an exact local envelope id",
+            &stored.verified.envelope.work_id,
+            "remove the mismatched local work entry and ask the sender to re-send it",
+        ));
+    }
+    Ok(stored)
+}
+
 fn source_name(stored: &StoredWork) -> &'static str {
     match stored.source {
         work_store::WorkSource::Directed => "directed",
@@ -917,7 +1296,7 @@ fn ensure_can_receive(row: &WorkRow, local_gateway: &str) -> Result<(), AppError
 fn write_ack_marker(home: &A2aHome, work_id: &str) -> Result<(), AppError> {
     let dir = home.root().join("work").join("acked");
     create_dir_0700(&dir).map_err(|e| AppError::new("IO", ExitCode::Internal, format!("creating ack marker dir: {e}")))?;
-    let path = dir.join(format!("{}.json", safe_file_component(work_id)));
+    let path = dir.join(format!("{work_id}.json"));
     let mut file = write_new_0600(&path)
         .map_err(|e| AppError::new("IO", ExitCode::Internal, format!("writing ack marker: {e}")))?;
     file.write_all(
@@ -963,8 +1342,10 @@ fn status_name(status: WorkStatus) -> &'static str {
         WorkStatus::Offered => "offered",
         WorkStatus::Approved => "approved",
         WorkStatus::Running => "running",
+        WorkStatus::AwaitingRelease => "awaiting_release",
         WorkStatus::Done => "done",
         WorkStatus::Failed => "failed",
+        WorkStatus::Rejected => "rejected",
         WorkStatus::Acked => "acked",
         WorkStatus::Declined => "declined",
         WorkStatus::Cancelled => "cancelled",
@@ -994,6 +1375,15 @@ fn work_not_found(work_id: &str) -> AppError {
         format!("work item {work_id} was not found"),
     )
     .remedy("check `a2a mesh work list` or ask the sender to re-send the work")
+}
+
+fn work_not_held(work_id: &str) -> AppError {
+    AppError::new(
+        "WORK_NOT_HELD",
+        ExitCode::Precondition,
+        format!("work item {work_id} is not awaiting release"),
+    )
+    .remedy("use `a2a mesh work release <id>` or `reject <id>` only for locally held work")
 }
 
 /// Work JSON sanitation preserves line structure and is explicitly not the terminal-safe
@@ -1032,10 +1422,4 @@ fn safe_peer_component(s: &str) -> String {
     } else {
         out
     }
-}
-
-fn safe_file_component(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect()
 }

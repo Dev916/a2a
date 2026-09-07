@@ -15,6 +15,9 @@ Run these steps before the first `a2a mesh work send` or `offer`:
    a2a update
    ```
 
+   Upgrade every member before any receiver begins holding work. A 0.3.0-floor
+   sender that reads an `awaiting_release` row reports `WORK_STATUS_INVALID`.
+
 2. On the fleet root machine only, migrate the registry:
 
    ```sh
@@ -99,15 +102,29 @@ Senders monitor and finish work with:
 
 ```sh
 a2a mesh work status <work_id>
-a2a mesh work retry-push <work_id>
+a2a mesh work diff <work_id>
+a2a mesh work release <work_id>
+a2a mesh work reject <work_id>
 a2a mesh work ack <work_id>
 ```
 
-The work loop reconciles a terminal worker, pushes the result branch, marks the
-registry row `done` or `failed`, and sends a `work_result` note back to the
-sender with text such as `work done: <title> (<work_id>) -> <result_ref>`.
-`retry-push` is safe to re-run after a transient git failure. `ack` closes a
-result after the sender has handled it.
+With the default `[mesh.work] auto_push = false`, the work loop reconciles a
+terminal worker and stops at `awaiting_release` without pushing. It emits one
+machine-generated `work_held` note. Review the frozen result with `diff`, then
+use `release` to push the recorded SHA, mark the row `done` or `failed`, send the
+`work_result` note, and post the milestone. Use `reject` to leave the row
+`rejected` with no result ref. `retry-push` is only for a transient push failure
+outside a hold; it refuses `awaiting_release`. `ack` closes a delivered result.
+
+## Holds and exits
+
+`decline` is the pre-approval verb and is valid only while a row is `offered`.
+`reject` is the post-review exit and is valid only from `awaiting_release`.
+Items held longer than `[mesh.work] release_stall_days` (default 7) become
+`failed` with delivery state `release_stalled`; `a2a mesh work reopen <id>`
+restores only that locally recorded hold. The ordinary abandoned-claim sweep
+never changes `awaiting_release`. `rejected` and `failed` checkouts become
+eligible for gc after `checkout_retain_days`; a held checkout never does.
 
 ## Security
 
@@ -153,6 +170,10 @@ set is empty.
 | `WORK_CONTROL_CHARS` | Work text contained terminal control characters. | Remove the control characters before sending. |
 | `WORK_BRIEF_INVALID` | Brief front matter is missing or malformed. | Fix the brief YAML before sending work. |
 | `WORK_STATE_CONFLICT` | The local work state does not allow the requested transition. | Re-check `a2a mesh work status <id>` and use the next valid command. |
+| `WORK_HELD` | A push retry was requested for an item still in `awaiting_release`. | Review with `a2a mesh work diff <id>`, then use `release` or `reject`. |
+| `WORK_ID_INVALID` | A work id is not a 26-character Crockford ULID or uses a reserved work-store name. | Use the generated id from `a2a mesh work send` or `offer`. |
+| `WORK_TERMINAL_OBSERVED` | This receiver previously observed cancellation or another terminal state for the id. | Do not approve it; ask the sender for a fresh work id. |
+| `WORK_NOT_HELD` | `release`, `reject`, or `reopen` was requested without the required local hold record and registry state. | Check `a2a mesh work status <id>` and act only on a locally held item. |
 | `WORK_NOT_FOUND` | The work id is not present locally or in the registry. | Check `a2a mesh work list` or ask the sender to re-send. |
 | `WORK_RESULT_NOT_LINEAR` | The reviewed commit range contains a merge, an unrelated base, or commits outside the HEAD chain. | Rebase the result into one linear chain rooted at the approved base. |
 | `WORK_BINARY_IN_RESULT` | An added or modified result blob/path is not reviewable UTF-8. | Replace binary output with reviewable UTF-8 text and rerun the worker. |

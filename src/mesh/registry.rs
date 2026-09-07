@@ -80,9 +80,18 @@ const WORK_LIST_SQL: &str = concat!(
     "AND ($3::text IS NULL OR claimed_by = $3) ",
     "ORDER BY created_at, work_id"
 );
+// `awaiting_release` is deliberately excluded: reviewer holds have their own long horizon.
 const WORK_SWEEP_ABANDONED_SQL: &str = concat!(
     "UPDATE mesh_work_items SET status = 'failed', swept_by = $2, updated_at = now() ",
     "WHERE fleet_id = $1 AND claimed_by = $2 AND status IN ('approved', 'running') ",
+    "AND updated_at < now() - ($3::bigint * interval '1 second') RETURNING ",
+    "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
+    "swept_by, created_at, updated_at, expires_at, schema_version"
+);
+const WORK_SWEEP_RELEASE_STALLED_SQL: &str = concat!(
+    "UPDATE mesh_work_items SET status = 'failed', swept_by = $2, ",
+    "result_delivery = 'release_stalled', updated_at = now() ",
+    "WHERE fleet_id = $1 AND claimed_by = $2 AND status = 'awaiting_release' ",
     "AND updated_at < now() - ($3::bigint * interval '1 second') RETURNING ",
     "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
     "swept_by, created_at, updated_at, expires_at, schema_version"
@@ -119,8 +128,10 @@ pub enum WorkStatus {
     Offered,
     Approved,
     Running,
+    AwaitingRelease,
     Done,
     Failed,
+    Rejected,
     Acked,
     Declined,
     Cancelled,
@@ -133,8 +144,10 @@ impl WorkStatus {
             WorkStatus::Offered => "offered",
             WorkStatus::Approved => "approved",
             WorkStatus::Running => "running",
+            WorkStatus::AwaitingRelease => "awaiting_release",
             WorkStatus::Done => "done",
             WorkStatus::Failed => "failed",
+            WorkStatus::Rejected => "rejected",
             WorkStatus::Acked => "acked",
             WorkStatus::Declined => "declined",
             WorkStatus::Cancelled => "cancelled",
@@ -147,8 +160,10 @@ impl WorkStatus {
             "offered" => Ok(WorkStatus::Offered),
             "approved" => Ok(WorkStatus::Approved),
             "running" => Ok(WorkStatus::Running),
+            "awaiting_release" => Ok(WorkStatus::AwaitingRelease),
             "done" => Ok(WorkStatus::Done),
             "failed" => Ok(WorkStatus::Failed),
+            "rejected" => Ok(WorkStatus::Rejected),
             "acked" => Ok(WorkStatus::Acked),
             "declined" => Ok(WorkStatus::Declined),
             "cancelled" => Ok(WorkStatus::Cancelled),
@@ -300,6 +315,12 @@ pub trait Registry {
         fleet_id: &str,
         claimer_gw: &str,
         stall: Duration,
+    ) -> Result<Vec<WorkRow>, AppError>;
+    async fn work_sweep_release_stalled(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        horizon: Duration,
     ) -> Result<Vec<WorkRow>, AppError>;
 }
 
@@ -711,6 +732,41 @@ impl Registry for FileRegistry {
             Ok(swept)
         })
     }
+
+    async fn work_sweep_release_stalled(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        horizon: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        let horizon = chrono::Duration::from_std(horizon).map_err(|e| {
+            AppError::new(
+                "DURATION_INVALID",
+                ExitCode::Precondition,
+                format!("release stall duration is invalid: {e}"),
+            )
+        })?;
+        self.with_work_rows(|rows| {
+            let now = Utc::now();
+            let cutoff = now - horizon;
+            let mut swept = Vec::new();
+            for row in rows {
+                if row.fleet_id == fleet_id
+                    && row.status == WorkStatus::AwaitingRelease
+                    && row.claimed_by.as_deref() == Some(claimer_gw)
+                    && row.updated_at < cutoff
+                {
+                    row.status = WorkStatus::Failed;
+                    row.swept_by = Some(claimer_gw.to_string());
+                    row.result_delivery = Some("release_stalled".to_string());
+                    row.updated_at = now;
+                    swept.push(row.clone());
+                }
+            }
+            swept.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+            Ok(swept)
+        })
+    }
 }
 
 fn work_row_mut<'a>(
@@ -1016,6 +1072,26 @@ impl Registry for RegistryHandle {
             RegistryBackend::Pg(registry) => {
                 registry
                     .work_sweep_abandoned(fleet_id, claimer_gw, stall)
+                    .await
+            }
+        }
+    }
+
+    async fn work_sweep_release_stalled(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        horizon: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        match &self.backend {
+            RegistryBackend::File(registry) => {
+                registry
+                    .work_sweep_release_stalled(fleet_id, claimer_gw, horizon)
+                    .await
+            }
+            RegistryBackend::Pg(registry) => {
+                registry
+                    .work_sweep_release_stalled(fleet_id, claimer_gw, horizon)
                     .await
             }
         }
@@ -1647,6 +1723,38 @@ impl Registry for PgRegistry {
                 .bind(fleet_id)
                 .bind(claimer_gw)
                 .bind(stall_secs)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(registry_work_error)?
+                .into_iter()
+                .map(pg_work_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+            tx.commit().await.map_err(registry_unreachable)?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|_| registry_unreachable_timeout())?
+    }
+
+    async fn work_sweep_release_stalled(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        horizon: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        let mut conn = self.acquire().await?;
+        let fleet_id = fleet_id.to_string();
+        let claimer_gw = claimer_gw.to_string();
+        let horizon_secs = i64::try_from(horizon.as_secs()).unwrap_or(i64::MAX);
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
+            set_local_statement_timeout(&mut tx, timeout).await?;
+            let mut rows = sqlx::query(WORK_SWEEP_RELEASE_STALLED_SQL)
+                .bind(fleet_id)
+                .bind(claimer_gw)
+                .bind(horizon_secs)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(registry_work_error)?

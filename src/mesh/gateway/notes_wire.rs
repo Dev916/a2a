@@ -3,13 +3,15 @@ use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::{
     feed,
     keys::{self, SystemClock},
-    registry::{self, Registry, WorkOwner, WorkPatch},
+    registry::{self, Registry, WorkOwner, WorkPatch, WorkStatus},
     row_mark::RowMarkStore,
     row_sig::RowVerifyCfg,
     peer_dir, scan_or_refuse,
     work::{verify_envelope, WorkEnvelope},
     work_exec::{corroborate_sender, CorroborationStage},
-    work_store::{self, WorkSource, WORK_OFFER_KIND, WORK_RESULT_KIND},
+    work_store::{
+        self, WorkSource, WORK_CANCELLED_KIND, WORK_OFFER_KIND, WORK_RESULT_KIND,
+    },
     Note, PeerId, NOTE_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode};
@@ -211,7 +213,8 @@ pub fn handle_ack(
         }
         "ingress_refused" | "TOKEN_EXPIRED" | "WORK_SIGNATURE_INVALID" | "WORK_SENDER_UNKNOWN"
         | "WORK_TOKEN_MISMATCH" | "WORK_EXPIRED" | "WORK_TOO_LARGE" | "WORK_BAD_REPO_URL"
-        | "WORK_WRONG_FLEET" | "WORK_SCHEMA_MISSING" | "WORK_CONTROL_CHARS" => {
+        | "WORK_WRONG_FLEET" | "WORK_SCHEMA_MISSING" | "WORK_CONTROL_CHARS"
+        | "WORK_ID_INVALID" => {
             archive(sender, &path, "rejected", to_gateway)?;
             record_result_delivery_ack(sender, &envelope, &format!("rejected:{outcome}"));
             log_note_action(
@@ -330,6 +333,22 @@ pub fn receive_note(
             code: "ingress_refused".to_string(),
         });
     }
+    if envelope.note.kind == WORK_CANCELLED_KIND {
+        let work_id = envelope
+            .note
+            .refs
+            .get("work_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AppError::new(
+                    "WORK_SCHEMA_MISSING",
+                    ExitCode::Precondition,
+                    "work_cancelled note refs must contain work_id",
+                )
+            })?;
+        work_store::validate_work_id(work_id)?;
+        work_store::mark_terminal_observed(home, work_id, WorkStatus::Cancelled)?;
+    }
     let peer = PeerId::parse(&envelope.to_peer)?;
     write_note_file_with_id(home, &peer, &envelope.note)?;
     remember_delivered(home, &envelope.from_gateway, note_id)?;
@@ -355,6 +374,7 @@ fn receive_work_offer(
         .and_then(|_| feed::validate_refs_size(&envelope.note.refs, cfg.mesh.work.max_directed_bytes))
         .and_then(|_| work_envelope_from_refs(&envelope.note.refs))
         .and_then(|work| {
+            work_store::validate_work_id(&work.work_id)?;
             crate::mesh::work::validate_envelope_hygiene(
                 &work,
                 cfg.mesh.work.max_directed_bytes as usize,

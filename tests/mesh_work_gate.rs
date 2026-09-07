@@ -81,7 +81,7 @@ async fn approve_records_base_sha_remote_url_and_base_ref_before_spawn() {
     copy_root_pub(root.root(), receiver.root());
     let sender_gw = enroll_joiner(&root, &sender);
     let receiver_gw = enroll_joiner(&root, &receiver);
-    let work_id = "work-gate-approve";
+    let work_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let remote_url = "file:///verified-origin.git";
     let base_ref = "release/1.2";
     let envelope = sign_envelope(
@@ -435,7 +435,8 @@ fn diff_body_is_fenced_escaped_and_masked_by_default() {
 fn work_diff_cli_prints_summary_patch_and_hit_set_digest() {
     let tmp = tempfile::tempdir().unwrap();
     let home = home_at(&tmp.path().join("home"));
-    let work_id = "work-gate-diff-cli";
+    let work_id = "01BX5ZZKBKACTAV9WEVGEMMVRY";
+    seed_stored_offer(tmp.path(), &home, work_id);
     let repo = home.work_dir().join(work_id).join("repo");
     init_repo(&repo);
     commit_text(&repo, "README.md", "base\n", "base");
@@ -477,6 +478,10 @@ fn work_diff_cli_prints_summary_patch_and_hit_set_digest() {
         closure_digest: None,
         base_ref: Some("main".to_string()),
         remote_url: Some("file:///verified-origin.git".to_string()),
+        held_since: None,
+        hold_note_id: None,
+        hold_hit_count: None,
+        observed_terminal: None,
     };
     work_exec::save_state(&home, &state).unwrap();
 
@@ -518,7 +523,8 @@ fn work_diff_cli_names_every_scanner_leg_without_leaking_the_dsn_password() {
     let home_bytes = b"opaque-not-a-secret-shape\n";
     std::fs::write(&registry_env, home_bytes).unwrap();
 
-    let work_id = "work-gate-scanner-cli";
+    let work_id = "01BX5ZZKBKACTAV9WEVGEMMVS0";
+    seed_stored_offer(tmp.path(), &home, work_id);
     let repo = home.work_dir().join(work_id).join("repo");
     init_repo(&repo);
     commit_text(&repo, "README.md", "base\n", "base");
@@ -573,6 +579,10 @@ fn work_diff_cli_names_every_scanner_leg_without_leaking_the_dsn_password() {
         closure_digest: None,
         base_ref: Some("main".to_string()),
         remote_url: Some("file:///verified-origin.git".to_string()),
+        held_since: None,
+        hold_note_id: None,
+        hold_hit_count: None,
+        observed_terminal: None,
     };
     work_exec::save_state(&home, &state).unwrap();
 
@@ -612,7 +622,8 @@ fn work_diff_cli_oversize_is_nonzero_and_never_reports_a_clean_scan() {
         "[mesh.work]\ndiff_scan_max_bytes = 64\n",
     )
     .unwrap();
-    let work_id = "work-gate-oversize-cli";
+    let work_id = "01BX5ZZKBKACTAV9WEVGEMMVS1";
+    seed_stored_offer(tmp.path(), &home, work_id);
     let repo = home.work_dir().join(work_id).join("repo");
     init_repo(&repo);
     commit_text(&repo, "README.md", "base\n", "base");
@@ -637,6 +648,10 @@ fn work_diff_cli_oversize_is_nonzero_and_never_reports_a_clean_scan() {
         closure_digest: None,
         base_ref: Some("main".to_string()),
         remote_url: Some("file:///verified-origin.git".to_string()),
+        held_since: None,
+        hold_note_id: None,
+        hold_hit_count: None,
+        observed_terminal: None,
     };
     work_exec::save_state(&home, &state).unwrap();
 
@@ -706,6 +721,39 @@ fn commit_text(repo: &Path, path: &str, body: &str, message: &str) {
 
 fn home_at(path: &Path) -> A2aHome {
     A2aHome::resolve(Some(path)).unwrap()
+}
+
+/// W3's exact-id one-bucket rule: diff/release/reject resolve the STORED
+/// envelope, so CLI fixtures must seed one, not just state.json.
+fn seed_stored_offer(tmp: &Path, receiver: &A2aHome, work_id: &str) {
+    let root = home_at(&tmp.join("seed-root"));
+    let sender = home_at(&tmp.join("seed-sender"));
+    fleet_init(&root).unwrap();
+    copy_root_pub(root.root(), sender.root());
+    copy_root_pub(root.root(), receiver.root());
+    enroll_joiner(&root, &sender);
+    enroll_joiner(&root, receiver);
+    let envelope = sign_envelope(
+        &sender,
+        UnsignedWorkEnvelope {
+            work_id: work_id.to_string(),
+            session: "user:test".to_string(),
+            addressing: WorkAddressing::Pool,
+            repo: WorkRepo {
+                remote_url: "file:///seed-origin.git".to_string(),
+                base_ref: "main".to_string(),
+            },
+            title: "Seeded stored offer".to_string(),
+            brief_text: "---\nlane: impl\nacceptance_criteria:\n  - seeded\nverify:\n  - cargo test --test mesh_work_gate\n---\n# Work\n".to_string(),
+            acceptance: "seeded".to_string(),
+            ttl_days: 7,
+            max_bytes: 262_144,
+        },
+        &SystemClock,
+    )
+    .unwrap();
+    let verified = verify_envelope(receiver, &envelope, &SystemClock).unwrap();
+    work_store::store_offer(receiver, verified, WorkSource::Pool).unwrap();
 }
 
 fn copy_root_pub(root: &Path, joiner: &Path) {

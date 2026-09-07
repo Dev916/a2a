@@ -9,12 +9,17 @@ use a2a::mesh::keys::{
     gateway_public_key_fingerprint, install_gateway_token, SystemClock,
 };
 use a2a::mesh::registry::{
-    write_registry_env, FileRegistry, GatewayRow, Registry, WorkRow, WorkStatus,
-    REGISTRY_SCHEMA_VERSION,
+    write_registry_env, FileRegistry, GatewayRow, Registry, WorkOwner, WorkPatch, WorkRow,
+    WorkStatus, REGISTRY_SCHEMA_VERSION,
 };
+use a2a::mesh::work_exec::{self, WorkPhase};
 use a2a::mesh::work_store;
+use a2a::mesh::work::{
+    sign_envelope, UnsignedWorkEnvelope, WorkAddressing, WorkRepo,
+};
+use a2a::mesh::Note;
 use assert_cmd::Command;
-use chrono::{TimeZone, Utc};
+use chrono::{SecondsFormat, TimeZone, Utc};
 use predicates::prelude::*;
 use rand::{rngs::StdRng, SeedableRng};
 use serde_json::{json, Value};
@@ -178,6 +183,79 @@ fn deliver_to_receiver(fixture: &MeshFixture) {
     )
     .unwrap();
     assert_eq!(report.delivered, 1);
+}
+
+fn held_item(fixture: &MeshFixture, title: &str) -> String {
+    let brief = write_valid_brief(&fixture.work, "mesh_work_cli");
+    let sent = cmd(fixture.sender.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "send",
+            "--to",
+            &fixture.receiver_gw,
+            "--repo",
+            "https://github.com/example/project.git",
+            "--base-ref",
+            "main",
+            "--title",
+            title,
+            "--brief",
+            brief.to_str().unwrap(),
+            "--acceptance",
+            "focused test passes",
+        ])
+        .assert()
+        .success();
+    let work_id = json_out(&sent)["data"]["work_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    deliver_to_receiver(fixture);
+
+    let fleet = fleet_id(&fixture.receiver).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        fixture
+            .registry
+            .work_claim(&fleet, &work_id, &fixture.receiver_gw)
+            .await
+            .unwrap();
+        fixture
+            .registry
+            .work_transition(
+                &fleet,
+                &work_id,
+                WorkStatus::Approved,
+                WorkStatus::Running,
+                WorkOwner::Claimer(fixture.receiver_gw.clone()),
+                WorkPatch::default(),
+            )
+            .await
+            .unwrap();
+        fixture
+            .registry
+            .work_transition(
+                &fleet,
+                &work_id,
+                WorkStatus::Running,
+                WorkStatus::AwaitingRelease,
+                WorkOwner::Claimer(fixture.receiver_gw.clone()),
+                WorkPatch::default(),
+            )
+            .await
+            .unwrap();
+    });
+    let mut state = work_exec::initial_claiming_state(&fixture.receiver, &work_id).unwrap();
+    state.phase = WorkPhase::AwaitingRelease;
+    state.worker_id = Some("impl-held".to_string());
+    state.result_status = Some(WorkStatus::Done);
+    state.held_since = Some(Utc::now());
+    state.hold_note_id = Some(ulid::Ulid::new().to_string());
+    state.hold_hit_count = Some(0);
+    work_exec::save_state(&fixture.receiver, &state).unwrap();
+    work_id
 }
 
 #[test]
@@ -573,20 +651,21 @@ fn decline_cancel_ack_status_and_show_route_notes_and_sanitize_display_strings()
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut done = row;
-    done.work_id = "done-work".to_string();
+    let done_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    done.work_id = done_id.to_string();
     done.status = WorkStatus::Done;
-    done.result_ref = Some("a2a/work/done-work".to_string());
+    done.result_ref = Some(format!("a2a/work/{done_id}"));
     rt.block_on(fixture.registry.work_insert(done)).unwrap();
 
     let status = cmd(fixture.sender.root(), &fixture.work)
-        .args(["--json", "mesh", "work", "status", "done-work"])
+        .args(["--json", "mesh", "work", "status", done_id])
         .assert()
         .success();
     let status = json_out(&status);
     assert_eq!(status["data"]["items"][0]["status"], "done", "{status}");
 
     let acked = cmd(fixture.sender.root(), &fixture.work)
-        .args(["--json", "mesh", "work", "ack", "done-work"])
+        .args(["--json", "mesh", "work", "ack", done_id])
         .assert()
         .success();
     let acked = json_out(&acked);
@@ -596,8 +675,215 @@ fn decline_cancel_ack_status_and_show_route_notes_and_sanitize_display_strings()
         .root()
         .join("work")
         .join("acked")
-        .join("done-work.json")
+        .join(format!("{done_id}.json"))
         .exists());
-    let row = work_row(&fixture.registry, &fleet_id(&fixture.sender).unwrap(), "done-work");
+    let row = work_row(&fixture.registry, &fleet_id(&fixture.sender).unwrap(), done_id);
     assert_eq!(row.status, WorkStatus::Acked);
+}
+
+#[test]
+fn reject_moves_a_held_item_to_rejected_with_no_result_ref() {
+    let fixture = mesh_fixture("0.3.0");
+    let work_id = held_item(&fixture, "Reject Me");
+    let rejected = cmd(fixture.receiver.root(), &fixture.work)
+        .args(["--json", "mesh", "work", "reject", &work_id])
+        .assert()
+        .success();
+    let out = json_out(&rejected);
+    assert_eq!(out["data"]["status"], "rejected", "{out}");
+    assert_eq!(out["data"]["result_ref"], Value::Null, "{out}");
+
+    let row = work_row(
+        &fixture.registry,
+        &fleet_id(&fixture.receiver).unwrap(),
+        &work_id,
+    );
+    assert_eq!(row.status, WorkStatus::Rejected);
+    assert_eq!(row.result_ref, None);
+    let state = work_exec::load_state(&fixture.receiver, &work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.phase, WorkPhase::Rejected);
+    let notes = spooled_notes(&fixture.receiver, &fixture.sender_gw);
+    let result = notes
+        .iter()
+        .find(|note| note.note.kind == work_store::WORK_RESULT_KIND)
+        .unwrap();
+    assert_eq!(result.note.refs["result"]["status"], "rejected");
+    assert_eq!(result.note.refs["result"]["result_ref"], Value::Null);
+    assert!(!result.note.text.contains("a2a/work/"));
+}
+
+#[test]
+fn decline_is_refused_past_offered_with_a_remedy_naming_reject() {
+    let fixture = mesh_fixture("0.3.0");
+    let work_id = held_item(&fixture, "Past Decline");
+    let refused = cmd(fixture.receiver.root(), &fixture.work)
+        .args(["--json", "mesh", "work", "decline", &work_id])
+        .assert()
+        .failure();
+    let out = json_out(&refused);
+    assert_eq!(out["error"]["code"], "WORK_STATE_CONFLICT", "{out}");
+    assert!(out["error"]["remedy"]
+        .as_str()
+        .unwrap()
+        .contains("reject"));
+}
+
+#[test]
+fn retry_push_refuses_a_held_item() {
+    let fixture = mesh_fixture("0.3.0");
+    let work_id = held_item(&fixture, "Do Not Retry");
+    let refused = cmd(fixture.receiver.root(), &fixture.work)
+        .args(["--json", "mesh", "work", "retry-push", &work_id])
+        .assert()
+        .failure();
+    let out = json_out(&refused);
+    assert_eq!(out["error"]["code"], "WORK_HELD", "{out}");
+    let remedy = out["error"]["remedy"].as_str().unwrap();
+    assert!(remedy.contains("release"), "{out}");
+    assert!(remedy.contains("reject"), "{out}");
+}
+
+#[test]
+fn non_ulid_work_id_is_refused_at_send_and_at_ingest() {
+    let fixture = mesh_fixture("0.3.0");
+    let brief = write_valid_brief(&fixture.work, "mesh_work_cli");
+    let refused = cmd(fixture.sender.root(), &fixture.work)
+        .args([
+            "--json",
+            "mesh",
+            "work",
+            "send",
+            "--to",
+            &fixture.receiver_gw,
+            "--work-id",
+            "../etc",
+            "--repo",
+            "https://github.com/example/project.git",
+            "--base-ref",
+            "main",
+            "--title",
+            "Invalid id",
+            "--brief",
+            brief.to_str().unwrap(),
+            "--acceptance",
+            "focused test passes",
+        ])
+        .assert()
+        .failure();
+    let out = json_out(&refused);
+    assert_eq!(out["error"]["code"], "WORK_ID_INVALID", "{out}");
+
+    let envelope = sign_envelope(
+        &fixture.sender,
+        UnsignedWorkEnvelope {
+            work_id: "pool".to_string(),
+            session: "user:test".to_string(),
+            addressing: WorkAddressing::Directed(fixture.receiver_gw.clone()),
+            repo: WorkRepo {
+                remote_url: "https://github.com/example/project.git".to_string(),
+                base_ref: "main".to_string(),
+            },
+            title: "Invalid ingress id".to_string(),
+            brief_text: fs::read_to_string(&brief).unwrap(),
+            acceptance: "focused test passes".to_string(),
+            ttl_days: 7,
+            max_bytes: 262_144,
+        },
+        &SystemClock,
+    )
+    .unwrap();
+    let note_id = ulid::Ulid::new().to_string();
+    let spooled = SpooledNote {
+        schema_version: 1,
+        trace_id: note_id.clone(),
+        from_gateway: fixture.sender_gw.clone(),
+        to_gateway: fixture.receiver_gw.clone(),
+        to_peer: format!("gateway:{}", fixture.receiver_gw),
+        attempts: 0,
+        next_attempt_after: None,
+        note: Note {
+            note_id: Some(note_id),
+            from: "user:mesh-work".to_string(),
+            to: format!("gateway:{}", fixture.receiver_gw),
+            ts: Utc::now(),
+            kind: work_store::WORK_OFFER_KIND.to_string(),
+            text: "work offer with invalid id".to_string(),
+            refs: json!({ "work": envelope }),
+            extra: serde_json::Map::new(),
+        },
+    };
+    let cfg = a2a::config::load(&fixture.receiver).unwrap().0;
+    let ack = notes_wire::receive_note(&fixture.receiver, &cfg, &spooled).unwrap();
+    assert_eq!(
+        ack,
+        notes_wire::NoteAck::Rejected {
+            code: "WORK_ID_INVALID".to_string()
+        }
+    );
+}
+
+#[test]
+fn sender_status_renders_the_receiver_and_held_since_from_the_hold_note() {
+    let fixture = mesh_fixture("0.3.0");
+    let work_id = held_item(&fixture, "Visible Hold");
+    let held_since = Utc.timestamp_opt(1_800_000_000, 123_456_000).unwrap();
+    let held_text = held_since.to_rfc3339_opts(SecondsFormat::Micros, true);
+    let cfg = a2a::config::load(&fixture.receiver).unwrap().0;
+    notes_wire::spool_note(
+        &fixture.receiver,
+        &cfg,
+        &fixture.receiver_gw,
+        &fixture.sender_gw,
+        Note {
+            note_id: Some(ulid::Ulid::new().to_string()),
+            from: "user:mesh-work".to_string(),
+            to: "user:mesh-work".to_string(),
+            ts: held_since,
+            kind: work_store::WORK_HELD_KIND.to_string(),
+            text: format!("work held: {work_id}"),
+            refs: json!({
+                "held": {
+                    "work_id": work_id,
+                    "status": "held",
+                    "hit_count": 0,
+                    "held_since": held_text,
+                }
+            }),
+            extra: serde_json::Map::new(),
+        },
+    )
+    .unwrap();
+    let mut rng = StdRng::seed_from_u64(11);
+    let delivered = deliver_spooled_once(
+        &cfg,
+        &fixture.receiver,
+        NoteDeliveryTarget::Gateway {
+            to_gateway: &fixture.sender_gw,
+            home: Some(&fixture.sender),
+        },
+        Utc::now(),
+        &mut rng,
+    )
+    .unwrap();
+    assert_eq!(delivered.delivered, 1);
+
+    let status = cmd(fixture.sender.root(), &fixture.work)
+        .args(["--json", "mesh", "work", "status", &work_id])
+        .assert()
+        .success();
+    let out = json_out(&status);
+    assert_eq!(
+        out["data"]["items"][0]["status"],
+        format!(
+            "running (held on {} since {})",
+            fixture.receiver_gw, held_text
+        ),
+        "{out}"
+    );
+    assert_eq!(
+        out["data"]["items"][0]["registry"]["status"],
+        "awaiting_release"
+    );
 }

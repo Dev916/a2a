@@ -1696,6 +1696,17 @@ impl Registry for FlippingRegistry {
     ) -> Result<Vec<WorkRow>, AppError> {
         self.inner.work_sweep_abandoned(fleet_id, claimer_gw, stall).await
     }
+
+    async fn work_sweep_release_stalled(
+        &self,
+        fleet_id: &str,
+        claimer_gw: &str,
+        horizon: Duration,
+    ) -> Result<Vec<WorkRow>, AppError> {
+        self.inner
+            .work_sweep_release_stalled(fleet_id, claimer_gw, horizon)
+            .await
+    }
 }
 
 fn registry_test_failure() -> AppError {

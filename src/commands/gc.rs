@@ -133,7 +133,7 @@ const NON_TERMINAL_REMEDY: &str = "stop it first with `a2a kill <id>` (or let it
 const NOT_OWNER_REMEDY: &str =
     "re-run with `--all` to sweep the whole machine, or as that owner (`A2A_OWNER=<owner> a2a gc`)";
 
-const WORK_HOLD_REMEDY: &str = "wait for mesh work completion routing to finish, or inspect it with `a2a mesh work status <work-id>` before re-running gc";
+const WORK_HOLD_REMEDY: &str = "review held work with `a2a mesh work diff <work-id>`, then `release` or `reject`; gc never removes an awaiting-release checkout";
 
 /// How many dirty paths a `kept` row carries. Enough to recognise the work at a
 /// glance; not so many that one forgotten `target/` fills the payload.
@@ -496,8 +496,21 @@ fn sweep_work(
     let mut sweep = WorkSweep::empty(retain_secs);
 
     for entry in states {
+        if entry.state.phase == WorkPhase::AwaitingRelease {
+            sweep.kept.push(json!({
+                "work_id": entry.state.work_id,
+                "worker_id": entry.state.worker_id,
+                "phase": "awaiting_release",
+                "reason": "work held",
+                "remedy": WORK_HOLD_REMEDY,
+            }));
+            continue;
+        }
         let acked = work_exec::acked_locally(home, &entry.state.work_id);
-        if entry.state.phase != WorkPhase::Reported && !acked {
+        if entry.state.phase != WorkPhase::Reported
+            && !matches!(entry.state.phase, WorkPhase::Rejected | WorkPhase::Failed)
+            && !acked
+        {
             continue;
         }
         let Some(worker_id) = entry.state.worker_id.clone() else {
@@ -619,6 +632,10 @@ fn checkout_hold(candidate: &WorkCandidate) -> Result<Option<Value>, AppError> {
         );
         row["dirty"] = json!(dirty);
         return Ok(Some(row));
+    }
+
+    if matches!(candidate.phase.as_str(), "rejected" | "failed") {
+        return Ok(None);
     }
 
     let head = git_output(&candidate.checkout, &["rev-parse", "--verify", "--quiet", "HEAD"])?;

@@ -671,6 +671,12 @@ pub enum MeshWorkCmd {
     },
     /// Force one result branch push attempt for a completed local work item
     RetryPush { work_id: String },
+    /// Push and report a locally held completed work item
+    Release { work_id: String },
+    /// Reject a locally held completed work item without publishing its result
+    Reject { work_id: String },
+    /// Restore a locally held item swept by the release-stall horizon
+    Reopen { work_id: String },
 }
 
 #[derive(clap::Args)]
@@ -689,6 +695,9 @@ pub struct MeshWorkOfferArgs {
 
 #[derive(clap::Args)]
 pub struct MeshWorkCreateArgs {
+    /// Supply a specific ULID (primarily for durable external orchestration)
+    #[arg(long)]
+    pub work_id: Option<String>,
     #[arg(long)]
     pub repo: String,
     #[arg(long)]

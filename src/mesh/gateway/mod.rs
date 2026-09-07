@@ -2415,14 +2415,11 @@ async fn anti_entropy_loop(
                         .saturating_mul(86_400)
                         .min(i64::MAX as u64) as i64,
                 )?;
-                let mut cursors = replicate::CursorStore::load_or_rebuild(&cfg.home)?;
-                replicate::compact_feed(
-                    &cfg.home,
+                cfg.links.compact_feed(
                     &cfg.config,
                     Utc::now(),
                     chrono::Duration::days(cfg.config.mesh.gateway.feed_retain_days as i64),
-                    &mut cursors,
-                )?;
+                ).await?;
                 tx.send(LoopEvent::Replication(cfg.links.health().await)).await.ok();
                 tx.send(LoopEvent::Limits(cfg.links.limits_health().await)).await.ok();
             }

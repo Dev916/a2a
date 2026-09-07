@@ -443,8 +443,17 @@ pub struct LinkStateHandle {
     inner: Arc<LinkStateInner>,
 }
 
+/// A read-only cursor view whose reads are copied through the owning link handle.
+#[derive(Clone)]
+pub struct PeerCursorView {
+    state: LinkStateHandle,
+    peer_gateway_id: String,
+}
+
 struct LinkStateInner {
     peers: Mutex<BTreeMap<String, PeerLinkState>>,
+    buckets: Mutex<BTreeMap<String, limits::PeerBuckets>>,
+    cursors: Mutex<BTreeMap<String, replicate::CursorStore>>,
     damping: Mutex<PeerDamping>,
     health: Mutex<replicate::ReplicationHealth>,
     registry_cache: Mutex<()>,
@@ -455,8 +464,6 @@ struct LinkStateInner {
 struct PeerLinkState {
     inbound: Option<LiveLink>,
     outbound: Option<LiveLink>,
-    buckets: Arc<Mutex<limits::PeerBuckets>>,
-    cursors: Arc<Mutex<replicate::CursorStore>>,
     peer_version: Option<String>,
     handshakes: VecDeque<DateTime<Utc>>,
 }
@@ -498,6 +505,8 @@ impl LinkStateHandle {
         Ok(Self {
             inner: Arc::new(LinkStateInner {
                 peers: Mutex::new(BTreeMap::new()),
+                buckets: Mutex::new(BTreeMap::new()),
+                cursors: Mutex::new(BTreeMap::new()),
                 damping: Mutex::new(PeerDamping::new(damping_window)),
                 health: Mutex::new(replicate::ReplicationHealth::default()),
                 registry_cache: Mutex::new(()),
@@ -516,23 +525,80 @@ impl LinkStateHandle {
     }
 
     fn new_peer_state(&self, peer_gateway_id: &str) -> PeerLinkState {
+        PeerLinkState {
+            inbound: None,
+            outbound: None,
+            peer_version: presence_wire::cached_peer_version(&self.inner.home, peer_gateway_id),
+            handshakes: VecDeque::new(),
+        }
+    }
+
+    fn new_peer_buckets(&self) -> limits::PeerBuckets {
         let cfg = self
             .inner
             .limits_cfg
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        limits::PeerBuckets::new(&cfg)
+    }
+
+    fn new_peer_cursors(&self, peer_gateway_id: &str) -> replicate::CursorStore {
         let owned = vec![peer_gateway_id.to_string()];
         let mut cursors = replicate::CursorStore::load_or_rebuild(&self.inner.home)
             .unwrap_or_else(|_| replicate::CursorStore::default());
         cursors.retain_origins(&owned);
-        PeerLinkState {
-            inbound: None,
-            outbound: None,
-            buckets: Arc::new(Mutex::new(limits::PeerBuckets::new(&cfg))),
-            cursors: Arc::new(Mutex::new(cursors)),
-            peer_version: presence_wire::cached_peer_version(&self.inner.home, peer_gateway_id),
-            handshakes: VecDeque::new(),
+        cursors
+    }
+
+    async fn ensure_peer_ingress(&self, peer_gateway_id: &str) {
+        {
+            let buckets = self.inner.buckets.lock().await;
+            if !buckets.contains_key(peer_gateway_id) {
+                drop(buckets);
+                let candidate = self.new_peer_buckets();
+                self.inner
+                    .buckets
+                    .lock()
+                    .await
+                    .entry(peer_gateway_id.to_string())
+                    .or_insert(candidate);
+            }
+        }
+        {
+            let cursors = self.inner.cursors.lock().await;
+            if !cursors.contains_key(peer_gateway_id) {
+                drop(cursors);
+                let candidate = self.new_peer_cursors(peer_gateway_id);
+                self.inner
+                    .cursors
+                    .lock()
+                    .await
+                    .entry(peer_gateway_id.to_string())
+                    .or_insert(candidate);
+            }
+        }
+    }
+
+    async fn with_peer_ingress<T>(
+        &self,
+        peer_gateway_id: &str,
+        op: impl FnOnce(&mut limits::PeerBuckets, &mut replicate::CursorStore) -> T,
+    ) -> T {
+        self.ensure_peer_ingress(peer_gateway_id).await;
+        loop {
+            let mut cursors = self.inner.cursors.lock().await;
+            if let Ok(mut buckets) = self.inner.buckets.try_lock() {
+                let buckets = buckets
+                    .get_mut(peer_gateway_id)
+                    .expect("ensured peer buckets are present");
+                let cursors = cursors
+                    .get_mut(peer_gateway_id)
+                    .expect("ensured peer cursors are present");
+                return op(buckets, cursors);
+            }
+            drop(cursors);
+            tokio::task::yield_now().await;
         }
     }
 
@@ -577,6 +643,8 @@ impl LinkStateHandle {
             tx,
             sent_cursors: BTreeMap::new(),
         });
+        drop(peers);
+        self.ensure_peer_ingress(&peer_gateway_id).await;
         Ok(())
     }
 
@@ -668,53 +736,6 @@ impl LinkStateHandle {
         self.inner.health.lock().await.clone()
     }
 
-    pub async fn peer_buckets(&self, peer_gateway_id: &str) -> Arc<Mutex<limits::PeerBuckets>> {
-        if let Some(buckets) = self
-            .inner
-            .peers
-            .lock()
-            .await
-            .get(peer_gateway_id)
-            .map(|peer| peer.buckets.clone())
-        {
-            return buckets;
-        }
-        let candidate = self.new_peer_state(peer_gateway_id);
-        self.inner
-            .peers
-            .lock()
-            .await
-            .entry(peer_gateway_id.to_string())
-            .or_insert(candidate)
-            .buckets
-            .clone()
-    }
-
-    pub async fn peer_cursors(
-        &self,
-        peer_gateway_id: &str,
-    ) -> Arc<Mutex<replicate::CursorStore>> {
-        if let Some(cursors) = self
-            .inner
-            .peers
-            .lock()
-            .await
-            .get(peer_gateway_id)
-            .map(|peer| peer.cursors.clone())
-        {
-            return cursors;
-        }
-        let candidate = self.new_peer_state(peer_gateway_id);
-        self.inner
-            .peers
-            .lock()
-            .await
-            .entry(peer_gateway_id.to_string())
-            .or_insert(candidate)
-            .cursors
-            .clone()
-    }
-
     async fn peer_version(&self, peer_gateway_id: &str) -> Option<String> {
         self.inner
             .peers
@@ -725,19 +746,54 @@ impl LinkStateHandle {
     }
 
     pub async fn limits_health(&self) -> BTreeMap<String, limits::PeerLimitHealth> {
-        let buckets = self
-            .inner
-            .peers
+        let buckets = self.inner.buckets.lock().await;
+        limits::health_by_peer(&buckets)
+    }
+
+    pub async fn peer_cursors(&self, peer_gateway_id: &str) -> PeerCursorView {
+        self.ensure_peer_ingress(peer_gateway_id).await;
+        PeerCursorView {
+            state: self.clone(),
+            peer_gateway_id: peer_gateway_id.to_string(),
+        }
+    }
+
+    async fn peer_cursor_snapshot(&self, peer_gateway_id: &str) -> replicate::CursorStore {
+        self.ensure_peer_ingress(peer_gateway_id).await;
+        self.inner
+            .cursors
             .lock()
             .await
-            .iter()
-            .map(|(peer, state)| (peer.clone(), state.buckets.clone()))
-            .collect::<Vec<_>>();
-        let mut health = BTreeMap::new();
-        for (peer, buckets) in buckets {
-            health.insert(peer, buckets.lock().await.health());
-        }
-        health
+            .get(peer_gateway_id)
+            .expect("ensured peer cursors are present")
+            .clone()
+    }
+
+    fn try_peer_cursor_snapshot(
+        &self,
+        peer_gateway_id: &str,
+    ) -> Result<replicate::CursorStore, tokio::sync::TryLockError> {
+        let cursors = self.inner.cursors.try_lock()?;
+        Ok(cursors
+            .get(peer_gateway_id)
+            .expect("peer cursor views are created only after initialization")
+            .clone())
+    }
+
+    pub async fn compact_feed(
+        &self,
+        cfg: &Config,
+        now: DateTime<Utc>,
+        retain: chrono::Duration,
+    ) -> Result<replicate::FeedCompaction, AppError> {
+        let mut cursors = self.inner.cursors.lock().await;
+        replicate::compact_feed_with_peer_cursors(
+            &self.inner.home,
+            cfg,
+            now,
+            retain,
+            &mut cursors,
+        )
     }
 
     pub async fn refresh_registry_cache(
@@ -757,6 +813,20 @@ impl LinkStateHandle {
             peer.peer_version = versions.get(gateway_id).cloned();
         }
         Ok(())
+    }
+}
+
+impl PeerCursorView {
+    pub async fn lock(&self) -> replicate::CursorStore {
+        self.state
+            .peer_cursor_snapshot(&self.peer_gateway_id)
+            .await
+    }
+
+    pub fn try_lock(
+        &self,
+    ) -> Result<replicate::CursorStore, tokio::sync::TryLockError> {
+        self.state.try_peer_cursor_snapshot(&self.peer_gateway_id)
     }
 }
 
@@ -1065,210 +1135,211 @@ async fn handle_inbound_frame(
     };
     let peer_version = state.peer_version(peer_gateway_id).await;
     let peer_supports_deferred = limits::peer_supports_deferred(peer_version.as_deref());
-    let cursor_handle = state.peer_cursors(peer_gateway_id).await;
-    let bucket_handle = state.peer_buckets(peer_gateway_id).await;
-    let mut cursors = cursor_handle.lock().await;
-    let mut buckets = bucket_handle.lock().await;
-    let now = Utc::now();
-    let mut deferred = false;
-    let mut deferred_ack = None;
-    let mut outbound = Vec::new();
-    match frame {
-        Frame::Digest { origins } => {
-            let outcome = buckets.allow(limits::BucketKind::Digests, now);
-            if observe_limit_outcome(
-                home,
-                peer_gateway_id,
-                limits::BucketKind::Digests,
-                outcome,
-                peer_supports_deferred,
-                &mut buckets,
-                &mut deferred_ack,
-            ) {
-                // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
-                let origins = origins
-                    .into_iter()
-                    .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
-                    .filter(|origin| origin.origin == peer_gateway_id)
-                    .collect::<Vec<_>>();
-                let wants = replicate::wants_from_digest(home, &cursors, &origins)?;
-                if !wants.is_empty() {
-                    outbound.push(Frame::Want { origins: wants });
-                }
-            } else {
-                deferred = true;
-            }
-        }
-        Frame::Want { origins } => {
-            let outcome = buckets.allow(limits::BucketKind::Wants, now);
-            if observe_limit_outcome(
-                home,
-                peer_gateway_id,
-                limits::BucketKind::Wants,
-                outcome,
-                peer_supports_deferred,
-                &mut buckets,
-                &mut deferred_ack,
-            ) {
-                // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
-                for want in origins
-                    .into_iter()
-                    .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
-                    .filter(|want| want.origin == local_gateway_id)
-                {
-                    match replicate::entries_for_want_capped(
+    let result = state
+        .with_peer_ingress(peer_gateway_id, |buckets, cursors| {
+            let now = Utc::now();
+            let mut deferred = false;
+            let mut deferred_ack = None;
+            let mut outbound = Vec::new();
+            match frame {
+                Frame::Digest { origins } => {
+                    let outcome = buckets.allow(limits::BucketKind::Digests, now);
+                    if observe_limit_outcome(
                         home,
-                        &want.origin,
-                        want.from_seq,
-                        &cursors,
-                        replicate::DEFAULT_WANT_ENTRY_CAP,
-                    )? {
-                        replicate::WantReply::Entries(entries) if !entries.is_empty() => {
-                            outbound.push(Frame::Feed {
-                                origin: want.origin,
-                                entries,
-                            });
+                        peer_gateway_id,
+                        limits::BucketKind::Digests,
+                        outcome,
+                        peer_supports_deferred,
+                        buckets,
+                        &mut deferred_ack,
+                    ) {
+                        // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+                        let origins = origins
+                            .into_iter()
+                            .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
+                            .filter(|origin| origin.origin == peer_gateway_id)
+                            .collect::<Vec<_>>();
+                        let wants = replicate::wants_from_digest(home, cursors, &origins)?;
+                        if !wants.is_empty() {
+                            outbound.push(Frame::Want { origins: wants });
                         }
-                        replicate::WantReply::Entries(_) => {}
-                        replicate::WantReply::Compacted { from_seq } => {
-                            outbound.push(replicate::compacted_err(from_seq));
-                        }
+                    } else {
+                        deferred = true;
                     }
                 }
-            } else {
-                deferred = true;
-            }
-        }
-        Frame::Feed { origin, entries } => {
-            // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
-            if origin != peer_gateway_id {
-                limits::log_origin_unbound(home, peer_gateway_id, &origin);
-                return Ok(());
-            }
-            let bytes_outcome = buckets.charge(limits::BucketKind::FeedBytes, feed_bytes, now);
-            if !observe_limit_outcome(
-                home,
-                peer_gateway_id,
-                limits::BucketKind::FeedBytes,
-                bytes_outcome,
-                peer_supports_deferred,
-                &mut buckets,
-                &mut deferred_ack,
-            ) {
-                deferred = true;
-            } else {
-                let mut frame_deferred = false;
-                let report = replicate::receive_feed_entries_metered(
-                    home,
-                    cfg,
-                    &mut cursors,
-                    reorder,
-                    &origin,
-                    entries,
-                    |entry, charge_feed_entry| {
-                        let kind = if charge_feed_entry {
-                            limits::BucketKind::FeedEntries
-                        } else if entry.refs.get("work").is_some() {
-                            limits::BucketKind::WorkOffers
-                        } else {
-                            return true;
-                        };
-                        let outcome = buckets.allow(kind, now);
-                        if !observe_limit_outcome(
+                Frame::Want { origins } => {
+                    let outcome = buckets.allow(limits::BucketKind::Wants, now);
+                    if observe_limit_outcome(
+                        home,
+                        peer_gateway_id,
+                        limits::BucketKind::Wants,
+                        outcome,
+                        peer_supports_deferred,
+                        buckets,
+                        &mut deferred_ack,
+                    ) {
+                        // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+                        for want in origins
+                            .into_iter()
+                            .take(limits::MAX_ORIGINS_PER_REQUEST_FRAME)
+                            .filter(|want| want.origin == local_gateway_id)
+                        {
+                            match replicate::entries_for_want_capped(
+                                home,
+                                &want.origin,
+                                want.from_seq,
+                                cursors,
+                                replicate::DEFAULT_WANT_ENTRY_CAP,
+                            )? {
+                                replicate::WantReply::Entries(entries) if !entries.is_empty() => {
+                                    outbound.push(Frame::Feed {
+                                        origin: want.origin,
+                                        entries,
+                                    });
+                                }
+                                replicate::WantReply::Entries(_) => {}
+                                replicate::WantReply::Compacted { from_seq } => {
+                                    outbound.push(replicate::compacted_err(from_seq));
+                                }
+                            }
+                        }
+                    } else {
+                        deferred = true;
+                    }
+                }
+                Frame::Feed { origin, entries } => {
+                    // Spec §5 deliberately forfeits transitive relay in v1; §6's three-member proof shifts to pool claims.
+                    if origin != peer_gateway_id {
+                        limits::log_origin_unbound(home, peer_gateway_id, &origin);
+                        return Ok::<_, AppError>(None);
+                    }
+                    let bytes_outcome =
+                        buckets.charge(limits::BucketKind::FeedBytes, feed_bytes, now);
+                    if !observe_limit_outcome(
+                        home,
+                        peer_gateway_id,
+                        limits::BucketKind::FeedBytes,
+                        bytes_outcome,
+                        peer_supports_deferred,
+                        buckets,
+                        &mut deferred_ack,
+                    ) {
+                        deferred = true;
+                    } else {
+                        let mut frame_deferred = false;
+                        let report = replicate::receive_feed_entries_metered(
                             home,
-                            peer_gateway_id,
-                            kind,
-                            outcome,
-                            peer_supports_deferred,
-                            &mut buckets,
-                            &mut deferred_ack,
-                        ) {
-                            frame_deferred = true;
-                            return false;
+                            cfg,
+                            cursors,
+                            reorder,
+                            &origin,
+                            entries,
+                            |entry, charge_feed_entry| {
+                                let kind = if charge_feed_entry {
+                                    limits::BucketKind::FeedEntries
+                                } else if entry.refs.get("work").is_some() {
+                                    limits::BucketKind::WorkOffers
+                                } else {
+                                    return true;
+                                };
+                                let outcome = buckets.allow(kind, now);
+                                if !observe_limit_outcome(
+                                    home,
+                                    peer_gateway_id,
+                                    kind,
+                                    outcome,
+                                    peer_supports_deferred,
+                                    buckets,
+                                    &mut deferred_ack,
+                                ) {
+                                    frame_deferred = true;
+                                    return false;
+                                }
+                                true
+                            },
+                        )?;
+                        if report.feed_entry_refunds > 0 {
+                            buckets
+                                .refund(limits::BucketKind::FeedEntries, report.feed_entry_refunds);
                         }
-                        true
-                    },
-                )?;
-                if report.feed_entry_refunds > 0 {
-                    buckets.refund(
-                        limits::BucketKind::FeedEntries,
-                        report.feed_entry_refunds,
-                    );
-                }
-                deferred = frame_deferred || report.deferred;
-                cursors.persist_merged(home, std::slice::from_ref(&origin))?;
-            }
-        }
-        Frame::Note { note } => {
-            let kind = if note.kind == crate::mesh::work_store::WORK_OFFER_KIND {
-                limits::BucketKind::WorkOffers
-            } else {
-                limits::BucketKind::Notes
-            };
-            let outcome = buckets.allow(kind, now);
-            if observe_limit_outcome(
-                home,
-                peer_gateway_id,
-                kind,
-                outcome,
-                peer_supports_deferred,
-                &mut buckets,
-                &mut deferred_ack,
-            ) {
-                let trace_id = note.note_id.clone().unwrap_or_default();
-                let envelope = notes_wire::SpooledNote {
-                    schema_version: 1,
-                    trace_id: trace_id.clone(),
-                    from_gateway: peer_gateway_id.to_string(),
-                    to_gateway: local_gateway_id.to_string(),
-                    to_peer: note.to.clone(),
-                    attempts: 0,
-                    next_attempt_after: None,
-                    note,
-                };
-                let ack = notes_wire::receive_note(home, cfg, &envelope).unwrap_or(
-                    notes_wire::NoteAck::Rejected {
-                        code: "ingress_refused".to_string(),
-                    },
-                );
-                let outcome = match ack {
-                    notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => {
-                        "delivered".to_string()
+                        deferred = frame_deferred || report.deferred;
+                        cursors.persist_merged(home, std::slice::from_ref(&origin))?;
                     }
-                    notes_wire::NoteAck::Rejected { code } => code,
-                };
-                outbound.push(Frame::Ack {
-                    ref_id: trace_id,
-                    outcome,
-                });
-            } else {
-                deferred = true;
+                }
+                Frame::Note { note } => {
+                    let kind = if note.kind == crate::mesh::work_store::WORK_OFFER_KIND {
+                        limits::BucketKind::WorkOffers
+                    } else {
+                        limits::BucketKind::Notes
+                    };
+                    let outcome = buckets.allow(kind, now);
+                    if observe_limit_outcome(
+                        home,
+                        peer_gateway_id,
+                        kind,
+                        outcome,
+                        peer_supports_deferred,
+                        buckets,
+                        &mut deferred_ack,
+                    ) {
+                        let trace_id = note.note_id.clone().unwrap_or_default();
+                        let envelope = notes_wire::SpooledNote {
+                            schema_version: 1,
+                            trace_id: trace_id.clone(),
+                            from_gateway: peer_gateway_id.to_string(),
+                            to_gateway: local_gateway_id.to_string(),
+                            to_peer: note.to.clone(),
+                            attempts: 0,
+                            next_attempt_after: None,
+                            note,
+                        };
+                        let ack = notes_wire::receive_note(home, cfg, &envelope).unwrap_or(
+                            notes_wire::NoteAck::Rejected {
+                                code: "ingress_refused".to_string(),
+                            },
+                        );
+                        let outcome = match ack {
+                            notes_wire::NoteAck::Delivered | notes_wire::NoteAck::Duplicate => {
+                                "delivered".to_string()
+                            }
+                            notes_wire::NoteAck::Rejected { code } => code,
+                        };
+                        outbound.push(Frame::Ack {
+                            ref_id: trace_id,
+                            outcome,
+                        });
+                    } else {
+                        deferred = true;
+                    }
+                }
+                Frame::Ack { ref_id, outcome } => {
+                    let _ = notes_wire::handle_ack(home, peer_gateway_id, &ref_id, &outcome)?;
+                }
+                Frame::Deferred {
+                    code,
+                    retry_after_secs,
+                } => {
+                    let _ = notes_wire::defer_spool_for_peer(
+                        home,
+                        cfg,
+                        peer_gateway_id,
+                        retry_after_secs,
+                        Utc::now(),
+                        &mut rand::thread_rng(),
+                    )?;
+                    limits::log_deferral_received(home, peer_gateway_id, &code, retry_after_secs);
+                }
+                Frame::Presence { peers } => {
+                    presence_wire::merge_presence_frame(home, peer_gateway_id, peers)?;
+                }
+                Frame::Err { .. } | Frame::Challenge { .. } | Frame::Hello { .. } => {}
             }
-        }
-        Frame::Ack { ref_id, outcome } => {
-            let _ = notes_wire::handle_ack(home, peer_gateway_id, &ref_id, &outcome)?;
-        }
-        Frame::Deferred {
-            code,
-            retry_after_secs,
-        } => {
-            let _ = notes_wire::defer_spool_for_peer(
-                home,
-                cfg,
-                peer_gateway_id,
-                retry_after_secs,
-                Utc::now(),
-                &mut rand::thread_rng(),
-            )?;
-            limits::log_deferral_received(home, peer_gateway_id, &code, retry_after_secs);
-        }
-        Frame::Presence { peers } => {
-            presence_wire::merge_presence_frame(home, peer_gateway_id, peers)?;
-        }
-        Frame::Err { .. } | Frame::Challenge { .. } | Frame::Hello { .. } => {}
-    }
-    drop(buckets);
-    drop(cursors);
+            Ok::<_, AppError>(Some((deferred, deferred_ack, outbound)))
+        })
+        .await?;
+    let Some((deferred, deferred_ack, outbound)) = result else {
+        return Ok(());
+    };
     if deferred {
         if let Some(frame) = deferred_ack {
             let _ = out_tx.try_send(frame);

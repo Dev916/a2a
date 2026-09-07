@@ -1051,6 +1051,25 @@ pub fn compact_feed(
     })
 }
 
+pub(crate) fn compact_feed_with_peer_cursors(
+    home: &A2aHome,
+    cfg: &Config,
+    now: DateTime<Utc>,
+    retain: Duration,
+    peer_cursors: &mut BTreeMap<String, CursorStore>,
+) -> Result<FeedCompaction, AppError> {
+    let mut cursors = CursorStore::load_or_rebuild(home)?;
+    let report = compact_feed(home, cfg, now, retain, &mut cursors)?;
+    for (origin, compacted_before_seq) in &report.compacted_before {
+        let Some(cursors) = peer_cursors.get_mut(origin) else {
+            continue;
+        };
+        cursors.raise_compacted_before_seq(origin.clone(), *compacted_before_seq);
+        cursors.prune_seqs_before(origin, *compacted_before_seq);
+    }
+    Ok(report)
+}
+
 fn apply_entry_for_report(
     home: &A2aHome,
     cfg: &Config,

@@ -206,6 +206,15 @@ impl PeerBuckets {
     }
 }
 
+pub(crate) fn health_by_peer(
+    buckets: &BTreeMap<String, PeerBuckets>,
+) -> BTreeMap<String, PeerLimitHealth> {
+    buckets
+        .iter()
+        .map(|(peer, buckets)| (peer.clone(), buckets.health()))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreAuthAdmission {
     Admitted,

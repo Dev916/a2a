@@ -6,7 +6,10 @@ use crate::mesh::{
 };
 use crate::output::{AppError, ExitCode, Outcome};
 use chrono::{DateTime, SecondsFormat, Utc};
-use expose::{Exposure, ExposureErrorChange, ExposureProvider, ExposurePublisher, ExposureRow};
+use expose::{
+    Exposure, ExposureErrorChange, ExposureProvider, ExposurePublisher, ExposureRow,
+    RowSigningContext,
+};
 use futures_util::FutureExt;
 use link::{LinkDirection, LinkSessionParams, LinkStateHandle};
 use nix::fcntl::{Flock, FlockArg};
@@ -323,6 +326,7 @@ enum LoopEvent {
     Endpoint(Option<String>),
     ExposureError(ExposureErrorChange),
     RegistryError(RegistryErrorReport),
+    RowSelfTamper { gateway_id: String, verdict: String },
     Replication(replicate::ReplicationHealth),
     Link(link::LinkHealthEvent),
     SessionEnd { slot: LoopSlot, detail: String },
@@ -1140,6 +1144,14 @@ async fn supervise(
                             log.line(registry_error_log_value(slot, &change)).await;
                         }
                     }
+                    LoopEvent::RowSelfTamper { gateway_id, verdict } => {
+                        log.line(json!({
+                            "ts": Utc::now(),
+                            "kind": "row_self_tamper_detected",
+                            "gateway_id": gateway_id,
+                            "verdict": verdict,
+                        })).await;
+                    }
                     LoopEvent::Replication(replication) => {
                         health.replication = replication;
                         write_health(&root, &mut health).await?;
@@ -1241,6 +1253,7 @@ struct GatewayRegistryRuntime {
     registry: RegistryHandle,
     exposure: ExposureProvider,
     row: ExposureRow,
+    signing: RowSigningContext,
     heartbeat_interval: Duration,
 }
 
@@ -1248,22 +1261,27 @@ fn bootstrap_registry_runtime(
     home: &A2aHome,
     cfg: &Config,
 ) -> Result<GatewayRegistryRuntime, AppError> {
-    let identity = keys::ensure_and_verify_gateway_enrollment(home, &SystemClock)?;
     let registry_url = read_gateway_registry_env(home)?;
     let registry = registry::open_registry(&registry_url)?;
     let exposure = ExposureProvider::from_config(cfg)?;
     Ok(GatewayRegistryRuntime {
         registry,
         exposure,
-        row: ExposureRow {
-            fleet_id: keys::fleet_id(home)?,
-            gateway_id: identity.gateway_id,
-            owner: gateway_owner(),
-            pubkey_fpr: keys::gateway_public_key_fingerprint(home)?,
-            cert_fpr: identity.cert_fpr,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
+        row: registry_exposure_row(home)?,
+        signing: RowSigningContext::from_config(home, cfg),
         heartbeat_interval: Duration::from_secs(cfg.mesh.gateway.registry_heartbeat_secs),
+    })
+}
+
+pub(crate) fn registry_exposure_row(home: &A2aHome) -> Result<ExposureRow, AppError> {
+    let identity = keys::ensure_and_verify_gateway_enrollment(home, &SystemClock)?;
+    Ok(ExposureRow {
+        fleet_id: keys::fleet_id(home)?,
+        gateway_id: identity.gateway_id,
+        owner: gateway_owner(),
+        pubkey_fpr: keys::gateway_public_key_fingerprint(home)?,
+        cert_fpr: identity.cert_fpr,
+        version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
@@ -1579,7 +1597,8 @@ async fn registry_loop(
         RegistrySlotParams {
             registry: &registry_runtime.registry,
             exposure: &registry_runtime.exposure,
-            publisher: ExposurePublisher::new(registry_runtime.row.clone()),
+            publisher: ExposurePublisher::new(registry_runtime.row.clone())
+                .with_signing(registry_runtime.signing.clone()),
             heartbeat_interval: registry_runtime.heartbeat_interval,
             clock: &SystemClock,
             stall_shutdown_slot: cfg.stall_shutdown_slot,
@@ -1618,6 +1637,7 @@ where
     } = params;
     let _ = tx.send(LoopEvent::Heartbeat(slot)).await;
     let (exposure_tx, mut exposure_rx) = mpsc::channel(16);
+    let gateway_id = publisher.gateway_id().to_string();
     let exposure_loop = expose::run_exposure_loop_with_events(
         registry,
         exposure,
@@ -1630,12 +1650,6 @@ where
     tokio::pin!(exposure_loop);
     loop {
         tokio::select! {
-            _ = token.cancelled() => {
-                if stall_shutdown_slot == Some(slot) {
-                    std::future::pending::<()>().await;
-                }
-                return Ok(());
-            }
             _ = tokio::time::sleep(jittered_heartbeat(HEARTBEAT_INTERVAL)) => {
                 if tx.send(LoopEvent::Heartbeat(slot)).await.is_err() {
                     token.cancel();
@@ -1643,6 +1657,15 @@ where
                 }
             }
             Some(tick) = exposure_rx.recv() => {
+                if let Some(verdict) = tick.self_tamper.clone() {
+                    if tx.send(LoopEvent::RowSelfTamper {
+                        gateway_id: gateway_id.clone(),
+                        verdict,
+                    }).await.is_err() {
+                        token.cancel();
+                        return Ok(());
+                    }
+                }
                 let registry_report = RegistryErrorReport {
                     slot,
                     error: tick.registry_error.clone(),
@@ -1668,6 +1691,11 @@ where
                 }
             }
             result = &mut exposure_loop => {
+                // The exposure loop observes cancellation only between complete publisher
+                // ticks, so discover -> self-check -> repair is never dropped half-finished.
+                if token.is_cancelled() && stall_shutdown_slot == Some(slot) {
+                    std::future::pending::<()>().await;
+                }
                 return result;
             }
         }
@@ -1725,6 +1753,14 @@ where
                             write_health(root, &mut health).await?;
                             write_jsonl(root, registry_error_log_value(slot, &change));
                         }
+                    }
+                    LoopEvent::RowSelfTamper { gateway_id, verdict } => {
+                        write_jsonl(root, json!({
+                            "ts": Utc::now(),
+                            "kind": "row_self_tamper_detected",
+                            "gateway_id": gateway_id,
+                            "verdict": verdict,
+                        }));
                     }
                     LoopEvent::SessionEnd { .. } => {}
                     LoopEvent::Replication(replication) => {
@@ -2360,6 +2396,8 @@ mod tests {
                 "anti_entropy_secs",
                 "feed_retain_days",
                 "shutdown_grace_secs",
+                "require_signed_rows",
+                "row_resign_secs",
             ]
         );
     }

@@ -100,15 +100,6 @@ async fn neon_registry_own_row_lifecycle_and_pooler_statement_cache_probe() {
     assert_eq!(rows[0].gateway_id, gateway_id);
     assert_eq!(rows[0].owner, "mesh-l2-live-test");
 
-    registry
-        .retire_self(&fleet_id, &gateway_id, now + chrono::Duration::seconds(2))
-        .await
-        .unwrap();
-    let rows = registry.discover(&fleet_id).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].gateway_id, gateway_id);
-    assert_eq!(rows[0].endpoint_url, None);
-
     let pooler = PgRegistry::connect_lazy(&pooler_url, 30).unwrap();
     assert_eq!(pooler.prepared_statement_probe().await.unwrap(), 17);
 }

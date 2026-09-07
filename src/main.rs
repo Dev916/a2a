@@ -96,6 +96,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshGatewayCmd::UninstallService => "mesh gateway uninstall-service",
                 MeshGatewayCmd::Identity => "mesh gateway identity",
                 MeshGatewayCmd::InstallToken { .. } => "mesh gateway install-token",
+                MeshGatewayCmd::Resign => "mesh gateway resign",
             },
             MeshCmd::Work { cmd } => match cmd {
                 MeshWorkCmd::Send(_) => "mesh work send",

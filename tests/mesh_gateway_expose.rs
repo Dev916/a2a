@@ -1,7 +1,7 @@
 use a2a::mesh::gateway::expose::{
     run_exposure_loop, run_exposure_loop_with_events, Exposure, ExposurePublisher, ExposureRow,
     ManualExposure, NgrokApi, NgrokExposure, NgrokTunnel, NgrokTunnelConfig, NgrokTunnels,
-    NoneExposure,
+    NoneExposure, RowSigningContext,
 };
 use a2a::mesh::gateway::link::{accept_once_io, dial_gateway_io};
 use a2a::mesh::gateway::{gateway_root, run_registry_slot_for_test, RegistrySlotParams};
@@ -10,14 +10,136 @@ use a2a::mesh::registry::{
     ClaimOutcome, FileRegistry, GatewayRow, Registry, TransitionOutcome, WorkListFilter,
     WorkOwner, WorkPatch, WorkRow, WorkStatus, REGISTRY_SCHEMA_VERSION,
 };
+use a2a::mesh::row_sig::{self, RowMsg, RowSigFault, RowVerdict};
 use a2a::mesh::wire::TlsIdentity;
 use a2a::output::{AppError, ExitCode};
+use assert_cmd::Command;
 use chrono::{DateTime, TimeZone, Utc};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+struct SignedPublisherFixture {
+    home: a2a::home::A2aHome,
+    cfg: a2a::config::Config,
+    registry: FileRegistry,
+    registry_dir: PathBuf,
+    row: ExposureRow,
+    fleet_id: String,
+    gateway_id: String,
+    root_fpr: String,
+}
+
+fn signed_publisher_fixture(root: &Path, manual_endpoint: Option<&str>) -> SignedPublisherFixture {
+    let home = a2a::home::A2aHome::resolve(Some(&root.join("home"))).unwrap();
+    keys::fleet_init(&home).unwrap();
+    let identity = keys::gateway_identity(&home, false).unwrap();
+    keys::ensure_gateway_token(&home, &SystemClock).unwrap();
+    if let Some(endpoint) = manual_endpoint {
+        std::fs::write(
+            home.root().join("config.toml"),
+            format!(
+                "[mesh.gateway]\nexpose = \"manual\"\nendpoint_url = \"{endpoint}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let cfg = a2a::config::load(&home).unwrap().0;
+    let registry_dir = root.join("registry");
+    let registry = FileRegistry::new(&registry_dir);
+    registry.init_schema().unwrap();
+    a2a::mesh::registry::write_registry_env(
+        &home,
+        &format!("file:{}", registry_dir.display()),
+    )
+    .unwrap();
+    let fleet_id = keys::fleet_id(&home).unwrap();
+    let gateway_id = identity.gateway_id.clone();
+    let row = ExposureRow {
+        fleet_id: fleet_id.clone(),
+        gateway_id: gateway_id.clone(),
+        owner: "signed-test-owner".to_string(),
+        pubkey_fpr: keys::gateway_public_key_fingerprint(&home).unwrap(),
+        cert_fpr: identity.cert_fpr,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    SignedPublisherFixture {
+        root_fpr: keys::fleet_root_fingerprint(&home).unwrap(),
+        home,
+        cfg,
+        registry,
+        registry_dir,
+        row,
+        fleet_id,
+        gateway_id,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn writer_verdict(
+    home: &a2a::home::A2aHome,
+    row: &GatewayRow,
+) -> (RowVerdict, Option<RowMsg>) {
+    let (row_msg, row_token, row_sig, signed_at) =
+        match (&row.row_msg, &row.row_token, &row.row_sig, row.signed_at) {
+            (Some(row_msg), Some(row_token), Some(row_sig), Some(signed_at)) => {
+                (row_msg, row_token, row_sig, signed_at)
+            }
+            (None, None, None, None) => return (RowVerdict::Unsigned { stripped: false }, None),
+            _ => return (RowVerdict::RowSigIncomplete, None),
+        };
+    let pubkey = keys::gateway_public_key_b64(home).unwrap();
+    let parsed = match row_sig::verify_row_bytes(row_msg, row_sig, &pubkey) {
+        Ok(parsed) => parsed,
+        Err(RowSigFault::UnknownVersion(_)) => {
+            return (RowVerdict::RowSigUnknownVersion, None)
+        }
+        Err(_) => return (RowVerdict::BadSig, None),
+    };
+    let projection_matches = parsed.fleet_id == row.fleet_id
+        && parsed.gateway_id == row.gateway_id
+        && parsed.endpoint_url == row.endpoint_url
+        && parsed.pubkey_fpr == row.pubkey_fpr
+        && parsed.cert_fpr == row.cert_fpr
+        && parsed.version == row.version
+        && parsed.owner == row.owner
+        && parsed.created_at == row.created_at
+        && parsed.schema_version == row.schema_version
+        && parsed.signed_at == signed_at
+        && parsed.row_token_sha256 == sha256_hex(row_token.as_bytes());
+    if !projection_matches {
+        return (RowVerdict::BadSig, Some(parsed));
+    }
+    (RowVerdict::ValidSigned, Some(parsed))
+}
+
+fn rewrite_registry_row(registry_dir: &Path, mutate: impl FnOnce(&mut GatewayRow)) {
+    let path = registry_dir.join("mesh_gateways.json");
+    let mut rows: Vec<GatewayRow> =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    mutate(rows.first_mut().unwrap());
+    std::fs::write(path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+}
+
+fn cli(home: &Path) -> Command {
+    let mut command = Command::cargo_bin("a2a").unwrap();
+    command
+        .arg("--home")
+        .arg(home)
+        .env_remove("A2A_HOME")
+        .env_remove("DATABASE_URL");
+    command
+}
 
 #[tokio::test]
 async fn none_and_manual_exposures_return_pinned_urls() {
@@ -28,6 +150,427 @@ async fn none_and_manual_exposures_return_pinned_urls() {
         manual.current_url().await.unwrap(),
         Some("wss://example.test:7787".to_string())
     );
+}
+
+#[tokio::test]
+async fn publisher_tick_writes_a_row_that_verifies_as_valid_signed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let endpoint = Some("wss://signed.example.test:7787".to_string());
+    let exposure = ManualExposure::new(endpoint.clone());
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let now = Utc.timestamp_opt(1_700_000_000, 123_456_000).unwrap();
+
+    let tick = publisher
+        .tick(&fixture.registry, &exposure, now)
+        .await
+        .unwrap();
+    assert!(tick.resigned);
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let (verdict, parsed) = writer_verdict(&fixture.home, &row);
+    let parsed = parsed.unwrap();
+
+    assert_eq!(verdict, RowVerdict::ValidSigned);
+    assert!(row.row_msg.is_some());
+    assert_eq!(row.signed_at, Some(parsed.signed_at));
+    assert_eq!(
+        parsed.enforce_require_signed_rows,
+        fixture.cfg.mesh.gateway.require_signed_rows
+    );
+    assert_eq!(parsed.row_resign_secs, 86_400);
+    assert_eq!(
+        parsed.roots_held,
+        serde_json::to_string(&vec![fixture.root_fpr]).unwrap()
+    );
+    assert_eq!(row.endpoint_url, endpoint);
+}
+
+#[tokio::test]
+async fn unchanged_signed_rows_heartbeat_until_the_resign_cadence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let exposure = ManualExposure::new(Some("wss://cadence.example.test:7787".to_string()));
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    assert!(
+        publisher
+            .tick(&fixture.registry, &exposure, t0)
+            .await
+            .unwrap()
+            .resigned
+    );
+
+    let heartbeat = publisher
+        .tick(
+            &fixture.registry,
+            &exposure,
+            t0 + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(!heartbeat.resigned);
+    let row = fixture.registry.discover(&fixture.fleet_id).await.unwrap().remove(0);
+    assert_eq!(row.signed_at, Some(t0));
+    assert_eq!(row.last_heartbeat, t0 + chrono::Duration::seconds(1));
+
+    let cadence = publisher
+        .tick(
+            &fixture.registry,
+            &exposure,
+            t0 + chrono::Duration::seconds(86_400),
+        )
+        .await
+        .unwrap();
+    assert!(cadence.resigned);
+    let row = fixture.registry.discover(&fixture.fleet_id).await.unwrap().remove(0);
+    assert_eq!(row.signed_at, Some(t0 + chrono::Duration::seconds(86_400)));
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
+}
+
+#[tokio::test]
+async fn publisher_reloads_the_gateway_token_and_held_roots_each_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let exposure = ManualExposure::new(Some("wss://roots.example.test:7787".to_string()));
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    publisher
+        .tick(&fixture.registry, &exposure, t0)
+        .await
+        .unwrap();
+    let old_token = keys::gateway_token(&fixture.home).unwrap();
+    let rotation = keys::rotate_root(&fixture.home, &SystemClock).unwrap();
+    assert!(rotation.gateway_token_rotated);
+
+    let tick = publisher
+        .tick(
+            &fixture.registry,
+            &exposure,
+            t0 + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(tick.resigned);
+    let row = fixture.registry.discover(&fixture.fleet_id).await.unwrap().remove(0);
+    assert_ne!(row.row_token.as_deref(), Some(old_token.as_str()));
+    let parsed = writer_verdict(&fixture.home, &row).1.unwrap();
+    let held: Vec<String> = serde_json::from_str(&parsed.roots_held).unwrap();
+    assert_eq!(held.len(), 2);
+    assert!(held.contains(&rotation.current_fingerprint));
+    assert!(held.contains(&rotation.next_fingerprint));
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
+}
+
+#[tokio::test]
+async fn restarted_publisher_signs_the_registrys_original_created_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let exposure = ManualExposure::new(Some("wss://restart.example.test:7787".to_string()));
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let mut first = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    first
+        .tick(&fixture.registry, &exposure, t0)
+        .await
+        .unwrap();
+    drop(first);
+
+    let mut restarted = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let tick = restarted
+        .tick(
+            &fixture.registry,
+            &exposure,
+            t0 + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    assert!(tick.resigned);
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    let (verdict, parsed) = writer_verdict(&fixture.home, &row);
+
+    assert_eq!(verdict, RowVerdict::ValidSigned);
+    assert_eq!(parsed.unwrap().created_at, t0);
+    assert_eq!(row.created_at, t0);
+}
+
+#[tokio::test]
+async fn tampered_own_row_is_detected_and_repaired_within_one_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let honest = "wss://honest.example.test:7787";
+    let exposure = ManualExposure::new(Some(honest.to_string()));
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    publisher
+        .tick(&fixture.registry, &exposure, t0)
+        .await
+        .unwrap();
+    rewrite_registry_row(&fixture.registry_dir, |row| {
+        row.endpoint_url = Some("wss://evil.test:1".to_string());
+    });
+
+    let tick = publisher
+        .tick(
+            &fixture.registry,
+            &exposure,
+            t0 + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tick.self_tamper, Some("BAD_SIG".to_string()));
+    assert!(tick.resigned);
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.endpoint_url.as_deref(), Some(honest));
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
+}
+
+#[tokio::test]
+async fn registry_loop_logs_one_self_tamper_transition_and_repairs_the_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let honest = "wss://logged.example.test:7787";
+    let exposure = ManualExposure::new(Some(honest.to_string()));
+    let clock = StepClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let token = CancellationToken::new();
+    let root = gateway_root(&fixture.home);
+    let run = run_registry_slot_for_test(
+        &root,
+        &fixture.cfg,
+        RegistrySlotParams {
+            registry: &fixture.registry,
+            exposure: &exposure,
+            publisher: ExposurePublisher::new(fixture.row.clone()).with_signing(
+                RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+            ),
+            heartbeat_interval: Duration::from_millis(20),
+            clock: &clock,
+            stall_shutdown_slot: None,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+    wait_for_row_in_fleet_while_running(
+        &mut run,
+        &fixture.registry,
+        &fixture.fleet_id,
+        Some(honest),
+    )
+    .await;
+    rewrite_registry_row(&fixture.registry_dir, |row| {
+        row.endpoint_url = Some("wss://evil.test:1".to_string());
+    });
+    clock.set(Utc.timestamp_opt(1_700_000_001, 0).unwrap());
+
+    let line = wait_for_log_line_while_running(
+        &mut run,
+        &root,
+        "\"verdict\":\"BAD_SIG\"",
+    )
+    .await;
+    assert!(line.contains("\"kind\":\"row_self_tamper_detected\""));
+    assert!(line.contains(&format!("\"gateway_id\":\"{}\"", fixture.gateway_id)));
+    wait_for_row_in_fleet_while_running(
+        &mut run,
+        &fixture.registry,
+        &fixture.fleet_id,
+        Some(honest),
+    )
+    .await;
+    for _ in 0..4 {
+        tokio::select! {
+            result = &mut run => panic!("registry slot exited unexpectedly: {:?}", result),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    assert_eq!(count_log_lines(&root, "\"verdict\":\"BAD_SIG\""), 1);
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
+
+    token.cancel();
+    tokio::select! {
+        result = &mut run => result.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("registry slot did not stop after cancellation"),
+    }
+}
+
+#[tokio::test]
+async fn unexposing_publishes_a_valid_signed_row_with_a_null_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = signed_publisher_fixture(tmp.path(), None);
+    let exposure = RotatingExposure::new([
+        Some("wss://visible.example.test:7787"),
+        None,
+    ]);
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    publisher
+        .tick(&fixture.registry, &exposure, t0)
+        .await
+        .unwrap();
+
+    let tick = publisher
+        .tick(
+            &fixture.registry,
+            &exposure,
+            t0 + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(tick.resigned);
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.endpoint_url, None);
+    assert_eq!(row.cert_fpr, None);
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
+}
+
+#[tokio::test]
+async fn gateway_resign_republishes_a_freshly_signed_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let honest = "wss://resign.example.test:7787";
+    let fixture = signed_publisher_fixture(tmp.path(), Some(honest));
+    let exposure = ManualExposure::new(Some(honest.to_string()));
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    let old_time = Utc::now() - chrono::Duration::hours(1);
+    publisher
+        .tick(&fixture.registry, &exposure, old_time)
+        .await
+        .unwrap();
+    let old_signed_at = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()[0]
+        .signed_at
+        .unwrap();
+    rewrite_registry_row(&fixture.registry_dir, |row| {
+        row.endpoint_url = Some("wss://evil.test:1".to_string());
+    });
+
+    let output = cli(fixture.home.root())
+        .args(["--json", "mesh", "gateway", "resign"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(output["command"], "mesh gateway resign");
+    assert_eq!(output["data"]["gateway_id"], fixture.gateway_id);
+    assert_eq!(
+        output["data"]["row_msg_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.endpoint_url.as_deref(), Some(honest));
+    assert!(row.signed_at.unwrap() > old_signed_at);
+    assert_eq!(
+        output["data"]["signed_at"],
+        serde_json::to_value(row.signed_at.unwrap()).unwrap()
+    );
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
+}
+
+#[tokio::test]
+async fn install_token_forces_an_immediate_registry_resign() {
+    let tmp = tempfile::tempdir().unwrap();
+    let endpoint = "wss://install-token.example.test:7787";
+    let fixture = signed_publisher_fixture(tmp.path(), Some(endpoint));
+    let exposure = ManualExposure::new(Some(endpoint.to_string()));
+    let mut publisher = ExposurePublisher::new(fixture.row.clone()).with_signing(
+        RowSigningContext::from_config(&fixture.home, &fixture.cfg),
+    );
+    publisher
+        .tick(
+            &fixture.registry,
+            &exposure,
+            Utc::now() - chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let before = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()[0]
+        .signed_at
+        .unwrap();
+    let token = keys::gateway_token(&fixture.home).unwrap();
+
+    let output = cli(fixture.home.root())
+        .args([
+            "--json",
+            "mesh",
+            "gateway",
+            "install-token",
+            "--file",
+            "-",
+        ])
+        .write_stdin(token)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(output["command"], "mesh gateway install-token");
+    assert!(output["data"]["signed_at"].is_string());
+    let row = fixture
+        .registry
+        .discover(&fixture.fleet_id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(row.signed_at.unwrap() > before);
+    assert_eq!(row.row_token.as_deref(), Some(keys::gateway_token(&fixture.home).unwrap().as_str()));
+    assert_eq!(writer_verdict(&fixture.home, &row).0, RowVerdict::ValidSigned);
 }
 
 #[tokio::test]
@@ -1062,15 +1605,6 @@ impl Registry for FlippingRegistry {
 
     async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError> {
         self.inner.discover(fleet_id).await
-    }
-
-    async fn retire_self(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        self.inner.retire_self(fleet_id, gateway_id, now).await
     }
 
     async fn revoke(

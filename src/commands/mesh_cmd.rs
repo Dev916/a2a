@@ -12,8 +12,9 @@ use crate::mesh::{
     scan_or_refuse, FeedEntry, Note, PeerId, Provider, STATUS_MAX_BYTES,
 };
 use crate::output::{AppError, ExitCode, Outcome};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -629,10 +630,19 @@ fn run_gateway(
                 token.trim(),
                 &crate::mesh::keys::SystemClock,
             )?;
+            let resigned = if home.root().join("mesh/fleet/registry.env").exists() {
+                Some(resign_gateway_row(home, cfg)?)
+            } else {
+                None
+            };
             if !json_mode {
+                let resign_suffix = resigned
+                    .as_ref()
+                    .map(|row| format!("; re-signed registry row at {}", row.signed_at))
+                    .unwrap_or_default();
                 return Ok(Outcome::from(Value::String(format!(
-                    "installed gateway token for {}",
-                    claims.gateway_id
+                    "installed gateway token for {}{}",
+                    claims.gateway_id, resign_suffix
                 ))));
             }
             Ok(Outcome::from(json!({
@@ -640,9 +650,101 @@ fn run_gateway(
                 "fleet_id": claims.fleet_id,
                 "gateway_id": claims.gateway_id,
                 "exp": claims.exp,
+                "signed_at": resigned.as_ref().map(|row| row.signed_at),
+                "row_msg_sha256": resigned.as_ref().map(|row| row.row_msg_sha256.as_str()),
+            })))
+        }
+        MeshGatewayCmd::Resign => {
+            let resigned = resign_gateway_row(home, cfg)?;
+            Ok(Outcome::from(json!({
+                "gateway_id": resigned.gateway_id,
+                "signed_at": resigned.signed_at,
+                "row_msg_sha256": resigned.row_msg_sha256,
             })))
         }
     }
+}
+
+struct GatewayResignResult {
+    gateway_id: String,
+    signed_at: DateTime<Utc>,
+    row_msg_sha256: String,
+}
+
+fn resign_gateway_row(
+    home: &A2aHome,
+    cfg: &Config,
+) -> Result<GatewayResignResult, AppError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            AppError::new(
+                "RUNTIME",
+                ExitCode::Internal,
+                format!("starting registry runtime: {err}"),
+            )
+        })?;
+    runtime.block_on(async {
+        let registry_url = read_registry_env(home)?;
+        let registry = open_registry(&registry_url)?;
+        let row = crate::mesh::gateway::registry_exposure_row(home)?;
+        let fleet_id = row.fleet_id.clone();
+        let gateway_id = row.gateway_id.clone();
+        let exposure = crate::mesh::gateway::expose::ExposureProvider::from_config(cfg)?;
+        let mut publisher = crate::mesh::gateway::expose::ExposurePublisher::new(row)
+            .with_signing(
+                crate::mesh::gateway::expose::RowSigningContext::from_config(home, cfg),
+            );
+        let tick = publisher.tick(&registry, &exposure, Utc::now()).await?;
+        if !tick.resigned {
+            return Err(AppError::new(
+                "REGISTRY_UNREACHABLE",
+                ExitCode::BrokerUnavailable,
+                tick.registry_error
+                    .or(tick.exposure_error)
+                    .unwrap_or_else(|| "gateway registry row was not re-signed".to_string()),
+            ));
+        }
+        let stored = registry
+            .discover(&fleet_id)
+            .await?
+            .into_iter()
+            .find(|stored| stored.gateway_id == gateway_id)
+            .ok_or_else(|| {
+                AppError::new(
+                    "INTERNAL",
+                    ExitCode::Internal,
+                    "re-signed gateway registry row was not readable",
+                )
+            })?;
+        let signed_at = stored.signed_at.ok_or_else(|| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                "re-signed gateway registry row is missing signed_at",
+            )
+        })?;
+        let row_msg = stored.row_msg.ok_or_else(|| {
+            AppError::new(
+                "INTERNAL",
+                ExitCode::Internal,
+                "re-signed gateway registry row is missing row_msg",
+            )
+        })?;
+        Ok(GatewayResignResult {
+            gateway_id,
+            signed_at,
+            row_msg_sha256: sha256_hex(row_msg.as_bytes()),
+        })
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn token_input(file: &str) -> Result<String, AppError> {

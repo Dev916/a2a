@@ -29,6 +29,8 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
             "anti_entropy_secs",
             "feed_retain_days",
             "shutdown_grace_secs",
+            "require_signed_rows",
+            "row_resign_secs",
         ]
     );
     assert_eq!(
@@ -61,6 +63,7 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
             expose = "manual"
             endpoint_url = "wss://127.0.0.1:8899"
             registry_heartbeat_secs = 17
+            require_signed_rows = true
             unknown = 1
         "#,
     )
@@ -68,6 +71,7 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
 
     let out = common::a2a(&home, &work)
         .env("A2A_MESH_GATEWAY_PING_SECS", "44")
+        .env("A2A_MESH_GATEWAY_ROW_RESIGN_SECS", "43200")
         .args(["--json", "config", "show", "--origin"])
         .assert()
         .success()
@@ -91,11 +95,18 @@ fn mesh_gateway_config_surface_is_pinned_and_originated() {
     assert_eq!(data["mesh"]["gateway"]["anti_entropy_secs"], 300);
     assert_eq!(data["mesh"]["gateway"]["feed_retain_days"], 30);
     assert_eq!(data["mesh"]["gateway"]["shutdown_grace_secs"], 10);
+    assert_eq!(data["mesh"]["gateway"]["require_signed_rows"], true);
+    assert_eq!(data["mesh"]["gateway"]["row_resign_secs"], 43_200);
     assert_eq!(data["mesh"]["work"]["work_poll_secs"], 15);
     assert_eq!(data["mesh"]["work"]["claim_stall_secs"], 900);
     assert_eq!(data["mesh"]["work"]["checkout_retain_days"], 30);
     assert_eq!(data["origins"]["mesh.gateway.listen_port"], "file");
     assert_eq!(data["origins"]["mesh.gateway.ping_secs"], "env");
+    assert_eq!(
+        data["origins"]["mesh.gateway.require_signed_rows"],
+        "file"
+    );
+    assert_eq!(data["origins"]["mesh.gateway.row_resign_secs"], "env");
     for field in a2a::config::MESH_GATEWAY_FIELDS {
         assert!(
             data["origins"]

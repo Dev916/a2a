@@ -617,6 +617,8 @@ pub enum MeshGatewayCmd {
         #[arg(long, value_name = "FILE")]
         file: String,
     },
+    /// Re-sign and republish this gateway's registry row
+    Resign,
 }
 
 #[derive(Subcommand)]

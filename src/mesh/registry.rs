@@ -22,6 +22,24 @@ const FILE_REGISTRY_ROWS: &str = "mesh_gateways.json";
 const FILE_WORK_ROWS: &str = "mesh_work_items.json";
 const FILE_WORK_LOCK: &str = "mesh_work_items.lock";
 const SET_LOCAL_STATEMENT_TIMEOUT: &str = concat!("SET", " LOCAL statement_timeout = ");
+pub const UPSERT_GATEWAY_SQL: &str = concat!(
+    "INSERT INTO mesh_gateways ",
+    "(fleet_id, gateway_id, owner, endpoint_url, pubkey_fpr, cert_fpr, version, ",
+    "created_at, last_heartbeat, revoked_at, schema_version, row_msg, row_token, ",
+    "row_sig, signed_at, revocation) ",
+    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ",
+    "ON CONFLICT (fleet_id, gateway_id) DO UPDATE SET ",
+    "owner = EXCLUDED.owner, endpoint_url = EXCLUDED.endpoint_url, ",
+    "pubkey_fpr = EXCLUDED.pubkey_fpr, cert_fpr = EXCLUDED.cert_fpr, ",
+    "version = EXCLUDED.version, last_heartbeat = EXCLUDED.last_heartbeat, ",
+    "schema_version = EXCLUDED.schema_version, row_msg = EXCLUDED.row_msg, ",
+    "row_token = EXCLUDED.row_token, row_sig = EXCLUDED.row_sig, ",
+    "signed_at = EXCLUDED.signed_at"
+);
+pub const HEARTBEAT_GATEWAY_SQL: &str = concat!(
+    "UPDATE mesh_gateways SET last_heartbeat = $3 ",
+    "WHERE fleet_id = $1 AND gateway_id = $2"
+);
 const WORK_SELECT_BY_ID_SQL: &str = concat!(
     "SELECT ",
     "fleet_id, work_id, sender_gw, addressing, status, claimed_by, result_ref, result_delivery, ",
@@ -216,12 +234,6 @@ pub trait Registry {
         now: DateTime<Utc>,
     ) -> Result<(), AppError>;
     async fn discover(&self, fleet_id: &str) -> Result<Vec<GatewayRow>, AppError>;
-    async fn retire_self(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError>;
     async fn revoke(
         &self,
         fleet_id: &str,
@@ -445,10 +457,21 @@ impl FileRegistry {
 }
 
 impl Registry for FileRegistry {
-    async fn upsert_self(&self, row: GatewayRow) -> Result<(), AppError> {
+    async fn upsert_self(&self, mut row: GatewayRow) -> Result<(), AppError> {
         let mut rows = self.read_rows()?;
-        rows.retain(|r| !(r.fleet_id == row.fleet_id && r.gateway_id == row.gateway_id));
-        rows.push(row);
+        if let Some(existing) = rows
+            .iter_mut()
+            .find(|existing| {
+                existing.fleet_id == row.fleet_id && existing.gateway_id == row.gateway_id
+            })
+        {
+            row.created_at = existing.created_at;
+            row.revoked_at = existing.revoked_at;
+            row.revocation.clone_from(&existing.revocation);
+            *existing = row;
+        } else {
+            rows.push(row);
+        }
         rows.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
         self.write_rows(&rows)
     }
@@ -475,23 +498,6 @@ impl Registry for FileRegistry {
             .into_iter()
             .filter(|r| r.fleet_id == fleet_id && r.revoked_at.is_none())
             .collect())
-    }
-
-    async fn retire_self(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        let mut rows = self.read_rows()?;
-        if let Some(row) = rows
-            .iter_mut()
-            .find(|r| r.fleet_id == fleet_id && r.gateway_id == gateway_id)
-        {
-            row.endpoint_url = None;
-            row.last_heartbeat = now;
-        }
-        self.write_rows(&rows)
     }
 
     async fn revoke(
@@ -753,18 +759,6 @@ impl Registry for RegistryHandle {
         match self {
             RegistryHandle::File(registry) => registry.discover(fleet_id).await,
             RegistryHandle::Pg(registry) => registry.discover(fleet_id).await,
-        }
-    }
-
-    async fn retire_self(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        match self {
-            RegistryHandle::File(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
-            RegistryHandle::Pg(registry) => registry.retire_self(fleet_id, gateway_id, now).await,
         }
     }
 
@@ -1043,20 +1037,7 @@ impl Registry for PgRegistry {
         tokio::time::timeout(timeout, async move {
             let mut tx = conn.begin().await.map_err(registry_unreachable)?;
             set_local_statement_timeout(&mut tx, timeout).await?;
-            sqlx::query(
-                "INSERT INTO mesh_gateways \
-                 (fleet_id, gateway_id, owner, endpoint_url, pubkey_fpr, cert_fpr, version, \
-                  created_at, last_heartbeat, revoked_at, schema_version, row_msg, row_token, \
-                  row_sig, signed_at, revocation) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
-                 ON CONFLICT (fleet_id, gateway_id) DO UPDATE SET \
-                 owner = EXCLUDED.owner, endpoint_url = EXCLUDED.endpoint_url, \
-                 pubkey_fpr = EXCLUDED.pubkey_fpr, cert_fpr = EXCLUDED.cert_fpr, \
-                 version = EXCLUDED.version, last_heartbeat = EXCLUDED.last_heartbeat, \
-                 schema_version = EXCLUDED.schema_version, row_msg = EXCLUDED.row_msg, \
-                 row_token = EXCLUDED.row_token, row_sig = EXCLUDED.row_sig, \
-                 signed_at = EXCLUDED.signed_at",
-            )
+            sqlx::query(UPSERT_GATEWAY_SQL)
             .bind(row.fleet_id)
             .bind(row.gateway_id)
             .bind(row.owner)
@@ -1095,10 +1076,7 @@ impl Registry for PgRegistry {
         tokio::time::timeout(timeout, async move {
             let mut tx = conn.begin().await.map_err(registry_unreachable)?;
             set_local_statement_timeout(&mut tx, timeout).await?;
-            sqlx::query(
-                "UPDATE mesh_gateways SET last_heartbeat = $3 \
-                 WHERE fleet_id = $1 AND gateway_id = $2",
-            )
+            sqlx::query(HEARTBEAT_GATEWAY_SQL)
             .bind(fleet_id)
             .bind(gateway_id)
             .bind(now)
@@ -1135,35 +1113,6 @@ impl Registry for PgRegistry {
             .collect::<Result<Vec<_>, _>>()?;
             tx.commit().await.map_err(registry_unreachable)?;
             Ok(rows)
-        })
-        .await
-        .map_err(|_| registry_unreachable_timeout())?
-    }
-
-    async fn retire_self(
-        &self,
-        fleet_id: &str,
-        gateway_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), AppError> {
-        let mut conn = self.acquire().await?;
-        let fleet_id = fleet_id.to_string();
-        let gateway_id = gateway_id.to_string();
-        let timeout = self.timeout;
-        tokio::time::timeout(timeout, async move {
-            let mut tx = conn.begin().await.map_err(registry_unreachable)?;
-            set_local_statement_timeout(&mut tx, timeout).await?;
-            sqlx::query(
-                "UPDATE mesh_gateways SET endpoint_url = NULL, last_heartbeat = $3 \
-                 WHERE fleet_id = $1 AND gateway_id = $2",
-            )
-            .bind(fleet_id)
-            .bind(gateway_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(registry_gateway_error)?;
-            tx.commit().await.map_err(registry_unreachable)
         })
         .await
         .map_err(|_| registry_unreachable_timeout())?

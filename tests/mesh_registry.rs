@@ -1,6 +1,7 @@
 use a2a::mesh::registry::{
     open_registry, read_registry_env, registry_plan, staleness, write_registry_env, FileRegistry,
     GatewayRow, Registry, RegistryHandle, RegistryStaleness, REGISTRY_SCHEMA_VERSION,
+    UPSERT_GATEWAY_SQL,
 };
 use assert_cmd::Command;
 use chrono::{TimeZone, Utc};
@@ -56,14 +57,16 @@ async fn file_registry_implements_lifecycle_and_skips_revoked_rows() {
         .await
         .unwrap();
     registry.heartbeat("fleet-a", "gw-a", t1).await.unwrap();
-    registry.retire_self("fleet-a", "gw-a", t1).await.unwrap();
     registry.revoke("fleet-a", "gw-b", t1).await.unwrap();
 
     let rows = registry.discover("fleet-a").await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].gateway_id, "gw-a");
     assert_eq!(rows[0].last_heartbeat, t1);
-    assert_eq!(rows[0].endpoint_url, None);
+    assert_eq!(
+        rows[0].endpoint_url.as_deref(),
+        Some("wss://gw-a.example.test")
+    );
     assert_eq!(
         registry.schema_version().await.unwrap(),
         REGISTRY_SCHEMA_VERSION
@@ -103,6 +106,52 @@ async fn signed_columns_round_trip_through_the_file_registry() {
     assert_eq!(rows[0].row_sig, signed.row_sig);
     assert_eq!(rows[0].signed_at, signed.signed_at);
     assert_eq!(rows[0].revocation, signed.revocation);
+}
+
+#[tokio::test]
+async fn file_upsert_preserves_insert_only_created_at_and_root_revocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = FileRegistry::new(tmp.path());
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let mut original = row("fleet-a", "gw-a", t0.timestamp());
+    original.revocation = Some("root-signed-revocation".to_string());
+    registry.upsert_self(original).await.unwrap();
+
+    let mut replacement = row("fleet-a", "gw-a", t0.timestamp() + 3_600);
+    replacement.owner = "updated-owner".to_string();
+    registry.upsert_self(replacement).await.unwrap();
+    let stored = registry.discover("fleet-a").await.unwrap().remove(0);
+
+    assert_eq!(stored.created_at, t0);
+    assert_eq!(stored.owner, "updated-owner");
+    assert_eq!(
+        stored.revocation.as_deref(),
+        Some("root-signed-revocation")
+    );
+}
+
+#[test]
+fn upsert_sql_sets_the_signature_columns_and_never_created_at_or_revocation() {
+    let update = UPSERT_GATEWAY_SQL
+        .split_once("DO UPDATE SET")
+        .expect("gateway upsert has an ON CONFLICT update clause")
+        .1;
+    for column in ["row_msg", "row_sig", "row_token", "signed_at"] {
+        assert!(update.contains(column), "upsert update clause omits {column}");
+    }
+    for column in ["created_at", "revocation", "revoked_at"] {
+        assert!(
+            !update.contains(column),
+            "upsert update clause must not modify {column}"
+        );
+    }
+}
+
+#[test]
+fn only_two_raw_updates_target_mesh_gateways() {
+    let source = include_str!("../src/mesh/registry.rs");
+    // Spec §2.1's write invariant permits only heartbeat and fleet revoke's legacy mirror.
+    assert_eq!(source.matches("UPDATE mesh_gateways").count(), 2);
 }
 
 #[tokio::test]

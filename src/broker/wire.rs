@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 76] = [
+pub const KNOWN_CODES: [&str; 77] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -131,6 +131,7 @@ pub const KNOWN_CODES: [&str; 76] = [
     "WORK_BRIEF_INVALID",
     "WORK_STATE_CONFLICT",
     "WORK_RESULT_NOT_LINEAR",
+    "WORK_RESULT_EMPTY",
     "WORK_BINARY_IN_RESULT",
     "WORK_ATTRS_IN_RESULT",
     "WORK_HEAD_MOVED",

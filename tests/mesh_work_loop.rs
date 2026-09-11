@@ -1160,3 +1160,95 @@ impl Registry for AlwaysErrRegistry {
 fn always_err() -> AppError {
     AppError::new("REGISTRY_ALWAYS_ERR", ExitCode::BrokerUnavailable, "registry unavailable")
 }
+
+// --- L4 work-handoff: framework commits the worker's in-tree result -------------
+// A codex impl worker cannot `git commit` (the codex sandbox denies .git writes),
+// so it leaves its change in the checkout uncommitted and defers the commit to the
+// framework. The gateway (not sandboxed) must commit that change before freezing
+// the result range, or the delivered result branch is hollow (base commit only).
+#[tokio::test(flavor = "multi_thread")]
+async fn framework_commits_uncommitted_worker_changes_so_the_result_is_not_hollow() {
+    let f = fixture("work-loop-uncommitted");
+    let mut cfg = cfg_for(&f.receiver);
+    cfg.mesh.work.auto_push = false;
+    let checkout = f.receiver.work_dir().join(&f.work_id).join("repo");
+    let base_sha = git_stdout(&checkout, &["rev-parse", "HEAD"]);
+    let bare = f._tmp.path().join("uncommitted-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    // Worker left GREETING.txt in the tree, UNCOMMITTED (sandbox denied .git writes).
+    std::fs::write(checkout.join("GREETING.txt"), "hello from the mesh handoff\n").unwrap();
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let report = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &FakeIo::terminal(),
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(report.registry_error, None, "{report:?}");
+
+    let state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    assert_eq!(state.phase, WorkPhase::AwaitingRelease);
+    let head = state.held_commit_sha.clone().expect("held_commit_sha set");
+    assert_ne!(
+        head, base_sha,
+        "framework must commit the worker's uncommitted change; result must not be the base commit"
+    );
+    let shown = git_stdout(&checkout, &["show", &format!("{head}:GREETING.txt")]);
+    assert_eq!(shown, "hello from the mesh handoff");
+}
+
+// WORK_RESULT_EMPTY guard: a worker that reports changed files but leaves the
+// checkout clean (its change never reached the tree, or it reverted) would
+// otherwise deliver a result branch identical to base — hollow. That must be
+// held as a failure, never announced done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_done_worker_that_changed_nothing_but_claimed_files_is_refused_as_empty() {
+    let f = fixture("work-loop-empty");
+    let mut cfg = cfg_for(&f.receiver);
+    cfg.mesh.work.auto_push = false;
+    let wdir = f.receiver.worker_dir("impl-terminal");
+    std::fs::create_dir_all(&wdir).unwrap();
+    std::fs::write(
+        wdir.join("result.json"),
+        r#"{"status":"pass","files_changed":["GREETING.txt"],"summary":"claimed a change it did not make"}"#,
+    )
+    .unwrap();
+    let bare = f._tmp.path().join("empty-remote.git");
+    run_git(f._tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    let mut state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    state.remote_url = Some(format!("file://{}", bare.display()));
+    work_exec::save_state(&f.receiver, &state).unwrap();
+
+    let io = FakeIo::terminal();
+    let report = work_exec::work_loop_tick(
+        &f.receiver,
+        &cfg,
+        &f.registry,
+        &io,
+        WorkLoopOptions::for_config(&cfg),
+    )
+    .await;
+    assert_eq!(report.registry_error, None, "{report:?}");
+
+    let state = work_exec::load_state(&f.receiver, &f.work_id).unwrap().unwrap();
+    assert_eq!(
+        state.result_status,
+        Some(WorkStatus::Failed),
+        "a hollow result must not be announced done"
+    );
+    assert!(
+        state
+            .result_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("WORK_RESULT_EMPTY"),
+        "summary was {:?}",
+        state.result_summary
+    );
+    assert_eq!(*io.pushes.lock().unwrap(), 0, "a hollow result must not be pushed");
+}

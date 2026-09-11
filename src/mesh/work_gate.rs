@@ -383,6 +383,77 @@ pub fn rev_parse_head(checkout: &Path) -> Result<String, AppError> {
     Ok(head.to_string())
 }
 
+/// Commit the worker's uncommitted tree changes so the frozen result range is not
+/// hollow. A codex impl worker cannot `git commit` — the codex sandbox denies
+/// `.git` writes (`.git/index.lock: Operation not permitted`), so an impl worker
+/// completes its change in-tree and defers the commit to here, on the receiver
+/// gateway, which is not sandboxed. Returns `Ok(true)` if a commit was made,
+/// `Ok(false)` if the tree was already clean (a worker that committed for itself,
+/// or a genuine no-op). The commit goes through the same pinned git as every other
+/// result step, so the committed range is exactly what `freeze_range` freezes and
+/// `gate_push` scans — nothing bypasses the object-closure or secret gate.
+pub fn commit_worker_result(checkout: &Path, work_id: &str) -> Result<bool, AppError> {
+    let invalid = |msg: String| {
+        AppError::new("WORK_STATE_INVALID", ExitCode::Precondition, msg)
+            .remedy("inspect the work checkout; re-clone and re-approve if it is corrupt")
+    };
+    let status = git_pinned(checkout)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|err| invalid(format!("running git status in {}: {err}", checkout.display())))?;
+    if !status.status.success() {
+        return Err(invalid(format!(
+            "git status failed in {} ({})",
+            checkout.display(),
+            status.status
+        )));
+    }
+    // A clean tree means either the worker committed for itself or produced no
+    // change; in both cases there is nothing for the framework to commit.
+    if status.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+    let add = git_pinned(checkout)
+        .args(["add", "-A"])
+        .output()
+        .map_err(|err| invalid(format!("running git add in {}: {err}", checkout.display())))?;
+    if !add.status.success() {
+        return Err(invalid(format!(
+            "git add failed in {}: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&add.stderr).trim()
+        )));
+    }
+    let message = format!(
+        "a2a work {work_id} result\n\nFramework-committed on the receiver: the worker completed the \
+         change in-tree but could not commit it itself (the codex sandbox denies .git writes)."
+    );
+    let commit = git_pinned(checkout)
+        .args([
+            "-c",
+            "user.email=a2a@localhost",
+            "-c",
+            "user.name=a2a",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-m",
+            &message,
+        ])
+        .output()
+        .map_err(|err| invalid(format!("running git commit in {}: {err}", checkout.display())))?;
+    if !commit.status.success() {
+        return Err(invalid(format!(
+            "git commit failed in {}: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&commit.stderr).trim()
+        )));
+    }
+    Ok(true)
+}
+
 /// Freeze the linear commit range and the exact object closure reviewed for publication.
 pub fn freeze_range(checkout: &Path, base_sha: &str) -> Result<ResultRange, AppError> {
     let head_sha = rev_parse_head(checkout).map_err(|err| {

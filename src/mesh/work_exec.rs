@@ -844,6 +844,12 @@ where
                     missing_work_state_field(&work_id_for_block, "base_sha")
                         .remedy("approve records base_sha; this item predates the gate")
                 })?;
+                // The worker may have completed its change in-tree without
+                // committing it — the codex sandbox denies .git writes, so an
+                // impl worker defers the commit to the receiver gateway (here,
+                // not sandboxed). Commit before freezing so the result range
+                // reflects the delivered work instead of an empty base..base.
+                work_gate::commit_worker_result(&checkout_for_block, &work_id_for_block)?;
                 Some(work_gate::freeze_range(&checkout_for_block, base_sha)?)
             } else {
                 None
@@ -867,6 +873,36 @@ where
                 let held = frozen.as_ref().ok_or_else(|| {
                     missing_work_state_field(&state.work_id, "held result range")
                 })?;
+                // WORK_RESULT_EMPTY guard: never deliver a hollow result as done.
+                // The framework commit above captures any dirty tree, so an empty
+                // range here means the worker's HEAD never moved. If the worker
+                // nonetheless reported changed files (they were outside the
+                // checkout, or reverted), the result branch would carry none of
+                // the work — surface it as a held failure for review instead.
+                if held.head_sha == held.base_sha
+                    && state
+                        .worker_id
+                        .as_deref()
+                        .map(|w| !worker_files_changed(home, w).is_empty())
+                        .unwrap_or(false)
+                {
+                    let changed = state
+                        .worker_id
+                        .as_deref()
+                        .map(|w| worker_files_changed(home, w).len())
+                        .unwrap_or(0);
+                    state.result_status = Some(WorkStatus::Failed);
+                    state.result_summary = Some(format!(
+                        "WORK_RESULT_EMPTY: worker reported {changed} changed file(s) but produced an empty result range (no commit)"
+                    ));
+                    state.evidence_excerpt = Some(evidence_excerpt);
+                    state.held_commit_sha = Some(held.head_sha.clone());
+                    state.closure_digest = Some(held.closure_digest.clone());
+                    let (report, _) =
+                        scan_result_for_hold(home, cfg, &state.checkout, held, &state).await;
+                    enter_hold(home, cfg, registry, &mut state, &report).await?;
+                    return Ok(state);
+                }
                 state.result_status = Some(WorkStatus::Done);
                 state.result_summary = Some(summary);
                 state.evidence_excerpt = Some(evidence_excerpt);
@@ -1614,6 +1650,28 @@ fn worker_result_excerpt(home: &A2aHome, worker_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The `files_changed` the worker reported in its result.json, if any. Empty on
+/// any absence or parse failure: the caller (the empty-result guard) only acts
+/// when the worker positively claims it changed files, so it fails safe.
+fn worker_files_changed(home: &A2aHome, worker_id: &str) -> Vec<String> {
+    let path = home.worker_dir(worker_id).join(reconcile::RESULT_JSON);
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("files_changed")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn initial_claiming_state(home: &A2aHome, work_id: &str) -> Result<WorkState, AppError> {

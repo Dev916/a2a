@@ -2315,6 +2315,18 @@ fn ensure_peer_not_revoked(home: &A2aHome, peer: &keys::TokenClaims) -> Result<(
     .remedy("keep the peer disconnected until the fleet root issues a strictly higher key epoch"))
 }
 
+/// Publish a fresh limits-health snapshot to the serve loop, which folds it
+/// into `gateway-health.json`. The in-memory defer/drop counters update the
+/// instant a frame is metered, but `gateway status` only sees them once this
+/// event flushes the file — so the fast replication poll emits it too, not just
+/// the ~5-minute anti-entropy tick, keeping backpressure visible within seconds
+/// of a deferral instead of up to `anti_entropy_secs` later (a2a-29j).
+async fn emit_limits_health(links: &link::LinkStateHandle, tx: &mpsc::Sender<LoopEvent>) {
+    tx.send(LoopEvent::Limits(links.limits_health().await))
+        .await
+        .ok();
+}
+
 async fn watcher_loop(
     slot: LoopSlot,
     token: CancellationToken,
@@ -2354,6 +2366,7 @@ async fn watcher_loop(
                     &mut outbound_retry_rng,
                 ).await?;
                 link::push_presence_gossip(&cfg.home, &cfg.registry.row.gateway_id, &cfg.links).await?;
+                emit_limits_health(&cfg.links, &tx).await;
             }
         }
     }
@@ -2421,7 +2434,7 @@ async fn anti_entropy_loop(
                     chrono::Duration::days(cfg.config.mesh.gateway.feed_retain_days as i64),
                 ).await?;
                 tx.send(LoopEvent::Replication(cfg.links.health().await)).await.ok();
-                tx.send(LoopEvent::Limits(cfg.links.limits_health().await)).await.ok();
+                emit_limits_health(&cfg.links, &tx).await;
             }
         }
     }
@@ -2716,5 +2729,20 @@ mod tests {
             handshake_refusal_code(&local_error),
             "GATEWAY_TOKEN_INVALID"
         );
+    }
+
+    #[tokio::test]
+    async fn emit_limits_health_publishes_a_limits_snapshot_event() {
+        // a2a-29j: the fast replication poll must publish limits health, not
+        // just the ~5-minute anti-entropy tick, so `gateway status` reflects
+        // deferrals within seconds. This pins the emit the watcher loop drives.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::home::A2aHome::resolve(Some(tmp.path())).unwrap();
+        let links =
+            link::LinkStateHandle::new(&home, std::time::Duration::from_secs(60)).unwrap();
+        let (tx, mut rx) = mpsc::channel::<LoopEvent>(4);
+        emit_limits_health(&links, &tx).await;
+        let event = rx.try_recv().expect("a limits-health event was published");
+        assert!(matches!(event, LoopEvent::Limits(_)));
     }
 }

@@ -77,9 +77,20 @@ pub enum Frame {
     /// Rejected is terminal: the sender must retry, not archive. Link-level,
     /// not per-note: it is emitted once per bucket state change, so it carries
     /// no ref_id and defers the whole outbound spool for that peer.
+    ///
+    /// For a *feed* deferral it additionally carries the receiver's confirmed
+    /// cursor (`origin` + `applied_through_seq`) so the sender can roll its
+    /// optimistically-advanced sent-cursor back to the real applied watermark
+    /// and re-drive the un-applied tail on the next delta sweep, instead of
+    /// waiting for the ~5-minute anti-entropy reconciliation. Both fields are
+    /// absent for non-feed deferrals and for pre-0.4.x senders (serde default).
     Deferred {
         code: String,
         retry_after_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied_through_seq: Option<u64>,
     },
 }
 

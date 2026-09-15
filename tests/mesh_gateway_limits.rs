@@ -9,6 +9,9 @@ use a2a::mesh::gateway::link::{
     accept_and_handshake, LinkDirection, LinkSessionParams, LinkStateHandle,
 };
 use a2a::mesh::gateway::notes_wire;
+use a2a::mesh::gateway::presence_wire;
+use a2a::mesh::registry::{GatewayRow, REGISTRY_SCHEMA_VERSION};
+use a2a::mesh::row_sig::RowVerdict;
 use a2a::mesh::keys::{
     enroll_gateway_token, ensure_gateway_token, fleet_init, gateway_public_key_b64,
     gateway_signing_key, gateway_token, install_gateway_token, RootSet, SystemClock, TestClock,
@@ -102,6 +105,31 @@ fn local_feed_entry(text: &str) -> FeedEntry {
         refs: json!({}),
         extra: serde_json::Map::new(),
     }
+}
+
+fn deferred_capable_row(gateway_id: &str) -> (GatewayRow, RowVerdict) {
+    let now = Utc::now();
+    (
+        GatewayRow {
+            fleet_id: "fleet-a".to_string(),
+            gateway_id: gateway_id.to_string(),
+            owner: gateway_id.to_string(),
+            endpoint_url: None,
+            pubkey_fpr: format!("{gateway_id}-pubkey"),
+            cert_fpr: None,
+            version: "0.4.0".to_string(),
+            created_at: now,
+            last_heartbeat: now,
+            revoked_at: None,
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            row_msg: None,
+            row_token: None,
+            row_sig: None,
+            signed_at: None,
+            revocation: None,
+        },
+        RowVerdict::Unsigned { stripped: false },
+    )
 }
 
 fn copy_root_pub(root: &A2aHome, joiner: &A2aHome) {
@@ -440,6 +468,65 @@ async fn feed_over_the_bucket_applies_backpressure_and_never_advances_the_cursor
     let repaired_cursors = repaired.b_state.peer_cursors("gw-a").await;
     assert_eq!(repaired_cursors.lock().await.last_seq("gw-a"), 5);
     repaired.stop().await;
+}
+
+#[tokio::test]
+async fn a_feed_deferral_rolls_back_the_sender_cursor_so_the_watcher_redrives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sender = home_at(&tmp.path().join("sender"));
+    let receiver = home_at(&tmp.path().join("receiver"));
+    write_gateway_key(sender.root(), "gw-a");
+    write_gateway_key(receiver.root(), "gw-b");
+    let cfg_a = cfg_for(&sender);
+    let mut limited_cfg_b = cfg_for(&receiver);
+    limited_cfg_b.mesh.limits.feed_entries_per_min = 2;
+    // B must see A as >= 0.4.0 so it DEFERS (and answers with a Deferred frame)
+    // rather than dropping; the deferral is what carries the rollback back to A.
+    presence_wire::refresh_registry_cache(
+        &receiver,
+        &[deferred_capable_row("gw-a")],
+        Utc::now(),
+    )
+    .unwrap();
+    for index in 1..=5 {
+        a2a::mesh::feed::append_entry(&sender, &cfg_a, local_feed_entry(&format!("entry {index}")))
+            .unwrap();
+    }
+
+    let link = common::start_mesh_link(
+        sender.clone(),
+        cfg_a.clone(),
+        "gw-a",
+        receiver.clone(),
+        limited_cfg_b,
+        "gw-b",
+    )
+    .await;
+
+    // The link auto-converges: A ships its feed, B admits 2 and defers 3-5, and
+    // B's deferral carries its confirmed cursor (2). Wait for B to admit the two
+    // and for A to process the deferral.
+    common::wait_until(|| a2a::mesh::feed::read(&receiver, 0).unwrap().len() == 2).await;
+    common::wait_until(|| {
+        std::fs::read_to_string(sender.root().join("mesh/gateway/gateway.jsonl"))
+            .map(|log| log.lines().any(|line| line.contains("deferral_received")))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // The deferral rolled A's sent-cursor back to B's applied seq (2), so a delta
+    // sweep now re-drives exactly the un-applied tail (entries 3-5). Without the
+    // rollback the optimistically-advanced sent-cursor would leave the tail
+    // stranded until the ~5-minute anti-entropy sweep, and this returns 0.
+    let redriven =
+        a2a::mesh::gateway::link::push_watcher_deltas(&sender, &cfg_a, "gw-a", &link.a_state)
+            .await
+            .unwrap();
+    assert_eq!(
+        redriven, 3,
+        "only the un-applied tail (entries 3-5) re-drives after the deferral rolls the sender cursor back to B's confirmed seq"
+    );
+    link.stop().await;
 }
 
 #[tokio::test]

@@ -768,6 +768,8 @@ async fn deferred_frame_reschedules_the_peer_spool_without_ending_the_link() {
                 Frame::Deferred {
                     code: "RATE_LIMITED".to_string(),
                     retry_after_secs: Some(45),
+                    origin: None,
+                    applied_through_seq: None,
                 },
             )
             .await
@@ -838,6 +840,8 @@ fn deferred_is_never_emitted_to_a_peer_that_predates_it() {
         Frame::Deferred {
             code: "RATE_LIMITED".to_string(),
             retry_after_secs: Some(30),
+            origin: None,
+            applied_through_seq: None,
         }
     );
 

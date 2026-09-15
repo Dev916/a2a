@@ -21,6 +21,8 @@ pub fn deferred_frame(code: &str, retry_after_secs: Option<u64>) -> Frame {
     Frame::Deferred {
         code: code.to_string(),
         retry_after_secs,
+        origin: None,
+        applied_through_seq: None,
     }
 }
 

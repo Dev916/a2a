@@ -200,6 +200,8 @@ async fn frame_enum_roundtrips_all_spec_kinds() {
         Frame::Deferred {
             code: "RATE_LIMITED".to_string(),
             retry_after_secs: Some(30),
+            origin: None,
+            applied_through_seq: None,
         },
     ];
 
@@ -220,6 +222,8 @@ fn deferred_frame_is_known_and_older_readers_skip_it() {
         Some(Frame::Deferred {
             code: "RATE_LIMITED".to_string(),
             retry_after_secs: None,
+            origin: None,
+            applied_through_seq: None,
         })
     );
     // The pre-L4 reader's behaviour, reproduced: an unknown kind is skipped, not fatal.

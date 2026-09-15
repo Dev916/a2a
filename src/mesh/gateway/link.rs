@@ -750,6 +750,36 @@ impl LinkStateHandle {
         limits::health_by_peer(&buckets)
     }
 
+    /// Roll a peer's feed sent-cursor back to the receiver's confirmed
+    /// watermark after a feed deferral. `push_watcher_deltas` advances the
+    /// sent-cursor optimistically when it *sends*, so a deferred tail would
+    /// otherwise fall outside the delta window and only recover on the
+    /// ~5-minute anti-entropy sweep (or a reconnect). Rolling back to the
+    /// applied seq lets the next 5s delta sweep re-drive exactly the
+    /// un-applied tail. Never advances the cursor: a stale deferral must not
+    /// skip entries the peer has since applied.
+    pub(crate) async fn rollback_sent_cursor(
+        &self,
+        peer_gateway_id: &str,
+        origin: &str,
+        applied_through_seq: u64,
+    ) {
+        let mut peers = self.inner.peers.lock().await;
+        if let Some(link) = peers
+            .get_mut(peer_gateway_id)
+            .and_then(PeerLinkState::selected_mut)
+        {
+            link.sent_cursors
+                .entry(origin.to_string())
+                .and_modify(|seq| {
+                    if *seq > applied_through_seq {
+                        *seq = applied_through_seq;
+                    }
+                })
+                .or_insert(applied_through_seq);
+        }
+    }
+
     pub async fn peer_cursors(&self, peer_gateway_id: &str) -> PeerCursorView {
         self.ensure_peer_ingress(peer_gateway_id).await;
         PeerCursorView {
@@ -1135,6 +1165,31 @@ async fn handle_inbound_frame(
     };
     let peer_version = state.peer_version(peer_gateway_id).await;
     let peer_supports_deferred = limits::peer_supports_deferred(peer_version.as_deref());
+    // Handled outside the ingress closure: the sent-cursor rollback needs the
+    // async peers lock, and defer-spool/logging touch only home/cfg.
+    if let Frame::Deferred {
+        code,
+        retry_after_secs,
+        origin,
+        applied_through_seq,
+    } = &frame
+    {
+        let _ = notes_wire::defer_spool_for_peer(
+            home,
+            cfg,
+            peer_gateway_id,
+            *retry_after_secs,
+            Utc::now(),
+            &mut rand::thread_rng(),
+        )?;
+        limits::log_deferral_received(home, peer_gateway_id, code, *retry_after_secs);
+        if let (Some(origin), Some(applied_through_seq)) = (origin, applied_through_seq) {
+            state
+                .rollback_sent_cursor(peer_gateway_id, origin, *applied_through_seq)
+                .await;
+        }
+        return Ok(());
+    }
     let result = state
         .with_peer_ingress(peer_gateway_id, |buckets, cursors| {
             let now = Utc::now();
@@ -1265,6 +1320,25 @@ async fn handle_inbound_frame(
                         deferred = frame_deferred || report.deferred;
                         cursors.persist_merged(home, std::slice::from_ref(&origin))?;
                     }
+                    // Enrich a feed deferral with the receiver's confirmed cursor
+                    // so the sender rolls its optimistically-advanced sent-cursor
+                    // back to the real applied seq and re-drives only the
+                    // un-applied tail on the next delta sweep (a2a-75j).
+                    if deferred {
+                        if let Some(Frame::Deferred {
+                            code,
+                            retry_after_secs,
+                            ..
+                        }) = deferred_ack.take()
+                        {
+                            deferred_ack = Some(Frame::Deferred {
+                                code,
+                                retry_after_secs,
+                                origin: Some(origin.clone()),
+                                applied_through_seq: Some(cursors.last_seq(&origin)),
+                            });
+                        }
+                    }
                 }
                 Frame::Note { note } => {
                     let kind = if note.kind == crate::mesh::work_store::WORK_OFFER_KIND {
@@ -1315,24 +1389,15 @@ async fn handle_inbound_frame(
                 Frame::Ack { ref_id, outcome } => {
                     let _ = notes_wire::handle_ack(home, peer_gateway_id, &ref_id, &outcome)?;
                 }
-                Frame::Deferred {
-                    code,
-                    retry_after_secs,
-                } => {
-                    let _ = notes_wire::defer_spool_for_peer(
-                        home,
-                        cfg,
-                        peer_gateway_id,
-                        retry_after_secs,
-                        Utc::now(),
-                        &mut rand::thread_rng(),
-                    )?;
-                    limits::log_deferral_received(home, peer_gateway_id, &code, retry_after_secs);
-                }
                 Frame::Presence { peers } => {
                     presence_wire::merge_presence_frame(home, peer_gateway_id, peers)?;
                 }
-                Frame::Err { .. } | Frame::Challenge { .. } | Frame::Hello { .. } => {}
+                // Deferred is handled before this closure (it needs the async
+                // peers lock for the sent-cursor rollback).
+                Frame::Deferred { .. }
+                | Frame::Err { .. }
+                | Frame::Challenge { .. }
+                | Frame::Hello { .. } => {}
             }
             Ok::<_, AppError>(Some((deferred, deferred_ack, outbound)))
         })

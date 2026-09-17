@@ -881,19 +881,27 @@ fn run_fleet(
             }
             Ok(Outcome::from(Value::String(status.render_human())))
         }
-        MeshFleetCmd::SetRegistry { url } => {
+        MeshFleetCmd::SetRegistry { url, allow_empty } => {
             let url = registry_input(url)?;
             let roots = reader_roots(home)?;
             let fleet_id = crate::mesh::keys::fleet_id(home)?;
             let now = Utc::now();
             let marks = RowMarkStore::open(home)?;
             let verify_cfg = RowVerifyCfg::from_config(now, cfg);
+            let allow_empty = *allow_empty;
             let rows = rt.block_on(async {
                 let registry = open_registry(&url, roots, fleet_id.clone())?
                     .with_reader_state(marks.clone(), verify_cfg.clone());
                 let fleet_ids = registry.fleet_ids().await?;
                 if let Some(other) = fleet_ids.iter().find(|seen| *seen != &fleet_id) {
                     return Err(registry_set_refused(&fleet_id, other));
+                }
+                // The wrong-fleet check above only fires on a conflicting fleet;
+                // an empty registry slips through and would silently re-home this
+                // machine onto a fat-fingered, fleet-less DB. Refuse unless the
+                // operator explicitly adopts a fresh registry (a2a-9mn).
+                if !allow_empty && !fleet_ids.contains(&fleet_id) {
+                    return Err(registry_set_empty(&fleet_id));
                 }
                 let rows = registry.discover().await?;
                 if let Some((row, _verdict)) =
@@ -1028,6 +1036,20 @@ fn registry_set_refused(local_fleet_id: &str, observed_fleet_id: &str) -> AppErr
         "local_fleet_id": local_fleet_id,
         "observed_fleet_id": observed_fleet_id,
     }))
+}
+
+fn registry_set_empty(local_fleet_id: &str) -> AppError {
+    AppError::new(
+        "REGISTRY_SET_EMPTY",
+        ExitCode::Precondition,
+        format!(
+            "the new registry holds no fleet at all, so it does not contain fleet {local_fleet_id}"
+        ),
+    )
+    .remedy(
+        "point set-registry at a registry that already holds this fleet; to intentionally adopt a fresh/migrated registry pass --allow-empty (or use `fleet init --registry` for a brand-new fleet)",
+    )
+    .data(json!({ "local_fleet_id": local_fleet_id }))
 }
 
 fn rotation_phase_unmet(evidence: &RotationEvidence, phase: RotationPhase) -> AppError {

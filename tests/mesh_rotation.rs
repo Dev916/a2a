@@ -599,6 +599,7 @@ fn set_registry_verifies_before_it_writes_and_prints_the_fleet_state() {
             "set-registry",
             "--url",
             &new_url,
+            "--allow-empty",
         ])
         .assert()
         .success();
@@ -687,6 +688,47 @@ fn set_registry_refuses_to_rehome_a_machine_to_a_different_fleet() {
     let out = json_out(&refused);
     assert_eq!(out["error"]["code"], "REGISTRY_SET_REFUSED", "{out}");
     assert_eq!(fs::read(env_path).unwrap(), before);
+}
+
+#[test]
+fn set_registry_refuses_an_empty_registry_unless_allow_empty_is_given() {
+    // a2a-9mn: a reachable, correctly-schema'd registry that holds no fleet at
+    // all is a fat-finger risk (a wrong-but-empty migrated DB) -- the
+    // wrong-fleet refusal only fires on conflicting rows. Refuse by default;
+    // require --allow-empty to intentionally adopt a fresh registry.
+    let owner = tempfile::tempdir().unwrap();
+    let owner_home = A2aHome::resolve(Some(owner.path())).unwrap();
+    keys::fleet_init(&owner_home).unwrap();
+    write_registry_env(&owner_home, "file:/old/fleet/credential").unwrap();
+    let env_path = owner.path().join("mesh/fleet/registry.env");
+    let before = fs::read(&env_path).unwrap();
+
+    let empty = owner.path().join("empty-registry");
+    FileRegistry::new(&empty).init_schema().unwrap();
+    let empty_url = format!("file:{}", empty.display());
+
+    let refused = cmd(owner.path())
+        .args(["--json", "mesh", "fleet", "set-registry", "--url", &empty_url])
+        .assert()
+        .failure();
+    let out = json_out(&refused);
+    assert_eq!(out["error"]["code"], "REGISTRY_SET_EMPTY", "{out}");
+    assert_eq!(fs::read(&env_path).unwrap(), before, "old credential kept");
+
+    // The explicit override adopts the fresh registry.
+    cmd(owner.path())
+        .args([
+            "--json",
+            "mesh",
+            "fleet",
+            "set-registry",
+            "--url",
+            &empty_url,
+            "--allow-empty",
+        ])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&env_path).unwrap(), format!("{empty_url}\n"));
 }
 
 #[test]
@@ -1193,6 +1235,34 @@ fn retire_is_blocked_by_soak_and_force_skips_only_the_soak() {
     assert_eq!(
         soak_state(&evidence, promoted_at + 3_600, 3_600),
         SoakState::Satisfied
+    );
+}
+
+#[test]
+fn soak_is_cleared_after_retire_even_if_promoted_at_lingers() {
+    // After retire the old root is gone (prev_fpr None, next_fpr None -> phase
+    // NotStaged), but promoted_at can linger in the rotation state. The soak
+    // block keys on prev_fpr, so it must report NotPromoted rather than a stale
+    // Pending/Satisfied block as if a rotation were still in flight (a2a-7ku).
+    let new_fpr = "b".repeat(64);
+    let promoted_at = 1_700_000_000;
+    let evidence = RotationEvidence {
+        current_fpr: new_fpr.clone(),
+        next_fpr: None,
+        prev_fpr: None,
+        promoted_at: Some(promoted_at),
+        members: vec![MemberEvidence {
+            gateway_id: "gw-one".to_string(),
+            verified_issuer_fpr: Some(new_fpr),
+            roots_held: Vec::new(),
+            last_handshake: None,
+        }],
+        unaccounted: Vec::new(),
+    };
+    assert_eq!(phase(&evidence), RotationPhase::NotStaged);
+    assert_eq!(
+        soak_state(&evidence, promoted_at + 30, 3_600),
+        SoakState::NotPromoted
     );
 }
 

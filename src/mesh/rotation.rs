@@ -339,6 +339,13 @@ pub fn phase(evidence: &RotationEvidence) -> RotationPhase {
 }
 
 pub fn soak_state(evidence: &RotationEvidence, now: i64, soak_secs: u64) -> SoakState {
+    // Soak measures how long the previous root has been held after promotion,
+    // so it applies only while that old root is still present (post-promote,
+    // pre-retire). Once retire drops prev_fpr there is nothing left soaking,
+    // even if promoted_at lingers in the rotation state (a2a-7ku).
+    if evidence.prev_fpr.is_none() {
+        return SoakState::NotPromoted;
+    }
     let Some(promoted_at) = evidence.promoted_at else {
         return SoakState::NotPromoted;
     };

@@ -631,6 +631,10 @@ pub enum MeshFleetCmd {
         /// Registry connection string source; use `-` to read from stdin
         #[arg(long, value_name = "SOURCE")]
         url: String,
+        /// Adopt a registry that holds no fleet yet (a fresh/migrated DB).
+        /// Without this, an empty registry is refused as a likely fat-finger.
+        #[arg(long)]
+        allow_empty: bool,
     },
 }
 

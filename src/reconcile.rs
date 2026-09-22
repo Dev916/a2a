@@ -191,6 +191,22 @@ fn reconcile_locked(
     //     sentinel, neither of which an app-server worker has.
     let mut turn_concluded = false;
     if ingested.turn_completed && snap.state == WorkerState::Running {
+        // Refresh an EXISTING result.md from this turn's own final agent message
+        // before reading it. The exec transport has no in-process `WorkerActor`
+        // to write result.md the way the app-server path does, so a stale
+        // result.md from a prior epoch (e.g. an app-server turn before a
+        // cross-transport resume) could otherwise be read as this turn's — codex
+        // overwrites it via --output-last-message, but that flush can lag the
+        // `turn.completed` we just ingested (a2a-niq). Gated on an existing
+        // result so a turn that produced none still parks: this only replaces a
+        // stale result with the fresh one, it never fabricates one.
+        if has_result(dir) {
+            if let Some(text) = &ingested.result_text {
+                if let Err(e) = crate::store::write_atomic(&dir.join(RESULT_MD), text.as_bytes()) {
+                    eprintln!("a2a: warning: {}: writing the synthesized result: {e}", snap.id);
+                }
+            }
+        }
         let has_result = has_result(dir);
         let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
         // A queued message concludes the turn by RESTARTING the worker, so it
@@ -466,6 +482,11 @@ pub fn conclude_turn(
 struct Ingested {
     session: Option<SessionIds>,
     turn_completed: bool,
+    /// The completed turn's own final agent message, synthesized from the
+    /// stream this pass ingested. `Some` only when the turn completed and it
+    /// produced a usable agent message; the exec path writes it over `result.md`
+    /// so a stale prior-epoch result cannot satisfy `has_result` (a2a-niq).
+    result_text: Option<String>,
 }
 
 struct SessionIds {
@@ -488,6 +509,7 @@ fn ingest(
     let mut found = Ingested {
         session: None,
         turn_completed: false,
+        result_text: None,
     };
     let path = exec::exec_stream_path(dir, snap.epoch);
     let key = format!("exec_offset_{}", snap.epoch);
@@ -556,6 +578,13 @@ fn ingest(
 
     offset += consumed as u64;
     snap.extra.insert(key, json!(offset));
+    // A completed turn's own final agent message IS its result. Capture it from
+    // the very stream that produced the completion signal, so the exec path can
+    // write result.md as freshly as the app-server actor does rather than
+    // trusting codex's asynchronous --output-last-message flush (a2a-niq).
+    if found.turn_completed {
+        found.result_text = crate::events::synthesize_result(&pending);
+    }
     Ok((fold::fold(snap, &pending, now), found))
 }
 
@@ -1330,6 +1359,62 @@ mod tests {
             vec![EventKind::ResultWritten, EventKind::StateChange]
         );
         assert!(dir.join(RESULT_JSON).exists());
+    }
+
+    /// Regression for a2a-niq. After a cross-transport resume — an app-server
+    /// epoch-1 turn left a `result.md` behind, then an exec epoch-2 resume ran —
+    /// reconcile must not reach `done` still pointing at the STALE epoch-1
+    /// result. The exec transport has no in-process `WorkerActor` to synthesize
+    /// the result the way the app-server path does, so a stale `result.md`
+    /// satisfies `has_result` the instant the epoch-2 `turn.completed` is
+    /// ingested — before codex's async `--output-last-message` lands. The fix
+    /// synthesizes this turn's own final agent message over the stale file at
+    /// conclusion, so `wait` reaching `done` and an immediate `result` agree.
+    #[test]
+    fn a_cross_transport_resume_does_not_conclude_on_a_stale_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let (cfg, _, _) = crate::config::load(&home).unwrap();
+        let id = "general-0814t1300-aaaa";
+        let dir = home.worker_dir(id);
+        std::fs::create_dir_all(dir.join("outbox")).unwrap();
+
+        // A Running exec worker at epoch 2 (the resume), and the STALE result.md
+        // the app-server epoch-1 turn left behind on disk.
+        let now = Utc::now();
+        let mut snap = WorkerSnapshot::new_for_test(id, dir.as_path());
+        snap.lane = Lane::General;
+        snap.transport = Transport::Exec;
+        snap.state = WorkerState::Running;
+        snap.epoch = 2;
+        snap.session_id = Some("sess-1".to_string());
+        snap.entered_state_at = now;
+        snap.deadline_at = None;
+        save_snapshot(&dir, &snap).unwrap();
+        std::fs::write(dir.join(RESULT_MD), b"EPOCH-1 stale answer\n").unwrap();
+
+        // The epoch-2 exec stream: its own final agent message, then
+        // turn.completed — codex has NOT yet flushed --output-last-message, so
+        // result.md on disk is still the epoch-1 text.
+        std::fs::write(
+            exec::exec_stream_path(&dir, 2),
+            "{\"type\":\"agent_message\",\"message\":\"EPOCH-2 fresh answer\"}\n\
+             {\"type\":\"turn.completed\",\"id\":\"t2\"}\n",
+        )
+        .unwrap();
+
+        let snap = reconcile(&home, &cfg, id, now).unwrap();
+
+        assert_eq!(snap.state, WorkerState::Done, "the turn concluded");
+        let result = std::fs::read_to_string(dir.join(RESULT_MD)).unwrap();
+        assert!(
+            result.contains("EPOCH-2 fresh answer"),
+            "result.md must reflect the epoch-2 turn, not the stale epoch-1 text; got {result:?}"
+        );
+        assert!(
+            !result.contains("EPOCH-1 stale"),
+            "the stale epoch-1 result must not survive the conclusion; got {result:?}"
+        );
     }
 
     /// An app-server worker's inbox is drained by its `WorkerActor` over the

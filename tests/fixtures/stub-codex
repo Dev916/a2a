@@ -42,6 +42,15 @@ fi
 if [ -n "$STUB_MESH_NOTE" ] && [ -n "$outbox" ]; then
   printf '%s\n' "$STUB_MESH_NOTE" > "$outbox/1.note.json"
 fi
+# Faithful to real codex: the turn's FINAL agent message is exactly what
+# --output-last-message records, so a result synthesized from the event stream
+# matches the file byte for byte. Emitted only when a result is produced (a
+# question turn parks with no result). JSON-escape the value so a JSON result
+# (e.g. a --schema payload) stays a valid message string.
+if [ -z "$STUB_NO_RESULT" ] && [ -z "$STUB_EMIT_QUESTION" ]; then
+  _resc=$(printf '%s' "${STUB_LAST_MSG:-done}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '%s\n' "{\"type\":\"agent_message\",\"message\":\"$_resc\"}"
+fi
 printf '%s\n' '{"type":"turn.completed","id":"t1"}'
 if [ -n "$out" ] && [ -z "$STUB_NO_RESULT" ] && [ -z "$STUB_EMIT_QUESTION" ]; then
   printf '%s\n' "${STUB_LAST_MSG:-done}" > "$out"

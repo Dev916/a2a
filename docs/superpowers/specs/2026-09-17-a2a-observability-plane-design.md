@@ -259,9 +259,16 @@ Content-type `application/json`; WS frames are one Event envelope each.
 3. **Depth-2 forensic capture:** add `turn`/`tool_call` normalizers over
    `workers/<id>/exec.<epoch>.jsonl`; already-reserved planes mean no consumer
    break. Opt-in (`--planes turn,tool_call` or a capture flag) because of volume.
-4. **Control spike:** a separate, auth-gated mutating surface (steer/answer/kill
-   proxied to the broker). The read-only serve stays the default and safe path;
-   the spike is evaluated on its own before any build.
+4. **Control spike → Agent Command Channel (committed 2026-09-21):** a separate,
+   auth-gated mutating surface. The management-app spec resolved this from a
+   "spike to evaluate" into a committed a2a-core capability — the **Agent Command
+   Channel** — that delivers imperative directives to the orchestrator (compact /
+   change model+effort / kick off a brainstorm) and steer/answer/kill to the
+   broker, and unlocks remote control. **This plane does not change:** it stays
+   read-only by hard invariant; the Command Channel is a *distinct* surface built
+   on its own brainstorm + spec, not a route added to `observe serve`. Build
+   order: this read-only plane first (the app depends on its contract), then the
+   Command Channel.
 
 ## Self-review notes
 

@@ -228,11 +228,18 @@ pub enum Cmd {
     /// Retry a worker: spawn a fresh one that inherits its lane, cwd, owner,
     /// model, effort, result schema and brief. Refused while the parent is
     /// still working, and after `admission.max_attempts` tries at one brief.
+    ///
+    /// To retry with a changed brief (e.g. folding in a blocked worker's
+    /// answer), either edit the parent's own copy at `workers/<id>/brief.md`
+    /// (it is re-read fresh here) or pass `--brief <amended-file>`. A bare
+    /// respawn re-runs the parent's brief unchanged; editing the original file
+    /// you first spawned from does not reach the retry unless you pass --brief.
     Respawn {
         /// Worker id, or any unambiguous prefix of one
         id: String,
-        /// Retry with this brief instead of the parent's (it goes through the
-        /// same front-matter and secret gates any spawn's brief does)
+        /// Retry with this brief instead of the parent's own `brief.md` (it
+        /// goes through the same front-matter and secret gates any spawn's
+        /// brief does)
         #[arg(long, value_name = "FILE")]
         brief: Option<std::path::PathBuf>,
         /// Respawn a worker owned by somebody else (spec §4.8). The child still

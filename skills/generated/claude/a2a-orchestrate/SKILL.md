@@ -109,6 +109,17 @@ has no memory of the exchange beyond what you send it. If the answer changes
 the task, say so explicitly; a steer that contradicts the brief without saying
 which one wins produces a worker that splits the difference.
 
+**Retrying with the answer folded into the brief.** When you would rather give
+up on a parked worker and retry with the clarification baked in, `a2a respawn
+<id>` re-runs the brief in a fresh worker. It reads the brief from the parent's
+own staged copy at `workers/<id>/brief.md` — read fresh at respawn time, not a
+cached snapshot — so the way to make an amendment land is to **edit that file**
+(or pass `a2a respawn <id> --brief <amended-file>`, which goes through the same
+front-matter and secret gates). Editing the *original* file you first spawned
+from does **not** reach the retry unless you point `--brief` at it: respawn
+inherits the parent's own copy, exactly as it inherits the parent's staged
+schema and context. A bare `respawn` re-runs the brief unchanged.
+
 ## The acceptance gate is mechanical
 
 Do not accept a worker's result on the strength of its own summary. Run

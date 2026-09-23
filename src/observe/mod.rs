@@ -7,6 +7,7 @@
 pub mod event;
 pub mod snapshot;
 pub mod cursor;
+pub mod serve;
 mod fold;
 mod source;
 mod tail;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 
 pub use cursor::Cursor;
 pub use event::{Event, Plane, Src, Subject};
+pub use serve::{router, AppState};
 pub use snapshot::Snapshot;
 pub use source::{read_json, read_jsonl, read_jsonl_from};
 

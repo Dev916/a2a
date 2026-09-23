@@ -13,6 +13,7 @@ pub mod home;
 pub mod ids;
 pub mod inbox;
 pub mod mesh;
+pub mod observe;
 pub mod output;
 pub mod protocol;
 pub mod reconcile;

@@ -7,10 +7,29 @@
 pub mod event;
 pub mod snapshot;
 pub mod cursor;
+mod fold;
 mod source;
 pub mod normalize;
+
+use std::path::PathBuf;
 
 pub use cursor::Cursor;
 pub use event::{Event, Plane, Src, Subject};
 pub use snapshot::Snapshot;
 pub use source::{read_json, read_jsonl, read_jsonl_from};
+
+/// Read-only entry point for observing one a2a home.
+#[derive(Clone, Debug)]
+pub struct Observer {
+    home: PathBuf,
+}
+
+impl Observer {
+    pub fn open(home: impl Into<PathBuf>) -> Observer {
+        Observer { home: home.into() }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        fold::snapshot(&self.home)
+    }
+}

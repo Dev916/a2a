@@ -1,11 +1,21 @@
 use crate::observe::snapshot::{AgentSummary, HealthView, PeerView, WorkerView, WorkView};
-use crate::observe::{Cursor, Event, Observer, Snapshot};
+use crate::observe::{Cursor, Event, Observer, Plane, Snapshot};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::{self, Instant};
+
+const STREAM_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const STREAM_PING_INTERVAL: Duration = Duration::from_secs(30);
+const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const STREAM_BUFFER_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -23,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/work", get(work))
         .route("/work/{id}", get(work_detail))
         .route("/feed", get(feed))
+        .route("/stream", get(stream))
         .with_state(state)
 }
 
@@ -108,6 +119,182 @@ async fn feed(
     Ok(Json(events))
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    from: Option<String>,
+    planes: Option<String>,
+}
+
+async fn stream(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(query): Query<StreamQuery>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_stream(socket, state, query))
+}
+
+fn stream_frames(events: &[Event], planes: Option<&[Plane]>) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| planes.is_none_or(|planes| planes.contains(&event.plane)))
+        .map(|event| {
+            serde_json::to_string(event)
+                .expect("Event envelopes contain only JSON-serializable values")
+        })
+        .collect()
+}
+
+fn parse_planes(value: Option<&str>) -> Option<Vec<Plane>> {
+    value.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| match value {
+                "mesh" => Plane::Mesh,
+                "work" => Plane::Work,
+                "worker" => Plane::Worker,
+                "presence" => Plane::Presence,
+                "health" => Plane::Health,
+                _ => Plane::Unknown,
+            })
+            .collect()
+    })
+}
+
+#[derive(Debug)]
+enum StreamMessage {
+    Text(String),
+    Ping,
+}
+
+#[derive(Debug, PartialEq)]
+enum TailExit {
+    SlowConsumer,
+    ReceiverClosed,
+}
+
+async fn handle_stream(mut socket: WebSocket, state: AppState, query: StreamQuery) {
+    let cursor = match query.from.as_deref().map(Cursor::decode).transpose() {
+        Ok(Some(cursor)) => cursor,
+        Ok(None) => Observer::open(&state.home).snapshot().cursor,
+        Err(_) => {
+            close_policy(&mut socket, "invalid stream cursor").await;
+            return;
+        }
+    };
+    let planes = parse_planes(query.planes.as_deref());
+    let observer = Observer::open(&state.home);
+    let (events, cursor) = observer.events_since(&cursor);
+
+    for frame in stream_frames(&events, planes.as_deref()) {
+        if !send_message(&mut socket, Message::Text(frame.into())).await {
+            return;
+        }
+    }
+
+    let (outbound, mut incoming) = mpsc::channel(STREAM_BUFFER_CAPACITY);
+    let mut tailer = tokio::spawn(live_tail(
+        state.home,
+        cursor,
+        planes,
+        outbound,
+    ));
+
+    loop {
+        tokio::select! {
+            result = &mut tailer => {
+                if matches!(result, Ok(TailExit::SlowConsumer)) {
+                    close_policy(&mut socket, "stream consumer too slow").await;
+                }
+                break;
+            }
+            message = incoming.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let message = match message {
+                    StreamMessage::Text(frame) => Message::Text(frame.into()),
+                    StreamMessage::Ping => Message::Ping(Vec::new().into()),
+                };
+                if !send_message(&mut socket, message).await {
+                    break;
+                }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if !send_message(&mut socket, Message::Pong(payload)).await {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+
+    tailer.abort();
+}
+
+async fn live_tail(
+    home: PathBuf,
+    mut cursor: Cursor,
+    planes: Option<Vec<Plane>>,
+    outbound: mpsc::Sender<StreamMessage>,
+) -> TailExit {
+    let observer = Observer::open(home);
+    let now = Instant::now();
+    let mut poll = time::interval_at(now + STREAM_POLL_INTERVAL, STREAM_POLL_INTERVAL);
+    let mut ping = time::interval_at(now + STREAM_PING_INTERVAL, STREAM_PING_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                let (events, advanced) = observer.events_since(&cursor);
+                for frame in stream_frames(&events, planes.as_deref()) {
+                    if let Err(exit) = queue_message(&outbound, StreamMessage::Text(frame)) {
+                        return exit;
+                    }
+                }
+                cursor = advanced;
+            }
+            _ = ping.tick() => {
+                if let Err(exit) = queue_message(&outbound, StreamMessage::Ping) {
+                    return exit;
+                }
+            }
+        }
+    }
+}
+
+fn queue_message(
+    outbound: &mpsc::Sender<StreamMessage>,
+    message: StreamMessage,
+) -> Result<(), TailExit> {
+    match outbound.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(TailExit::SlowConsumer),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(TailExit::ReceiverClosed),
+    }
+}
+
+async fn send_message(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        time::timeout(STREAM_SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn close_policy(socket: &mut WebSocket, reason: &'static str) {
+    let close = Message::Close(Some(CloseFrame {
+        code: close_code::POLICY,
+        reason: reason.into(),
+    }));
+    let _ = time::timeout(STREAM_SEND_TIMEOUT, socket.send(close)).await;
+}
+
 #[derive(Serialize)]
 struct SnapshotResponse {
     agent: AgentSummary,
@@ -141,14 +328,60 @@ impl From<Snapshot> for SnapshotResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{router, AppState};
-    use crate::observe::Cursor;
+    use super::{router, stream_frames, AppState};
+    use crate::observe::{Cursor, Event, Plane, Src, Subject};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use serde_json::Value;
     use std::fs;
     use tower::ServiceExt;
+
+    fn stream_event(plane: Plane, kind: &str, reference: &str) -> Event {
+        Event {
+            v: 1,
+            ts: format!("2026-09-23T07:00:0{reference}Z"),
+            agent_id: "gw-local".into(),
+            plane,
+            kind: kind.into(),
+            subject: Subject {
+                worker_id: None,
+                work_id: None,
+                peer: None,
+            },
+            payload: serde_json::json!({"reference": reference}),
+            src: Src {
+                artifact: "fixture.jsonl".into(),
+                reference: reference.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn stream_frames_preserve_order_and_filter_planes() {
+        let events = vec![
+            stream_event(Plane::Mesh, "mesh-first", "1"),
+            stream_event(Plane::Worker, "worker-middle", "2"),
+            stream_event(Plane::Work, "work-last", "3"),
+        ];
+
+        let filtered = stream_frames(&events, Some(&[Plane::Mesh, Plane::Work]));
+        assert_eq!(
+            filtered,
+            vec![
+                serde_json::to_string(&events[0]).unwrap(),
+                serde_json::to_string(&events[2]).unwrap(),
+            ]
+        );
+
+        assert_eq!(
+            stream_frames(&events, None),
+            events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
 
     fn seed_home_with_one_worker() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();

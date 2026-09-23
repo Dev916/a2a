@@ -1,5 +1,6 @@
 use a2a::cli::{
-    BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshWorkCmd, SyncCmd,
+    BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshWorkCmd, ObserveCmd,
+    SyncCmd,
 };
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
@@ -19,11 +20,21 @@ fn main() {
         a2a::exec::shim_main(worker_dir, *epoch, prompt_file, argv);
     }
     let cmd_name = command_name(&cli.cmd);
+    // `observe snapshot` is itself a raw Snapshot JSON producer. Its local
+    // `--json` spelling shares clap's global JSON argument id, so do not wrap
+    // that document in the ordinary command envelope.
+    let envelope_json = cli.global.json
+        && !matches!(
+            &cli.cmd,
+            Cmd::Observe {
+                cmd: ObserveCmd::Snapshot { .. }
+            }
+        );
     let code = match run(&cli) {
         // A command can succeed and still exit nonzero: `status` on a failed
         // worker answered the question correctly (exit 4, full payload).
         Ok(out) => {
-            emit_ok(cli.global.json, cmd_name, out.data);
+            emit_ok(envelope_json, cmd_name, out.data);
             out.exit as i32
         }
         Err(e) => emit_err(cli.global.json, cmd_name, &e),
@@ -120,6 +131,11 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshWorkCmd::Reject { .. } => "mesh work reject",
                 MeshWorkCmd::Reopen { .. } => "mesh work reopen",
             },
+        },
+        Cmd::Observe { cmd } => match cmd {
+            ObserveCmd::Serve { .. } => "observe serve",
+            ObserveCmd::Tail { .. } => "observe tail",
+            ObserveCmd::Snapshot { .. } => "observe snapshot",
         },
     }
 }
@@ -384,5 +400,33 @@ fn run(cli: &Cli) -> Result<Outcome, AppError> {
                 cli.global.quiet,
             )
         }
+        Cmd::Observe { cmd } => match cmd {
+            ObserveCmd::Serve {
+                home,
+                bind,
+                port,
+                token,
+                token_file,
+                tls,
+                planes,
+            } => a2a::commands::observe::serve(
+                home.as_deref().or(cli.global.home.as_deref()),
+                *bind,
+                *port,
+                token.as_deref(),
+                token_file.as_deref(),
+                *tls,
+                planes.as_deref(),
+            ),
+            ObserveCmd::Tail { home, from, planes } => a2a::commands::observe::tail(
+                home.as_deref().or(cli.global.home.as_deref()),
+                from.as_deref(),
+                planes.as_deref(),
+            ),
+            ObserveCmd::Snapshot { home, json } => a2a::commands::observe::snapshot(
+                home.as_deref().or(cli.global.home.as_deref()),
+                *json,
+            ),
+        },
     }
 }

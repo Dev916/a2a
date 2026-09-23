@@ -262,6 +262,60 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: MeshCmd,
     },
+    /// Inspect and stream the local read-only observability plane
+    Observe {
+        #[command(subcommand)]
+        cmd: ObserveCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ObserveCmd {
+    /// Serve the read-only observability API
+    Serve {
+        /// Read this a2a home instead of $A2A_HOME or ~/.a2a
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Address to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: std::net::IpAddr,
+        /// Port to bind
+        #[arg(long, default_value_t = 7718)]
+        port: u16,
+        /// Require this bearer token
+        #[arg(long, conflicts_with = "token_file")]
+        token: Option<String>,
+        /// Read the required bearer token from this file
+        #[arg(long, value_name = "FILE", conflicts_with = "token")]
+        token_file: Option<PathBuf>,
+        /// Request TLS (unsupported in the Phase 1 server)
+        #[arg(long)]
+        tls: bool,
+        /// Comma-separated event planes to expose
+        #[arg(long)]
+        planes: Option<String>,
+    },
+    /// Print new events as JSON lines
+    Tail {
+        /// Read this a2a home instead of $A2A_HOME or ~/.a2a
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Resume from this opaque cursor (defaults to the current snapshot)
+        #[arg(long)]
+        from: Option<String>,
+        /// Comma-separated event planes to print
+        #[arg(long)]
+        planes: Option<String>,
+    },
+    /// Print one read-only snapshot as JSON
+    Snapshot {
+        /// Read this a2a home instead of $A2A_HOME or ~/.a2a
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Explicitly request JSON output (JSON is also the default)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

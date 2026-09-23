@@ -34,8 +34,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+# The observability plane's `a2a observe serve` HTTP+WS surface (Epic 1). `ws`
+# is opt-in; routing/extractors/JSON come from the default features.
+axum = { version = "0.8", features = ["ws"] }
 
 [dev-dependencies]
+# `util` gives `ServiceExt::oneshot`, which drives the observe routes in-process
+# with no bound port — the only way the plane's serve tests can run under a
+# codex worker (workers cannot bind loopback listeners).
+tower = { version = "0.5", features = ["util"] }
 assert_cmd = "2.2.2"
 # Fake-fidelity validation only (spec §8.3). Default features would drag in
 # reqwest + a TLS stack to resolve remote $refs; the snapshots are self-contained.

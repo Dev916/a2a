@@ -9,6 +9,7 @@ pub mod snapshot;
 pub mod cursor;
 mod fold;
 mod source;
+mod tail;
 pub mod normalize;
 
 use std::path::PathBuf;
@@ -30,6 +31,13 @@ impl Observer {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        fold::snapshot(&self.home)
+        let mut snapshot = fold::snapshot(&self.home);
+        tail::stamp_line_generations(&self.home, &mut snapshot.cursor);
+        snapshot
+    }
+
+    /// Return normalized events after `cursor` and the cursor advanced past them.
+    pub fn events_since(&self, cursor: &Cursor) -> (Vec<Event>, Cursor) {
+        tail::events_since(&self.home, cursor)
     }
 }

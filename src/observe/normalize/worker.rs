@@ -1,7 +1,8 @@
 //! Normalization for per-worker lifecycle and result artifacts.
 
 use crate::observe::cursor::Watermark;
-use crate::observe::source::{read_json, read_jsonl};
+use crate::observe::source::read_json;
+use crate::observe::tail::read_retained_jsonl;
 use crate::observe::{Cursor, Event, Plane, Src, Subject};
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
@@ -64,7 +65,7 @@ fn normalize_worker(
     let watermark = sequence_watermark(cursor, &event_artifact);
     let mut result_written_ts = None;
 
-    for row in read_jsonl(&worker_dir.join(EVENTS_FILE)) {
+    for row in read_retained_jsonl(&worker_dir.join(EVENTS_FILE)) {
         if row.get("kind").and_then(Value::as_str) == Some("result_written") {
             result_written_ts = explicit_timestamp(&row).map(str::to_string);
         }

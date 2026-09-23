@@ -1,7 +1,8 @@
 //! Normalization for distributed work-item transitions.
 
 use crate::observe::cursor::Watermark;
-use crate::observe::source::{read_json, read_jsonl, read_jsonl_records_from};
+use crate::observe::source::read_json;
+use crate::observe::tail::{read_line_records, read_retained_jsonl};
 use crate::observe::{Cursor, Event, Plane, Src, Subject};
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
@@ -29,7 +30,7 @@ pub fn normalize(home: &Path, cursor: &Cursor) -> Vec<Event> {
 
 fn normalize_mesh_events(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Vec<Event>) {
     let watermark = sequence_watermark(cursor, MESH_EVENTS_ARTIFACT);
-    for row in read_jsonl(&home.join(MESH_EVENTS_ARTIFACT)) {
+    for row in read_retained_jsonl(&home.join(MESH_EVENTS_ARTIFACT)) {
         let Some(sequence) = row.get("seq").and_then(Value::as_u64) else {
             continue;
         };
@@ -47,9 +48,7 @@ fn normalize_mesh_events(home: &Path, cursor: &Cursor, agent_id: &str, events: &
 }
 
 fn normalize_broker(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Vec<Event>) {
-    let offset = line_watermark(cursor, BROKER_ARTIFACT);
-    let (rows, _advanced) = read_jsonl_records_from(&home.join(BROKER_ARTIFACT), offset);
-    for (row, end_offset) in rows {
+    for (row, end_offset) in read_line_records(home, cursor, BROKER_ARTIFACT) {
         push_transition(
             events,
             agent_id,
@@ -253,13 +252,6 @@ fn source_timestamp(value: &Value) -> String {
 fn sequence_watermark(cursor: &Cursor, artifact: &str) -> u64 {
     match cursor.watermarks.get(artifact) {
         Some(Watermark::Sequence { seq }) => *seq,
-        _ => 0,
-    }
-}
-
-fn line_watermark(cursor: &Cursor, artifact: &str) -> u64 {
-    match cursor.watermarks.get(artifact) {
-        Some(Watermark::Line { position, .. }) => *position,
         _ => 0,
     }
 }

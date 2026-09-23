@@ -1,7 +1,8 @@
 //! Normalization for mesh feed, note, and gateway-limit artifacts.
 
 use crate::observe::cursor::Watermark;
-use crate::observe::source::{read_json, read_jsonl, read_jsonl_records_from};
+use crate::observe::source::read_json;
+use crate::observe::tail::{read_line_records, read_retained_jsonl};
 use crate::observe::{Cursor, Event, Plane, Src, Subject};
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
@@ -30,7 +31,7 @@ pub fn normalize(home: &Path, cursor: &Cursor) -> Vec<Event> {
 
 fn normalize_feed(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Vec<Event>) {
     let watermark = sequence_watermark(cursor, FEED_ARTIFACT);
-    for row in read_jsonl(&home.join(FEED_ARTIFACT)) {
+    for row in read_retained_jsonl(&home.join(FEED_ARTIFACT)) {
         if is_feed_bookkeeping(&row) {
             continue;
         }
@@ -56,7 +57,7 @@ fn normalize_feed(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Vec
 
 fn normalize_notes(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Vec<Event>) {
     let watermark = sequence_watermark(cursor, EVENTS_ARTIFACT);
-    for row in read_jsonl(&home.join(EVENTS_ARTIFACT)) {
+    for row in read_retained_jsonl(&home.join(EVENTS_ARTIFACT)) {
         if row.get("kind").and_then(Value::as_str) == Some("events_rotated") {
             continue;
         }
@@ -77,9 +78,7 @@ fn normalize_notes(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Ve
 }
 
 fn normalize_gateway(home: &Path, cursor: &Cursor, agent_id: &str, events: &mut Vec<Event>) {
-    let offset = line_watermark(cursor, GATEWAY_ARTIFACT);
-    let (rows, _advanced) = read_jsonl_records_from(&home.join(GATEWAY_ARTIFACT), offset);
-    for (row, end_offset) in rows {
+    for (row, end_offset) in read_line_records(home, cursor, GATEWAY_ARTIFACT) {
         let Some(kind) = gateway_kind(&row) else {
             continue;
         };
@@ -141,13 +140,6 @@ fn source_timestamp(value: &Value) -> String {
 fn sequence_watermark(cursor: &Cursor, artifact: &str) -> u64 {
     match cursor.watermarks.get(artifact) {
         Some(Watermark::Sequence { seq }) => *seq,
-        _ => 0,
-    }
-}
-
-fn line_watermark(cursor: &Cursor, artifact: &str) -> u64 {
-    match cursor.watermarks.get(artifact) {
-        Some(Watermark::Line { position, .. }) => *position,
         _ => 0,
     }
 }

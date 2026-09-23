@@ -1005,7 +1005,12 @@ fn registry_awaiting_release_ids(
         let roots = keys::RootSet::load(&ctx.home)?;
         let fleet_id = keys::fleet_id(&ctx.home)?;
         let gateway_id = keys::gateway_id(&ctx.home)?;
-        let registry = open_registry(&url, roots, fleet_id.clone())?;
+        // The runtime must exist BEFORE the registry: `open_registry` builds an
+        // sqlx pool, which requires a Tokio context, so it — and the query, and
+        // the pool's drop — all run inside `block_on`. Creating the pool first,
+        // outside any runtime, panics "requires a Tokio context" the instant a
+        // registry is configured (no hermetic test exercises that path). This is
+        // the proven ordering in mesh_cmd.rs. (a2a-qyi)
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1017,13 +1022,18 @@ fn registry_awaiting_release_ids(
                 )
             })?;
         let mut ids = runtime
-            .block_on(registry.work_list(
-                &fleet_id,
-                WorkListFilter {
-                    status: Some(WorkStatus::AwaitingRelease),
-                    claimed_by: Some(gateway_id),
-                },
-            ))?
+            .block_on(async {
+                let registry = open_registry(&url, roots, fleet_id.clone())?;
+                registry
+                    .work_list(
+                        &fleet_id,
+                        WorkListFilter {
+                            status: Some(WorkStatus::AwaitingRelease),
+                            claimed_by: Some(gateway_id),
+                        },
+                    )
+                    .await
+            })?
             .into_iter()
             .map(|row| row.work_id)
             .collect::<Vec<_>>();

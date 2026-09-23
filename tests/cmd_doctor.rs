@@ -230,6 +230,35 @@ fn work_awaiting_release_requires_the_registry_status_and_a_local_hold() {
     assert!(remedy.contains("reject"), "{held}");
 }
 
+/// Regression for a2a-qyi. With a POSTGRES registry configured, the
+/// work_awaiting_release check builds an sqlx pool — which requires a Tokio
+/// context. The old code created the pool BEFORE the runtime and panicked
+/// "requires a Tokio context" the instant any real deployment (which always has
+/// a pg registry) ran `a2a doctor`. A `file:` registry never caught it (no
+/// sqlx). The url here is unreachable on purpose: the check must degrade to a
+/// warning, never panic, when it cannot reach the registry — so doctor still
+/// exits 0.
+#[test]
+fn doctor_with_a_postgres_registry_does_not_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_path = tmp.path().join("h");
+    let home = a2a::home::A2aHome::resolve(Some(&home_path)).unwrap();
+    a2a::mesh::keys::fleet_init(&home).unwrap();
+    a2a::mesh::keys::gateway_identity(&home, false).unwrap();
+    a2a::mesh::keys::ensure_gateway_token(&home, &a2a::mesh::keys::SystemClock).unwrap();
+    // Syntactically valid, unreachable pg url (no sslmode → accepted). The old
+    // code panicked building the pool for this before the runtime existed.
+    write_registry_env(&home, "postgresql://a2a:x@127.0.0.1:1/postgres").unwrap();
+
+    let (v, code) = checks(&home_path, tmp.path(), |_| {});
+    assert_eq!(code, 0, "doctor must complete, not panic, with a pg registry");
+    let held = check(&v, "work_awaiting_release");
+    assert_ne!(
+        held["status"], "fail",
+        "an unreachable registry degrades to a warning, never a fail: {held}"
+    );
+}
+
 #[test]
 fn allowed_roots_warns_when_only_implicit_worktrees_root_remains() {
     let tmp = tempfile::tempdir().unwrap();

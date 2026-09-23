@@ -175,13 +175,13 @@ fn cli_check_json_envelope_uses_local_repo_tags_without_building() {
 }
 
 #[test]
-fn version_pin_is_030() {
+fn version_pin_is_040() {
     Command::cargo_bin("a2a")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::starts_with("a2a 0.3.0\n"));
+        .stdout(predicate::str::starts_with("a2a 0.4.0\n"));
 }
 
 #[derive(Default)]

@@ -1,14 +1,18 @@
 use crate::observe::snapshot::{AgentSummary, HealthView, PeerView, WorkerView, WorkView};
 use crate::observe::{Cursor, Event, Observer, Plane, Snapshot};
+use crate::output::{AppError, ExitCode};
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
@@ -23,7 +27,34 @@ pub struct AppState {
     pub token: Option<String>,
 }
 
+pub async fn run(state: AppState, bind: IpAddr, port: u16, tls: bool) -> Result<(), AppError> {
+    if tls {
+        return Err(AppError::new(
+            "OBSERVE_TLS_UNSUPPORTED",
+            ExitCode::Precondition,
+            "TLS is not supported by the Phase 1 observability server",
+        )
+        .remedy("run plaintext on loopback or terminate TLS with an operator-managed tunnel"));
+    }
+
+    let listener = TcpListener::bind((bind, port)).await.map_err(|err| {
+        AppError::new(
+            "OBSERVE_BIND",
+            ExitCode::Precondition,
+            format!("binding observability server to {bind}:{port}: {err}"),
+        )
+    })?;
+    axum::serve(listener, router(state)).await.map_err(|err| {
+        AppError::new(
+            "OBSERVE_SERVE",
+            ExitCode::Internal,
+            format!("serving observability API: {err}"),
+        )
+    })
+}
+
 pub fn router(state: AppState) -> Router {
+    let auth_state = state.clone();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/snapshot", get(snapshot))
@@ -35,6 +66,51 @@ pub fn router(state: AppState) -> Router {
         .route("/feed", get(feed))
         .route("/stream", get(stream))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(auth_state, auth_mw))
+}
+
+async fn auth_mw(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !request_is_authorized(state.token.as_deref(), &request) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
+}
+
+fn request_is_authorized(expected: Option<&str>, request: &Request) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    let bearer = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    // The Authorization header is the ONLY token channel, including for
+    // `/stream`: a `?token=` query would leak the secret into access logs,
+    // proxies and Referer headers (security review). Native WS clients and the
+    // Tauri app set the header; browser WebSocket support via a subprotocol
+    // ticket is a follow-up. Compared in constant time so response timing
+    // cannot reveal the token byte by byte.
+    bearer.is_some_and(|candidate| ct_eq(candidate, expected))
+}
+
+/// Length-checked constant-time byte comparison, so a token check leaks no
+/// timing oracle. The length short-circuit is intentional — a token's length is
+/// not the secret its bytes are.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Serialize)]
@@ -328,7 +404,7 @@ impl From<Snapshot> for SnapshotResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{router, stream_frames, AppState};
+    use super::{request_is_authorized, router, stream_frames, AppState};
     use crate::observe::{Cursor, Event, Plane, Src, Subject};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
@@ -424,6 +500,97 @@ mod tests {
     async fn body_json(response: Response) -> Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_token_rejects_missing_or_wrong_bearer() {
+        let tmp = seed_home_with_one_worker();
+        let app = router(AppState {
+            home: tmp.path().into(),
+            token: Some("t".into()),
+        });
+
+        let missing = app
+            .clone()
+            .oneshot(Request::get("/snapshot").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .oneshot(
+                Request::get("/snapshot")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn read_token_accepts_matching_bearer() {
+        let tmp = seed_home_with_one_worker();
+        let response = router(AppState {
+            home: tmp.path().into(),
+            token: Some("t".into()),
+        })
+        .oneshot(
+            Request::get("/snapshot")
+                .header(axum::http::header::AUTHORIZATION, "Bearer t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn absent_read_token_allows_request_without_bearer() {
+        let tmp = seed_home_with_one_worker();
+        let response = router(AppState {
+            home: tmp.path().into(),
+            token: None,
+        })
+        .oneshot(Request::get("/snapshot").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn stream_requires_the_bearer_header_not_a_query_token() {
+        // A `?token=` query is no longer accepted — it would leak the secret
+        // into access logs / proxies / Referer. /stream is gated by the same
+        // Authorization header as every route (security review).
+        let query_only = Request::get("/stream?token=t")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!request_is_authorized(Some("t"), &query_only));
+
+        let bearer = Request::get("/stream")
+            .header(axum::http::header::AUTHORIZATION, "Bearer t")
+            .body(Body::empty())
+            .unwrap();
+        assert!(request_is_authorized(Some("t"), &bearer));
+
+        let wrong = Request::get("/stream")
+            .header(axum::http::header::AUTHORIZATION, "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!request_is_authorized(Some("t"), &wrong));
+    }
+
+    #[test]
+    fn read_token_compare_is_length_checked_constant_time() {
+        assert!(super::ct_eq("secret-token", "secret-token"));
+        assert!(!super::ct_eq("secret-token", "secret-toke"));
+        assert!(!super::ct_eq("secret-token", "secret-tokex"));
+        assert!(!super::ct_eq("", "x"));
     }
 
     #[tokio::test]

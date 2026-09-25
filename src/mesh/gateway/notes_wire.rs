@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::{
+    directive,
     feed,
     keys::{self, SystemClock},
     registry::{self, Registry, WorkOwner, WorkPatch, WorkStatus},
@@ -333,6 +334,45 @@ pub fn receive_note(
         return Ok(NoteAck::Rejected {
             code: "ingress_refused".to_string(),
         });
+    }
+    if envelope.note.kind == directive::DIRECTIVE_KIND {
+        let pending = match directive::decode_transport_note(
+            home,
+            &envelope.from_gateway,
+            &envelope.to_gateway,
+            &envelope.to_peer,
+            &envelope.note,
+        ) {
+            Ok(directive) => directive::store_pending(home, &directive)?,
+            Err(error) if error.code == directive::DIRECTIVE_SCHEMA_INVALID => {
+                log_note_action(
+                    home,
+                    &envelope.from_gateway,
+                    &envelope.to_gateway,
+                    &envelope.to_peer,
+                    &envelope.trace_id,
+                    "ingress_refused",
+                );
+                return Ok(NoteAck::Rejected {
+                    code: "ingress_refused".to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        remember_delivered(home, &envelope.from_gateway, note_id)?;
+        let (ack, action) = match pending {
+            directive::PendingStore::Stored => (NoteAck::Delivered, "delivered"),
+            directive::PendingStore::Duplicate => (NoteAck::Duplicate, "duplicate"),
+        };
+        log_note_action(
+            home,
+            &envelope.from_gateway,
+            &envelope.to_gateway,
+            &envelope.to_peer,
+            &envelope.trace_id,
+            action,
+        );
+        return Ok(ack);
     }
     if envelope.note.kind == WORK_CANCELLED_KIND {
         let work_id = envelope

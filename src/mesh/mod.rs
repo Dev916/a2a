@@ -180,6 +180,7 @@ fn invalid_peer_id(message: impl Into<String>) -> AppError {
     AppError::new("PEER_ID_INVALID", ExitCode::Precondition, message)
 }
 
+pub mod command_grants;
 pub mod directive;
 pub mod feed;
 pub mod gateway;

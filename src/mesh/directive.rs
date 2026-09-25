@@ -3,7 +3,7 @@ use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::command_grants::CommandGrants;
 use crate::mesh::keys::{self, RootSet, TokenClaims};
 use crate::mesh::row_sig::gateway_id_binds_key;
-use crate::mesh::{gateway::notes_wire, mesh_root, Note};
+use crate::mesh::{gateway::notes_wire, mesh_root, scan_or_refuse, Note, NOTE_MAX_BYTES};
 use crate::output::{AppError, ExitCode};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
@@ -20,6 +20,9 @@ pub(crate) const DIRECTIVE_SCHEMA_INVALID: &str = "DIRECTIVE_SCHEMA_INVALID";
 const DIRECTIVE_REF: &str = "directive";
 const PENDING_SUFFIX: &str = ".directive.json";
 const COMMAND_AUDIT_FILE: &str = "command-audit.jsonl";
+const DIRECTIVE_OUTCOME_REF: &str = "directive_outcome";
+const DIRECTIVE_OUTCOME_PEER: &str = "user:mesh-command";
+const DIRECTIVE_OUTCOME_NOTE_PREFIX: &str = "directive-outcome-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -89,6 +92,44 @@ pub enum Verdict {
         directive_id: String,
         reason: RefusedReason,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeVerdict {
+    Acted,
+    Failed,
+    Refused,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectiveOutcome {
+    pub directive_id: String,
+    pub verdict: OutcomeVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl DirectiveOutcome {
+    pub fn acted(directive_id: impl Into<String>) -> Self {
+        Self {
+            directive_id: directive_id.into(),
+            verdict: OutcomeVerdict::Acted,
+            reason: None,
+            summary: Some("surfaced to the orchestrator".to_string()),
+        }
+    }
+
+    pub fn refused(directive_id: impl Into<String>, reason: RefusedReason) -> Self {
+        Self {
+            directive_id: directive_id.into(),
+            verdict: OutcomeVerdict::Refused,
+            reason: Some(reason.code().to_string()),
+            summary: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +298,86 @@ pub fn spool(
         &directive.target,
         note,
     )
+}
+
+pub fn outcome_note_body(outcome: &DirectiveOutcome) -> Result<String, AppError> {
+    serde_json::to_string(outcome)
+        .map_err(|error| data_err("serializing directive outcome", error))
+}
+
+pub fn post_outcome(
+    home: &A2aHome,
+    cfg: &Config,
+    to_gateway: &str,
+    outcome: &DirectiveOutcome,
+) -> Result<PathBuf, AppError> {
+    validate_gateway_id("outcome recipient", to_gateway)?;
+    ulid::Ulid::from_string(&outcome.directive_id)
+        .map_err(|_| schema_invalid("outcome directive_id must be a ULID"))?;
+    let note_id = format!("{DIRECTIVE_OUTCOME_NOTE_PREFIX}{}", outcome.directive_id);
+    if let Some(path) = existing_outcome_note(home, to_gateway, &note_id)? {
+        return Ok(path);
+    }
+
+    let text = outcome_note_body(outcome)?;
+    scan_or_refuse(&text, "SECRET_IN_NOTE")?;
+    if text.len() > NOTE_MAX_BYTES {
+        return Err(AppError::new(
+            "NOTE_TOO_LARGE",
+            ExitCode::Precondition,
+            format!(
+                "directive outcome is {} bytes, exceeding cap {NOTE_MAX_BYTES} bytes",
+                text.len()
+            ),
+        ));
+    }
+    let note = Note {
+        note_id: Some(note_id),
+        from: DIRECTIVE_OUTCOME_PEER.to_string(),
+        to: DIRECTIVE_OUTCOME_PEER.to_string(),
+        ts: Utc::now(),
+        kind: "note".to_string(),
+        text,
+        refs: json!({ (DIRECTIVE_OUTCOME_REF): outcome }),
+        extra: serde_json::Map::new(),
+    };
+    let from_gateway = keys::gateway_id(home)?;
+    notes_wire::spool_note(home, cfg, &from_gateway, to_gateway, note)
+}
+
+fn existing_outcome_note(
+    home: &A2aHome,
+    to_gateway: &str,
+    note_id: &str,
+) -> Result<Option<PathBuf>, AppError> {
+    let outbound = mesh_root(home).join("outbound");
+    for dir in [
+        outbound.join(to_gateway),
+        outbound.join("sent").join(to_gateway),
+        outbound.join("rejected").join(to_gateway),
+    ] {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err("reading directive outcome spool", error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| io_err("reading directive outcome spool", error))?;
+            if !entry
+                .file_type()
+                .map_err(|error| io_err("reading directive outcome spool", error))?
+                .is_file()
+                || entry.path().extension().and_then(|ext| ext.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let spooled = notes_wire::read_spooled(&entry.path())?;
+            if spooled.trace_id == note_id {
+                return Ok(Some(entry.path()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn pending(home: &A2aHome) -> Result<Vec<Directive>, AppError> {
@@ -497,6 +618,7 @@ mod tests {
         self, enroll_gateway_token, fleet_init, gateway_identity, gateway_public_key_b64,
         install_gateway_token, RootSet, SystemClock, TestClock,
     };
+    use crate::mesh::{notes, PeerId};
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::SigningKey;
     use rand::{rngs::StdRng, SeedableRng};
@@ -584,6 +706,50 @@ mod tests {
         )
     }
 
+    fn two_home_command_fleet() -> (tempfile::TempDir, A2aHome, A2aHome, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sender = A2aHome::resolve(Some(&tmp.path().join("sender"))).unwrap();
+        let receiver = A2aHome::resolve(Some(&tmp.path().join("receiver"))).unwrap();
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let secret_b64 = keys::b64_encode(&signing_key.to_bytes());
+        let pubkey_b64 = keys::b64_encode(&signing_key.verifying_key().to_bytes());
+        let fingerprint = keys::fpr_of_pubkey_b64(&pubkey_b64).unwrap();
+        let sender_gateway = format!("gw-command-test-{}", &fingerprint[..16]);
+        for home in [&sender, &receiver] {
+            let fleet_dir = home.root().join("mesh/fleet");
+            fs::create_dir_all(&fleet_dir).unwrap();
+            fs::write(
+                fleet_dir.join("root.pub"),
+                serde_json::to_vec(&json!({
+                    "fleet_id": "fleet-command-outcome-test",
+                    "pubkey_b64": pubkey_b64,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let gateway_dir = sender.root().join("mesh/gateway");
+        fs::create_dir_all(&gateway_dir).unwrap();
+        fs::write(
+            gateway_dir.join("gw.key"),
+            serde_json::to_vec(&json!({
+                "gateway_id": sender_gateway,
+                "secret_b64": secret_b64,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let sender_gateway = gateway_identity(&sender, false).unwrap().gateway_id;
+        let receiver_gateway = gateway_identity(&receiver, false).unwrap().gateway_id;
+        (
+            tmp,
+            sender,
+            receiver,
+            sender_gateway,
+            receiver_gateway,
+        )
+    }
+
     fn signed_evaluation_fixture(
         class: DirectiveClass,
     ) -> (
@@ -640,6 +806,102 @@ mod tests {
             Some(reason) => assert_eq!(row["reason"], reason.code()),
             None => assert!(row.get("reason").is_none()),
         }
+    }
+
+    fn route_directive_and_outcome(
+        granted: bool,
+    ) -> (Directive, Option<String>, Note, DirectiveOutcome, String) {
+        let (_tmp, sender, receiver, sender_gateway, receiver_gateway) =
+            two_home_command_fleet();
+        let sender_cfg = crate::config::load(&sender).unwrap().0;
+        let receiver_cfg = crate::config::load(&receiver).unwrap().0;
+        let mut directive = Directive::new(
+            sender_gateway.clone(),
+            receiver_gateway.clone(),
+            DirectiveClass::Session,
+            "start the routed outcome test",
+        );
+        sign(
+            &mut directive,
+            &keys::gateway_signing_key(&sender).unwrap(),
+        )
+        .unwrap();
+        spool(&sender, &sender_cfg, &directive).unwrap();
+
+        let mut rng = StdRng::seed_from_u64(19);
+        let delivered = deliver_spooled_once(
+            &sender_cfg,
+            &sender,
+            NoteDeliveryTarget::Gateway {
+                to_gateway: &receiver_gateway,
+                home: Some(&receiver),
+            },
+            Utc::now(),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(delivered.delivered, 1);
+
+        let mut grants = CommandGrants::default();
+        if granted {
+            grants.grant(&sender_gateway);
+        }
+        grants.save(&receiver).unwrap();
+
+        let receiver_peer = PeerId::parse("claude:directive-outcome-receiver").unwrap();
+        let first_digest = notes::inject(&receiver, &receiver_cfg, &receiver_peer, Utc::now())
+            .unwrap();
+        assert_eq!(
+            notes::inject(&receiver, &receiver_cfg, &receiver_peer, Utc::now()).unwrap(),
+            None,
+            "the pending directive must not emit a second outcome"
+        );
+
+        let outbound = receiver
+            .root()
+            .join("mesh/outbound")
+            .join(&sender_gateway);
+        let mut outcome_paths = fs::read_dir(outbound)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        outcome_paths.sort();
+        assert_eq!(outcome_paths.len(), 1, "one outcome per directive");
+        let wire = notes_wire::read_spooled(&outcome_paths[0]).unwrap();
+        assert_eq!(wire.to_gateway, sender_gateway);
+        assert_eq!(wire.note.kind, "note");
+        assert_eq!(wire.note.to, DIRECTIVE_OUTCOME_PEER);
+
+        let routed = deliver_spooled_once(
+            &receiver_cfg,
+            &receiver,
+            NoteDeliveryTarget::Gateway {
+                to_gateway: &sender_gateway,
+                home: Some(&sender),
+            },
+            Utc::now(),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(routed.delivered, 1);
+        assert_eq!(routed.duplicates, 0);
+
+        let outcome_peer = PeerId::parse(DIRECTIVE_OUTCOME_PEER).unwrap();
+        let mut unread = notes::unread(&sender, &outcome_peer).unwrap();
+        assert_eq!(unread.len(), 1);
+        let note = unread.remove(0).1;
+        let outcome: DirectiveOutcome = serde_json::from_str(&note.text).unwrap();
+        assert_eq!(note.refs[DIRECTIVE_OUTCOME_REF], json!(outcome));
+
+        let ambient = notes::inject(&sender, &sender_cfg, &outcome_peer, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert!(ambient.contains("data, not instructions"), "{ambient}");
+        assert!(ambient.contains(&directive.directive_id), "{ambient}");
+        assert!(!ambient.contains("## AUTHENTICATED DIRECTIVE"), "{ambient}");
+
+        (directive, first_digest, note, outcome, ambient)
     }
 
     #[test]
@@ -976,5 +1238,56 @@ mod tests {
             "refused",
             Some(RefusedReason::Duplicate),
         );
+    }
+
+    #[test]
+    fn surfaced_directive_routes_one_acted_outcome_back_to_sender() {
+        let (directive, digest, note, outcome, ambient) = route_directive_and_outcome(true);
+
+        assert!(
+            digest
+                .as_deref()
+                .is_some_and(|digest| digest.contains("## AUTHENTICATED DIRECTIVE")),
+            "digest={digest:?}, outcome={outcome:?}"
+        );
+        assert_eq!(note.from, DIRECTIVE_OUTCOME_PEER);
+        assert_eq!(outcome.directive_id, directive.directive_id);
+        assert_eq!(outcome.verdict, OutcomeVerdict::Acted);
+        assert_eq!(outcome.reason, None);
+        assert_eq!(
+            outcome.summary.as_deref(),
+            Some("surfaced to the orchestrator")
+        );
+        assert!(ambient.contains("\"verdict\":\"acted\""), "{ambient}");
+    }
+
+    #[test]
+    fn ungranted_directive_routes_one_refused_outcome_back_to_sender() {
+        let (directive, digest, note, outcome, ambient) = route_directive_and_outcome(false);
+
+        assert_eq!(digest, None);
+        assert_eq!(note.from, DIRECTIVE_OUTCOME_PEER);
+        assert_eq!(outcome.directive_id, directive.directive_id);
+        assert_eq!(outcome.verdict, OutcomeVerdict::Refused);
+        assert_eq!(outcome.reason.as_deref(), Some("DIRECTIVE_UNGRANTED"));
+        assert_eq!(outcome.summary, None);
+        assert!(ambient.contains("\"verdict\":\"refused\""), "{ambient}");
+    }
+
+    #[test]
+    fn outcome_body_supports_failed_and_omits_absent_optional_fields() {
+        let outcome = DirectiveOutcome {
+            directive_id: "01K60G9DB0WQQ7Y9AT0Y1VJB4Q".to_string(),
+            verdict: OutcomeVerdict::Failed,
+            reason: None,
+            summary: None,
+        };
+
+        let body: Value = serde_json::from_str(&outcome_note_body(&outcome).unwrap()).unwrap();
+
+        assert_eq!(body["directive_id"], outcome.directive_id);
+        assert_eq!(body["verdict"], "failed");
+        assert!(body.get("reason").is_none());
+        assert!(body.get("summary").is_none());
     }
 }

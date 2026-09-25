@@ -5,7 +5,7 @@ use crate::ids;
 use crate::inbox::MsgKind;
 use crate::mesh::{
     command_grants::CommandGrants,
-    directive::{self, Directive, Verdict},
+    directive::{self, Directive, DirectiveOutcome, RefusedReason, Verdict},
     feed, gateway::notes_wire,
     keys::{self, RootSet},
     peer_dir, presence, scan_or_refuse, FeedEntry, Note, PeerId, Presence, Provider,
@@ -168,7 +168,7 @@ pub fn consume(home: &A2aHome, id: &PeerId, files: &[PathBuf]) -> Result<(), App
 
 pub fn inject(
     home: &A2aHome,
-    _cfg: &Config,
+    cfg: &Config,
     id: &PeerId,
     now: DateTime<Utc>,
 ) -> Result<Option<String>, AppError> {
@@ -177,12 +177,13 @@ pub fn inject(
         None => presence::new_presence(home, id, now)?,
     };
     let old_feed_seq = p.cursors.feed_seq;
-    let imperatives = pending_imperatives(home)?;
+    let pending_directives = pending_directives(home)?;
     let notes = pending_inject_notes(home, id, p.cursors.inbox.as_deref())?;
     let feed_entries = feed::read(home, p.cursors.feed_seq)?;
 
-    if imperatives.is_empty() && notes.is_empty() && feed_entries.is_empty() {
+    if pending_directives.imperatives.is_empty() && notes.is_empty() && feed_entries.is_empty() {
         presence::save_inject_cursors(home, &mut p, old_feed_seq, None, now)?;
+        post_directive_outcomes(home, cfg, &pending_directives.outcomes)?;
         return Ok(None);
     }
 
@@ -202,7 +203,9 @@ pub fn inject(
 
     let ambient = (!notes.is_empty() || !feed_entries.is_empty())
         .then(|| format_inject_block(&notes, &feed_entries, old_feed_seq));
-    Ok(Some(format_inject_digest(&imperatives, ambient)))
+    let digest = format_inject_digest(&pending_directives.imperatives, ambient);
+    post_directive_outcomes(home, cfg, &pending_directives.outcomes)?;
+    Ok(Some(digest))
 }
 
 pub fn roster(
@@ -360,22 +363,56 @@ fn archive_unread_notes(home: &A2aHome, id: &PeerId, notes: &[InjectNote]) -> Re
     Ok(())
 }
 
-fn pending_imperatives(home: &A2aHome) -> Result<Vec<Directive>, AppError> {
+#[derive(Default)]
+struct PendingDirectives {
+    imperatives: Vec<Directive>,
+    outcomes: Vec<(String, DirectiveOutcome)>,
+}
+
+fn pending_directives(home: &A2aHome) -> Result<PendingDirectives, AppError> {
     let pending = directive::pending(home)?;
     if pending.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PendingDirectives::default());
     }
     let grants = CommandGrants::load(home)?;
     let roots = RootSet::load(home)?;
     let self_id = keys::gateway_id(home)?;
+    let origins = pending
+        .iter()
+        .map(|directive| (directive.from.clone(), directive.directive_id.clone()))
+        .collect::<Vec<_>>();
     let verdicts = directive::evaluate(home, &grants, &roots, &self_id, pending)?;
-    Ok(verdicts
-        .into_iter()
-        .filter_map(|verdict| match verdict {
-            Verdict::Imperative(directive) => Some(directive),
-            Verdict::Refused { .. } => None,
-        })
-        .collect())
+    let mut batch = PendingDirectives::default();
+    for ((from, directive_id), verdict) in origins.into_iter().zip(verdicts) {
+        match verdict {
+            Verdict::Imperative(directive) => {
+                batch
+                    .outcomes
+                    .push((from, DirectiveOutcome::acted(&directive_id)));
+                batch.imperatives.push(directive);
+            }
+            Verdict::Refused { reason, .. } => {
+                let outcome = if reason == RefusedReason::Duplicate {
+                    DirectiveOutcome::acted(directive_id)
+                } else {
+                    DirectiveOutcome::refused(directive_id, reason)
+                };
+                batch.outcomes.push((from, outcome));
+            }
+        }
+    }
+    Ok(batch)
+}
+
+fn post_directive_outcomes(
+    home: &A2aHome,
+    cfg: &Config,
+    outcomes: &[(String, DirectiveOutcome)],
+) -> Result<(), AppError> {
+    for (to_gateway, outcome) in outcomes {
+        directive::post_outcome(home, cfg, to_gateway, outcome)?;
+    }
+    Ok(())
 }
 
 fn format_inject_digest(imperatives: &[Directive], ambient: Option<String>) -> String {

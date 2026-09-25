@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
+use crate::mesh::command_grants::CommandGrants;
 use crate::mesh::keys::{self, RootSet, TokenClaims};
 use crate::mesh::row_sig::gateway_id_binds_key;
 use crate::mesh::{gateway::notes_wire, mesh_root, Note};
@@ -8,7 +9,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ pub(crate) const DIRECTIVE_SCHEMA_INVALID: &str = "DIRECTIVE_SCHEMA_INVALID";
 
 const DIRECTIVE_REF: &str = "directive";
 const PENDING_SUFFIX: &str = ".directive.json";
+const COMMAND_AUDIT_FILE: &str = "command-audit.jsonl";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +59,166 @@ impl Directive {
             sig: String::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusedReason {
+    Ungranted,
+    BadSignature,
+    HarnessClass,
+    Duplicate,
+}
+
+impl RefusedReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Ungranted => "DIRECTIVE_UNGRANTED",
+            Self::BadSignature => "DIRECTIVE_BAD_SIGNATURE",
+            Self::HarnessClass => "DIRECTIVE_HARNESS_CLASS",
+            Self::Duplicate => "DIRECTIVE_DUPLICATE",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Imperative(Directive),
+    Refused {
+        directive_id: String,
+        reason: RefusedReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AuditVerdict {
+    Imperative,
+    Refused,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CommandAuditEntry {
+    ts: DateTime<Utc>,
+    directive_id: String,
+    from: String,
+    verdict: AuditVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+pub fn evaluate(
+    home: &A2aHome,
+    grants: &CommandGrants,
+    roots: &RootSet,
+    self_id: &str,
+    directives: Vec<Directive>,
+) -> Result<Vec<Verdict>, AppError> {
+    let mut acted = acted_directive_ids(home)?;
+    let mut verdicts = Vec::with_capacity(directives.len());
+
+    for directive in directives {
+        let directive_id = directive.directive_id.clone();
+        let from = directive.from.clone();
+        let verdict = if acted.contains(&directive_id) {
+            Verdict::Refused {
+                directive_id: directive_id.clone(),
+                reason: RefusedReason::Duplicate,
+            }
+        } else if verify(&directive, roots).is_err() {
+            Verdict::Refused {
+                directive_id: directive_id.clone(),
+                reason: RefusedReason::BadSignature,
+            }
+        } else if !grants.is_granted(&from, self_id) {
+            Verdict::Refused {
+                directive_id: directive_id.clone(),
+                reason: RefusedReason::Ungranted,
+            }
+        } else if directive.class != DirectiveClass::Session {
+            Verdict::Refused {
+                directive_id: directive_id.clone(),
+                reason: RefusedReason::HarnessClass,
+            }
+        } else {
+            Verdict::Imperative(directive)
+        };
+
+        append_verdict(home, &directive_id, &from, &verdict)?;
+        if matches!(&verdict, Verdict::Imperative(_)) {
+            acted.insert(directive_id);
+        }
+        verdicts.push(verdict);
+    }
+
+    Ok(verdicts)
+}
+
+fn acted_directive_ids(home: &A2aHome) -> Result<BTreeSet<String>, AppError> {
+    let text = match fs::read_to_string(command_audit_path(home)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => return Err(io_err("reading command audit", error)),
+    };
+    let mut acted = BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: CommandAuditEntry = serde_json::from_str(line).map_err(|error| {
+            AppError::new(
+                "DATA",
+                ExitCode::Precondition,
+                format!("command audit line {} is invalid: {error}", index + 1),
+            )
+            .remedy("repair or remove the invalid line in mesh/command-audit.jsonl")
+        })?;
+        if entry.verdict == AuditVerdict::Imperative {
+            acted.insert(entry.directive_id);
+        }
+    }
+    Ok(acted)
+}
+
+fn append_verdict(
+    home: &A2aHome,
+    directive_id: &str,
+    from: &str,
+    verdict: &Verdict,
+) -> Result<(), AppError> {
+    let (audit_verdict, reason) = match verdict {
+        Verdict::Imperative(_) => (AuditVerdict::Imperative, None),
+        Verdict::Refused { reason, .. } => {
+            (AuditVerdict::Refused, Some(reason.code().to_string()))
+        }
+    };
+    let entry = CommandAuditEntry {
+        ts: Utc::now(),
+        directive_id: directive_id.to_string(),
+        from: from.to_string(),
+        verdict: audit_verdict,
+        reason,
+    };
+    let path = command_audit_path(home);
+    let parent = path.parent().expect("command audit path has a parent");
+    create_dir_0700(parent).map_err(|error| io_err("creating command audit directory", error))?;
+    let mut line = serde_json::to_vec(&entry)
+        .map_err(|error| data_err("serializing command audit entry", error))?;
+    line.push(b'\n');
+    let mut file = crate::exec::open_append_0600(&path)
+        .map_err(|error| io_err("opening command audit", error))?;
+    file.write_all(&line)
+        .map_err(|error| io_err("appending command audit", error))?;
+    file.sync_data()
+        .map_err(|error| io_err("syncing command audit", error))?;
+    Ok(())
+}
+
+fn command_audit_path(home: &A2aHome) -> PathBuf {
+    home.root().join("mesh").join(COMMAND_AUDIT_FILE)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,6 +489,7 @@ fn signature_invalid(message: &'static str) -> AppError {
 mod tests {
     use super::*;
     use crate::home::A2aHome;
+    use crate::mesh::command_grants::CommandGrants;
     use crate::mesh::gateway::notes_wire::{
         self, deliver_spooled_once, NoteAck, NoteDeliveryTarget,
     };
@@ -339,6 +502,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use serde_json::json;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     fn trusted_key() -> (tempfile::TempDir, SigningKey, RootSet, String) {
         let tmp = tempfile::tempdir().unwrap();
@@ -418,6 +582,64 @@ mod tests {
             sender_gateway,
             receiver_gateway,
         )
+    }
+
+    fn signed_evaluation_fixture(
+        class: DirectiveClass,
+    ) -> (
+        tempfile::TempDir,
+        A2aHome,
+        RootSet,
+        String,
+        String,
+        Directive,
+    ) {
+        let (tmp, key, roots, from) = trusted_key();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let mut directive = fixture(from.clone());
+        directive.class = class;
+        sign(&mut directive, &key).unwrap();
+        let self_id = directive.target.clone();
+        (tmp, home, roots, from, self_id, directive)
+    }
+
+    fn granted_to(from: &str) -> CommandGrants {
+        let mut grants = CommandGrants::default();
+        grants.grant(from);
+        grants
+    }
+
+    fn audit_rows(home: &A2aHome) -> Vec<Value> {
+        fs::read_to_string(home.root().join("mesh/command-audit.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn assert_refused_only(verdicts: &[Verdict]) {
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| !matches!(verdict, Verdict::Imperative(_))),
+            "a directive that fails a gate must never become imperative"
+        );
+    }
+
+    fn assert_audit_row(
+        row: &Value,
+        directive: &Directive,
+        verdict: &str,
+        reason: Option<RefusedReason>,
+    ) {
+        assert!(row["ts"].as_str().is_some_and(|ts| !ts.is_empty()));
+        assert_eq!(row["directive_id"], directive.directive_id);
+        assert_eq!(row["from"], directive.from);
+        assert_eq!(row["verdict"], verdict);
+        match reason {
+            Some(reason) => assert_eq!(row["reason"], reason.code()),
+            None => assert!(row.get("reason").is_none()),
+        }
     }
 
     #[test]
@@ -552,5 +774,207 @@ mod tests {
         let after_redelivery = pending(&receiver).unwrap();
         assert_eq!(after_redelivery.len(), 1);
         assert_eq!(after_redelivery[0].directive_id, directive.directive_id);
+    }
+
+    #[test]
+    fn granted_verified_session_directive_is_imperative_and_audited() {
+        let (_tmp, home, roots, from, self_id, directive) =
+            signed_evaluation_fixture(DirectiveClass::Session);
+        let grants = granted_to(&from);
+
+        let verdicts = evaluate(
+            &home,
+            &grants,
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(verdicts, vec![Verdict::Imperative(directive.clone())]);
+        let rows = audit_rows(&home);
+        assert_eq!(rows.len(), 1);
+        assert_audit_row(&rows[0], &directive, "imperative", None);
+        let mode = fs::metadata(home.root().join("mesh/command-audit.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn ungranted_directive_is_refused_and_audited() {
+        let (_tmp, home, roots, _from, self_id, directive) =
+            signed_evaluation_fixture(DirectiveClass::Session);
+
+        let verdicts = evaluate(
+            &home,
+            &CommandGrants::default(),
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Refused {
+                directive_id: directive.directive_id.clone(),
+                reason: RefusedReason::Ungranted,
+            }]
+        );
+        assert_refused_only(&verdicts);
+        let rows = audit_rows(&home);
+        assert_eq!(rows.len(), 1);
+        assert_audit_row(
+            &rows[0],
+            &directive,
+            "refused",
+            Some(RefusedReason::Ungranted),
+        );
+    }
+
+    #[test]
+    fn tampered_signature_directive_is_refused_and_audited() {
+        let (_tmp, home, roots, from, self_id, mut directive) =
+            signed_evaluation_fixture(DirectiveClass::Session);
+        let grants = granted_to(&from);
+        directive.instruction.push('!');
+
+        let verdicts = evaluate(
+            &home,
+            &grants,
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Refused {
+                directive_id: directive.directive_id.clone(),
+                reason: RefusedReason::BadSignature,
+            }]
+        );
+        assert_refused_only(&verdicts);
+        let rows = audit_rows(&home);
+        assert_eq!(rows.len(), 1);
+        assert_audit_row(
+            &rows[0],
+            &directive,
+            "refused",
+            Some(RefusedReason::BadSignature),
+        );
+    }
+
+    #[test]
+    fn harness_directive_is_refused_and_audited() {
+        let (_tmp, home, roots, from, self_id, directive) =
+            signed_evaluation_fixture(DirectiveClass::Harness);
+        let grants = granted_to(&from);
+
+        let verdicts = evaluate(
+            &home,
+            &grants,
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Refused {
+                directive_id: directive.directive_id.clone(),
+                reason: RefusedReason::HarnessClass,
+            }]
+        );
+        assert_refused_only(&verdicts);
+        let rows = audit_rows(&home);
+        assert_eq!(rows.len(), 1);
+        assert_audit_row(
+            &rows[0],
+            &directive,
+            "refused",
+            Some(RefusedReason::HarnessClass),
+        );
+    }
+
+    #[test]
+    fn unknown_class_directive_is_refused_and_audited() {
+        let (_tmp, home, roots, from, self_id, directive) =
+            signed_evaluation_fixture(DirectiveClass::Unknown);
+        let grants = granted_to(&from);
+
+        let verdicts = evaluate(
+            &home,
+            &grants,
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Refused {
+                directive_id: directive.directive_id.clone(),
+                reason: RefusedReason::HarnessClass,
+            }]
+        );
+        assert_refused_only(&verdicts);
+        let rows = audit_rows(&home);
+        assert_eq!(rows.len(), 1);
+        assert_audit_row(
+            &rows[0],
+            &directive,
+            "refused",
+            Some(RefusedReason::HarnessClass),
+        );
+    }
+
+    #[test]
+    fn already_imperative_directive_is_duplicate_and_audited() {
+        let (_tmp, home, roots, from, self_id, directive) =
+            signed_evaluation_fixture(DirectiveClass::Session);
+        let grants = granted_to(&from);
+
+        let first = evaluate(
+            &home,
+            &grants,
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+        let second = evaluate(
+            &home,
+            &grants,
+            &roots,
+            &self_id,
+            vec![directive.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(first, vec![Verdict::Imperative(directive.clone())]);
+        assert_eq!(
+            second,
+            vec![Verdict::Refused {
+                directive_id: directive.directive_id.clone(),
+                reason: RefusedReason::Duplicate,
+            }]
+        );
+        assert_refused_only(&second);
+        let rows = audit_rows(&home);
+        assert_eq!(rows.len(), 2);
+        assert_audit_row(&rows[0], &directive, "imperative", None);
+        assert_audit_row(
+            &rows[1],
+            &directive,
+            "refused",
+            Some(RefusedReason::Duplicate),
+        );
     }
 }

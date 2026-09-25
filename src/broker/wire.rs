@@ -83,7 +83,7 @@ pub const ERR_BROKER_UNAVAILABLE: &str = "BROKER_UNAVAILABLE";
 /// leaked once, which is bounded by the number of distinct unknown codes a
 /// short-lived CLI process can meet, and is strictly better than discarding the
 /// one field an orchestrator branches on.
-pub const KNOWN_CODES: [&str; 77] = [
+pub const KNOWN_CODES: [&str; 83] = [
     ERR_VERSION_SKEW,
     ERR_FRAME_TOO_LARGE,
     ERR_BAD_FRAME,
@@ -169,6 +169,16 @@ pub const KNOWN_CODES: [&str; 77] = [
     "PREAUTH_LIMIT",
     "WORK_POOL_FULL",
     "FEED_ORIGIN_UNBOUND",
+    // Agent Command Channel transport errors and receiver verdicts are a stable
+    // taxonomy; refusal reasons also travel in outcomes and audit records. The
+    // local-only DIRECTIVE_INSTRUCTION_SOURCE and GATEWAY_NOT_ENROLLED preflight
+    // errors follow the existing CLI-only convention and are deliberately omitted.
+    "DIRECTIVE_SCHEMA_INVALID",
+    "DIRECTIVE_SIGNATURE_INVALID",
+    "DIRECTIVE_UNGRANTED",
+    "DIRECTIVE_BAD_SIGNATURE",
+    "DIRECTIVE_HARNESS_CLASS",
+    "DIRECTIVE_DUPLICATE",
 ];
 
 /// This process's protocol version.

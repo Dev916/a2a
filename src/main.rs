@@ -1,6 +1,6 @@
 use a2a::cli::{
-    BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshWorkCmd, ObserveCmd,
-    SyncCmd,
+    BrokerCmd, Cli, Cmd, ConfigCmd, MeshCmd, MeshCommandCmd, MeshFleetCmd, MeshGatewayCmd,
+    MeshWorkCmd, ObserveCmd, SyncCmd,
 };
 use a2a::home::A2aHome;
 use a2a::output::{emit_err, emit_ok, AppError, ExitCode, Outcome};
@@ -130,6 +130,13 @@ fn command_name(cmd: &Cmd) -> &'static str {
                 MeshWorkCmd::Release { .. } => "mesh work release",
                 MeshWorkCmd::Reject { .. } => "mesh work reject",
                 MeshWorkCmd::Reopen { .. } => "mesh work reopen",
+            },
+            MeshCmd::Command { cmd } => match cmd {
+                MeshCommandCmd::Grant { .. } => "mesh command grant",
+                MeshCommandCmd::Revoke { .. } => "mesh command revoke",
+                MeshCommandCmd::List => "mesh command list",
+                MeshCommandCmd::Send { .. } => "mesh command send",
+                MeshCommandCmd::Log => "mesh command log",
             },
         },
         Cmd::Observe { cmd } => match cmd {

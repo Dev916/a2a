@@ -1,8 +1,10 @@
-use crate::cli::{MeshCmd, MeshFleetCmd, MeshGatewayCmd, MeshPeerArgs};
+use crate::cli::{MeshCmd, MeshCommandCmd, MeshFleetCmd, MeshGatewayCmd, MeshPeerArgs};
 use crate::config::Config;
 use crate::home::A2aHome;
 use crate::mesh::{
     enroll_ledger::{enroll_conflict, enrollment_epoch, EnrollLedger, LedgerEntry},
+    command_grants::CommandGrants,
+    directive::{self, Directive, DirectiveClass},
     feed,
     notes::{self, RosterRow},
     presence,
@@ -219,6 +221,137 @@ pub fn run(
         MeshCmd::Work { cmd } => {
             crate::commands::work_cmd::run(home, cfg, cmd, json_mode, quiet)
         }
+        MeshCmd::Command { cmd } => run_command(home, cfg, cmd, json_mode),
+    }
+}
+
+fn run_command(
+    home: &A2aHome,
+    cfg: &Config,
+    cmd: &MeshCommandCmd,
+    json_mode: bool,
+) -> Result<Outcome, AppError> {
+    match cmd {
+        MeshCommandCmd::Grant { peer } => {
+            let mut grants = CommandGrants::load(home)?;
+            grants.grant(peer);
+            grants.save(home)?;
+            Ok(Outcome::from(Value::Null))
+        }
+        MeshCommandCmd::Revoke { peer } => {
+            let mut grants = CommandGrants::load(home)?;
+            grants.revoke(peer);
+            grants.save(home)?;
+            Ok(Outcome::from(Value::Null))
+        }
+        MeshCommandCmd::List => {
+            let peers = CommandGrants::load(home)?.list();
+            if json_mode {
+                return Ok(Outcome::from(json!(peers)));
+            }
+            if peers.is_empty() {
+                return Ok(Outcome::from(Value::Null));
+            }
+            Ok(Outcome::from(Value::String(peers.join("\n"))))
+        }
+        MeshCommandCmd::Send {
+            to,
+            instruction,
+            instruction_file,
+        } => {
+            let instruction = directive_instruction(
+                instruction.as_deref(),
+                instruction_file.as_deref(),
+            )?;
+            let identity = crate::mesh::keys::ensure_and_verify_gateway_enrollment(
+                home,
+                &crate::mesh::keys::SystemClock,
+            )?;
+            let _fleet_id = crate::mesh::keys::fleet_id(home)?;
+            let signing_key = crate::mesh::keys::gateway_signing_key(home)?;
+            let mut directive = Directive::new(
+                identity.gateway_id,
+                to,
+                DirectiveClass::Session,
+                instruction,
+            );
+            directive::sign(&mut directive, &signing_key)?;
+            directive::spool(home, cfg, &directive)?;
+            Ok(Outcome::from(Value::Null))
+        }
+        MeshCommandCmd::Log => command_log(home),
+    }
+}
+
+fn directive_instruction(
+    instruction: Option<&str>,
+    instruction_file: Option<&Path>,
+) -> Result<String, AppError> {
+    match (instruction, instruction_file) {
+        (Some(_), Some(_)) => Err(AppError::new(
+            "DIRECTIVE_INSTRUCTION_SOURCE",
+            ExitCode::Precondition,
+            "provide exactly one of --instruction or --instruction-file",
+        )),
+        (Some("-"), None) => {
+            let mut text = String::new();
+            std::io::stdin().read_to_string(&mut text).map_err(|error| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading directive instruction from stdin: {error}"),
+                )
+            })?;
+            Ok(text)
+        }
+        (None, Some(path)) if path == Path::new("-") => {
+            let mut text = String::new();
+            std::io::stdin().read_to_string(&mut text).map_err(|error| {
+                AppError::new(
+                    "IO",
+                    ExitCode::Internal,
+                    format!("reading directive instruction from stdin: {error}"),
+                )
+            })?;
+            Ok(text)
+        }
+        (Some(text), None) => Ok(text.to_string()),
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|error| {
+            AppError::new(
+                "IO",
+                ExitCode::Precondition,
+                format!("reading directive instruction {}: {error}", path.display()),
+            )
+            .remedy("pass a readable file to --instruction-file, or use --instruction-file - for stdin")
+        }),
+        (None, None) => Err(AppError::new(
+            "DIRECTIVE_INSTRUCTION_SOURCE",
+            ExitCode::Precondition,
+            "provide exactly one of --instruction or --instruction-file",
+        )),
+    }
+}
+
+fn command_log(home: &A2aHome) -> Result<Outcome, AppError> {
+    let path = home.root().join("mesh/command-audit.jsonl");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Outcome::from(Value::Null));
+        }
+        Err(error) => {
+            return Err(AppError::new(
+                "IO",
+                ExitCode::Internal,
+                format!("reading {}: {error}", path.display()),
+            ));
+        }
+    };
+    let text = text.trim_end_matches('\n');
+    if text.is_empty() {
+        Ok(Outcome::from(Value::Null))
+    } else {
+        Ok(Outcome::from(Value::String(text.to_string())))
     }
 }
 

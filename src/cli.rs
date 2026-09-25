@@ -607,6 +607,41 @@ pub enum MeshCmd {
         #[command(subcommand)]
         cmd: MeshWorkCmd,
     },
+    /// Manage signed imperative directives and receiver-owned consent grants
+    Command {
+        #[command(subcommand)]
+        cmd: MeshCommandCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MeshCommandCmd {
+    /// Consent to imperative directives from this peer gateway
+    Grant { peer: String },
+    /// Revoke this peer gateway's consent to send imperative directives
+    Revoke { peer: String },
+    /// List peer gateways granted imperative-directive consent
+    List,
+    /// Mint, sign, and route an imperative session directive
+    #[command(
+        group = clap::ArgGroup::new("instruction_source")
+            .required(true)
+            .multiple(false)
+            .args(["instruction", "instruction_file"])
+    )]
+    Send {
+        /// Target gateway id
+        #[arg(long)]
+        to: String,
+        /// Directive text; use `-` for stdin and prefer --instruction-file
+        #[arg(long, value_name = "TEXT")]
+        instruction: Option<String>,
+        /// Read directive text from FILE; use `-` for stdin
+        #[arg(long, value_name = "FILE")]
+        instruction_file: Option<PathBuf>,
+    },
+    /// Print the local imperative-directive audit log
+    Log,
 }
 
 #[derive(clap::Args)]

@@ -1,4 +1,6 @@
-use crate::observe::snapshot::{AgentSummary, HealthView, PeerView, WorkerView, WorkView};
+use crate::observe::snapshot::{
+    AgentSummary, HealthView, PeerView, SessionView, WorkerView, WorkView,
+};
 use crate::observe::{Cursor, Event, Observer, Plane, Snapshot};
 use crate::output::{AppError, ExitCode};
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -378,6 +380,7 @@ struct SnapshotResponse {
     work: Vec<WorkView>,
     peers: Vec<PeerView>,
     health: Option<HealthView>,
+    sessions: Vec<SessionView>,
     cursor: String,
 }
 
@@ -389,6 +392,7 @@ impl From<Snapshot> for SnapshotResponse {
             work,
             peers,
             health,
+            sessions,
             cursor,
         } = snapshot;
         Self {
@@ -397,6 +401,7 @@ impl From<Snapshot> for SnapshotResponse {
             work,
             peers,
             health,
+            sessions,
             cursor: cursor.encode(),
         }
     }

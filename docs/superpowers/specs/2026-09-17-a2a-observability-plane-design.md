@@ -165,7 +165,22 @@ volume ever makes the merge-scan too slow. Not needed at management-depth.)*
 Local HTTP + WS over one home. All endpoints are read-only.
 
 - `GET /snapshot` — folded current state: `{ agent, workers[], work[], peers[],
-  health, cursor }`.
+  health, sessions[], cursor }`.
+  *Additive (2026-10-03), all optional — older readers ignore them, older
+  planes simply omit them:*
+  - `workers[].session_id | pid | model | effort | transport | cwd` — copied
+    from the worker's `state.json` when present (`session_id` falls back to
+    `thread_id`); absent keys are omitted, never `null`.
+  - `sessions[]` — Claude / Codex sessions homed on THIS agent, from
+    `mesh/peers/*/presence.json`, most recent first: `{ peer, provider,
+    session_id, pid?, pid_alive?, cwd?, worker_id?, status?, working_on?,
+    last_seen, label }`. `label` is `"active"` (seen < 900 s) or `"stale"`;
+    retired sessions, sessions homed on another gateway, and sessions unseen
+    for 24 h are excluded. `pid` comes from presence (recorded by
+    `a2a mesh register|heartbeat|status|post|retire` walking up to the
+    `claude`/`_claude`/`codex` ancestor, or `A2A_SESSION_PID`), else from the
+    linked worker's `state.json`; `pid_alive` is a signal-0 existence check.
+    The same array is in `a2a observe snapshot --json`.
 - `WS /stream?from=<cursor>&planes=mesh,work,worker,...` — replay from cursor
   then live tail. `planes` filter optional. Server heartbeats to keep the
   socket alive; client resumes with its last cursor on reconnect.

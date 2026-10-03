@@ -393,6 +393,11 @@ fn register(home: &A2aHome, id: &PeerId) -> Result<(), AppError> {
 }
 
 fn save_presence_change(home: &A2aHome, p: &mut crate::mesh::Presence) -> Result<(), AppError> {
+    // Correlate this mesh session with its OS process (console: session id + pid).
+    // Only the session's own invocations know their ancestry, so refresh it here.
+    if let Some(pid) = crate::mesh::session_pid::find_session_pid(&p.provider) {
+        p.extra.insert("pid".to_string(), serde_json::Value::from(pid));
+    }
     if let Some(gateway_id) = feed::existing_gateway_id(home) {
         return crate::mesh::gateway::presence_wire::save_local_change(home, p, &gateway_id);
     }

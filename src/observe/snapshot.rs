@@ -11,6 +11,9 @@ pub struct Snapshot {
     pub work: Vec<WorkView>,
     pub peers: Vec<PeerView>,
     pub health: Option<HealthView>,
+    /// Agent sessions (Claude / Codex) homed on this agent, most recent first.
+    #[serde(default)]
+    pub sessions: Vec<SessionView>,
     pub cursor: Cursor,
 }
 
@@ -45,6 +48,43 @@ pub struct WorkerView {
     pub last_result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_input: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// One orchestrator or worker session known to this agent's mesh presence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionView {
+    pub peer: String,
+    pub provider: String,
+    /// The provider's resumable session id (`claude --resume` / `codex exec resume`).
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u64>,
+    /// Whether `pid` is a live process on this machine right now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_alive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_on: Option<String>,
+    pub last_seen: String,
+    /// "active" or "stale".
+    pub label: String,
 }
 
 /// Minimal distributed-work projection.
@@ -94,6 +134,12 @@ mod tests {
                 turns_this_epoch: Some(1),
                 last_result: None,
                 awaiting_input: None,
+                session_id: Some("019a-session".into()),
+                pid: Some(13127),
+                model: None,
+                effort: None,
+                transport: None,
+                cwd: None,
             }],
             work: vec![WorkView {
                 work_id: "work-1".into(),
@@ -108,11 +154,39 @@ mod tests {
                 status: "ok".into(),
                 details: serde_json::json!({"state": "ok"}),
             }),
+            sessions: vec![SessionView {
+                peer: "claude:aaa".into(),
+                provider: "claude".into(),
+                session_id: "aaa".into(),
+                pid: Some(812),
+                pid_alive: Some(true),
+                cwd: None,
+                worker_id: None,
+                status: None,
+                working_on: None,
+                last_seen: "2026-10-03T00:00:00Z".into(),
+                label: "active".into(),
+            }],
             cursor: Cursor::default(),
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn older_snapshots_without_sessions_still_parse() {
+        let json = serde_json::json!({
+            "agent": {"agent_id": "gw-local"},
+            "workers": [{"worker_id": "impl-1", "state": "running"}],
+            "work": [],
+            "peers": [],
+            "health": null,
+            "cursor": {"watermarks": {}}
+        });
+        let back: Snapshot = serde_json::from_value(json).unwrap();
+        assert!(back.sessions.is_empty());
+        assert_eq!(back.workers[0].session_id, None);
     }
 }

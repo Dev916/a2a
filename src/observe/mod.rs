@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use cursor::Cursor;
 pub use event::{Event, Plane, Src, Subject};
 pub use serve::{router, AppState};
-pub use snapshot::Snapshot;
+pub use snapshot::{SessionView, Snapshot, WorkerView};
 pub use source::{read_json, read_jsonl, read_jsonl_from};
 
 /// Read-only entry point for observing one a2a home.

@@ -2,7 +2,7 @@
 
 use crate::observe::normalize::{presence, work};
 use crate::observe::snapshot::{
-    AgentSummary, HealthView, PeerView, Snapshot, WorkerView, WorkView,
+    AgentSummary, HealthView, PeerView, SessionView, Snapshot, WorkerView, WorkView,
 };
 use crate::observe::{read_json, read_jsonl, read_jsonl_from, Cursor};
 use serde_json::Value;
@@ -20,10 +20,12 @@ pub fn snapshot(home: &Path) -> Snapshot {
     let work = work_views(home);
     let peers = peer_views(home);
     let health = health_view(home);
+    let agent_id = agent_id(home);
+    let sessions = session_views(home, &agent_id, &workers);
 
     Snapshot {
         agent: AgentSummary {
-            agent_id: agent_id(home),
+            agent_id,
             online: health
                 .as_ref()
                 .is_some_and(|health| health.status == "running"),
@@ -35,6 +37,7 @@ pub fn snapshot(home: &Path) -> Snapshot {
         work,
         peers,
         health,
+        sessions,
         cursor,
     }
 }
@@ -105,6 +108,13 @@ fn worker_view(worker_id: &str, worker_dir: &Path) -> WorkerView {
     )
     .then(|| latest_unanswered_question(worker_dir, last_delivered_seq))
     .flatten();
+    let text = |key: &str| {
+        state
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
 
     WorkerView {
         worker_id: worker_id.to_string(),
@@ -125,7 +135,84 @@ fn worker_view(worker_id: &str, worker_dir: &Path) -> WorkerView {
             .and_then(Value::as_u64),
         last_result: read_json(&worker_dir.join("result.json")),
         awaiting_input,
+        session_id: text("session_id").or_else(|| text("thread_id")),
+        pid: state
+            .as_ref()
+            .and_then(|value| value.get("pid"))
+            .and_then(Value::as_u64),
+        model: text("model"),
+        effort: text("effort"),
+        transport: text("transport"),
+        cwd: text("cwd"),
     }
+}
+
+/// Sessions seen within this window are "active"; older ones are "stale".
+/// Matches the default mesh `stale_after_secs`.
+const SESSION_STALE_AFTER_SECS: i64 = 900;
+/// Sessions not seen for a day are noise and are left out entirely.
+const SESSION_HIDE_AFTER_SECS: i64 = 24 * 60 * 60;
+
+fn pid_alive(pid: u64) -> Option<bool> {
+    let pid = i32::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    // Signal 0: existence check only, nothing is delivered. EPERM means the
+    // process exists but belongs to someone else.
+    Some(matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    ))
+}
+
+fn session_views(home: &Path, agent_id: &str, workers: &[WorkerView]) -> Vec<SessionView> {
+    let Ok(entries) = fs::read_dir(home.join("mesh/peers")) else {
+        return Vec::new();
+    };
+    let now = chrono::Utc::now();
+    let mut sessions = entries
+        .flatten()
+        .filter_map(|entry| {
+            let p = read_json(&entry.path().join("presence.json"))?;
+            let text = |key: &str| p.get(key).and_then(Value::as_str).map(str::to_string);
+            if p.get("retired").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            // Presence replicated from other gateways is not a session of THIS agent.
+            if text("home_gateway").is_some_and(|gateway| gateway != agent_id) {
+                return None;
+            }
+            let peer = text("peer")?;
+            let (provider, session_id) = peer.split_once(':')?;
+            let last_seen = text("last_seen")?;
+            let age = chrono::DateTime::parse_from_rfc3339(&last_seen)
+                .map(|seen| (now - seen.with_timezone(&chrono::Utc)).num_seconds())
+                .unwrap_or(i64::MAX);
+            if age >= SESSION_HIDE_AFTER_SECS {
+                return None;
+            }
+            let worker_id = text("worker_id");
+            // A codex worker's pid lives in its worker state, not in presence.
+            let pid = p.get("pid").and_then(Value::as_u64).or_else(|| {
+                let id = worker_id.as_deref()?;
+                workers.iter().find(|w| w.worker_id == id)?.pid
+            });
+            Some(SessionView {
+                provider: text("provider").unwrap_or_else(|| provider.to_string()),
+                session_id: session_id.to_string(),
+                peer: peer.clone(),
+                pid,
+                pid_alive: pid.and_then(pid_alive),
+                cwd: text("cwd"),
+                worker_id,
+                status: text("status"),
+                working_on: text("working_on"),
+                label: if age >= SESSION_STALE_AFTER_SECS { "stale" } else { "active" }
+                    .to_string(),
+                last_seen,
+            })
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    sessions
 }
 
 fn latest_unanswered_question(worker_dir: &Path, last_delivered_seq: u64) -> Option<Value> {
@@ -506,5 +593,98 @@ mod tests {
             "choose A or B"
         );
         assert!(snapshot.health.is_none());
+    }
+
+    #[test]
+    fn workers_expose_session_id_pid_and_run_parameters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("workers/impl-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json"),
+            r#"{"state":"running","lane":"impl","session_id":"01a10203-869c-7ff1-8036-92650cc0c4da",
+                "pid":13127,"model":"gpt-5.6-sol","effort":"max","transport":"app-server","cwd":"/w"}"#,
+        )
+        .unwrap();
+        let snapshot = super::snapshot(tmp.path());
+        let w = &snapshot.workers[0];
+        assert_eq!(w.session_id.as_deref(), Some("01a10203-869c-7ff1-8036-92650cc0c4da"));
+        assert_eq!(w.pid, Some(13127));
+        assert_eq!(w.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(w.effort.as_deref(), Some("max"));
+        assert_eq!(w.transport.as_deref(), Some("app-server"));
+        assert_eq!(w.cwd.as_deref(), Some("/w"));
+    }
+
+    #[test]
+    fn worker_session_id_falls_back_to_thread_id_and_absent_fields_stay_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("workers/impl-2");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("state.json"), r#"{"state":"done","thread_id":"t-123"}"#).unwrap();
+        let snapshot = super::snapshot(tmp.path());
+        let w = &snapshot.workers[0];
+        assert_eq!(w.session_id.as_deref(), Some("t-123"));
+        assert_eq!(w.pid, None);
+        assert_eq!(w.model, None);
+        let json = serde_json::to_value(w).unwrap();
+        assert!(json.get("pid").is_none(), "absent optional fields are not serialized: {json}");
+    }
+
+    #[test]
+    fn sessions_list_local_live_peers_with_session_id_and_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let peer = |name: &str, body: String| {
+            let dir = tmp.path().join("mesh/peers").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("presence.json"), body).unwrap();
+        };
+        let me = std::process::id();
+        peer("claude-aaa", format!(r#"{{"peer":"claude:aaa","provider":"claude","retired":false,"last_seen":"{now}","pid":{me},"cwd":"/proj","working_on":"plan"}}"#));
+        peer("claude-old", r#"{"peer":"claude:old","provider":"claude","retired":false,"last_seen":"2026-01-01T00:00:00Z"}"#.to_string());
+        peer("claude-gone", format!(r#"{{"peer":"claude:gone","provider":"claude","retired":true,"last_seen":"{now}"}}"#));
+        peer("claude-far", format!(r#"{{"peer":"claude:far","provider":"claude","retired":false,"last_seen":"{now}","home_gateway":"gw-somewhere-else"}}"#));
+        peer("broken", "{not json".to_string());
+
+        let sessions = super::snapshot(tmp.path()).sessions;
+        assert_eq!(sessions.len(), 1, "retired, remote-homed, long-stale and corrupt peers are excluded: {sessions:?}");
+        let s = &sessions[0];
+        assert_eq!(s.session_id, "aaa");
+        assert_eq!(s.provider, "claude");
+        assert_eq!(s.pid, Some(u64::from(me)));
+        assert_eq!(s.pid_alive, Some(true));
+        assert_eq!(s.cwd.as_deref(), Some("/proj"));
+        assert_eq!(s.working_on.as_deref(), Some("plan"));
+        assert_eq!(s.label, "active");
+    }
+
+    #[test]
+    fn sessions_keep_locally_homed_peers_and_borrow_codex_worker_pids() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mesh/gateway")).unwrap();
+        fs::write(
+            tmp.path().join("mesh/gateway/gw.key"),
+            br#"{"gateway_id":"gw-local","secret_b64":"unused"}"#,
+        )
+        .unwrap();
+        let worker = tmp.path().join("workers/impl-9");
+        fs::create_dir_all(&worker).unwrap();
+        fs::write(worker.join("state.json"), r#"{"state":"running","pid":4242}"#).unwrap();
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+        let dir = tmp.path().join("mesh/peers/codex-ccc");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("presence.json"),
+            format!(r#"{{"peer":"codex:ccc","provider":"codex","retired":false,"last_seen":"{stale}","home_gateway":"gw-local","worker_id":"impl-9"}}"#),
+        )
+        .unwrap();
+
+        let sessions = super::snapshot(tmp.path()).sessions;
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].provider, "codex");
+        assert_eq!(sessions[0].worker_id.as_deref(), Some("impl-9"));
+        assert_eq!(sessions[0].pid, Some(4242));
+        assert_eq!(sessions[0].label, "stale");
     }
 }

@@ -191,6 +191,7 @@ pub mod render;
 pub mod row_mark;
 pub mod row_sig;
 pub mod routing;
+pub mod session_pid;
 pub mod wire;
 pub mod work;
 pub mod work_exec;

@@ -279,8 +279,8 @@ pub enum ObserveCmd {
         /// Address to bind
         #[arg(long, default_value = "127.0.0.1")]
         bind: std::net::IpAddr,
-        /// Port to bind
-        #[arg(long, default_value_t = 7718)]
+        /// Port to bind (default avoids the common 7717/7718 hq dev ports)
+        #[arg(long, default_value_t = 9718)]
         port: u16,
         /// Require this bearer token
         #[arg(long, conflicts_with = "token_file")]

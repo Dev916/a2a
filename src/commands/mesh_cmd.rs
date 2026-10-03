@@ -269,11 +269,13 @@ fn run_command(
             )?;
             let _fleet_id = crate::mesh::keys::fleet_id(home)?;
             let signing_key = crate::mesh::keys::gateway_signing_key(home)?;
+            let enroll_token = crate::mesh::keys::gateway_token(home)?;
             let mut directive = Directive::new(
                 identity.gateway_id,
                 to,
                 DirectiveClass::Session,
                 instruction,
+                enroll_token,
             );
             directive::sign(&mut directive, &signing_key)?;
             directive::spool(home, cfg, &directive)?;

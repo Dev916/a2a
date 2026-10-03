@@ -783,6 +783,24 @@ mod tests {
             ts,
             class,
             instruction: INSTRUCTION.to_string(),
+            enroll_token: {
+                let root_key_path = fleet_dir.join("root.key");
+                let root_key_bytes = serde_json::to_vec(&json!({
+                    "fleet_id": "fleet-inject-test",
+                    "secret_b64": keys::b64_encode(&signing_key.to_bytes()),
+                }))
+                .unwrap();
+                let mut root_key = crate::home::write_new_0600(&root_key_path).unwrap();
+                std::io::Write::write_all(&mut root_key, &root_key_bytes).unwrap();
+                drop(root_key);
+                keys::enroll_gateway_token(
+                    &home,
+                    &from,
+                    &pubkey_b64,
+                    &TestClock::new(ts),
+                )
+                .unwrap()
+            },
             sig: String::new(),
         };
         directive::sign(&mut directive, &signing_key).unwrap();

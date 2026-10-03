@@ -36,7 +36,6 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde_json::json;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -60,29 +59,22 @@ struct Fleet {
 }
 
 /// One fleet, two enrolled gateway homes: A commands, B receives.
-///
-/// A holds the fleet root and its gateway key IS that root key. That is not
-/// decoration: `directive::verify` (T1) checks a directive's signature against
-/// the fleet RootSet entries — `gateway_id_binds_key(from, claims)` is applied
-/// with the ROOT's pubkey — so the only sender whose directives can verify
-/// today is one whose gateway key is a fleet root key (the same shape
-/// `src/mesh/directive.rs`'s own routing tests build). A plain enrolled peer,
-/// whose gateway key is bound to the root only through its enrollment token,
-/// is refused `DIRECTIVE_BAD_SIGNATURE` before the grant gate is ever reached.
 fn fleet() -> Fleet {
     let tmp = tempfile::tempdir().unwrap();
+    let root = A2aHome::resolve(Some(&tmp.path().join("root"))).unwrap();
     let a = A2aHome::resolve(Some(&tmp.path().join("a"))).unwrap();
     let b = A2aHome::resolve(Some(&tmp.path().join("b"))).unwrap();
-    keys::fleet_init(&a).unwrap();
-    let gw_a = adopt_root_key_as_gateway(&a);
-    keys::ensure_and_verify_gateway_enrollment(&a, &SystemClock).unwrap();
-    fs::create_dir_all(b.root().join("mesh/fleet")).unwrap();
-    fs::copy(
-        a.root().join("mesh/fleet/root.pub"),
-        b.root().join("mesh/fleet/root.pub"),
-    )
-    .unwrap();
-    let gw_b = enroll(&a, &b);
+    keys::fleet_init(&root).unwrap();
+    for home in [&a, &b] {
+        fs::create_dir_all(home.root().join("mesh/fleet")).unwrap();
+        fs::copy(
+            root.root().join("mesh/fleet/root.pub"),
+            home.root().join("mesh/fleet/root.pub"),
+        )
+        .unwrap();
+    }
+    let gw_a = enroll(&root, &a);
+    let gw_b = enroll(&root, &b);
     Fleet {
         _tmp: tmp,
         a,
@@ -90,33 +82,6 @@ fn fleet() -> Fleet {
         gw_a,
         gw_b,
     }
-}
-
-/// Point the commanding home's gateway key at its own fleet root key, and name
-/// the gateway after that key's fingerprint so `gateway_id_binds_key` holds.
-fn adopt_root_key_as_gateway(home: &A2aHome) -> String {
-    let fleet_dir = home.root().join("mesh/fleet");
-    let root_key: serde_json::Value =
-        serde_json::from_slice(&fs::read(fleet_dir.join("root.key")).unwrap()).unwrap();
-    let root_pub: serde_json::Value =
-        serde_json::from_slice(&fs::read(fleet_dir.join("root.pub")).unwrap()).unwrap();
-    let pubkey_b64 = root_pub["pubkey_b64"].as_str().unwrap();
-    let fingerprint = keys::fpr_of_pubkey_b64(pubkey_b64).unwrap();
-    let gateway_id = format!("gw-host-{}", &fingerprint[..16]);
-    let dir = home.root().join("mesh/gateway");
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("gw.key");
-    fs::write(
-        &path,
-        serde_json::to_vec(&json!({
-            "gateway_id": gateway_id,
-            "secret_b64": root_key["secret_b64"],
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    gateway_id
 }
 
 fn enroll(root: &A2aHome, joiner: &A2aHome) -> String {

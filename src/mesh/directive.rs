@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::home::{create_dir_0700, write_new_0600, A2aHome};
 use crate::mesh::command_grants::CommandGrants;
-use crate::mesh::keys::{self, RootSet, TokenClaims};
+use crate::mesh::keys::{self, RootSet};
 use crate::mesh::row_sig::gateway_id_binds_key;
 use crate::mesh::{gateway::notes_wire, mesh_root, scan_or_refuse, Note, NOTE_MAX_BYTES};
 use crate::output::{AppError, ExitCode};
@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
@@ -41,6 +42,8 @@ pub struct Directive {
     pub ts: DateTime<Utc>,
     pub class: DirectiveClass,
     pub instruction: String,
+    #[serde(default)]
+    pub enroll_token: String,
     pub sig: String,
 }
 
@@ -50,6 +53,7 @@ impl Directive {
         target: impl Into<String>,
         class: DirectiveClass,
         instruction: impl Into<String>,
+        enroll_token: impl Into<String>,
     ) -> Self {
         let clock = keys::SystemClock;
         Self {
@@ -59,6 +63,7 @@ impl Directive {
             ts: Utc::now(),
             class,
             instruction: instruction.into(),
+            enroll_token: enroll_token.into(),
             sig: String::new(),
         }
     }
@@ -533,9 +538,11 @@ fn data_err(context: &'static str, error: serde_json::Error) -> AppError {
 }
 
 pub fn canonical_bytes(directive: &Directive) -> Result<String, AppError> {
+    let enroll_token_sha256 = sha256_hex(directive.enroll_token.as_bytes());
     let fields: BTreeMap<&str, Value> = BTreeMap::from([
         ("class", json!(&directive.class)),
         ("directive_id", json!(&directive.directive_id)),
+        ("enroll_token_sha256", json!(enroll_token_sha256)),
         ("from", json!(&directive.from)),
         ("instruction", json!(&directive.instruction)),
         ("target", json!(&directive.target)),
@@ -551,6 +558,9 @@ pub fn canonical_bytes(directive: &Directive) -> Result<String, AppError> {
 }
 
 pub fn sign(directive: &mut Directive, key: &SigningKey) -> Result<(), AppError> {
+    if directive.enroll_token.is_empty() {
+        return Err(signature_invalid("directive enrollment token is missing"));
+    }
     let canonical = canonical_bytes(directive)?;
     let signature = key.sign(canonical.as_bytes());
     directive.sig = keys::b64_encode(&signature.to_bytes());
@@ -558,6 +568,28 @@ pub fn sign(directive: &mut Directive, key: &SigningKey) -> Result<(), AppError>
 }
 
 pub fn verify(directive: &Directive, roots: &RootSet) -> Result<String, AppError> {
+    let (claims, issuer) = keys::verify_token_no_clock(&directive.enroll_token, roots)
+        .map_err(|_| signature_invalid("directive enrollment token is invalid"))?;
+    let issuer_fleet_matches = roots.entries().iter().any(|root| {
+        root.fpr == issuer && root.fleet_id == claims.fleet_id
+    });
+    if !issuer_fleet_matches {
+        return Err(signature_invalid(
+            "directive enrollment token fleet does not match its trusted issuer",
+        ));
+    }
+    if claims.gateway_id != directive.from {
+        return Err(signature_invalid(
+            "directive sender does not match its enrollment token",
+        ));
+    }
+    if !gateway_id_binds_key(&directive.from, &claims) {
+        return Err(signature_invalid(
+            "directive sender is not bound to its enrolled gateway key",
+        ));
+    }
+    let key = keys::verifying_key_from_b64(&claims.pubkey_b64)
+        .map_err(|_| signature_invalid("enrolled directive public key is invalid"))?;
     let signature_bytes = keys::b64_decode(&directive.sig)
         .map_err(|_| signature_invalid("directive signature is not base64"))?;
     let signature_bytes: [u8; 64] = signature_bytes
@@ -565,37 +597,18 @@ pub fn verify(directive: &Directive, roots: &RootSet) -> Result<String, AppError
         .map_err(|_| signature_invalid("directive signature has invalid length"))?;
     let signature = Signature::from_bytes(&signature_bytes);
     let canonical = canonical_bytes(directive)?;
-    let mut sender_is_bound = false;
+    key.verify(canonical.as_bytes(), &signature)
+        .map_err(|_| {
+            signature_invalid("directive signature does not verify with the enrolled gateway key")
+        })?;
+    Ok(directive.from.clone())
+}
 
-    for root in roots.entries() {
-        let claims = TokenClaims {
-            fleet_id: root.fleet_id.clone(),
-            gateway_id: directive.from.clone(),
-            pubkey_b64: root.pubkey_b64.clone(),
-            key_epoch: 0,
-            issued_at: 0,
-            exp: 0,
-        };
-        if !gateway_id_binds_key(&directive.from, &claims) {
-            continue;
-        }
-        sender_is_bound = true;
-        let key = keys::verifying_key_from_b64(&claims.pubkey_b64)
-            .map_err(|_| signature_invalid("trusted directive public key is invalid"))?;
-        if key.verify(canonical.as_bytes(), &signature).is_ok() {
-            return Ok(directive.from.clone());
-        }
-    }
-
-    if sender_is_bound {
-        Err(signature_invalid(
-            "directive signature does not verify against the bound trusted key",
-        ))
-    } else {
-        Err(signature_invalid(
-            "directive sender is not bound to a trusted key",
-        ))
-    }
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn signature_invalid(message: &'static str) -> AppError {
@@ -626,29 +639,43 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    fn trusted_key() -> (tempfile::TempDir, SigningKey, RootSet, String) {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
-        let key = SigningKey::from_bytes(&[7_u8; 32]);
-        let pubkey_b64 = keys::b64_encode(&key.verifying_key().to_bytes());
-        let fingerprint = keys::fpr_of_pubkey_b64(&pubkey_b64).unwrap();
-        let root_dir = home.root().join("mesh/fleet");
-        fs::create_dir_all(&root_dir).unwrap();
-        fs::write(
-            root_dir.join("root.pub"),
-            serde_json::to_vec(&json!({
-                "fleet_id": "fleet-directive-test",
-                "pubkey_b64": pubkey_b64,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let roots = RootSet::load(&home).unwrap();
-        let from = format!("gw-directive-test-{}", &fingerprint[..16]);
-        (tmp, key, roots, from)
+    struct EnrolledSigner {
+        _tmp: tempfile::TempDir,
+        root: A2aHome,
+        sender: A2aHome,
+        key: SigningKey,
+        roots: RootSet,
+        from: String,
+        token: String,
     }
 
-    fn fixture(from: String) -> Directive {
+    fn enrolled_peer() -> EnrolledSigner {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = A2aHome::resolve(Some(&tmp.path().join("root"))).unwrap();
+        let sender = A2aHome::resolve(Some(&tmp.path().join("sender"))).unwrap();
+        fleet_init(&root).unwrap();
+        copy_root_pub(&root, &sender);
+        let from = enroll_joiner(&root, &sender);
+        let key = keys::gateway_signing_key(&sender).unwrap();
+        let token = keys::gateway_token(&sender).unwrap();
+        let roots = RootSet::load(&sender).unwrap();
+        assert_ne!(
+            gateway_public_key_b64(&sender).unwrap().as_str(),
+            roots.entries()[0].pubkey_b64.as_str(),
+            "the enrolled sender's gateway key must not be the fleet root key"
+        );
+        EnrolledSigner {
+            _tmp: tmp,
+            root,
+            sender,
+            key,
+            roots,
+            from,
+            token,
+        }
+    }
+
+    fn fixture(from: String, enroll_token: String) -> Directive {
         let ts = Utc
             .with_ymd_and_hms(2026, 9, 25, 16, 21, 0)
             .single()
@@ -660,6 +687,7 @@ mod tests {
             ts,
             class: DirectiveClass::Session,
             instruction: "start a brainstorm on signed directives".to_string(),
+            enroll_token,
             sig: String::new(),
         }
     }
@@ -707,47 +735,14 @@ mod tests {
     }
 
     fn two_home_command_fleet() -> (tempfile::TempDir, A2aHome, A2aHome, String, String) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sender = A2aHome::resolve(Some(&tmp.path().join("sender"))).unwrap();
-        let receiver = A2aHome::resolve(Some(&tmp.path().join("receiver"))).unwrap();
-        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
-        let secret_b64 = keys::b64_encode(&signing_key.to_bytes());
-        let pubkey_b64 = keys::b64_encode(&signing_key.verifying_key().to_bytes());
-        let fingerprint = keys::fpr_of_pubkey_b64(&pubkey_b64).unwrap();
-        let sender_gateway = format!("gw-command-test-{}", &fingerprint[..16]);
-        for home in [&sender, &receiver] {
-            let fleet_dir = home.root().join("mesh/fleet");
-            fs::create_dir_all(&fleet_dir).unwrap();
-            fs::write(
-                fleet_dir.join("root.pub"),
-                serde_json::to_vec(&json!({
-                    "fleet_id": "fleet-command-outcome-test",
-                    "pubkey_b64": pubkey_b64,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
-        let gateway_dir = sender.root().join("mesh/gateway");
-        fs::create_dir_all(&gateway_dir).unwrap();
-        fs::write(
-            gateway_dir.join("gw.key"),
-            serde_json::to_vec(&json!({
-                "gateway_id": sender_gateway,
-                "secret_b64": secret_b64,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let sender_gateway = gateway_identity(&sender, false).unwrap().gateway_id;
-        let receiver_gateway = gateway_identity(&receiver, false).unwrap().gateway_id;
-        (
-            tmp,
-            sender,
-            receiver,
-            sender_gateway,
-            receiver_gateway,
-        )
+        let fleet = two_home_fleet();
+        let roots = RootSet::load(&fleet.1).unwrap();
+        assert_ne!(
+            gateway_public_key_b64(&fleet.1).unwrap().as_str(),
+            roots.entries()[0].pubkey_b64.as_str(),
+            "the command sender must be an enrolled peer, not the root key holder"
+        );
+        fleet
     }
 
     fn signed_evaluation_fixture(
@@ -760,13 +755,19 @@ mod tests {
         String,
         Directive,
     ) {
-        let (tmp, key, roots, from) = trusted_key();
-        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
-        let mut directive = fixture(from.clone());
+        let enrolled = enrolled_peer();
+        let mut directive = fixture(enrolled.from.clone(), enrolled.token.clone());
         directive.class = class;
-        sign(&mut directive, &key).unwrap();
+        sign(&mut directive, &enrolled.key).unwrap();
         let self_id = directive.target.clone();
-        (tmp, home, roots, from, self_id, directive)
+        let EnrolledSigner {
+            _tmp,
+            sender,
+            roots,
+            from,
+            ..
+        } = enrolled;
+        (_tmp, sender, roots, from, self_id, directive)
     }
 
     fn granted_to(from: &str) -> CommandGrants {
@@ -820,6 +821,7 @@ mod tests {
             receiver_gateway.clone(),
             DirectiveClass::Session,
             "start the routed outcome test",
+            keys::gateway_token(&sender).unwrap(),
         );
         sign(
             &mut directive,
@@ -905,15 +907,34 @@ mod tests {
     }
 
     #[test]
-    fn signed_directive_verifies_against_a_bound_trusted_key() {
-        let (_tmp, key, roots, from) = trusted_key();
-        let mut directive = fixture(from.clone());
+    fn signed_directive_from_an_enrolled_peer_verifies_with_its_gateway_key() {
+        let enrolled = enrolled_peer();
+        let mut directive = fixture(enrolled.from.clone(), enrolled.token.clone());
 
-        sign(&mut directive, &key).unwrap();
+        sign(&mut directive, &enrolled.key).unwrap();
 
         assert!(!directive.sig.is_empty());
-        assert_eq!(verify(&directive, &roots).unwrap(), from);
+        assert_eq!(verify(&directive, &enrolled.roots).unwrap(), enrolled.from);
         assert!(ulid::Ulid::from_string(&directive.directive_id).is_ok());
+    }
+
+    #[test]
+    fn a_root_holder_can_send_only_through_its_enrolled_gateway_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = A2aHome::resolve(Some(tmp.path())).unwrap();
+        fleet_init(&root).unwrap();
+        let identity = keys::ensure_and_verify_gateway_enrollment(&root, &SystemClock).unwrap();
+        let roots = RootSet::load(&root).unwrap();
+        assert_ne!(
+            gateway_public_key_b64(&root).unwrap().as_str(),
+            roots.entries()[0].pubkey_b64.as_str(),
+            "the root holder's enrolled gateway key must remain distinct from its root key"
+        );
+        let mut directive = fixture(identity.gateway_id.clone(), keys::gateway_token(&root).unwrap());
+
+        sign(&mut directive, &keys::gateway_signing_key(&root).unwrap()).unwrap();
+
+        assert_eq!(verify(&directive, &roots).unwrap(), identity.gateway_id);
     }
 
     #[test]
@@ -923,59 +944,92 @@ mod tests {
             "gw-target-0123456789abcdef",
             DirectiveClass::Session,
             "start the requested work",
+            "enrollment-token",
         );
 
         assert!(ulid::Ulid::from_string(&directive.directive_id).is_ok());
+        assert_eq!(directive.enroll_token, "enrollment-token");
         assert!(directive.sig.is_empty());
     }
 
     #[test]
     fn tampered_instruction_is_rejected() {
-        let (_tmp, key, roots, from) = trusted_key();
-        let mut directive = fixture(from);
-        sign(&mut directive, &key).unwrap();
+        let enrolled = enrolled_peer();
+        let mut directive = fixture(enrolled.from.clone(), enrolled.token.clone());
+        sign(&mut directive, &enrolled.key).unwrap();
 
         directive.instruction.push('!');
 
-        assert!(verify(&directive, &roots).is_err());
+        assert!(verify(&directive, &enrolled.roots).is_err());
     }
 
     #[test]
     fn tampered_sender_is_rejected() {
-        let (_tmp, key, roots, from) = trusted_key();
-        let mut directive = fixture(from);
-        sign(&mut directive, &key).unwrap();
+        let enrolled = enrolled_peer();
+        let mut directive = fixture(enrolled.from.clone(), enrolled.token.clone());
+        sign(&mut directive, &enrolled.key).unwrap();
 
         directive.from.push_str("-tampered");
 
-        assert!(verify(&directive, &roots).is_err());
+        assert!(verify(&directive, &enrolled.roots).is_err());
     }
 
     #[test]
     fn a_valid_signature_from_an_unbound_key_is_rejected() {
-        let (_tmp, key, roots, _from) = trusted_key();
-        let mut directive = fixture("gw-directive-test-deadbeef".to_string());
+        let enrolled = enrolled_peer();
+        let mut directive = fixture(
+            "gw-directive-test-deadbeef".to_string(),
+            enrolled.token.clone(),
+        );
 
-        sign(&mut directive, &key).unwrap();
+        sign(&mut directive, &enrolled.key).unwrap();
 
-        assert!(verify(&directive, &roots).is_err());
+        assert!(verify(&directive, &enrolled.roots).is_err());
+    }
+
+    #[test]
+    fn swapping_a_valid_enrollment_token_after_signing_is_rejected() {
+        let enrolled = enrolled_peer();
+        let mut directive = fixture(enrolled.from.clone(), enrolled.token.clone());
+        sign(&mut directive, &enrolled.key).unwrap();
+        let replacement_clock = TestClock::new(
+            Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0)
+                .single()
+                .unwrap(),
+        );
+        let replacement = enroll_gateway_token(
+            &enrolled.root,
+            &enrolled.from,
+            &gateway_public_key_b64(&enrolled.sender).unwrap(),
+            &replacement_clock,
+        )
+        .unwrap();
+        assert_ne!(replacement, directive.enroll_token);
+
+        directive.enroll_token = replacement;
+
+        assert!(verify(&directive, &enrolled.roots).is_err());
     }
 
     #[test]
     fn canonical_bytes_are_stable_across_struct_field_order() {
-        let (_tmp, _key, _roots, from) = trusted_key();
-        let first = fixture(from.clone());
+        let enrolled = enrolled_peer();
+        let first = fixture(enrolled.from.clone(), enrolled.token.clone());
         let second = Directive {
             sig: "ignored-signature".to_string(),
+            enroll_token: first.enroll_token.clone(),
             instruction: first.instruction.clone(),
             class: DirectiveClass::Session,
             ts: first.ts,
             target: first.target.clone(),
-            from,
+            from: enrolled.from,
             directive_id: first.directive_id.clone(),
         };
 
-        assert_eq!(canonical_bytes(&first).unwrap(), canonical_bytes(&second).unwrap());
+        let canonical = canonical_bytes(&first).unwrap();
+        assert_eq!(canonical, canonical_bytes(&second).unwrap());
+        assert!(canonical.contains(&sha256_hex(first.enroll_token.as_bytes())));
+        assert!(!canonical.contains(&first.enroll_token));
     }
 
     #[test]
@@ -995,6 +1049,7 @@ mod tests {
             receiver_gateway.clone(),
             DirectiveClass::Session,
             "start the routed work",
+            keys::gateway_token(&sender).unwrap(),
         );
         sign(
             &mut directive,

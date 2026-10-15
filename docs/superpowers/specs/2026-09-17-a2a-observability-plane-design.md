@@ -126,7 +126,7 @@ it is versioned and additively extensible.
 | `work` | `work_offered`, `work_approved`, `work_released`, `work_done`, `work_failed`, `work_result_empty` | work store transitions in `events.jsonl` / `broker.jsonl` |
 | `worker` | `worker_spawned`, `worker_status`, `worker_awaiting_input`, `worker_answered`, `worker_result`, `worker_interrupted`, `worker_killed`, `worker_budget_exhausted`, `worker_respawned` | `workers/<id>/events.jsonl`, `result.json`, `broker.jsonl` |
 | `presence` | `peer_up`, `peer_down`, `peer_version` | presence + `gateway-health.json` |
-| `health` | `limits`, `replication`, `exposure`, `rotation` | `gateway-health.json` |
+| `health` | `gateway`, `loops`, `links`, `limits`, `replication`, `exposure`, `rotation` | `gateway-health.json` |
 
 **Reserved for later (consumers already tolerate them):**
 - plane `turn` — kinds `turn_started`, `turn_completed` (depth-2, from
@@ -145,6 +145,27 @@ dense integer. The token encodes per-source watermarks (e.g. feed
 `origin_seq` high-water, `events.jsonl` seq, `gateway.jsonl`/`broker.jsonl`
 line position + rotation generation, per-worker `events.jsonl` positions). The
 plane resumes each source from its encoded watermark and merges by `ts`.
+
+The cursor must stay bounded (it travels in a `?from=` URL):
+- **Peers:** one `mesh/peers` watermark — the newest `presence.json` mtime
+  (ns) across every peer dir — not one watermark per dir (a home with ~3,000
+  session dirs produced a 400 KB cursor). A peer is re-emitted when its
+  presence file is newer. Cursors minted with legacy per-peer keys
+  (`mesh/peers/<peer>/presence.json`) still decode and resume with the old
+  per-file rule for one pass; the advanced cursor drops them.
+- **Health:** `gateway-health.json` is rewritten every second with heartbeat
+  counters, so `health_seq` alone is not a change signal. Each health kind
+  stores a fingerprint of its meaningful subset at
+  `mesh/gateway-health.json#<kind>` (plus `#peers` for presence rows derived
+  from health links) and is emitted only when that fingerprint changes.
+  Heartbeats, `last_heartbeat`, `written_at` and per-link traffic timestamps
+  are excluded. Fingerprints are taken from the exact snapshot the
+  normalizer read.
+- **Workers** still cost two watermarks each (`events.jsonl` seq, `result.json`).
+
+The snapshot's `peers[]` lists gateway peers (health links, registry cache)
+unconditionally, but a session's own presence only while it is not retired /
+revoked and was seen within 24 h (the `sessions[]` window).
 
 Why opaque, not a global integer seq:
 - **Read-only:** a dense global seq would need a durable plane-owned index; the

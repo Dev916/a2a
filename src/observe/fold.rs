@@ -287,8 +287,17 @@ fn work_state(value: &Value) -> Option<String> {
 }
 
 fn peer_views(home: &Path) -> Vec<PeerView> {
+    let now = chrono::Utc::now();
     let mut peers: BTreeMap<String, PeerView> = BTreeMap::new();
     for event in presence::normalize(home, &Cursor::default()) {
+        // Every Claude/Codex session that ever registered leaves a peer dir.
+        // Only gateway sources (health links, registry cache) are listed
+        // unconditionally; a session's own presence must be live to count.
+        if event.src.artifact.starts_with("mesh/peers/")
+            && presence_hidden(&event.payload, now)
+        {
+            continue;
+        }
         let Some(peer) = event.subject.peer else {
             continue;
         };
@@ -305,6 +314,25 @@ fn peer_views(home: &Path) -> Vec<PeerView> {
         }
     }
     peers.into_values().collect()
+}
+
+/// A session's presence is hidden from the peer list once it is retired or
+/// revoked, or has not been seen for a day (the same window as `sessions`).
+fn presence_hidden(presence: &Value, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if presence.get("retired").and_then(Value::as_bool) == Some(true)
+        || ["retired_at", "revoked_at"]
+            .into_iter()
+            .any(|field| presence.get(field).is_some_and(|value| !value.is_null()))
+    {
+        return true;
+    }
+    let age = presence
+        .get("last_seen")
+        .and_then(Value::as_str)
+        .and_then(|seen| chrono::DateTime::parse_from_rfc3339(seen).ok())
+        .map(|seen| (now - seen.with_timezone(&chrono::Utc)).num_seconds())
+        .unwrap_or(i64::MAX);
+    age >= SESSION_HIDE_AFTER_SECS
 }
 
 fn peer_version(value: &Value) -> Option<String> {
@@ -657,6 +685,56 @@ mod tests {
         assert_eq!(s.cwd.as_deref(), Some("/proj"));
         assert_eq!(s.working_on.as_deref(), Some("plan"));
         assert_eq!(s.label, "active");
+    }
+
+    #[test]
+    fn peers_exclude_retired_and_day_stale_presence_but_keep_gateways() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mesh/gateway")).unwrap();
+        fs::write(
+            tmp.path().join("mesh/gateway/gw.key"),
+            br#"{"gateway_id":"gw-local","secret_b64":"unused"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("mesh/gateway-health.json"),
+            br#"{"health_seq":3,"state":"running","links":[{"peer":"gw-linked","version":"0.4.0"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("mesh/gateway/registry-cache.json"),
+            br#"{"gateways":{"gw-host-408f2f":{"last_heartbeat":"2026-08-01T00:00:00Z","version":"0.1.0"}}}"#,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let old = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        let peer = |name: &str, body: String| {
+            let dir = tmp.path().join("mesh/peers").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("presence.json"), body).unwrap();
+        };
+        peer("claude-live", format!(r#"{{"peer":"claude:live","retired":false,"last_seen":"{now}","presence_seq":4}}"#));
+        peer("claude-far", format!(r#"{{"peer":"claude:far","retired":false,"last_seen":"{now}","home_gateway":"gw-host-408f2f","presence_seq":2}}"#));
+        peer("claude-gone", format!(r#"{{"peer":"claude:gone","retired":true,"last_seen":"{now}","presence_seq":5}}"#));
+        peer("claude-revoked", format!(r#"{{"peer":"claude:revoked","last_seen":"{now}","retired_at":"{now}"}}"#));
+        peer("claude-old", format!(r#"{{"peer":"claude:old","retired":false,"last_seen":"{old}","presence_seq":1}}"#));
+        peer("claude-unseen", r#"{"peer":"claude:unseen","retired":false}"#.to_string());
+
+        let snapshot = super::snapshot(tmp.path());
+        let peers = snapshot
+            .peers
+            .iter()
+            .map(|view| view.peer.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            peers,
+            vec!["claude:far", "claude:live", "gw-host-408f2f", "gw-linked"],
+            "retired, revoked, day-stale and never-seen presence is excluded: {:?}",
+            snapshot.peers
+        );
+        assert_eq!(snapshot.agent.peer_count, snapshot.peers.len());
+        let linked = snapshot.peers.iter().find(|view| view.peer == "gw-linked").unwrap();
+        assert_eq!(linked.status, "up");
     }
 
     #[test]

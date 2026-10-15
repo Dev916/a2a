@@ -1,6 +1,6 @@
 //! Read-only folding of one a2a home into its current observable state.
 
-use crate::observe::normalize::{presence, work};
+use crate::observe::normalize::{health, presence, work};
 use crate::observe::snapshot::{
     AgentSummary, HealthView, PeerView, SessionView, Snapshot, WorkerView, WorkView,
 };
@@ -387,6 +387,12 @@ fn current_cursor(home: &Path) -> Cursor {
         "mesh/gateway/registry-cache.json",
         "registry_seq",
     );
+    for (key, fingerprint) in health::watermarks(home) {
+        cursor.set(key, fingerprint);
+    }
+    if let Some(fingerprint) = presence::health_peers_watermark(home) {
+        cursor.set(presence::HEALTH_PEERS_WATERMARK, fingerprint);
+    }
 
     for (worker_id, worker_dir) in worker_dirs(home) {
         let events_artifact = format!("workers/{worker_id}/events.jsonl");

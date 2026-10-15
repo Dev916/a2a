@@ -21,8 +21,10 @@ pub(super) fn events_since(home: &Path, cursor: &Cursor) -> (Vec<Event>, Cursor)
     events.extend(mesh::normalize(home, &read_cursor));
     events.extend(work::normalize(home, &read_cursor));
     events.extend(worker::normalize(home, &read_cursor));
-    events.extend(presence::normalize(home, &read_cursor));
-    events.extend(health::normalize(home, &read_cursor));
+    let (presence_events, presence_marks) = presence::normalize_with_watermarks(home, &read_cursor);
+    events.extend(presence_events);
+    let (health_events, health_marks) = health::normalize_with_watermarks(home, &read_cursor);
+    events.extend(health_events);
     events.sort_by(|left, right| {
         left.ts
             .cmp(&right.ts)
@@ -32,6 +34,11 @@ pub(super) fn events_since(home: &Path, cursor: &Cursor) -> (Vec<Event>, Cursor)
     });
 
     let mut advanced = advanced_cursor(home, cursor);
+    // Fingerprints describe the exact snapshot the normalizers read; a re-read
+    // could already reflect a newer change that was not emitted.
+    for (key, fingerprint) in presence_marks.into_iter().chain(health_marks) {
+        advanced.set(key, fingerprint);
+    }
     advanced.gap = cursor.gap || sequence_gap || line_gap;
     (events, advanced)
 }
@@ -206,7 +213,8 @@ fn advanced_cursor(home: &Path, cursor: &Cursor) -> Cursor {
         .watermarks
         .retain(|artifact, _| !is_legacy_presence_watermark(artifact));
     for (artifact, watermark) in observed.watermarks {
-        let path = home.join(&artifact);
+        // `artifact#facet` keys (health fingerprints) live in `artifact`.
+        let path = home.join(artifact.split('#').next().unwrap_or(&artifact));
         let retained_exists = path.exists() || rotated_path(&path).exists();
         if retained_exists || !advanced.watermarks.contains_key(&artifact) {
             advanced.watermarks.insert(artifact, watermark);
@@ -658,6 +666,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         seed_identity(home);
+        // A full gateway health snapshot contributes its per-kind fingerprints.
+        fs::write(
+            home.join("mesh/gateway-health.json"),
+            br#"{"health_seq":9,"state":"running","pid":1,"loops":{},"links":[],"limits":{},
+                "replication":{},"expose":"none","token_expires_at":null}"#,
+        )
+        .unwrap();
         for index in 0..3000 {
             write_presence(
                 home,
@@ -675,7 +690,7 @@ mod tests {
         let snapshot = Observer::open(home).snapshot();
         let watermarks = &snapshot.cursor.watermarks;
         assert!(
-            watermarks.len() <= 10 + 2 * workers,
+            watermarks.len() <= 16 + 2 * workers,
             "cursor must be bounded, got {} watermarks",
             watermarks.len()
         );
@@ -684,7 +699,7 @@ mod tests {
         assert!(snapshot.cursor.encode().len() < 2_000);
 
         let (_, advanced) = Observer::open(home).events_since(&snapshot.cursor);
-        assert!(advanced.watermarks.len() <= 10 + 2 * workers);
+        assert!(advanced.watermarks.len() <= 16 + 2 * workers);
     }
 
     #[test]

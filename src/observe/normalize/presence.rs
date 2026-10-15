@@ -15,6 +15,9 @@ const PEERS_DIR: &str = "mesh/peers";
 /// The single cursor watermark for every `mesh/peers/<peer>/presence.json`:
 /// the newest presence file modification time, in nanoseconds since the epoch.
 pub(crate) const PEERS_WATERMARK: &str = "mesh/peers";
+/// Fingerprint of the peer rows derived from `gateway-health.json` (links and
+/// peers), so heartbeat-only rewrites do not re-announce every linked peer.
+pub(crate) const HEALTH_PEERS_WATERMARK: &str = "mesh/gateway-health.json#peers";
 
 #[derive(Clone)]
 struct PeerRow {
@@ -27,6 +30,12 @@ struct PeerRow {
 
 /// Normalize current peer presence and version snapshots.
 pub fn normalize(home: &Path, cursor: &Cursor) -> Vec<Event> {
+    normalize_with_watermarks(home, cursor).0
+}
+
+/// Like [`normalize`], also returning the health-peer fingerprint of the exact
+/// `gateway-health.json` that was read.
+pub fn normalize_with_watermarks(home: &Path, cursor: &Cursor) -> (Vec<Event>, Vec<(String, u64)>) {
     let agent_id = read_agent_id(home);
     let health_path = home.join(HEALTH_ARTIFACT);
     let health = read_json(&health_path).filter(Value::is_object);
@@ -82,7 +91,13 @@ pub fn normalize(home: &Path, cursor: &Cursor) -> Vec<Event> {
         }
     }
 
-    if health.is_some() && snapshot_is_new(cursor, HEALTH_ARTIFACT, health_sequence) {
+    let health_fingerprint = health.as_ref().map(|_| health_peers_fingerprint(&health_rows));
+    let health_rows_changed = match (cursor.watermarks.get(HEALTH_PEERS_WATERMARK), health_fingerprint) {
+        (Some(Watermark::Sequence { seq }), Some(current)) => *seq != current,
+        // Cursors minted before the fingerprint resume on health_seq.
+        _ => snapshot_is_new(cursor, HEALTH_ARTIFACT, health_sequence),
+    };
+    if health.is_some() && health_rows_changed {
         for row in &health_rows {
             if row.peer == agent_id {
                 continue;
@@ -191,7 +206,30 @@ pub fn normalize(home: &Path, cursor: &Cursor) -> Vec<Event> {
             .then_with(|| left.kind.cmp(&right.kind))
             .then_with(|| left.src.artifact.cmp(&right.src.artifact))
     });
-    events
+    let watermarks = health_fingerprint
+        .map(|fingerprint| vec![(HEALTH_PEERS_WATERMARK.to_string(), fingerprint)])
+        .unwrap_or_default();
+    (events, watermarks)
+}
+
+/// The health-peer fingerprint for the `gateway-health.json` on disk.
+pub(crate) fn health_peers_watermark(home: &Path) -> Option<u64> {
+    let health_path = home.join(HEALTH_ARTIFACT);
+    let health = read_json(&health_path).filter(Value::is_object)?;
+    Some(health_peers_fingerprint(&health_peer_rows(&health, "")))
+}
+
+/// Identity, status and version of each health-derived peer row; traffic
+/// timestamps and heartbeats are deliberately left out.
+fn health_peers_fingerprint(rows: &[PeerRow]) -> u64 {
+    let mut identity = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!([row.peer, row.status, row.version])
+        })
+        .collect::<Vec<_>>();
+    identity.sort_by_key(Value::to_string);
+    super::health::fingerprint(&Value::Array(identity))
 }
 
 fn health_peer_rows(value: &Value, fallback_timestamp: &str) -> Vec<PeerRow> {

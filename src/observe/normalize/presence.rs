@@ -1,7 +1,7 @@
 //! Normalization for mesh peer presence and version snapshots.
 
 use crate::observe::cursor::Watermark;
-use crate::observe::source::read_json;
+use crate::observe::source::{modified_nanos, read_json};
 use crate::observe::{Cursor, Event, Plane, Src, Subject};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
@@ -12,6 +12,9 @@ use std::path::Path;
 const HEALTH_ARTIFACT: &str = "mesh/gateway-health.json";
 const REGISTRY_ARTIFACT: &str = "mesh/gateway/registry-cache.json";
 const PEERS_DIR: &str = "mesh/peers";
+/// The single cursor watermark for every `mesh/peers/<peer>/presence.json`:
+/// the newest presence file modification time, in nanoseconds since the epoch.
+pub(crate) const PEERS_WATERMARK: &str = "mesh/peers";
 
 #[derive(Clone)]
 struct PeerRow {
@@ -137,7 +140,7 @@ pub fn normalize(home: &Path, cursor: &Cursor) -> Vec<Event> {
 
     for (artifact, path, value) in presence_artifacts(home) {
         let sequence = value.get("presence_seq").and_then(Value::as_u64);
-        if !snapshot_is_new(cursor, &artifact, sequence) {
+        if !presence_is_new(cursor, &artifact, &path, sequence) {
             continue;
         }
         let Some(peer) = peer_id(&value).map(str::to_string).or_else(|| {
@@ -448,6 +451,33 @@ fn modified_timestamp(path: &Path) -> Option<String> {
 
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Newest presence.json modification time across every peer dir (0 if none).
+pub(crate) fn peers_tip(home: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(home.join(PEERS_DIR)) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| modified_nanos(&entry.path().join("presence.json")))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether one peer's presence changed after `cursor`.
+///
+/// Current cursors carry one `mesh/peers` mtime watermark. Cursors minted
+/// before it carried one sequence watermark per presence file; those still
+/// resume with their original per-file semantics for one pass, after which the
+/// advanced cursor holds only the bounded watermark.
+fn presence_is_new(cursor: &Cursor, artifact: &str, path: &Path, sequence: Option<u64>) -> bool {
+    match cursor.watermarks.get(PEERS_WATERMARK) {
+        Some(Watermark::Sequence { seq }) => {
+            modified_nanos(path).is_none_or(|modified| modified > *seq)
+        }
+        Some(Watermark::Line { .. }) | None => snapshot_is_new(cursor, artifact, sequence),
+    }
 }
 
 fn snapshot_is_new(cursor: &Cursor, artifact: &str, sequence: Option<u64>) -> bool {

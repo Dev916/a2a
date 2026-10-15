@@ -401,21 +401,10 @@ fn current_cursor(home: &Path) -> Cursor {
         );
     }
 
-    let peers_dir = home.join("mesh/peers");
-    if let Ok(entries) = fs::read_dir(peers_dir) {
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            set_snapshot_tip(
-                &mut cursor,
-                home,
-                &format!("mesh/peers/{name}/presence.json"),
-                "presence_seq",
-            );
-        }
-    }
+    // One watermark for every peer dir: the newest presence.json mtime. A
+    // per-peer watermark made the cursor grow with every session that ever
+    // registered (3,000 dirs -> a 400 KB cursor).
+    cursor.set(presence::PEERS_WATERMARK, presence::peers_tip(home));
     cursor
 }
 

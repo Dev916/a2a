@@ -30,6 +30,14 @@ pub fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_reader(file).ok()
 }
 
+/// Modification time of `path` in nanoseconds since the Unix epoch, or `None`
+/// when the file is missing or the platform cannot report it.
+pub(crate) fn modified_nanos(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_nanos()).ok()
+}
+
 /// The normalizers also need each row's ending byte position for auditable
 /// provenance. This keeps the public reader API small while sharing exactly
 /// the same torn-tail discipline.

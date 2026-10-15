@@ -201,6 +201,10 @@ fn advanced_cursor(home: &Path, cursor: &Cursor) -> Cursor {
     let mut observed = super::fold::snapshot(home).cursor;
     stamp_line_generations(home, &mut observed);
     let mut advanced = cursor.clone();
+    // Legacy per-peer presence watermarks are superseded by `mesh/peers`.
+    advanced
+        .watermarks
+        .retain(|artifact, _| !is_legacy_presence_watermark(artifact));
     for (artifact, watermark) in observed.watermarks {
         let path = home.join(&artifact);
         let retained_exists = path.exists() || rotated_path(&path).exists();
@@ -209,6 +213,10 @@ fn advanced_cursor(home: &Path, cursor: &Cursor) -> Cursor {
         }
     }
     advanced
+}
+
+fn is_legacy_presence_watermark(artifact: &str) -> bool {
+    artifact.starts_with("mesh/peers/") && artifact.ends_with("/presence.json")
 }
 
 fn sequence_artifacts(home: &Path, cursor: &Cursor) -> BTreeSet<String> {
@@ -615,6 +623,118 @@ mod tests {
         assert_eq!(events[0].src.reference, "origin_seq=5");
         assert_eq!(events[0].payload["text"], "earliest");
         assert!(advanced.gap);
+        assert!(observer.events_since(&advanced).0.is_empty());
+    }
+
+    fn write_presence(home: &Path, dir: &str, body: &str) -> std::path::PathBuf {
+        let peer_dir = home.join("mesh/peers").join(dir);
+        fs::create_dir_all(&peer_dir).unwrap();
+        let path = peer_dir.join("presence.json");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn presence_peers(events: &[crate::observe::Event]) -> Vec<String> {
+        let mut peers = events
+            .iter()
+            .filter(|event| event.src.artifact.starts_with("mesh/peers/"))
+            .filter_map(|event| event.subject.peer.clone())
+            .collect::<Vec<_>>();
+        peers.dedup();
+        peers
+    }
+
+    #[test]
+    fn cursor_does_not_scale_with_peer_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        seed_identity(home);
+        for index in 0..3000 {
+            write_presence(
+                home,
+                &format!("claude-{index:05}"),
+                &format!(r#"{{"peer":"claude:{index:05}","presence_seq":{index},"retired":true}}"#),
+            );
+        }
+        let workers = 2;
+        for index in 0..workers {
+            let worker = home.join("workers").join(format!("impl-{index}"));
+            fs::create_dir_all(&worker).unwrap();
+            fs::write(worker.join("state.json"), br#"{"state":"done"}"#).unwrap();
+        }
+
+        let snapshot = Observer::open(home).snapshot();
+        let watermarks = &snapshot.cursor.watermarks;
+        assert!(
+            watermarks.len() <= 10 + 2 * workers,
+            "cursor must be bounded, got {} watermarks",
+            watermarks.len()
+        );
+        assert!(watermarks.contains_key("mesh/peers"));
+        assert!(!watermarks.keys().any(|key| key.starts_with("mesh/peers/")));
+        assert!(snapshot.cursor.encode().len() < 2_000);
+
+        let (_, advanced) = Observer::open(home).events_since(&snapshot.cursor);
+        assert!(advanced.watermarks.len() <= 10 + 2 * workers);
+    }
+
+    #[test]
+    fn presence_events_follow_the_single_peers_watermark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        seed_identity(home);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let a = write_presence(home, "claude-a", r#"{"peer":"claude:a","presence_seq":1}"#);
+        let b = write_presence(home, "claude-b", r#"{"peer":"claude:b","presence_seq":2}"#);
+        set_mtime(&a, past);
+        set_mtime(&b, past);
+        let observer = Observer::open(home);
+        let c0 = observer.snapshot().cursor;
+        assert!(observer.events_since(&c0).0.is_empty());
+
+        fs::write(&a, r#"{"peer":"claude:a","presence_seq":3,"retired":true}"#).unwrap();
+        set_mtime(&a, std::time::SystemTime::now() + std::time::Duration::from_secs(1));
+        let (events, c1) = observer.events_since(&c0);
+
+        assert_eq!(presence_peers(&events), vec!["claude:a".to_string()]);
+        let down = events.iter().find(|event| event.kind == "peer_down").unwrap();
+        assert_eq!(down.subject.peer.as_deref(), Some("claude:a"));
+        assert!(observer.events_since(&c1).0.is_empty());
+    }
+
+    #[test]
+    fn legacy_per_peer_cursor_still_decodes_and_is_folded_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        seed_identity(home);
+        write_presence(home, "claude-a", r#"{"peer":"claude:a","presence_seq":3}"#);
+        write_presence(home, "claude-b", r#"{"peer":"claude:b","presence_seq":5}"#);
+        let mut legacy = crate::observe::Cursor::default();
+        legacy.set("mesh/peers/claude-a/presence.json", 3);
+        legacy.set("mesh/peers/claude-b/presence.json", 4);
+        let token = legacy.encode();
+
+        let decoded = crate::observe::Cursor::decode(&token).expect("legacy cursor decodes");
+        let observer = Observer::open(home);
+        let (events, advanced) = observer.events_since(&decoded);
+
+        assert_eq!(presence_peers(&events), vec!["claude:b".to_string()]);
+        assert!(advanced.watermarks.contains_key("mesh/peers"));
+        assert!(
+            !advanced.watermarks.keys().any(|key| key.starts_with("mesh/peers/")),
+            "legacy per-peer keys are dropped once folded: {:?}",
+            advanced.watermarks.keys().collect::<Vec<_>>()
+        );
+        assert!(!advanced.gap);
         assert!(observer.events_since(&advanced).0.is_empty());
     }
 }

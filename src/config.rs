@@ -247,7 +247,7 @@ pub const MESH_LIMITS_FIELDS: [&str; 10] = [
 ];
 
 /// Every per-lane key, in the order `config show --origin` reports them.
-pub const LANE_FIELDS: [&str; 11] = [
+pub const LANE_FIELDS: [&str; 12] = [
     "sandbox",
     "network",
     "worktree_default",
@@ -266,6 +266,9 @@ pub const LANE_FIELDS: [&str; 11] = [
     // APPENDED LAST, same discipline again (spec §4.8). The key exists on every
     // lane for surface uniformity; only `lanes.impl.auto_review` is ever read.
     "auto_review",
+    // APPENDED LAST, same discipline. Framework commit on `done`: parses on
+    // every lane, but only impl and general workers may ever act on it.
+    "auto_commit",
 ];
 
 /// Every `[profiles.<name>]` key, in the order `config show --origin` reports
@@ -401,6 +404,16 @@ pub struct LaneConfig {
     /// the first spends an account's headroom, and that is an opt-in.
     #[serde(default)]
     pub auto_review: bool,
+    /// Commit a finished worker's change from OUTSIDE the codex sandbox (which
+    /// makes `.git` read-only, so a worker can never commit for itself).
+    ///
+    /// `true` for the impl lane by default, `false` everywhere else. Only the
+    /// impl and general lanes may ever act on it — review and research never
+    /// touch code — so on those lanes it parses and means nothing. The
+    /// per-worker decision (`spawn --commit/--no-commit` over this) is taken at
+    /// spawn and recorded in genesis; see `src/auto_commit.rs`.
+    #[serde(default)]
+    pub auto_commit: bool,
 }
 
 /// One named model/effort routing choice.
@@ -747,6 +760,8 @@ fn default_lane(lane: Lane) -> LaneConfig {
         max_turns,
         // Nobody's quota is spent on a review nobody asked for.
         auto_review: false,
+        // The lane that writes code is the lane whose work gets committed.
+        auto_commit: lane == Lane::Impl,
     }
 }
 
@@ -1532,6 +1547,7 @@ fn apply_lane_toml(
         "allow_elevation" => lc.allow_elevation = want_bool(dotted, v)?,
         "max_turns" => lc.max_turns = want_u64(dotted, v)?,
         "auto_review" => lc.auto_review = want_bool(dotted, v)?,
+        "auto_commit" => lc.auto_commit = want_bool(dotted, v)?,
         _ => unreachable!("field membership checked by caller"),
     }
     Ok(())
@@ -1828,6 +1844,7 @@ fn apply_lane_str(lc: &mut LaneConfig, key: &str, field: &str, s: &str) -> Resul
         "allow_elevation" => lc.allow_elevation = parse_bool_str(key, s)?,
         "max_turns" => lc.max_turns = parse_u64_str(key, s)?,
         "auto_review" => lc.auto_review = parse_bool_str(key, s)?,
+        "auto_commit" => lc.auto_commit = parse_bool_str(key, s)?,
         _ => unreachable!("field membership fixed by LANE_FIELDS"),
     }
     Ok(())
@@ -2091,7 +2108,7 @@ mod tests {
             "A2A_ADMISSION_LANES_IMPL_CAP"
         );
         // The layering test's key set is stable: admission is its own section.
-        assert_eq!(LANE_FIELDS.len(), 11);
+        assert_eq!(LANE_FIELDS.len(), 12);
         assert!(!LANE_FIELDS.contains(&"cap"));
         // The §5 permission is a LANE key, appended after the Phase-1 block so
         // the reported order of every key before it is untouched.
@@ -2099,8 +2116,56 @@ mod tests {
         // ...and the Phase-5 turn budget is appended after THAT, for the same
         // reason. Whatever is last is the newest key, always.
         assert!(LANE_FIELDS.contains(&"max_turns"));
-        // ...and auto_review after THAT. Whatever is last is the newest key.
-        assert_eq!(*LANE_FIELDS.last().unwrap(), "auto_review");
+        // ...and auto_review after THAT...
+        assert_eq!(LANE_FIELDS[10], "auto_review");
+        // ...and auto_commit after THAT. Whatever is last is the newest key.
+        assert_eq!(*LANE_FIELDS.last().unwrap(), "auto_commit");
+    }
+
+    /// `auto_commit`'s surface: a per-lane bool, `true` ONLY for the impl lane
+    /// by default (the lane that writes code), with the ordinary env spelling.
+    /// Like `auto_review` it parses on every lane — one table, one surface —
+    /// but only `impl` and `general` workers may ever act on it (that half is
+    /// behaviour, pinned at spawn and in `tests/auto_commit.rs`).
+    #[test]
+    fn the_auto_commit_surface_defaults_on_for_impl_only() {
+        for lane in Lane::ALL {
+            assert_eq!(
+                default_lane(lane).auto_commit,
+                lane == Lane::Impl,
+                "{lane}"
+            );
+        }
+        assert_eq!(
+            lane_env_key(Lane::General, "auto_commit"),
+            "A2A_LANES_GENERAL_AUTO_COMMIT"
+        );
+        let mut cfg = Config {
+            codex_bin: None,
+            codex_version_range: DEFAULT_CODEX_VERSION_RANGE.to_string(),
+            allowed_roots: vec![],
+            lanes: Lane::ALL.iter().map(|l| (*l, default_lane(*l))).collect(),
+            profiles: default_profiles(),
+            broker: BrokerConfig::default(),
+            admission: AdmissionConfig::default(),
+            sync: SyncConfig::default(),
+            update: UpdateConfig::default(),
+            mesh: MeshConfig::default(),
+        };
+        let mut origins: Origins = BTreeMap::new();
+        let mut warnings = vec![];
+        let table: toml::Table = "[lanes.impl]\nauto_commit = false\n[lanes.general]\nauto_commit = true\n"
+            .parse()
+            .unwrap();
+        apply_file(&mut cfg, &mut origins, &mut warnings, &table).unwrap();
+        assert!(!cfg.lanes[&Lane::Impl].auto_commit);
+        assert!(cfg.lanes[&Lane::General].auto_commit);
+        assert_eq!(origins.get("lanes.impl.auto_commit"), Some(&Origin::File));
+
+        let bad: toml::Table = "[lanes.impl]\nauto_commit = \"yes\"\n".parse().unwrap();
+        let err = apply_file(&mut cfg, &mut origins, &mut warnings, &bad).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        assert!(err.message.contains("lanes.impl.auto_commit"), "{}", err.message);
     }
 
     /// `auto_review`'s surface (spec §4.8): a per-lane bool that is `false`

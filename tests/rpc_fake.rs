@@ -933,6 +933,7 @@ fn lane_cfg(sandbox: SandboxMode, network: bool, effort: &str) -> LaneConfig {
         allow_elevation: false,
         max_turns: 30,
         auto_review: false,
+        auto_commit: false,
     }
 }
 

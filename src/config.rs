@@ -18,7 +18,7 @@ pub const DEFAULT_MODEL: &str = "gpt-5.5";
 /// (spec §9 risk table: the exec JSONL shape is version-coupled). `doctor`
 /// warns outside it — never fails, because a drifted codex is a thing to tell
 /// an operator about, not a reason to refuse to run.
-pub const DEFAULT_CODEX_VERSION_RANGE: &str = ">=0.140, <0.150";
+pub const DEFAULT_CODEX_VERSION_RANGE: &str = ">=0.140, <0.153";
 pub const DEFAULT_START_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_BLOCKED_TIMEOUT_SECS: u64 = 1800;
@@ -682,7 +682,7 @@ impl SyncConfig {
 pub struct Config {
     /// `A2A_CODEX_BIN` env / `codex_bin` config key; else `codex` on PATH.
     pub codex_bin: Option<PathBuf>,
-    /// Comma-separated version constraints (`>=0.140, <0.150`) that `doctor`
+    /// Comma-separated version constraints (`>=0.140, <0.153`) that `doctor`
     /// holds the resolved codex to.
     pub codex_version_range: String,
     /// CANONICALIZED at load; default `[~/dev]`.

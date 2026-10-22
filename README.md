@@ -44,7 +44,7 @@ a2a doctor
 
 ```
 ✓ codex_present  codex resolves to /Users/you/.nvm/versions/node/v23.10.0/bin/codex
-✓ codex_version  codex 0.140.0 satisfies >=0.140, <0.150
+✓ codex_version  codex 0.152.1 satisfies >=0.140, <0.153
 ✓ layout_version  home layout v1
 ✓ home_perms  /Users/you/.a2a is 0700
 ✓ workers_health  0 worker(s): 0 orphaned, 0 parked (non-terminal, no live process), 0 unreadable
@@ -521,7 +521,7 @@ The middle layer is a TOML file you write:
 ```toml
 # $A2A_HOME/config.toml
 allowed_roots = ["/Users/you/dev", "/Users/you/work"]
-codex_version_range = ">=0.140, <0.150"
+codex_version_range = ">=0.140, <0.153"
 
 [lanes.impl]
 model = "gpt-5.5"

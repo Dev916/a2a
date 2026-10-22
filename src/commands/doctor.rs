@@ -344,7 +344,7 @@ fn codex_version(ctx: &Ctx) -> Check {
             "codex_version",
             format!("codex {found}, but `codex_version_range` (`{range}`) is not a version range"),
         )
-        .remedy("write it as comma-separated constraints, e.g. `>=0.140, <0.150`"),
+        .remedy("write it as comma-separated constraints, e.g. `>=0.140, <0.153`"),
         Some(cs) if cs.iter().all(|c| c.admits(found)) => Check::ok(
             "codex_version",
             format!("codex {found} satisfies {range}"),
@@ -1437,7 +1437,7 @@ enum Op {
 
 impl Constraint {
     /// Every clause must parse or the whole range is rejected: silently
-    /// dropping the half of `>=0.140, <0.150` that had a typo would leave a
+    /// dropping the half of `>=0.140, <0.153` that had a typo would leave a
     /// check that reports "in range" while enforcing nothing.
     fn parse_all(spec: &str) -> Option<Vec<Constraint>> {
         let cs: Vec<Constraint> = spec
@@ -1527,7 +1527,8 @@ mod tests {
         assert!(admits(Version(0, 140, 0)), "the lower bound is inclusive");
         assert!(admits(Version(0, 147, 0)));
         assert!(admits(Version(0, 149, 99)));
-        assert!(!admits(Version(0, 150, 0)), "the upper bound is exclusive");
+        assert!(admits(Version(0, 152, 1)), "the release both real tiers were verified on");
+        assert!(!admits(Version(0, 153, 0)), "the upper bound is exclusive");
         assert!(!admits(Version(0, 99, 0)));
         assert!(!admits(Version(1, 0, 0)));
     }

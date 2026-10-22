@@ -1194,7 +1194,7 @@ mod tests {
         );
         assert_eq!(
             crate::config::DEFAULT_CODEX_VERSION_RANGE,
-            ">=0.140, <0.150"
+            ">=0.140, <0.153"
         );
     }
 }

@@ -16,7 +16,7 @@ regen costs **zero tokens and needs no auth**.
 
 - `codex-cli 0.152.1` (`codex --version`), 2026-09-02.
 - Version range the binary accepts lives in `config::DEFAULT_CODEX_VERSION_RANGE`
-  (`>=0.140, <0.150`). This file does not duplicate it.
+  (`>=0.140, <0.153`). This file does not duplicate it.
 
 ## Regen command
 

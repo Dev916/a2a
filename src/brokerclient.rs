@@ -747,7 +747,7 @@ mod tests {
     fn the_daemon_environment_is_by_name_and_by_prefix() {
         let env: Vec<(String, String)> = [
             ("A2A_CODEX_BIN", "/opt/codex"),
-            ("A2A_CODEX_VERSION_RANGE", ">=0.140, <0.150"),
+            ("A2A_CODEX_VERSION_RANGE", ">=0.140, <0.153"),
             ("A2A_ALLOWED_ROOTS", "/Users/x/dev"),
             ("A2A_SHIM_BIN", "/usr/local/bin/a2a"),
             ("A2A_LANES_IMPL_TASK_TIMEOUT_SECS", "60"),

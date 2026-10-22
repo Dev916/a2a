@@ -4,7 +4,9 @@
 #            STUB_EMIT_QUESTION, STUB_MESH_NOTE, STUB_RECORD (dir for resume recordings), STUB_RESUME_FAIL
 #            STUB_ARGV_FILE (file; the whole argv, every run),
 #            STUB_PWD_FILE (file; this child's own working directory)
-out=""; outbox=""; resume=0
+#            STUB_WRITE (space-separated paths, relative to the `-C` workspace;
+#                        each is written with "stub\n" — the worker's "change")
+out=""; outbox=""; resume=0; cdir=""
 argv="$*"   # captured before the parse loop consumes it — resume-argv.txt is the ps-safety witness
 [ "$1" = "exec" ] && shift
 while [ $# -gt 0 ]; do
@@ -16,6 +18,7 @@ while [ $# -gt 0 ]; do
     resume)                resume=1;;
     --output-last-message) shift; out="$1";;
     --add-dir)             shift; outbox="$1";;
+    -C)                    shift; cdir="$1";;
   esac; shift
 done
 # STUB_ARGV_FILE: the whole argv, every run — the witness for `-C <workspace>`
@@ -36,6 +39,11 @@ printf '%s\n' "{\"type\":\"agent_message\",\"message\":\"working ${STUB_LEAK:-}\
 printf '%s\n' '{"type":"agent_message_delta","delta":"x"}'
 if [ -n "$STUB_DUMP_ENV" ]; then env > "$STUB_DUMP_ENV"; fi
 [ -n "$STUB_SLEEP" ] && sleep "$STUB_SLEEP"
+if [ -n "$STUB_WRITE" ] && [ -n "$cdir" ]; then
+  for _f in $STUB_WRITE; do
+    mkdir -p "$cdir/$(dirname "$_f")" && printf 'stub\n' > "$cdir/$_f"
+  done
+fi
 if [ -n "$STUB_EMIT_QUESTION" ] && [ -n "$outbox" ]; then
   printf '%s\n' '{"seq":1,"question":"A or B?","blocking":true}' > "$outbox/1.question.json"
 fi

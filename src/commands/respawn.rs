@@ -197,6 +197,10 @@ fn inherited_args(parent: &WorkerSnapshot, parent_dir: &Path, brief: Option<&Pat
         base_ref: None,
         danger_full_access: false,
         reason: None,
+        // The parent's EFFECTIVE auto-commit decision, exactly: a retry of a
+        // worker someone spawned `--no-commit` must not start committing.
+        commit: parent.auto_commit_enabled,
+        no_commit: !parent.auto_commit_enabled,
     }
 }
 

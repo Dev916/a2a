@@ -234,6 +234,8 @@ pub enum Cmd {
     /// (it is re-read fresh here) or pass `--brief <amended-file>`. A bare
     /// respawn re-runs the parent's brief unchanged; editing the original file
     /// you first spawned from does not reach the retry unless you pass --brief.
+    /// The child inherits the parent's auto-commit decision (`--commit` /
+    /// `--no-commit` as the parent was spawned).
     Respawn {
         /// Worker id, or any unambiguous prefix of one
         id: String,
@@ -405,6 +407,15 @@ pub struct SpawnArgs {
     /// §5 gate, so a missing reason is a typed envelope, not clap's exit 2.
     #[arg(long, value_name = "TEXT")]
     pub reason: Option<String>,
+    /// Framework-commit this worker's change when it reaches `done`, from
+    /// outside the sandbox (default: the lane's `auto_commit` — on for impl).
+    /// Impl and general lanes only. Stages `files_changed` from the result, or
+    /// everything in the worker's own worktree; never pushes.
+    #[arg(long, conflicts_with = "no_commit")]
+    pub commit: bool,
+    /// Never framework-commit this worker's change, whatever the lane default
+    #[arg(long)]
+    pub no_commit: bool,
 }
 
 impl SpawnArgs {

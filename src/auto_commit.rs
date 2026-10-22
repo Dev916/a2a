@@ -194,6 +194,16 @@ pub fn plan_staging(files_changed: Option<&[String]>, own_worktree: bool) -> Sta
 /// absolute root) or names `.git` anywhere is refused — the worker does not get
 /// to steer a commit outside its own tree.
 pub fn normalize_path(top: &Path, raw: &str) -> Result<String, String> {
+    // `files_changed` is worker-controlled, and a git pathspec has magic: a
+    // leading `:` (`:/`, `:!x`, `:(top)…`) or a glob (`*`, `?`, `[`) would let
+    // a worker widen what gets staged. Every git call here also runs with
+    // GIT_LITERAL_PATHSPECS=1; refusing the shapes outright fails closed.
+    if raw.starts_with(':') {
+        return Err(format!("`{raw}` looks like pathspec magic"));
+    }
+    if raw.contains(['*', '?', '[']) {
+        return Err(format!("`{raw}` contains a glob character"));
+    }
     let given = Path::new(raw);
     let rel: PathBuf = if given.is_absolute() {
         given
@@ -267,6 +277,9 @@ fn git(top: &Path) -> Command {
     ] {
         cmd.env_remove(var);
     }
+    // Every pathspec this module passes is a worker-supplied file name, never
+    // a pattern: no globs, no `:(magic)`.
+    cmd.env("GIT_LITERAL_PATHSPECS", "1");
     cmd
 }
 
@@ -351,22 +364,7 @@ fn commit_inner(dir: &Path, snap: &WorkerSnapshot) -> Result<AutoCommitOutcome, 
             // A listed path git cannot stage — gone and never tracked, or
             // ignored — is dropped rather than failing the whole commit.
             let tracked = nul_split(&git_ok(&top, &["ls-files", "-z"], &paths)?.stdout);
-            let ignored = {
-                let out = run_git(&top, &["-c", "core.quotePath=false", "check-ignore"], &paths)?;
-                match out.status.code() {
-                    Some(0) => String::from_utf8_lossy(&out.stdout)
-                        .lines()
-                        .map(str::to_string)
-                        .collect(),
-                    Some(1) => Vec::new(),
-                    _ => {
-                        return Err(format!(
-                            "git check-ignore failed: {}",
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        ))
-                    }
-                }
-            };
+            let ignored = ignored_paths(&top, &paths)?;
             paths.retain(|p| {
                 let exists = std::fs::symlink_metadata(top.join(p)).is_ok();
                 (exists || tracked.contains(p)) && !ignored.contains(p)
@@ -399,6 +397,30 @@ fn commit_inner(dir: &Path, snap: &WorkerSnapshot) -> Result<AutoCommitOutcome, 
         }
     }
     let staged = nul_split(&git_ok(&top, &["diff", "--cached", "--name-only", "-z"], &paths)?.stdout);
+    // The scoped branch commits only what the worker listed: anything staged
+    // under those pathspecs that is not one of them (or under one of them, for
+    // a listed directory) refuses the commit.
+    if scoped {
+        let outside: Vec<&String> = staged
+            .iter()
+            .filter(|f| {
+                !paths
+                    .iter()
+                    .any(|p| *f == p || f.starts_with(&format!("{p}/")))
+            })
+            .collect();
+        if !outside.is_empty() {
+            unstage(&top);
+            return Err(format!(
+                "staged paths outside files_changed: {}",
+                outside
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
 
     // An unresolved merge is never committed on the worker's behalf.
     let diff = match git_ok(
@@ -455,6 +477,44 @@ fn commit_inner(dir: &Path, snap: &WorkerSnapshot) -> Result<AutoCommitOutcome, 
         files: staged.len(),
         branch,
     })
+}
+
+/// Which of `paths` are ignored (and untracked). Paths go over `--stdin`,
+/// where `check-ignore` reads PATH NAMES rather than pathspecs — it does not
+/// support the `literal` magic GIT_LITERAL_PATHSPECS would impose, and stdin
+/// sidesteps pathspec parsing entirely.
+fn ignored_paths(top: &Path, paths: &[String]) -> Result<Vec<String>, String> {
+    use std::io::Write;
+    let mut cmd = git(top);
+    cmd.env_remove("GIT_LITERAL_PATHSPECS")
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("running git check-ignore: {e}"))?;
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p.as_bytes());
+        input.push(0);
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&input)
+            .map_err(|e| format!("writing to git check-ignore: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("running git check-ignore: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(nul_split(&out.stdout)),
+        Some(1) => Ok(Vec::new()),
+        _ => Err(format!(
+            "git check-ignore failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
 /// Files whose staged additions carry a conflict marker, from a `-U0` diff.
@@ -545,6 +605,28 @@ pub fn run_locked(
     }
 }
 
+/// The exec transport's call site: [`crate::reconcile::reconcile`] calls this
+/// with `state.lock` held, right after its locked pass. An app-server worker is
+/// the broker's (its `WorkerActor` calls [`run_locked`] itself), so it is left
+/// alone here — the CLI must not be a second writer of a broker-owned log.
+pub fn after_exec_reconcile(
+    dir: &Path,
+    cfg: &crate::config::Config,
+    snap: WorkerSnapshot,
+    now: DateTime<Utc>,
+) -> WorkerSnapshot {
+    if snap.transport != crate::events::Transport::Exec || !should_run(&snap) {
+        return snap;
+    }
+    match EventLog::open_capped(dir, cfg.broker.events_max_bytes) {
+        Ok(mut log) => run_locked(&mut log, dir, snap, now),
+        Err(e) => {
+            eprintln!("a2a: warning: {}: opening events.jsonl for the auto-commit: {e}", snap.id);
+            snap
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +706,11 @@ mod tests {
         assert!(normalize_path(top, ".git/config").is_err());
         assert!(normalize_path(top, "sub/.git/hooks/pre-commit").is_err());
         assert!(normalize_path(top, ".").is_err());
+        // Pathspec magic and globs are refused before git ever sees them.
+        for magic in [":/", ":!a.txt", ":(top)a.txt", "*", "src/*.rs", "a?.txt", "[ab].txt"] {
+            assert!(normalize_path(top, magic).is_err(), "{magic}");
+        }
+        assert_eq!(normalize_path(top, "a:b.txt").unwrap(), "a:b.txt");
     }
 
     #[test]
@@ -676,6 +763,22 @@ mod tests {
         assert!(shown.contains("a.txt") && !shown.contains("unlisted.txt"), "{shown}");
         let status = git_in(r.path(), &["status", "--porcelain"]);
         assert!(status.contains("?? unlisted.txt"), "{status}");
+    }
+
+    #[test]
+    fn ignored_and_vanished_listed_paths_are_dropped_not_fatal() {
+        let r = repo();
+        let wdir = tempfile::tempdir().unwrap();
+        std::fs::write(r.path().join(".gitignore"), "*.log\n").unwrap();
+        git_in(r.path(), &["add", ".gitignore"]);
+        git_in(r.path(), &["commit", "-q", "-m", "ignore logs"]);
+        std::fs::write(r.path().join("build.log"), "noise\n").unwrap();
+        std::fs::write(r.path().join("a.txt"), "a\n").unwrap();
+        result_json(wdir.path(), &["build.log", "gone.txt", "a.txt"], "add a");
+        let out = commit_worker(wdir.path(), &done_snap("impl-0814t1300-aaaa", r.path(), false));
+        let AutoCommitOutcome::Committed { sha, files, .. } = out else { panic!("{out:?}") };
+        assert_eq!(files, 1);
+        assert_eq!(git_in(r.path(), &["show", "--name-only", "--format=", &sha]).trim(), "a.txt");
     }
 
     #[test]

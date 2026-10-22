@@ -1901,6 +1901,8 @@ impl BrokerCore {
             worktree_skipped: None,
             lineage: None,
             auto_review_of: Some(impl_id.clone()),
+            // A reviewer never touches code, so it is never committed.
+            auto_commit: false,
             queued,
         };
         let cfg = self.cfg.clone();

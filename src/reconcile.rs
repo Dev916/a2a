@@ -89,7 +89,9 @@ pub fn reconcile(
     }
     let snap = {
         let _lock = lock_state(&dir)?;
-        reconcile_locked(home.root(), &dir, cfg, now)?
+        let snap = reconcile_locked(home.root(), &dir, cfg, now)?;
+        // Exec-transport framework commit on `done` (still under the lock).
+        crate::auto_commit::after_exec_reconcile(&dir, cfg, snap, now)
     };
     if snap.transport == Transport::Exec {
         route_outbox_notes(home, cfg, &dir, &snap);

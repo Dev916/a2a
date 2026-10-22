@@ -210,6 +210,9 @@ pub struct SeedPlan {
     /// a reviewer is not a retry of anything, and conflating the two would make
     /// `max_attempts` count reviews.
     pub auto_review_of: Option<String>,
+    /// The effective framework-commit decision ([`effective_auto_commit`]).
+    /// Genesis records it only when it is "yes".
+    pub auto_commit: bool,
     pub queued: bool,
 }
 
@@ -385,6 +388,8 @@ pub fn run_with_overrides(
     if let Some(msg) = &clamp {
         warn(msg);
     }
+    let auto_commit =
+        effective_auto_commit(lane, lane_cfg.auto_commit, args.commit, args.no_commit, &warn);
 
     let model = args
         .model
@@ -549,6 +554,7 @@ pub fn run_with_overrides(
         worktree_skipped: wt_gate.skipped,
         lineage: lineage.clone(),
         auto_review_of: None,
+        auto_commit,
         queued,
     };
     let (id, wdir, mut snap) = match seed_worker(home, &cfg, &plan, now) {
@@ -641,6 +647,7 @@ pub fn run_with_overrides(
                 // admission queue (spec §4.9).
                 "queue_position": snap.queue_position,
                 "worktree": worktree_payload,
+                "auto_commit": auto_commit,
                 "deadline_at": snap.deadline_at,
             });
             add_lineage(&mut payload, lineage.as_ref());
@@ -729,6 +736,7 @@ pub fn run_with_overrides(
             "model": model,
             "effort": effort,
             "worktree": worktree_payload,
+            "auto_commit": auto_commit,
             "deadline_at": snap.deadline_at,
         });
         add_lineage(&mut payload, lineage.as_ref());
@@ -875,8 +883,40 @@ pub fn seed_worker(
     if let Some(reviewed) = &plan.auto_review_of {
         genesis["auto_review_of"] = json!(reviewed);
     }
+    // The framework-commit decision, ONLY when it is "yes": the fold reads an
+    // absent key as "no", which is also what every pre-feature worker is.
+    if plan.auto_commit {
+        genesis["auto_commit_enabled"] = json!(true);
+    }
     let snap = append_and_fold(&mut log, &wdir, snap, EventKind::Spawned, genesis, now)?;
     Ok((plan.id.clone(), wdir, snap))
+}
+
+/// The per-worker framework-commit decision: `--no-commit` over `--commit`
+/// over the lane's `auto_commit`, and never on a lane that does not write code
+/// (review and research) — asking for it there is a warning, not a refusal.
+pub fn effective_auto_commit(
+    lane: Lane,
+    lane_default: bool,
+    commit: bool,
+    no_commit: bool,
+    warn: &dyn Fn(&str),
+) -> bool {
+    if !crate::auto_commit::lane_may_commit(lane) {
+        if commit {
+            warn(&format!(
+                "--commit has no effect on the {lane} lane: only impl and general workers are ever committed"
+            ));
+        }
+        return false;
+    }
+    if no_commit {
+        false
+    } else if commit {
+        true
+    } else {
+        lane_default
+    }
 }
 
 /// The two lineage keys, added to a spawn payload ONLY when this spawn is a
@@ -2039,6 +2079,7 @@ mod tests {
             worktree_skipped: None,
             lineage: None,
             auto_review_of: None,
+            auto_commit: false,
             queued: false,
         };
         let (id, wdir, snap) = seed_worker(&home, &cfg, &plan, now).unwrap();
@@ -2108,6 +2149,61 @@ mod tests {
         }
     }
 
+    /// The framework-commit decision: `--no-commit` > `--commit` > the lane
+    /// default, and never on review/research (a warning there, not an error).
+    #[test]
+    fn the_auto_commit_decision_table() {
+        let warned = std::cell::RefCell::new(Vec::<String>::new());
+        let warn = |m: &str| warned.borrow_mut().push(m.to_string());
+        assert!(effective_auto_commit(Lane::Impl, true, false, false, &warn));
+        assert!(!effective_auto_commit(Lane::Impl, true, false, true, &warn));
+        assert!(!effective_auto_commit(Lane::General, false, false, false, &warn));
+        assert!(effective_auto_commit(Lane::General, false, true, false, &warn));
+        assert!(warned.borrow().is_empty());
+        assert!(!effective_auto_commit(Lane::Review, true, true, false, &warn));
+        assert!(!effective_auto_commit(Lane::Research, true, false, false, &warn));
+        assert_eq!(warned.borrow().len(), 1, "only an explicit --commit warns");
+    }
+
+    /// `auto_commit_enabled` reaches genesis only when it is "yes", and the
+    /// fold puts it on the snapshot.
+    #[test]
+    fn a_yes_auto_commit_decision_is_a_genesis_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let (cfg, _, _) = config::load(&home).unwrap();
+        let plan = SeedPlan {
+            id: "impl-0819t1200-cccc".to_string(),
+            lane: Lane::Impl,
+            cwd: PathBuf::from("/repo"),
+            brief_text: "---\nlane: impl\nacceptance_criteria:\n  - it works\nverify:\n  - \"true\"\n---\nbody\n".to_string(),
+            context: vec![],
+            schema: None,
+            profile: None,
+            model: "gpt-5.5".to_string(),
+            effort: "high".to_string(),
+            owner: None,
+            max_turns: 40,
+            sandbox: SandboxMode::WorkspaceWrite,
+            transport: Transport::Exec,
+            requested_transport: Transport::Exec,
+            transport_selection: "auto",
+            elevation_reason: None,
+            worktree: None,
+            base_ref: None,
+            worktree_skipped: None,
+            lineage: None,
+            auto_review_of: None,
+            auto_commit: true,
+            queued: false,
+        };
+        let (_, wdir, snap) = seed_worker(&home, &cfg, &plan, Utc::now()).unwrap();
+        let line = std::fs::read_to_string(wdir.join("events.jsonl")).unwrap();
+        let env: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(env["raw"]["auto_commit_enabled"], true);
+        assert!(snap.auto_commit_enabled);
+    }
+
     /// The conditional half: every key that appears only when the fact behind
     /// it exists — and the auto-review marker, which is `auto_review_of` and
     /// never `parent_id`.
@@ -2140,6 +2236,7 @@ mod tests {
             worktree_skipped: None,
             lineage: None,
             auto_review_of: Some("impl-0819t1200-aaaa".to_string()),
+            auto_commit: false,
             queued: true,
         };
         let (_, wdir, snap) = seed_worker(&home, &cfg, &plan, now).unwrap();

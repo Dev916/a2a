@@ -399,6 +399,25 @@ line in `broker.jsonl`; reviewing a diff that does not exist is worse than not
 reviewing. Reviewers are never themselves reviewed, and a worker that already
 has a `review.json` is not reviewed twice.
 
+### `auto_commit` — the framework commits a finished worker's change
+
+```toml
+[lanes.impl]
+auto_commit = true       # ON by default for impl; `spawn --no-commit` opts out
+```
+
+The codex sandbox makes `.git` read-only, so a worker cannot commit. When an
+impl worker reaches `done`, a2a commits its change from outside the sandbox as
+`a2a <a2a@localhost>` — subject `impl <id>: <summary>`, with `Worker:` and
+`Co-Authored-By: Codex` trailers. It stages exactly the result's
+`files_changed`; with an empty list it stages everything in the worker's own
+worktree, and in a shared cwd (`--no-worktree`) it stages nothing and records
+why. `a2a result <id>` prints `committed <sha>`, `--json` carries
+`committed_sha`, and `a2a ls` marks the row `✓ committed`. A failed commit
+leaves the worker `done` with a `commit_failed` event. The general lane opts in
+with `spawn --commit`; review and research never commit; `respawn` inherits the
+parent's choice. Nothing is pushed or merged.
+
 ### `a2a spawn --template <lane>` — the brief scaffold
 
 ```bash
@@ -530,6 +549,8 @@ task_timeout_secs = 7200
 max_turns = 40           # per-lane turn budget: impl 40, general 30,
                          # research 20, review 15. A brief may only lower it.
 auto_review = false      # impl only: review every finished impl worktree
+auto_commit = true       # commit a done worker's change (impl on by default;
+                         # general opt-in; never review/research)
 
 [admission]              # app-server transport only
 global_cap = 8
@@ -546,7 +567,7 @@ events_max_bytes = 10485760   # 10 MiB, then events.jsonl rotates to .1
 Every key has an `A2A_`-prefixed environment override
 (`A2A_ALLOWED_ROOTS`, `A2A_CODEX_VERSION_RANGE`,
 `A2A_LANES_IMPL_TASK_TIMEOUT_SECS`, `A2A_LANES_IMPL_MAX_TURNS`,
-`A2A_LANES_IMPL_AUTO_REVIEW`, `A2A_ADMISSION_GLOBAL_CAP`,
+`A2A_LANES_IMPL_AUTO_REVIEW`, `A2A_LANES_IMPL_AUTO_COMMIT`, `A2A_ADMISSION_GLOBAL_CAP`,
 `A2A_ADMISSION_LANES_IMPL_CAP`, `A2A_ADMISSION_BREAKER_FAILURES`,
 `A2A_ADMISSION_MAX_ATTEMPTS`, `A2A_BROKER_EVENTS_MAX_BYTES`, …). `A2A_HOME` (or `--home`) relocates the
 entire tree — that is how the test suite stays hermetic. Two variables are

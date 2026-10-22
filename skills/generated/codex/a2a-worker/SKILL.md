@@ -107,9 +107,17 @@ secrets are refused rather than delivered.
 ## You are probably in a git worktree
 
 An impl-lane worker runs in a git worktree at `$A2A_HOME/worktrees/<id>`,
-checked out on branch `a2a/<lane>/<id>` from an explicit base ref. Commit your
-work on that branch: **a2a never merges branches** — it produces the branch plus
-a verification artifact, and a human or an explicit devloop step merges.
+checked out on branch `a2a/<lane>/<id>` from an explicit base ref. **You cannot
+commit** — the sandbox makes `.git` read-only — and you do not need to: leave
+your change in the tree and list **every file you created, modified or
+deleted** in your result's `files_changed` (repo-relative, plain paths — no
+globs). When you finish, a2a commits it for you from outside the sandbox
+(**auto-commit**): exactly the paths in `files_changed`, or, when that list is
+empty and you are in your own worktree, everything in the tree. In a shared cwd
+(no worktree) an empty list means nothing is committed, so an accurate
+`files_changed` is what makes your work land. **a2a never merges or pushes
+branches** — it produces the branch plus a verification artifact, and a human or
+an explicit devloop step merges.
 
 A fresh worktree has **no build artifacts** — `node_modules`, `target`, `.venv`
 and every compiled test binary are untracked and were never copied, so **verify

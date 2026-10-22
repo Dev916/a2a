@@ -161,6 +161,11 @@ struct Row {
     ///
     /// `--json` only, like the lineage keys above.
     auto_review_of: Option<String>,
+    /// The commit the framework made when this worker reached `done`
+    /// (`src/auto_commit.rs`). Drives the `✓ committed` suffix on the human
+    /// row, which is APPENDED after the last column so every existing column
+    /// keeps its width and position.
+    committed_sha: Option<String>,
     /// Why this worker was allowed `danger-full-access` (spec §5). An elevated
     /// worker must never be visually identical to an ordinary one, so this
     /// drives the `/ELEV` marker on the STATE cell as well as the `--json` key.
@@ -186,6 +191,7 @@ impl Row {
             parent_id: snap.parent_id.clone(),
             attempt: snap.attempt,
             auto_review_of: extra_str(&snap.extra, "auto_review_of"),
+            committed_sha: snap.committed_sha.clone(),
             elevation_reason: snap.elevation_reason.clone(),
             created_at: Some(snap.created_at),
             dwell_secs: Some(age_secs(snap.entered_state_at, now)),
@@ -222,6 +228,7 @@ impl Row {
             auto_review_of: stale
                 .as_ref()
                 .and_then(|s| extra_str(&s.extra, "auto_review_of")),
+            committed_sha: stale.as_ref().and_then(|s| s.committed_sha.clone()),
             // Kept from the stale snapshot on purpose: a worker we can no
             // longer reconcile is exactly the one whose elevation matters most.
             elevation_reason: stale.as_ref().and_then(|s| s.elevation_reason.clone()),
@@ -248,6 +255,7 @@ impl Row {
             "parent_id": self.parent_id,
             "attempt": self.attempt,
             "auto_review_of": self.auto_review_of,
+            "committed_sha": self.committed_sha,
             "elevation_reason": self.elevation_reason,
         })
     }
@@ -270,6 +278,17 @@ impl Row {
         match self.elevation_reason {
             Some(_) => format!("{}/ELEV", self.state),
             None => self.state.clone(),
+        }
+    }
+
+    /// `  ✓ committed` after the last column when the framework committed this
+    /// worker's change — a suffix rather than a column, so a fleet with no
+    /// commits renders byte for byte as before.
+    fn committed_suffix(&self) -> &'static str {
+        if self.committed_sha.is_some() {
+            "  \u{2713} committed"
+        } else {
+            ""
         }
     }
 
@@ -372,12 +391,13 @@ fn render_table(rows: &[Row], all: bool) -> String {
                 String::new()
             };
             format!(
-                "{:<idw$}  {:<lanew$}  {:<statew$}  {owner}{worktree}{}  {}",
+                "{:<idw$}  {:<lanew$}  {:<statew$}  {owner}{worktree}{}  {}{}",
                 r.id,
                 r.lane,
                 r.state_cell(),
                 humanize(r.dwell_secs),
                 humanize(r.last_event_age_secs),
+                r.committed_suffix(),
             )
         })
         .collect::<Vec<_>>()
@@ -405,6 +425,7 @@ mod tests {
             parent_id: None,
             attempt: None,
             auto_review_of: None,
+            committed_sha: None,
             elevation_reason: None,
             created_at: None,
             dwell_secs: dwell,
@@ -506,6 +527,21 @@ mod tests {
         // ...and without the flag the projection is exactly the Phase-1 one.
         let plain = render_table(&[row("general-0814t1300-aaaa", "done", Some(240))], false);
         assert!(plain.ends_with("done  4m  -"), "{plain}");
+    }
+
+    /// A framework-committed worker gets a `✓ committed` SUFFIX: every existing
+    /// column keeps its width and position, and the uncommitted row is
+    /// byte-identical to before.
+    #[test]
+    fn a_committed_worker_gets_a_suffix_and_nothing_moves() {
+        let plain = row("general-0814t1300-aaaa", "done", Some(240));
+        let mut committed = row("impl-0814t1301-bbbb", "done", Some(5));
+        committed.committed_sha = Some("abc123".into());
+        let text = render_table(&[plain, committed], false);
+        let lines: Vec<_> = text.lines().collect();
+        assert!(lines[0].ends_with("done  4m  -"), "{}", lines[0]);
+        assert!(lines[1].ends_with("done  5s  -  \u{2713} committed"), "{}", lines[1]);
+        assert_eq!(lines[0].find("4m"), lines[1].find("5s"));
     }
 
     /// The WT column costs a column, so it is only rendered when it answers

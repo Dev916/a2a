@@ -396,3 +396,53 @@ fn hostile_files_changed_entries_fail_closed() {
     let id = w.run_worker("impl", &devloop(&["a.txt"], "add a"), "a.txt", &["--no-worktree"]);
     assert_eq!(w.snap(&id)["auto_commit"]["outcome"], "committed");
 }
+
+/// The surface: `a2a result` names the commit on stderr (stdout stays exactly
+/// the result) and carries it under `--json`; `a2a ls` suffixes the row and
+/// carries the sha under `--json`; a failure is shown the same way.
+#[test]
+fn result_and_ls_show_the_commit_or_why_not() {
+    let w = world();
+    let id = w.run_worker("impl", &devloop(&["a.txt"], "add a"), "a.txt", &[]);
+    let sha = w.snap(&id)["committed_sha"].as_str().unwrap().to_string();
+
+    let out = w.cli().args(["result", &id]).assert().code(0);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(stderr.contains(&format!("a2a: {id} committed {sha}")), "{stderr}");
+    assert!(!stdout.contains("committed "), "stdout is the result only: {stdout}");
+
+    let out = w.cli().args(["--json", "result", &id]).assert().code(0);
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["committed_sha"], json!(sha), "{v}");
+    assert_eq!(v["data"]["auto_commit"]["outcome"], "committed", "{v}");
+    assert_eq!(v["data"]["result"]["committed_sha"], json!(sha), "result.json stamped");
+
+    let out = w.cli().args(["ls"]).assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let row = stdout.lines().find(|l| l.starts_with(&id)).expect(&stdout);
+    assert!(row.ends_with("  \u{2713} committed"), "{row}");
+    let out = w.cli().args(["--json", "ls"]).assert().success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["workers"][0]["committed_sha"], json!(sha), "{v}");
+
+    // A failure is reported by `result`, and `ls` adds no marker.
+    std::fs::write(w.repo.join(".git/index.lock"), "").unwrap();
+    let failed = w.run_worker(
+        "impl",
+        &devloop(&["b.txt"], "add b"),
+        "b.txt",
+        &["--no-worktree"],
+    );
+    let out = w.cli().args(["result", &failed]).assert().code(0);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains(&format!("a2a: {failed} commit failed: ")), "{stderr}");
+    let out = w.cli().args(["--json", "result", &failed]).assert().code(0);
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["data"]["committed_sha"], Value::Null);
+    assert_eq!(v["data"]["auto_commit"]["outcome"], "failed");
+    let out = w.cli().args(["ls"]).assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let row = stdout.lines().find(|l| l.starts_with(&failed)).expect(&stdout);
+    assert!(!row.contains("committed"), "{row}");
+}

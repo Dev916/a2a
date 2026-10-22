@@ -96,6 +96,15 @@ pub enum EventKind {
     /// `fsm` key, so the fold consumes its seq and changes nothing — the split
     /// is visible in the log rather than inferred from a missing prefix.
     EventsRotated,
+    /// The framework committed a `done` worker's change (`src/auto_commit.rs`).
+    /// Bookkeeping like [`EventKind::ResultWritten`]: NO `fsm` key, so it moves
+    /// no state — the fold only records the sha and the outcome.
+    ResultCommitted,
+    /// The framework commit ran and made no commit: a clean tree, or a shared
+    /// cwd with no `files_changed` to stage. Payload `{outcome, reason}`.
+    CommitSkipped,
+    /// The framework commit failed. The worker stays `done`; payload `{reason}`.
+    CommitFailed,
     #[serde(other)]
     Unknown,
 }
@@ -853,7 +862,8 @@ mod tests {
     /// Every post-Phase-1 kind crosses the file layer: a Phase-1 binary reading
     /// a newer `events.jsonl` must degrade to `Unknown`, not fail the read.
     ///
-    /// `budget_exhausted`, `turn_stalled`, and `events_rotated` are here for
+    /// `budget_exhausted`, `turn_stalled`, `events_rotated` and the three
+    /// auto-commit kinds are here for
     /// exactly that reason and are deliberately absent from
     /// [`Phase1EventKind`] below — the mirror is the frozen
     /// vocabulary of a deployed older binary, and adding to it would assert the
@@ -867,6 +877,9 @@ mod tests {
             (EventKind::BudgetExhausted, "budget_exhausted"),
             (EventKind::TurnStalled, "turn_stalled"),
             (EventKind::EventsRotated, "events_rotated"),
+            (EventKind::ResultCommitted, "result_committed"),
+            (EventKind::CommitSkipped, "commit_skipped"),
+            (EventKind::CommitFailed, "commit_failed"),
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), json!(wire));
             let back: EventKind = serde_json::from_value(json!(wire)).unwrap();

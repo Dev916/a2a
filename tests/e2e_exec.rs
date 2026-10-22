@@ -153,6 +153,42 @@ fn stub_blocked_pipeline_wait_blocked_send_wait_result() {
     );
 }
 
+/// codex 0.152 flushes `--output-last-message` a few hundred ms AFTER
+/// `turn.completed`, process still alive. The turn's own final agent message is
+/// its result, so the worker must land `done` on it — not park
+/// `awaiting-input{turn_ended_without_result}` because result.md was late.
+#[test]
+fn stub_late_result_flush_still_concludes_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("proj");
+    std::fs::create_dir_all(&work).unwrap();
+    let brief = write_brief(tmp.path(), "answer in one word\n");
+
+    let out = a2a(&home, tmp.path())
+        .env("STUB_LAST_MSG", "A2A-LATE-OK")
+        .env("STUB_RESULT_LAG", "3")
+        .args(["--json", "spawn", "--lane", "general", "--cwd"])
+        .arg(&work)
+        .arg("--brief")
+        .arg(&brief)
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let id = v["data"]["id"].as_str().unwrap().to_string();
+
+    a2a(&home, tmp.path())
+        .args(["wait", &id, "--timeout", "30s"])
+        .assert()
+        .code(0);
+    let res = a2a(&home, tmp.path())
+        .args(["result", &id])
+        .assert()
+        .code(0);
+    let printed = String::from_utf8_lossy(&res.get_output().stdout).to_string();
+    assert!(printed.contains("A2A-LATE-OK"), "result stdout was: {printed}");
+}
+
 /// Tier 5: the only test that runs a real `codex`.
 ///
 /// This is what validates `events::map_exec_line` against the vocabulary codex

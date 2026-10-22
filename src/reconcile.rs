@@ -191,24 +191,27 @@ fn reconcile_locked(
     //     sentinel, neither of which an app-server worker has.
     let mut turn_concluded = false;
     if ingested.turn_completed && snap.state == WorkerState::Running {
-        // Refresh an EXISTING result.md from this turn's own final agent message
-        // before reading it. The exec transport has no in-process `WorkerActor`
-        // to write result.md the way the app-server path does, so a stale
-        // result.md from a prior epoch (e.g. an app-server turn before a
-        // cross-transport resume) could otherwise be read as this turn's — codex
-        // overwrites it via --output-last-message, but that flush can lag the
-        // `turn.completed` we just ingested (a2a-niq). Gated on an existing
-        // result so a turn that produced none still parks: this only replaces a
-        // stale result with the fresh one, it never fabricates one.
-        if has_result(dir) {
-            if let Some(text) = &ingested.result_text {
+        // Publish this turn's own final agent message as result.md BEFORE the
+        // `has_result` gate reads it — transport parity with the app-server
+        // `WorkerActor`, which does exactly this. codex's --output-last-message
+        // is not a reliable witness at this instant: its flush trails the
+        // `turn.completed` we just ingested (by ~300 ms on codex 0.152, where a
+        // first turn with no result.md yet parked `turn_ended_without_result`),
+        // and over a stale prior-epoch result.md it would let this turn conclude
+        // on the OLD text (a2a-niq). The text comes only from THIS epoch's own
+        // stream, so a prior epoch's message can never be promoted. A question
+        // outranks: a turn that asked one and left no result is not given one
+        // here (an existing result.md is still refreshed, per a2a-niq). codex's
+        // later flush rewrites the same text, which is harmless.
+        let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
+        if let Some(text) = &ingested.result_text {
+            if has_result(dir) || !has_question {
                 if let Err(e) = crate::store::write_atomic(&dir.join(RESULT_MD), text.as_bytes()) {
                     eprintln!("a2a: warning: {}: writing the synthesized result: {e}", snap.id);
                 }
             }
         }
         let has_result = has_result(dir);
-        let has_question = has_unanswered_question(dir, snap.last_delivered_seq);
         // A queued message concludes the turn by RESTARTING the worker, so it
         // outranks the liveness verdict: a worker we are about to resume is
         // emphatically not dead.
@@ -539,6 +542,9 @@ fn ingest(
         offset = len;
     }
 
+    // Where THIS pass starts reading: everything before it was ingested by an
+    // earlier pass (see [`earlier_final_message`]).
+    let start = offset;
     let mut file = File::open(&path).map_err(|e| io_err("opening the exec stream", e))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| io_err("seeking the exec stream", e))?;
@@ -583,9 +589,57 @@ fn ingest(
     // write result.md as freshly as the app-server actor does rather than
     // trusting codex's asynchronous --output-last-message flush (a2a-niq).
     if found.turn_completed {
-        found.result_text = crate::events::synthesize_result(&pending);
+        found.result_text = crate::events::synthesize_result(&pending)
+            .or_else(|| earlier_final_message(&buf_before(&path, start), &snap, now));
     }
     Ok((fold::fold(snap, &pending, now), found))
+}
+
+/// The bytes of this epoch's exec stream that EARLIER passes already ingested.
+/// Empty when there are none or the stream cannot be read.
+fn buf_before(path: &Path, upto: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    if upto > 0 {
+        if let Ok(f) = File::open(path) {
+            let _ = f.take(upto).read_to_end(&mut out);
+        }
+    }
+    out
+}
+
+/// The final agent message of the CURRENT turn among lines an earlier pass
+/// ingested: a polling reader can land between codex writing the answer and
+/// writing `turn.completed`, so the pass that sees the completion may not carry
+/// the message. Only THIS epoch's stream is read, so no prior epoch's text can
+/// surface; and since an answered question continues in the SAME epoch (the
+/// shim appends to this stream), everything up to the last turn boundary
+/// belongs to an earlier turn and is discarded. Redacted exactly as ingest
+/// redacts.
+fn earlier_final_message(
+    bytes: &[u8],
+    snap: &WorkerSnapshot,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let mut this_turn: Vec<Envelope> = Vec::new();
+    for line in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let text = redact::redact_egress(&String::from_utf8_lossy(line));
+        let Ok(raw) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match map_exec_line(&raw) {
+            Some((_, EventKind::TurnStarted | EventKind::TurnCompleted)) => this_turn.clear(),
+            Some((class, EventKind::AgentMessage)) => this_turn.push(Envelope::new(
+                snap.epoch,
+                snap.transport,
+                class,
+                EventKind::AgentMessage,
+                raw,
+                now,
+            )),
+            _ => {}
+        }
+    }
+    crate::events::synthesize_result(&this_turn)
 }
 
 /// Session identification across the spellings the exec transport has used
@@ -1415,6 +1469,182 @@ mod tests {
             !result.contains("EPOCH-1 stale"),
             "the stale epoch-1 result must not survive the conclusion; got {result:?}"
         );
+    }
+
+    /// A Running exec worker at epoch 1 whose exec stream is `stream` and whose
+    /// `result.md` does NOT exist yet — the shape every codex >=0.152 exec turn
+    /// is in at the instant `turn.completed` lands, because its
+    /// `--output-last-message` flush trails the stream by a few hundred ms.
+    fn exec_turn_fixture(stream: &str) -> (tempfile::TempDir, A2aHome, Config, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = A2aHome::resolve(Some(tmp.path())).unwrap();
+        let (cfg, _, _) = crate::config::load(&home).unwrap();
+        let id = "general-0814t1300-bbbb".to_string();
+        let dir = home.worker_dir(&id);
+        std::fs::create_dir_all(dir.join("outbox")).unwrap();
+        let mut snap = WorkerSnapshot::new_for_test(&id, dir.as_path());
+        snap.lane = Lane::General;
+        snap.transport = Transport::Exec;
+        snap.state = WorkerState::Running;
+        snap.epoch = 1;
+        snap.session_id = Some("sess-1".to_string());
+        snap.entered_state_at = Utc::now();
+        snap.deadline_at = None;
+        save_snapshot(&dir, &snap).unwrap();
+        std::fs::write(exec::exec_stream_path(&dir, 1), stream).unwrap();
+        (tmp, home, cfg, id)
+    }
+
+    /// The codex 0.152.1 exec tail, verbatim in shape: a warning surfaced as an
+    /// `item.completed` of type `error`, the answer, then the completion.
+    const LATE_FLUSH_STREAM: &str = "{\"type\":\"turn.started\"}\n\
+         {\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"Under-development features enabled: chronicle\"}}\n\
+         {\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"PIN-CHECK-OK\"}}\n\
+         {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\n";
+
+    /// codex 0.152 flushes `--output-last-message` ~300 ms AFTER
+    /// `turn.completed`. The turn's own final agent message is its result —
+    /// the app-server actor already publishes it that way — so the exec path
+    /// must conclude `done` on it rather than parking `turn_ended_without_result`.
+    #[test]
+    fn an_exec_turn_concludes_on_its_own_final_message_when_codex_flushes_late() {
+        let (_tmp, home, cfg, id) = exec_turn_fixture(LATE_FLUSH_STREAM);
+        let dir = home.worker_dir(&id);
+        assert!(!dir.join(RESULT_MD).exists(), "precondition: codex has not flushed");
+
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+
+        assert_eq!(snap.state, WorkerState::Done, "{:?}", snap.state_reason);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(RESULT_MD)).unwrap(),
+            "PIN-CHECK-OK"
+        );
+        // codex's own flush, landing afterwards with the same text, is harmless.
+        std::fs::write(dir.join(RESULT_MD), "PIN-CHECK-OK\n").unwrap();
+        let again = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+        assert_eq!(again.state, WorkerState::Done);
+    }
+
+    /// The answer and the completion can straddle two reconcile passes (a
+    /// polling `wait` reads between codex's two writes). The message is still
+    /// THIS epoch's own, so it is still the result.
+    #[test]
+    fn a_final_message_ingested_a_pass_before_the_completion_is_still_the_result() {
+        let (_tmp, home, cfg, id) = exec_turn_fixture(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SPLIT-OK\"}}\n",
+        );
+        let dir = home.worker_dir(&id);
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+        assert_eq!(snap.state, WorkerState::Running, "no completion yet");
+
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(exec::exec_stream_path(&dir, 1))
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"type\":\"turn.completed\"}\n").unwrap();
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+
+        assert_eq!(snap.state, WorkerState::Done, "{:?}", snap.state_reason);
+        assert_eq!(std::fs::read_to_string(dir.join(RESULT_MD)).unwrap(), "SPLIT-OK");
+    }
+
+    /// An answered question continues in the SAME epoch, appending to the same
+    /// stream: the earlier turn's message must never become the later turn's
+    /// result when the later turn says nothing.
+    #[test]
+    fn an_earlier_turn_of_the_same_epoch_never_lends_its_message() {
+        let (_tmp, home, cfg, id) = exec_turn_fixture(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"TURN-1 chatter\"}}\n\
+             {\"type\":\"turn.completed\"}\n",
+        );
+        let dir = home.worker_dir(&id);
+        ask_question(&dir, 1);
+        let mut snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+        assert_eq!(snap.state, WorkerState::AwaitingInput);
+
+        // The answer was delivered (same epoch); turn 2 starts, then ends silent.
+        snap.state = WorkerState::Running;
+        snap.state_reason = None;
+        snap.last_delivered_seq = 1;
+        save_snapshot(&dir, &snap).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(exec::exec_stream_path(&dir, 1))
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"type\":\"turn.started\"}\n").unwrap();
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+        assert_eq!(snap.state, WorkerState::Running);
+        std::io::Write::write_all(&mut f, b"{\"type\":\"turn.completed\"}\n").unwrap();
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+
+        assert_eq!(snap.state, WorkerState::AwaitingInput);
+        assert_eq!(snap.state_reason, Some(StateReason::TurnEndedWithoutResult));
+        assert!(!dir.join(RESULT_MD).exists(), "turn 1's chatter is not turn 2's result");
+    }
+
+    /// A question outranks: a turn that asked one parks `blocked`, and its
+    /// in-flight chatter is NOT promoted to a result.
+    #[test]
+    fn an_exec_turn_that_asked_a_question_parks_without_a_synthesized_result() {
+        let (_tmp, home, cfg, id) = exec_turn_fixture(LATE_FLUSH_STREAM);
+        let dir = home.worker_dir(&id);
+        ask_question(&dir, 1);
+
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+
+        assert_eq!(snap.state, WorkerState::AwaitingInput);
+        assert_eq!(snap.state_reason, Some(StateReason::Blocked));
+        assert!(!dir.join(RESULT_MD).exists(), "no result fabricated for a question turn");
+    }
+
+    /// A turn with no agent message at all is unchanged: alive it parks
+    /// `turn_ended_without_result`; dead it is `failed{no_result}`. codex's
+    /// `item.completed{type:error}` warnings are not agent messages.
+    #[test]
+    fn an_exec_turn_with_no_agent_message_still_parks_or_fails() {
+        let stream = "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"Skill descriptions were shortened\"}}\n\
+                      {\"type\":\"turn.completed\"}\n";
+        let (_tmp, home, cfg, id) = exec_turn_fixture(stream);
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+        assert_eq!(snap.state, WorkerState::AwaitingInput);
+        assert_eq!(snap.state_reason, Some(StateReason::TurnEndedWithoutResult));
+        assert!(!home.worker_dir(&id).join(RESULT_MD).exists());
+
+        let (_tmp, home, cfg, id) = exec_turn_fixture(stream);
+        std::fs::write(home.worker_dir(&id).join("exit_code"), "0\n").unwrap();
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+        assert_eq!(snap.state, WorkerState::Failed);
+        assert_eq!(snap.failure_class, Some(crate::fsm::FailureClass::NoResult));
+    }
+
+    /// The schema gate applies to a synthesized result exactly as to codex's
+    /// own file: a violating message fails the worker `schema_violation`, raw
+    /// text preserved, `done` never reached.
+    #[test]
+    fn a_synthesized_result_that_violates_the_schema_is_result_invalid() {
+        let (_tmp, home, cfg, id) = exec_turn_fixture(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"not json at all\"}}\n\
+             {\"type\":\"turn.completed\"}\n",
+        );
+        let dir = home.worker_dir(&id);
+        let schema = dir.join("schema.json");
+        std::fs::write(&schema, br#"{"type":"object","required":["status"]}"#).unwrap();
+        let mut snap = load_snapshot(&dir).unwrap();
+        snap.schema_path = Some(schema);
+        save_snapshot(&dir, &snap).unwrap();
+
+        let snap = reconcile(&home, &cfg, &id, Utc::now()).unwrap();
+
+        assert_eq!(snap.state, WorkerState::Failed);
+        assert_eq!(
+            snap.failure_class,
+            Some(crate::fsm::FailureClass::SchemaViolation)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(RESULT_RAW)).unwrap(),
+            "not json at all"
+        );
+        assert!(!dir.join(RESULT_JSON).exists());
     }
 
     /// An app-server worker's inbox is drained by its `WorkerActor` over the

@@ -782,6 +782,11 @@ impl WorkerActor {
                     has_result,
                     has_question,
                 )?;
+                // The app-server transport's framework commit on `done`: in
+                // the SAME locked step, so it lands before the settlement is
+                // announced (and therefore before `auto_review` diffs the
+                // branch), and this actor stays the sole writer of the log.
+                let snap = crate::auto_commit::run_locked(log, dir, snap, Utc::now());
                 Ok((snap, ()))
             })
             .await;

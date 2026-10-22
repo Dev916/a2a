@@ -118,6 +118,13 @@ pub fn fold(mut snap: WorkerSnapshot, events: &[Envelope], now: DateTime<Utc>) -
                 events::EventKind::InboxDelivered | events::EventKind::TransportRestarted
             ) {
                 apply_transport_identity(&mut snap, env);
+            } else if matches!(
+                env.kind,
+                events::EventKind::ResultCommitted
+                    | events::EventKind::CommitSkipped
+                    | events::EventKind::CommitFailed
+            ) {
+                absorb_auto_commit(&mut snap, env);
             }
         }
         // else: stale epoch — fenced. The seq is still consumed below.
@@ -280,6 +287,10 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     if let Some(attempt) = raw.get("attempt").and_then(|v| v.as_u64()) {
         snap.attempt = Some(attempt as u32);
     }
+    // The framework-commit decision (`src/auto_commit.rs`), present ONLY when
+    // it is "yes": an ABSENT key is "no", so every worker born before the
+    // feature existed is never committed by the binary that introduced it.
+    snap.auto_commit_enabled = raw.get("auto_commit_enabled").and_then(|v| v.as_bool()) == Some(true);
     // The auto-review marker (spec §4.8): which impl worker's diff this worker
     // was made to review. Bookkeeping the snapshot carries verbatim, like
     // `schema_source` — and deliberately NOT `parent_id`, which is the retry
@@ -312,6 +323,34 @@ fn seed_from_genesis(snap: &mut WorkerSnapshot, env: &Envelope, now: DateTime<Ut
     snap.failure_class = None;
     snap.entered_state_at = snap.created_at;
     snap.updated_at = now;
+}
+
+/// The framework commit's verdict on a `done` worker. Bookkeeping, not a
+/// transition: these rows carry no `fsm` key and only ever fill in the
+/// snapshot's `auto_commit` record (and `committed_sha` when there is one).
+fn absorb_auto_commit(snap: &mut WorkerSnapshot, env: &Envelope) {
+    let s = |k: &str| env.raw.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let record = match env.kind {
+        events::EventKind::ResultCommitted => {
+            snap.committed_sha = s("sha");
+            crate::state::AutoCommitRecord {
+                outcome: "committed".to_string(),
+                sha: s("sha"),
+                reason: None,
+            }
+        }
+        events::EventKind::CommitSkipped => crate::state::AutoCommitRecord {
+            outcome: s("outcome").unwrap_or_else(|| "skipped".to_string()),
+            sha: None,
+            reason: s("reason"),
+        },
+        _ => crate::state::AutoCommitRecord {
+            outcome: "failed".to_string(),
+            sha: None,
+            reason: s("reason"),
+        },
+    };
+    snap.auto_commit = Some(record);
 }
 
 /// Transport bookkeeping: events that move no state but replace the worker's
@@ -1102,6 +1141,42 @@ mod tests {
             Utc::now(),
         );
         assert_eq!(after.transport, Transport::Exec);
+    }
+
+    /// The auto-commit rows: genesis carries the decision, and the verdict row
+    /// fills in the record (and the sha) without moving the state.
+    #[test]
+    fn genesis_carries_the_auto_commit_decision_and_the_verdict_folds_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = WorkerSnapshot::blank("impl-0814t1300-aaaa", tmp.path());
+        let mut genesis = ev(json!({"fsm": "Spawn", "id": "impl-0814t1300-aaaa",
+                                    "auto_commit_enabled": true}), 1, 1);
+        genesis.kind = EventKind::Spawned;
+        let snap = fold(base.clone(), &[genesis.clone()], Utc::now());
+        assert!(snap.auto_commit_enabled);
+        let mut plain = ev(json!({"fsm": "Spawn", "id": "impl-0814t1300-aaaa"}), 1, 1);
+        plain.kind = EventKind::Spawned;
+        assert!(!fold(base.clone(), &[plain], Utc::now()).auto_commit_enabled);
+
+        let mut committed = ev(json!({"sha": "abc123", "files": 1, "branch": "b"}), 1, 2);
+        committed.kind = EventKind::ResultCommitted;
+        let after = fold(snap.clone(), &[committed], Utc::now());
+        assert_eq!(after.committed_sha.as_deref(), Some("abc123"));
+        assert_eq!(after.auto_commit.as_ref().unwrap().outcome, "committed");
+        assert_eq!(after.state, snap.state, "bookkeeping moves no state");
+        assert!(after.extra.get("fold_rejections").is_none());
+
+        let mut skipped = ev(json!({"outcome": "clean", "reason": "nothing to commit"}), 1, 2);
+        skipped.kind = EventKind::CommitSkipped;
+        let after = fold(snap.clone(), &[skipped], Utc::now());
+        assert_eq!(after.committed_sha, None);
+        assert_eq!(after.auto_commit.as_ref().unwrap().outcome, "clean");
+
+        let mut failed = ev(json!({"reason": "git said no"}), 1, 2);
+        failed.kind = EventKind::CommitFailed;
+        let after = fold(snap, &[failed], Utc::now());
+        let rec = after.auto_commit.unwrap();
+        assert_eq!((rec.outcome.as_str(), rec.reason.as_deref()), ("failed", Some("git said no")));
     }
 
     #[test]

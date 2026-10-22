@@ -975,3 +975,34 @@ fn a_malformed_sync_allowlist_fails_naming_its_dotted_key() {
         "{stderr}"
     );
 }
+
+/// `auto_commit` (framework commit on `done`): on for the impl lane only by
+/// default, listed by `config show --origin` on every lane, and layered through
+/// the file and the environment like every other lane key.
+#[test]
+fn auto_commit_defaults_on_for_impl_and_lists_its_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let v = show(tmp.path(), &[], true);
+    assert_eq!(v["data"]["lanes"]["impl"]["auto_commit"], true);
+    for lane in ["review", "research", "general"] {
+        assert_eq!(v["data"]["lanes"][lane]["auto_commit"], false, "{lane}");
+    }
+    for lane in ["impl", "review", "research", "general"] {
+        assert_eq!(
+            v["data"]["origins"][format!("lanes.{lane}.auto_commit")],
+            "default",
+            "{lane}"
+        );
+    }
+
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[lanes.impl]\nauto_commit = false\n",
+    )
+    .unwrap();
+    let v = show(tmp.path(), &[("A2A_LANES_GENERAL_AUTO_COMMIT", "true")], true);
+    assert_eq!(v["data"]["lanes"]["impl"]["auto_commit"], false);
+    assert_eq!(v["data"]["origins"]["lanes.impl.auto_commit"], "file");
+    assert_eq!(v["data"]["lanes"]["general"]["auto_commit"], true);
+    assert_eq!(v["data"]["origins"]["lanes.general.auto_commit"], "env");
+}

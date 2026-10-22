@@ -116,6 +116,9 @@ pub fn run(
                 hint(snap.state)
             ),
         }
+        if let Some(line) = commit_line(&snap) {
+            eprintln!("a2a: {id} {line}");
+        }
     }
 
     if json_mode {
@@ -129,6 +132,21 @@ pub fn run(
         None => Value::Null,
     };
     Ok(Outcome::with(data, exit))
+}
+
+/// The framework commit's verdict, for the human decoration line:
+/// `committed <sha>`, or why there is none. `None` when it never ran.
+fn commit_line(snap: &WorkerSnapshot) -> Option<String> {
+    if let Some(sha) = &snap.committed_sha {
+        return Some(format!("committed {sha}"));
+    }
+    let rec = snap.auto_commit.as_ref()?;
+    let reason = rec.reason.as_deref().unwrap_or("");
+    Some(match rec.outcome.as_str() {
+        "failed" => format!("commit failed: {}", redact::redact_egress(reason)),
+        "clean" => "not committed: nothing to commit".to_string(),
+        other => format!("not committed ({other}): {reason}"),
+    })
 }
 
 /// What to suggest when there is nothing to print. Terminal-but-empty is a
@@ -165,6 +183,10 @@ fn payload(id: &str, snap: &WorkerSnapshot, found: Option<&Found>) -> Value {
         "format": found.map(|f| f.format.as_str()),
         "result_path": found.map(|f| f.path.clone()),
         "result": result,
+        // The framework commit on `done` (`src/auto_commit.rs`): the sha when
+        // one was made, and the whole verdict either way (`null` = never ran).
+        "committed_sha": snap.committed_sha,
+        "auto_commit": snap.auto_commit,
     })
 }
 
@@ -249,6 +271,38 @@ mod tests {
         assert_eq!(v["format"], json!("json"));
         let note = v["result"]["note"].as_str().unwrap();
         assert!(!note.contains("xoxb-1234567890"), "{note}");
+    }
+
+    #[test]
+    fn the_commit_verdict_is_in_the_payload_and_the_decoration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snap = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        snap.state = WorkerState::Done;
+        assert_eq!(commit_line(&snap), None);
+        let v = payload("impl-0814t1300-aaaa", &snap, None);
+        assert_eq!((v["committed_sha"].clone(), v["auto_commit"].clone()), (Value::Null, Value::Null));
+
+        snap.committed_sha = Some("abc123".into());
+        snap.auto_commit = Some(crate::state::AutoCommitRecord {
+            outcome: "committed".into(),
+            sha: Some("abc123".into()),
+            reason: None,
+        });
+        assert_eq!(commit_line(&snap).as_deref(), Some("committed abc123"));
+        let v = payload("impl-0814t1300-aaaa", &snap, None);
+        assert_eq!(v["committed_sha"], json!("abc123"));
+        assert_eq!(v["auto_commit"]["outcome"], json!("committed"));
+
+        snap.committed_sha = None;
+        snap.auto_commit = Some(crate::state::AutoCommitRecord {
+            outcome: "failed".into(),
+            sha: None,
+            reason: Some("git add failed: locked".into()),
+        });
+        assert_eq!(
+            commit_line(&snap).as_deref(),
+            Some("commit failed: git add failed: locked")
+        );
     }
 
     #[test]

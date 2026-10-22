@@ -511,6 +511,49 @@ include a compaction-forcing brief.
   worker on an impl worker's diff at `done` (findings → `review.json`), counted
   against the caps.
 
+#### `auto_commit` — the framework commits on `done`
+
+Codex's workspace-write sandbox makes `.git` read-only, so a worker can finish a
+change in-tree but can never commit it. When a worker reaches `done`, a2a
+commits for it from outside the sandbox (`src/auto_commit.rs`), through the
+mesh path's pinned git (`work_gate::git_pinned`: hooks off, no gpg, literal
+pathspecs) as `a2a <a2a@localhost>`.
+
+- **Policy:** lane key `auto_commit` (appended last to `LANE_FIELDS`), default
+  `true` for `impl`, `false` elsewhere; only `impl` and `general` may ever
+  commit. `spawn --commit` / `--no-commit` override per worker; the effective
+  decision is recorded in genesis (`auto_commit_enabled`, written only when
+  true — an absent key is "no", so pre-feature workers are never committed by an
+  upgrade) and `respawn` inherits it.
+- **Staging:** the result's `files_changed` when non-empty (paths normalized to
+  the checkout; `..`, absolute paths outside it, `.git`, pathspec magic and
+  globs refuse the commit; ignored or vanished paths are dropped; the staged set
+  is verified against the list and the commit is `--only` those paths, so a
+  human's other staged changes stay put). Empty/absent list → `git add -A` in
+  the worker's **own worktree** only; in a shared cwd nothing is staged and
+  `commit_skipped{outcome:"skipped"}` says why. Nothing staged → `clean`.
+  Conflict markers in staged additions refuse the commit.
+- **Message:** `<lane> <id>: <summary first line, ≤72 chars, redacted>`, blank
+  line, `Worker: <id> (<model>/<effort>, <transport>)` and
+  `Co-Authored-By: Codex <noreply@openai.com>`.
+- **Where it runs:** one implementation, one call per transport, under
+  `state.lock`: exec in `reconcile()` right after the locked pass; app-server in
+  the `WorkerActor`'s turn-concluding persist step — before the settlement is
+  announced, so `auto_review`'s `base_ref..branch` diff includes the commit, and
+  the actor stays the sole writer of its WAL.
+- **Recording:** a `result_committed{sha,files,branch}` /
+  `commit_skipped{outcome,reason}` / `commit_failed{reason}` lifecycle row with
+  no `fsm` key; the fold fills `state.json`'s `committed_sha` and
+  `auto_commit{outcome,sha?,reason?}`; `result.json` (when a JSON object) gains
+  `committed_sha`. Each worker is answered once. A failure never changes the
+  worker: it stays `done`.
+- **Surface:** `a2a result` prints `committed <sha>` (or why not) on stderr and
+  carries `committed_sha`/`auto_commit` in `--json`; `a2a ls` appends
+  `✓ committed` after the last column and carries `committed_sha` in `--json`.
+  The commit lands on the worker's branch (or the shared cwd's current branch);
+  nothing is ever pushed or merged. Mesh work spawns opt out — the receiver
+  commits a work result itself (`work_gate::commit_worker_result`).
+
 ### 4.9 Lanes
 
 Lanes are brief templates + spawn defaults. Model/effort are explicit per lane

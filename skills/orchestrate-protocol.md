@@ -172,6 +172,22 @@ unless you pass `--force`: unfinished work keeps its directory alive instead of
 disappearing quietly. Removal is `git worktree remove` plus `prune`, and **the
 branch outlives `gc`** — including `gc --force`. The branch is the deliverable;
 a2a never deletes one.
+
+**Auto-commit: you do not commit by hand.** A worker cannot commit (the codex
+sandbox makes `.git` read-only), so when an impl worker reaches `done` a2a
+commits its change from outside the sandbox, as `a2a <a2a@localhost>`, with the
+subject `<lane> <id>: <summary>` and a `Co-Authored-By: Codex` trailer. It
+stages exactly the result's `files_changed`; with an empty list it stages
+everything in the worker's **own worktree**, and in a shared cwd
+(`--no-worktree`) it stages nothing and records why. On by default for the impl
+lane (`lanes.impl.auto_commit`), off for general (`spawn --commit` turns it on),
+never for review or research; `spawn --no-commit` turns it off for one worker
+and `respawn` inherits the parent's choice. `a2a result <id>` prints
+`committed <sha>` (or the reason it did not), `--json` carries `committed_sha`,
+and `a2a ls` marks the row `✓ committed`. A failed commit never fails the
+worker — it stays `done` with a `commit_failed` event. The commit lands on the
+worker's branch (or the shared cwd's current branch); **nothing is ever pushed
+or merged**.
 <!-- a2a:end worktree-hygiene -->
 
 <!-- a2a:section ownership -->
@@ -218,7 +234,10 @@ verifies it with the toolkit the task actually needs.
 
 The impl lane's result **is** devloop's `sample-task-result.json` shape —
 `{status, iterations, summary, evidence, files_changed, next_step_hint}` — so
-devloop step **4.3.4** parses a worker's result **without an adapter**. The
+devloop step **4.3.4** parses a worker's result **without an adapter**. With
+`--no-worktree`, auto-commit commits exactly that result's `files_changed` onto
+devloop's working tree's current branch (other dirty files are left alone); pass
+`--no-commit` if your devloop step commits the task itself. The
 shipped copy is `templates/impl-result.schema.json`, materialized into each
 impl worker as `result-schema.json` and enforced at the turn boundary: a result
 that does not carry every required key fails the worker `schema_violation`

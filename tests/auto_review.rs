@@ -429,6 +429,64 @@ fn a_finished_impl_worktree_becomes_a_reviewer_whose_findings_land_as_review_jso
     common::assert_no_broker_left(&w.home);
 }
 
+/// Framework commit on `done`, app-server leg: the worker leaves its change
+/// UNCOMMITTED (it cannot commit — the sandbox makes `.git` read-only), the
+/// broker's actor commits it in the same step that concludes the turn, and only
+/// then does the settlement reach `auto_review` — so the reviewer's diff, taken
+/// as `base_ref..branch`, includes the framework's commit.
+#[test]
+fn the_framework_commit_lands_before_the_reviewer_diffs_the_branch() {
+    let w = world();
+    let guard = common::BrokerGuard::new(&w.home);
+
+    let id = w.spawn_impl(&[], "spawn");
+    w.until_state(&id, "running");
+    let wt = w.worktree(&id);
+    // In-tree and uncommitted, exactly as a sandboxed worker leaves it.
+    std::fs::write(wt.join("src/marker.rs"), format!("// {DIFF_MARKER}\n")).unwrap();
+    w.finish(&id, "send-impl");
+    // The verdict row follows the `done` checkpoint inside the same locked
+    // step (and so precedes the settlement); converge on it.
+    let done = until(&format!("worker {id} done and committed"), || {
+        w.snap(&id)
+            .filter(|s| s["state"] == json!("done") && !s["auto_commit"].is_null())
+    });
+    let sha = done["committed_sha"]
+        .as_str()
+        .unwrap_or_else(|| panic!("committed in the turn's own step: {done}"))
+        .to_string();
+    assert_eq!(done["auto_commit"]["outcome"], json!("committed"), "{done}");
+    let branch = format!("a2a/impl/{id}");
+    assert_eq!(git_ok(&w.repo, &["rev-parse", &branch]).trim(), sha);
+    let msg = git_ok(&w.repo, &["show", "-s", "--format=%an|%B", &sha]);
+    assert!(
+        msg.starts_with(&format!("a2a|impl {id}: ")) && msg.contains("app-server)"),
+        "{msg}"
+    );
+    assert_eq!(git_ok(&wt, &["status", "--porcelain"]), "", "nothing left behind");
+
+    // ...so the reviewer's brief carries the framework-committed diff.
+    let reviewer = w.until_reviewer(&id);
+    let rid = reviewer["id"].as_str().unwrap().to_string();
+    let rbrief = std::fs::read_to_string(w.worker_dir(&rid).join("brief.md")).unwrap();
+    assert!(
+        rbrief.contains(DIFF_MARKER),
+        "the review's diff includes the framework commit: {rbrief}"
+    );
+    // A reviewer is never itself committed.
+    let rsnap = w.snap(&rid).unwrap();
+    assert_eq!(rsnap["auto_commit_enabled"], json!(false), "{rsnap}");
+
+    // `a2a result --json` reports it, through the broker-owned worker.
+    let ran = run(w.cli(&["--json", "result", &id]), &w.scratch, "result");
+    assert_eq!(ran.data()["committed_sha"], json!(sha), "{}", ran.stdout);
+
+    w.finish(&rid, "send-review");
+    w.until_state(&rid, "done");
+    drop(guard);
+    common::assert_no_broker_left(&w.home);
+}
+
 /// A diff past the 200 KiB cap is truncated with the EXACT marker — the
 /// reviewer must be able to tell it was handed part of a change.
 #[test]
@@ -689,7 +747,15 @@ fn a_reviewer_that_never_finishes_never_touches_the_impl_worker() {
     w.until_state(&id, "running");
     w.commit_in_worktree(&id, "src/marker.rs", &format!("// {DIFF_MARKER}\n"));
     w.finish(&id, "send-impl");
-    let done = w.until_state(&id, "done");
+    // `done` AND the framework commit's verdict row (here `clean` — the change
+    // was committed by hand), which the actor writes in the same locked step
+    // just after the `done` checkpoint and before the settlement: the baseline
+    // is the WAL as the reviewer found it.
+    let done = until(&format!("worker {id} done with its auto-commit verdict"), || {
+        w.snap(&id)
+            .filter(|s| s["state"] == json!("done") && !s["auto_commit"].is_null())
+    });
+    assert_eq!(done["auto_commit"]["outcome"], json!("clean"), "{done}");
     let events_at_done = std::fs::read_to_string(w.worker_dir(&id).join("events.jsonl"))
         .unwrap()
         .lines()

@@ -669,6 +669,7 @@ mod tests {
             allow_elevation: false,
             max_turns: 30,
             auto_review: false,
+            auto_commit: false,
         }
     }
 

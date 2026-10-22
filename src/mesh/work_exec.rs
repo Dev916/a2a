@@ -401,6 +401,10 @@ impl WorkSpawner for RealSpawner {
             base_ref: None,
             danger_full_access: false,
             reason: None,
+            // The mesh commits a work result itself, on the receiver, through
+            // `work_gate::commit_worker_result` — never twice.
+            commit: false,
+            no_commit: true,
         };
         crate::commands::spawn::run_with_overrides(
             home,

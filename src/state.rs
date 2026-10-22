@@ -47,6 +47,22 @@ pub struct WorktreeRef {
     pub repo: PathBuf,
 }
 
+/// What the framework commit on `done` did for one worker (see
+/// `src/auto_commit.rs`). Fold-derived from the worker's own
+/// `result_committed` / `commit_skipped` / `commit_failed` row, so a snapshot
+/// rebuilt from the WAL reports the same outcome.
+///
+/// `outcome` is an open string — `committed`, `clean`, `skipped` or `failed`
+/// today — so a newer binary's verdict round-trips through an older one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AutoCommitRecord {
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorkerSnapshot {
     pub schema_version: u32,
@@ -117,6 +133,22 @@ pub struct WorkerSnapshot {
     /// and nothing about it changes on disk when this binary reads it.
     #[serde(default)]
     pub attempt: Option<u32>,
+    /// Will the framework commit this worker's change when it reaches `done`?
+    ///
+    /// The EFFECTIVE decision (lane `auto_commit` under `spawn --commit` /
+    /// `--no-commit`), taken at spawn and carried by genesis like every other
+    /// per-worker override — so an operator flipping the lane key later never
+    /// re-decides a worker already in flight, and a worker born before the
+    /// feature existed (no key at all) is never committed by an upgrade.
+    #[serde(default)]
+    pub auto_commit_enabled: bool,
+    /// The commit the framework made on `done`, when it made one.
+    #[serde(default)]
+    pub committed_sha: Option<String>,
+    /// What the framework commit did — `None` until it has run (or for a
+    /// worker it never runs for).
+    #[serde(default)]
+    pub auto_commit: Option<AutoCommitRecord>,
     pub rollout_path: Option<PathBuf>,
     pub pid: Option<u32>,
     pub pid_start_witness: Option<String>,
@@ -178,6 +210,9 @@ impl WorkerSnapshot {
             turns_this_epoch: None,
             parent_id: None,
             attempt: None,
+            auto_commit_enabled: false,
+            committed_sha: None,
+            auto_commit: None,
             rollout_path: None,
             pid: None,
             pid_start_witness: None,
@@ -433,6 +468,27 @@ mod tests {
                 && back.extra.get("attempt").is_none(),
             "the new fields are typed, not swept into the forward-compat bag"
         );
+    }
+
+    /// A snapshot written before the framework commit existed has none of its
+    /// three keys, and must load as a worker that is never auto-committed —
+    /// never as `Corrupt`, and never as one an upgrade would suddenly commit.
+    #[test]
+    fn a_snapshot_without_the_auto_commit_fields_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = WorkerSnapshot::new_for_test("impl-0814t1300-aaaa", tmp.path());
+        let mut value = serde_json::to_value(&s).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("auto_commit_enabled");
+        obj.remove("committed_sha");
+        obj.remove("auto_commit");
+        std::fs::write(tmp.path().join(STATE_FILE), value.to_string()).unwrap();
+
+        let back = load_snapshot(tmp.path()).expect("an older snapshot is not corrupt");
+        assert!(!back.auto_commit_enabled);
+        assert_eq!(back.committed_sha, None);
+        assert_eq!(back.auto_commit, None);
+        assert!(back.extra.is_empty(), "typed, not swept into the bag");
     }
 
     /// The worktree round trips as a typed object, and the diff anchor agrees

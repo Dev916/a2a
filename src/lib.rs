@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod auto_commit;
 pub mod brief;
 pub mod broker;
 pub mod brokerclient;

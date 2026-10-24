@@ -479,3 +479,15 @@ pub fn sync_a2a(home: &Path, codex_home: &Path, claude_dir: &Path, allowed_root:
         .env_remove("A2A_SYNC_ALLOW_SKILLS");
     c
 }
+
+/// The model the real-codex tiers pin on their `general` lane. A fresh
+/// `A2A_HOME` has no `[lanes.*]` config, so without this the tier rode on
+/// `DEFAULT_MODEL` alone — and while that was `gpt-5.5`, codex 0.152 refused it
+/// on ChatGPT accounts and every worker parked `failed{no_result}` (a2a-w80).
+/// `A2A_E2E_MODEL` wins, then an operator's own `A2A_LANES_GENERAL_MODEL`, then
+/// the config default — so the model the worker runs is always a deliberate one.
+pub fn e2e_model() -> String {
+    std::env::var("A2A_E2E_MODEL")
+        .or_else(|_| std::env::var("A2A_LANES_GENERAL_MODEL"))
+        .unwrap_or_else(|_| a2a::config::DEFAULT_MODEL.to_string())
+}

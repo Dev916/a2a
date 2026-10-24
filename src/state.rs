@@ -217,7 +217,7 @@ impl WorkerSnapshot {
             pid: None,
             pid_start_witness: None,
             profile: None,
-            model: "gpt-5.5".to_string(),
+            model: crate::config::DEFAULT_MODEL.to_string(),
             effort: "medium".to_string(),
             brief_sha: String::new(),
             schema_path: None,
@@ -240,7 +240,7 @@ impl WorkerSnapshot {
     ///
     /// Seeds: schema_version 1, epoch 1, state `spawned`, lane parsed from the
     /// id prefix (fallback `general`), cwd as given, transport/requested
-    /// `exec`, sandbox `workspace-write`, network false, model `gpt-5.5`,
+    /// `exec`, sandbox `workspace-write`, network false, model `DEFAULT_MODEL`,
     /// effort `medium`, all seqs 0, timestamps now.
     pub fn new_for_test(id: &str, cwd: &Path) -> Self {
         Self::blank(id, cwd)
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(s.base_ref, None);
         assert_eq!(s.sandbox, SandboxMode::WorkspaceWrite);
         assert!(!s.network);
-        assert_eq!(s.model, "gpt-5.5");
+        assert_eq!(s.model, crate::config::DEFAULT_MODEL);
         assert_eq!(s.effort, "medium");
         assert_eq!(
             (s.last_event_seq, s.last_applied_seq, s.last_delivered_seq),

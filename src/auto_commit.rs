@@ -722,7 +722,13 @@ mod tests {
         let lines: Vec<&str> = msg.lines().collect();
         assert_eq!(lines[0], format!("impl impl-0814t1300-aaaa: {}", "x".repeat(72)));
         assert_eq!(lines[1], "");
-        assert_eq!(lines[2], "Worker: impl-0814t1300-aaaa (gpt-5.5/medium, exec)");
+        assert_eq!(
+            lines[2],
+            format!(
+                "Worker: impl-0814t1300-aaaa ({}/medium, exec)",
+                crate::config::DEFAULT_MODEL
+            )
+        );
         assert_eq!(lines[3], CO_AUTHOR_TRAILER);
         assert!(commit_message(&s, None).starts_with("impl impl-0814t1300-aaaa: worker result"));
     }

@@ -18,7 +18,7 @@ fn defaults_match_spec_lane_table() {
     let tmp = tempfile::tempdir().unwrap();
     let v = show(tmp.path(), &[], false);
     assert_eq!(v["data"]["lanes"]["impl"]["sandbox"], "workspace-write");
-    assert_eq!(v["data"]["lanes"]["impl"]["model"], "gpt-5.5");
+    assert_eq!(v["data"]["lanes"]["impl"]["model"], "gpt-5.6-sol");
     assert_eq!(v["data"]["lanes"]["impl"]["effort"], "high");
     // The impl lane — and only it — defaults to its own worktree now that
     // `src/worktree.rs` can create one.
@@ -37,9 +37,9 @@ fn profiles_pin_defaults_and_layer_file_then_env_with_custom_names() {
 
     let tmp = tempfile::tempdir().unwrap();
     let v = show(tmp.path(), &[], true);
-    assert_eq!(v["data"]["profiles"]["quick"]["model"], "gpt-5.5");
+    assert_eq!(v["data"]["profiles"]["quick"]["model"], "gpt-5.6-sol");
     assert_eq!(v["data"]["profiles"]["quick"]["effort"], "low");
-    assert_eq!(v["data"]["profiles"]["standard"]["model"], "gpt-5.5");
+    assert_eq!(v["data"]["profiles"]["standard"]["model"], "gpt-5.6-sol");
     assert_eq!(v["data"]["profiles"]["standard"]["effort"], "high");
     assert_eq!(v["data"]["profiles"]["max"]["model"], "gpt-5.6-sol");
     assert_eq!(v["data"]["profiles"]["max"]["effort"], "max");
@@ -722,7 +722,7 @@ fn admission_caps_default_to_8_32_4_and_name_their_layer() {
         );
     }
     // The lane table is its own section: `lanes.*` is untouched by any of this.
-    assert_eq!(v["data"]["lanes"]["impl"]["model"], "gpt-5.5");
+    assert_eq!(v["data"]["lanes"]["impl"]["model"], "gpt-5.6-sol");
 
     std::fs::write(
         tmp.path().join("config.toml"),

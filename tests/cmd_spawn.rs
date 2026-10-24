@@ -23,7 +23,7 @@ fn spawn_general_creates_worker_and_runs() {
     assert_eq!(snap["state"], "running");
     assert_eq!(snap["transport"], "exec");
     assert_eq!(snap["sandbox"], "workspace-write");
-    assert_eq!(snap["model"], "gpt-5.5");
+    assert_eq!(snap["model"], "gpt-5.6-sol");
     assert_eq!(snap["brief_sha"].as_str().unwrap().len(), 64);
 }
 
@@ -94,9 +94,9 @@ fn explicit_effort_beats_profile_while_profile_model_stays() {
         spawn_profile_case(&tmp, "quick", &["--effort", "xhigh"]);
 
     assert_eq!(payload["data"]["profile"], "quick");
-    assert_eq!(payload["data"]["model"], "gpt-5.5");
+    assert_eq!(payload["data"]["model"], "gpt-5.6-sol");
     assert_eq!(payload["data"]["effort"], "xhigh");
-    assert!(argv.contains("-m gpt-5.5"), "{argv}");
+    assert!(argv.contains("-m gpt-5.6-sol"), "{argv}");
     assert!(
         argv.contains("model_reasoning_effort=\"xhigh\""),
         "{argv}"

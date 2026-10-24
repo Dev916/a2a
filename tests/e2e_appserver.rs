@@ -785,6 +785,7 @@ fn real_cli(env: &Env, args: &[&str]) -> Command {
         .env("A2A_ALLOWED_ROOTS", &env.allowed)
         .env("A2A_OWNER", common::TEST_OWNER)
         .env("A2A_BROKER_BIN", a2a_bin())
+        .env("A2A_LANES_GENERAL_MODEL", common::e2e_model())
         .env("A2A_SHIM_BIN", a2a_bin());
     c
 }
@@ -1322,7 +1323,7 @@ async fn real_steer_precondition_error_is_the_one_the_matcher_knows() {
         sandbox: SandboxMode::WorkspaceWrite,
         network: false,
         worktree_default: false,
-        model: a2a::config::DEFAULT_MODEL.to_string(),
+        model: common::e2e_model(),
         effort: "medium".to_string(),
         start_timeout_secs: 120,
         task_timeout_secs: 3600,

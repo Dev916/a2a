@@ -543,7 +543,7 @@ allowed_roots = ["/Users/you/dev", "/Users/you/work"]
 codex_version_range = ">=0.140, <0.153"
 
 [lanes.impl]
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 effort = "high"
 task_timeout_secs = 7200
 max_turns = 40           # per-lane turn budget: impl 40, general 30,
@@ -923,6 +923,9 @@ cargo test                                     # hermetic: no real codex, no net
 # The gated proofs. Real codex, real ~/.codex auth (read, never written), tokens.
 A2A_E2E=1 cargo test --test e2e_exec      -- --ignored --nocapture
 A2A_E2E=1 cargo test --test e2e_appserver -- --ignored --nocapture
+# Both real tiers pin the general lane's model: A2A_E2E_MODEL, else your own
+# A2A_LANES_GENERAL_MODEL, else the config default — a fresh A2A_HOME never
+# rides on a model the account happens to refuse (a2a-w80).
 
 # Read-only, no tokens: both syncs dry-run against this machine ([Sync](#sync-giving-codex-workers-the-same-capability-layer)).
 A2A_SYNC_LIVE=1 cargo test --test sync_live -- --ignored

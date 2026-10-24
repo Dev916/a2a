@@ -13,7 +13,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const DEFAULT_MODEL: &str = "gpt-5.5";
+/// The model every lane and built-in profile starts from when nothing sets
+/// one. `gpt-5.5` was the default until 2026-10-23; codex 0.152 refuses it on
+/// ChatGPT accounts (400 "not supported when using Codex with a ChatGPT
+/// account"), so every worker in a fresh home parked `failed{no_result}`
+/// (a2a-w80). Override per lane with `[lanes.<lane>] model` or
+/// `A2A_LANES_<LANE>_MODEL`, per profile with `[profiles.<name>] model`.
+pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 /// The codex releases Phase 1's transport contract was written against
 /// (spec §9 risk table: the exec JSONL shape is version-coupled). `doctor`
 /// warns outside it — never fails, because a drifted codex is a thing to tell
@@ -765,14 +771,16 @@ fn default_lane(lane: Lane) -> LaneConfig {
     }
 }
 
-/// The three routing names available even when no config file exists.
+/// The three routing names available even when no config file exists. They
+/// share [`DEFAULT_MODEL`] and differ only in effort — a built-in profile
+/// naming a model the account cannot use is the a2a-w80 failure again.
 /// Operators may override either field in `config.toml` or the environment,
 /// while additional file-defined profiles join this map.
 pub(crate) fn default_profiles() -> BTreeMap<String, ProfileConfig> {
     [
-        ("quick", "gpt-5.5", "low"),
-        ("standard", "gpt-5.5", "high"),
-        ("max", "gpt-5.6-sol", "max"),
+        ("quick", DEFAULT_MODEL, "low"),
+        ("standard", DEFAULT_MODEL, "high"),
+        ("max", DEFAULT_MODEL, "max"),
     ]
     .into_iter()
     .map(|(name, model, effort)| {
@@ -1978,7 +1986,7 @@ mod tests {
         );
         for lane in Lane::ALL {
             let d = default_lane(lane);
-            assert_eq!(d.model, "gpt-5.5");
+            assert_eq!(d.model, DEFAULT_MODEL);
             assert_eq!(d.start_timeout_secs, 120);
             assert_eq!(d.task_timeout_secs, 3600);
             assert_eq!(d.blocked_timeout_secs, 1800);

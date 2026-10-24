@@ -171,7 +171,7 @@ fn a_done_impl_worktree_worker_is_committed_once_on_its_branch() {
     assert_eq!(
         msg.trim_end(),
         format!(
-            "impl {id}: add a.txt\n\nWorker: {id} (gpt-5.5/high, exec)\nCo-Authored-By: Codex <noreply@openai.com>"
+            "impl {id}: add a.txt\n\nWorker: {id} (gpt-5.6-sol/high, exec)\nCo-Authored-By: Codex <noreply@openai.com>"
         )
     );
     // The main checkout is untouched.

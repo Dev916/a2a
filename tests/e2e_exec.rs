@@ -232,6 +232,7 @@ fn real_codex_smoke() {
             .env("A2A_ALLOWED_ROOTS", tmp.path())
             .env("A2A_SHIM_BIN", assert_cmd::cargo::cargo_bin("a2a"))
             .env("A2A_BROKER_DISABLE", "1")
+            .env("A2A_LANES_GENERAL_MODEL", common::e2e_model())
             .env_remove("A2A_CODEX_BIN");
     };
 

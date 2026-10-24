@@ -562,9 +562,9 @@ the design).
 
 | Lane | Sandbox (explicit per spawn) | Model / effort default | MCP | Brief requires | Result |
 |------|------------------------------|------------------------|-----|----------------|--------|
-| `impl` | workspaceWrite; worktree default; outbox writable root | gpt-5.5 / high | **none** | acceptance criteria, files_in_scope, verify commands, non-goals | devloop `sample-task-result.json` schema |
-| `review` | workspaceWrite with **no repo root** (outbox only) — semantically read-only | gpt-5.5 / medium | none | diff/branch ref, review dimensions | findings schema (file, line, severity, rationale) |
-| `research` | as review + `networkAccess: true`; cwd = worker scratch dir, never a repo or $HOME | gpt-5.5 / medium | config allowlist (default none; codex built-in web search preferred) | question, source hints, report format | report + citations |
+| `impl` | workspaceWrite; worktree default; outbox writable root | gpt-5.6-sol / high | **none** | acceptance criteria, files_in_scope, verify commands, non-goals | devloop `sample-task-result.json` schema |
+| `review` | workspaceWrite with **no repo root** (outbox only) — semantically read-only | gpt-5.6-sol / medium | none | diff/branch ref, review dimensions | findings schema (file, line, severity, rationale) |
+| `research` | as review + `networkAccess: true`; cwd = worker scratch dir, never a repo or $HOME | gpt-5.6-sol / medium | config allowlist (default none; codex built-in web search preferred) | question, source hints, report format | report + citations |
 | `general` | workspaceWrite | config default | none | freeform | freeform |
 
 `brief.md` has YAML front matter (`lane`, `acceptance_criteria: []`,
